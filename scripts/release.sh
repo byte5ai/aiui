@@ -103,17 +103,20 @@ git push origin "${TAG}"
 # 8. GitHub Release
 NOTES_FILE="$(mktemp)"
 trap "rm -f ${NOTES_FILE}" EXIT
-{
-  echo "## aiui ${TAG}"
-  echo
-  echo "**Install:**"
-  echo '```sh'
-  echo "# Download aiui-${VERSION}-arm64.zip, then:"
-  echo "ditto -xk aiui-${VERSION}-arm64.zip /Applications/"
-  echo "```"
-  echo
-  echo "Signed + notarized by byte5 GmbH — no quarantine warnings."
-} > "${NOTES_FILE}"
+cat > "${NOTES_FILE}" <<NOTES_EOF
+## aiui ${TAG}
+
+Signed + notarized by high5 ventures GmbH — no quarantine warnings on macOS.
+
+**Install:**
+
+\`\`\`sh
+# after downloading aiui-${VERSION}-arm64.zip:
+ditto -xk aiui-${VERSION}-arm64.zip /Applications/
+\`\`\`
+
+See [CHANGELOG](https://github.com/byte5ai/aiui/commits/${TAG}) for the full diff since the previous release.
+NOTES_EOF
 
 gh release create "${TAG}" "${ZIP_OUT}" \
   --title "aiui ${TAG}" \
