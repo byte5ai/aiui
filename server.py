@@ -39,7 +39,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 
 
 def _git_sha() -> str:
@@ -157,18 +157,33 @@ async def ask(
     multi_select: bool = False,
     allow_other: bool = True,
 ) -> dict[str, Any]:
-    """Zeigt eine Frage mit Optionen als nativen Dialog am User-Mac.
+    """Single- or multi-choice picker with optional free-text fallback.
 
-    Like AskUserQuestion, but routed through the aiui companion so you can
-    layer more UI on top later. Returns `{cancelled, answers, other?}`.
+    WHEN TO USE: 2–6 mutually-exclusive options where context per option helps
+    (description field). For pure yes/no, use `confirm`. For mixed inputs
+    (text + choice + slider…), use `form`.
+
+    WRITE OPTIONS:
+    - Label: noun or short imperative, ≤ 5 words, no punctuation, no emoji.
+    - Description: one sentence stating the trade-off or consequence.
+    - Value: snake_case stable identifier if distinct from label.
+    - Keep options parallel in grammar ("In-place" / "Blue-green" / "Dump", not
+      "In-place" / "We do a blue-green" / "Dump it").
+
+    ANTI-PATTERNS: > 8 options (use `form` with a `list` field instead);
+    generic labels like "Option 1" or "Choice A"; redundant descriptions that
+    just restate the label.
+
+    Returns `{cancelled, answers, other?}`. `answers` is a list of values in
+    selection order; `other` contains the free-text answer if any.
 
     Args:
-        question: Die vollständige Frage.
-        options: Liste von {"label": "...", "description": "...", "value": "..."}.
-            `description` und `value` sind optional; bei fehlendem value wird `label` zurückgegeben.
-        header: Kurzer Chip/Tag über der Frage (max ~14 Zeichen).
-        multi_select: Mehrfachauswahl erlauben.
-        allow_other: "Andere Antwort"-Freitextfeld anbieten.
+        question: The full question, imperative or interrogative.
+        options: List of {"label": str, "description"?: str, "value"?: str}.
+        header: Short chip above the question (≤ 14 chars). Use sparingly for
+            disambiguation (e.g. "Migration", "Refactor").
+        multi_select: Allow selecting multiple options.
+        allow_other: Offer a free-text "other answer" fallback.
     """
     spec = {
         "kind": "ask",
@@ -191,32 +206,60 @@ async def form(
     submit_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """Zeigt ein freies Fenster mit kombinierbaren UI-Primitives.
+    """Composite window: multiple typed fields + multiple action buttons.
 
-    Kompositions-Philosophie: Der Agent baut ein vollständiges Fenster aus
-    Feld-Blöcken und Action-Buttons. Returns `{cancelled, action?, values: {name: value}}`.
+    WHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.
+    For a single yes/no, use `confirm`. For a single choice, use `ask`.
+
+    WRITE LABELS:
+    - Imperative or noun, ≤ 6 words, no punctuation, no emoji.
+    - Consistent register across all fields (don't mix "Name" with "Bitte
+      geben Sie Ihr Alter ein").
+    - Field-level descriptions only if the label alone is ambiguous.
+
+    BE RESTRAINT:
+    - ≤ 8 fields in one dialog. If you need more, split into multiple dialogs
+      or use a `static_text` separator and group logically.
+    - `static_text` only for context the user couldn't derive from labels;
+      don't echo the title or re-explain the action buttons.
+    - Defaults that a human would actually pick, not "enter value here".
+
+    ACTION BUTTONS:
+    - Verb-based, concrete ("Bericht erstellen" / "Create report"), not "OK".
+    - Destructive actions: set `destructive: true` — never red a save button.
+    - `skip_validation: true` on escape hatches ("Später", "Entwurf", "Cancel")
+      so the user isn't trapped if required fields are empty.
+    - ≤ 3 actions.
+
+    FIELD KINDS:
+    - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
+    - password:    {kind, name, label, placeholder?, required?}  — value masked, agent must treat it as secret
+    - number:      {kind, name, label, default?, min?, max?, step?, required?}
+    - select:      {kind, name, label, options: [{label, value}], default?, required?}
+    - checkbox:    {kind, name, label, default?}
+    - slider:      {kind, name, label, min, max, step?, default?}
+    - date:        {kind, name, label, default?, required?}  — ISO YYYY-MM-DD
+    - date_range:  {kind, name, label, default?: {from, to}, required?}  — result {from, to}
+    - color:       {kind, name, label, default?}  — hex "#RRGGBB"
+    - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — no input, display-only
+    - list:        {kind, name, label?, items: [{label, value, description?}],
+                    selectable?, multi_select?, sortable?, default_selected?: [values]}
+      Result: {selected: [values], order: [values]}
+    - tree:        {kind, name, label?, items: [{label, value, description?, children?: [...]}],
+                    multi_select?, default_selected?: [values], default_expanded?: [values]}
+      Result: {selected: [values]}. Hierarchical — for paths, categories, nested pickers.
+
+    Returns `{cancelled, action?, values: {name: value, ...}}`.
 
     Args:
-        title: Titel des Fensters.
-        fields: Liste von Feld-Blöcken. Unterstützte `kind`-Werte:
-            - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
-            - password:    {kind, name, label, placeholder?, required?}  (Eingabe maskiert)
-            - number:      {kind, name, label, default?, min?, max?, step?, required?}
-            - select:      {kind, name, label, options: [{label, value}], default?, required?}
-            - checkbox:    {kind, name, label, default?}
-            - slider:      {kind, name, label, min, max, step?, default?}
-            - date:        {kind, name, label, default?, required?}
-            - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  (reine Anzeige)
-            - list:        {kind, name, label?, items: [{label, value, description?}],
-                            selectable?, multi_select?, sortable?, default_selected?: [values]}
-              Result: {selected: [values], order: [values]}
-        description: Untertitel (optional).
-        header: Chip/Tag oberhalb des Titels (optional).
-        actions: Liste von Buttons im Footer (überschreibt submit_label/cancel_label):
-            [{label, value, primary?, destructive?, skip_validation?}, ...]
-            Result enthält `action: <value>`. Ohne actions: Default ist Abbrechen + Senden.
-        submit_label: Legacy — Beschriftung des Default-Submit-Buttons.
-        cancel_label: Legacy — Beschriftung des Default-Abbrechen-Buttons.
+        title: Window title. Same rules as labels.
+        fields: List of field blocks, each with a `kind` from above.
+        description: Subtitle, ≤ 2 sentences. Keep short — labels carry the weight.
+        header: Chip above the title (≤ 14 chars).
+        actions: Footer buttons [{label, value, primary?, destructive?, skip_validation?}].
+            Without actions, defaults to Cancel + Submit.
+        submit_label: Legacy — label of the default submit button.
+        cancel_label: Legacy — label of the default cancel button.
     """
     spec = {
         "kind": "form",
@@ -240,18 +283,32 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """Zeigt einen Ja/Nein-Dialog.
+    """Hard yes/no decision with optional destructive styling.
 
-    Returns `{cancelled, confirmed}`. `cancelled=True` wenn User Escape drückt
-    oder das Fenster schließt; bei explizitem Klick auf Nein: `cancelled=False, confirmed=False`.
+    WHEN TO USE: irreversible or high-stakes step where "just proceed" is
+    unsafe. For plain information display, do not use a dialog — respond in
+    chat. For a choice between 3+ options, use `ask`.
+
+    WRITE:
+    - Title: the decision as a question, ≤ 10 words ("Migration starten?").
+    - Message: one sentence stating the concrete consequence ("15 Tabellen
+      werden umgezogen, Dauer ca. 3 Min.").
+    - `destructive=True` for deletions, force-pushes, rollbacks — never for
+      saves or creates.
+    - `confirm_label` / `cancel_label` if verbs clarify ("Löschen" / "Behalten"
+      is better than "Ja" / "Nein" for destructive actions).
+
+    Returns `{cancelled, confirmed}`. `cancelled=True` means the user pressed
+    Escape or closed the window. `cancelled=False, confirmed=False` means
+    they clicked the explicit No.
 
     Args:
-        title: Überschrift des Dialogs.
-        message: Erklärtext (optional).
-        header: Chip/Tag (optional).
-        destructive: Rot-gefärbten Confirm-Button anzeigen (für löschende Aktionen).
-        confirm_label: Default "Ja".
-        cancel_label: Default "Nein".
+        title: The decision phrased as a question.
+        message: One-sentence explanation of what happens on confirm.
+        header: Chip above the title (optional).
+        destructive: Red confirm button for destructive actions.
+        confirm_label: Defaults to "Ja".
+        cancel_label: Defaults to "Nein".
     """
     spec = {
         "kind": "confirm",
@@ -263,6 +320,17 @@ async def confirm(
         "cancelLabel": cancel_label,
     }
     return _format_result(await _post_render(spec))
+
+
+@mcp.prompt()
+def widgets() -> str:
+    """Returns the full aiui widget catalog — when to use which dialog, copy
+    conventions, anti-patterns, example payloads. Use this before composing
+    the first dialog in a session."""
+    skill_path = Path(__file__).parent / "docs" / "skill.md"
+    if skill_path.exists():
+        return skill_path.read_text()
+    return "aiui skill doc not bundled with this install. See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
 
 
 @mcp.tool()

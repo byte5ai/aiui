@@ -1,7 +1,15 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
+  import TreeNode from "./TreeNode.svelte";
 
   type SelectOption = { label: string; value: string; description?: string };
+
+  type TreeItem = {
+    label: string;
+    value: string;
+    description?: string;
+    children?: TreeItem[];
+  };
 
   type Field =
     | { kind: "text"; name: string; label: string; placeholder?: string; default?: string; multiline?: boolean; required?: boolean }
@@ -11,6 +19,8 @@
     | { kind: "checkbox"; name: string; label: string; default?: boolean }
     | { kind: "slider"; name: string; label: string; min: number; max: number; step?: number; default?: number }
     | { kind: "date"; name: string; label: string; default?: string; required?: boolean }
+    | { kind: "date_range"; name: string; label: string; default?: { from?: string; to?: string }; required?: boolean }
+    | { kind: "color"; name: string; label: string; default?: string }
     | { kind: "static_text"; text: string; tone?: "info" | "warn" | "muted" }
     | {
         kind: "list";
@@ -21,6 +31,15 @@
         multi_select?: boolean;
         sortable?: boolean;
         default_selected?: string[];
+      }
+    | {
+        kind: "tree";
+        name: string;
+        label?: string;
+        items: TreeItem[];
+        multi_select?: boolean;
+        default_selected?: string[];
+        default_expanded?: string[];
       };
 
   type Action = {
@@ -47,6 +66,10 @@
 
   let { spec, onsubmit, oncancel }: { spec: Spec; onsubmit: (r: any) => void; oncancel: () => void } = $props();
 
+  function collectTreeValues(items: TreeItem[]): string[] {
+    return items.flatMap((it) => [it.value, ...collectTreeValues(it.children ?? [])]);
+  }
+
   function initialValue(f: Field): any {
     switch (f.kind) {
       case "static_text":
@@ -55,10 +78,19 @@
         return f.default ?? false;
       case "slider":
         return f.default ?? f.min;
+      case "color":
+        return f.default ?? "#000000";
+      case "date_range":
+        return { from: f.default?.from ?? "", to: f.default?.to ?? "" };
       case "list":
         return {
           selected: [...(f.default_selected ?? [])],
           order: f.items.map((it) => it.value),
+        };
+      case "tree":
+        return {
+          selected: [...(f.default_selected ?? [])],
+          expanded: new Set(f.default_expanded ?? collectTreeValues(f.items)),
         };
       default:
         return (f as any).default ?? "";
@@ -100,6 +132,26 @@
     values[name] = { ...list, selected };
   }
 
+  function toggleTreeExpand(name: string, value: string) {
+    const t = values[name] as { selected: string[]; expanded: Set<string> };
+    const expanded = new Set(t.expanded);
+    expanded.has(value) ? expanded.delete(value) : expanded.add(value);
+    values[name] = { ...t, expanded };
+  }
+
+  function toggleTreeSelect(name: string, value: string, multi: boolean) {
+    const t = values[name] as { selected: string[]; expanded: Set<string> };
+    let selected = t.selected;
+    if (multi) {
+      selected = selected.includes(value)
+        ? selected.filter((v) => v !== value)
+        : [...selected, value];
+    } else {
+      selected = selected.includes(value) ? [] : [value];
+    }
+    values[name] = { ...t, selected };
+  }
+
   // Validation
   function isFieldComplete(f: Field): boolean {
     if (f.kind === "static_text") return true;
@@ -128,6 +180,19 @@
         ]
   );
 
+  function serialisableValues(): Record<string, any> {
+    // Sets don't JSON-serialize; strip tree `expanded` and keep just `selected`.
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(values)) {
+      if (v && typeof v === "object" && "expanded" in v && v.expanded instanceof Set) {
+        out[k] = { selected: v.selected };
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
   function runAction(a: Action) {
     if (a.value === "__cancel__") {
       oncancel();
@@ -136,7 +201,7 @@
     if (!a.skip_validation && !canSubmit) return;
     onsubmit({
       action: a.value === "__submit__" ? null : a.value,
-      values,
+      values: serialisableValues(),
     });
   }
 </script>
@@ -152,6 +217,24 @@
     {#each spec.fields as f}
       {#if f.kind === "static_text"}
         <div class="static-text {f.tone ?? 'info'}">{f.text}</div>
+      {:else if f.kind === "tree"}
+        {@const treeValue = values[f.name] as { selected: string[]; expanded: Set<string> }}
+        <div>
+          {#if f.label}<label>{f.label}</label>{/if}
+          <div class="tree-widget">
+            {#each f.items as root (root.value)}
+              <TreeNode
+                item={root}
+                depth={0}
+                selected={treeValue.selected}
+                expanded={treeValue.expanded}
+                multiSelect={!!f.multi_select}
+                onToggleExpand={(v) => toggleTreeExpand(f.name, v)}
+                onToggleSelect={(v) => toggleTreeSelect(f.name, v, !!f.multi_select)}
+              />
+            {/each}
+          </div>
+        </div>
       {:else if f.kind === "list"}
         {@const listValue = values[f.name] as { selected: string[]; order: string[] }}
         <div>
@@ -229,6 +312,17 @@
             </div>
           {:else if f.kind === "date"}
             <input type="date" bind:value={values[f.name]} />
+          {:else if f.kind === "date_range"}
+            <div class="row">
+              <input type="date" bind:value={values[f.name].from} style="flex: 1;" />
+              <span style="color: var(--muted); font-size: 12px;">—</span>
+              <input type="date" bind:value={values[f.name].to} style="flex: 1;" />
+            </div>
+          {:else if f.kind === "color"}
+            <div class="row">
+              <input type="color" bind:value={values[f.name]} style="width: 50px; height: 34px; padding: 2px;" />
+              <code>{values[f.name]}</code>
+            </div>
           {/if}
         </div>
       {/if}

@@ -22,7 +22,11 @@
     "uninstall.confirm": "Wirklich? Entfernt alle aiui-Einträge aus Configs und Remote-Tokens.",
     "uninstall.back": "Zurück",
     "uninstall.do": "Alles entfernen",
-    "updates.check": "Nach Updates suchen"
+    "updates.check": "Nach Updates suchen",
+    "skill.button": "Skill installieren",
+    "skill.hint": "Kopiert das aiui-Skill nach ~/.claude/skills/aiui/ — lokal und auf allen Remote-Hosts. Gibt Agents konkrete Regeln, damit sie saubere Dialoge bauen.",
+    "report.button": "Problem melden",
+    "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt."
   },
   "dialog": {
     "cancel": "Abbrechen",

@@ -22,7 +22,11 @@
     "uninstall.confirm": "Really? Removes all aiui entries from configs and remote tokens.",
     "uninstall.back": "Back",
     "uninstall.do": "Remove everything",
-    "updates.check": "Check for updates"
+    "updates.check": "Check for updates",
+    "skill.button": "Install skill",
+    "skill.hint": "Copies the aiui skill into ~/.claude/skills/aiui/ — locally and on every registered remote. Gives agents concrete rules so they build clean dialogs.",
+    "report.button": "Report issue",
+    "report.hint": "Opens a new GitHub issue with version and build pre-filled."
   },
   "dialog": {
     "cancel": "Cancel",

@@ -5,6 +5,7 @@ mod lifetime;
 mod logging;
 mod mcp;
 mod setup;
+mod skill;
 mod tunnel;
 
 use std::sync::Arc;
@@ -79,6 +80,7 @@ async fn add_remote(
 
     let token_path = cfg.token_path.display().to_string();
     results.push(setup::push_token_to_remote(&host_alias, &token_path));
+    results.push(skill::install_to_remote(&host_alias));
 
     let mut list = setup::load_remotes();
     if !list.contains(&host_alias) {
@@ -86,6 +88,15 @@ async fn add_remote(
         let _ = setup::save_remotes(&list);
     }
     tm.ensure(host_alias).await;
+    Ok(results)
+}
+
+#[tauri::command]
+async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
+    let mut results = vec![skill::install_locally()];
+    for host in setup::load_remotes() {
+        results.push(skill::install_to_remote(&host));
+    }
     Ok(results)
 }
 
@@ -101,6 +112,7 @@ async fn remove_remote(
     let mut results = Vec::new();
     results.push(setup::remove_ssh_forward(&host_alias, cfg.http_port));
     results.push(setup::remove_token_from_remote(&host_alias));
+    results.push(skill::remove_from_remote(&host_alias));
     let list: Vec<String> = setup::load_remotes()
         .into_iter()
         .filter(|h| h != &host_alias)
@@ -120,7 +132,9 @@ async fn uninstall_all(
     for host in setup::load_remotes() {
         results.push(setup::remove_ssh_forward(&host, cfg.http_port));
         results.push(setup::remove_token_from_remote(&host));
+        results.push(skill::remove_from_remote(&host));
     }
+    results.push(skill::remove_locally());
     let _ = std::fs::remove_file(&cfg.token_path);
     let _ = std::fs::remove_file(cfg.config_dir.join("first_run_done"));
     let _ = setup::save_remotes(&[]);
@@ -222,6 +236,7 @@ pub fn run() {
             status,
             add_remote,
             remove_remote,
+            reinstall_skill,
             uninstall_all
         ])
         .setup(move |app| {
@@ -242,6 +257,11 @@ pub fn run() {
             if !setup::is_claude_config_current(&bin) {
                 let _ = setup::patch_claude_desktop_config(&bin);
             }
+
+            // Auto-install the aiui skill into the local Claude Code skill
+            // directory on every GUI launch. Idempotent: overwrites old copies
+            // so skill updates ride with app updates.
+            let _ = skill::install_locally();
 
             // HTTP server on localhost:7777.
             rt.spawn(async move {

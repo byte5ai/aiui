@@ -3,6 +3,7 @@
   import { _ } from "svelte-i18n";
   import { onMount, onDestroy } from "svelte";
   import { checkForUpdates } from "./updater";
+  import logoUrl from "../assets/logo.png";
 
   type StepResult = { ok: boolean; message: string; details: string | null };
   type TunnelStatus =
@@ -74,6 +75,26 @@
     }
   }
 
+  async function reinstallSkill() {
+    busy = true;
+    try {
+      const results = await invoke<StepResult[]>("reinstall_skill");
+      pushLog(results);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function openIssue() {
+    const body = encodeURIComponent(
+      `**Version:** ${status?.build_info ?? "unknown"}\n\n` +
+        `**Describe the bug:**\n\n\n` +
+        `**Steps to reproduce:**\n1.\n2.\n3.\n\n` +
+        `**Expected / actual:**\n\n`,
+    );
+    window.open(`https://github.com/byte5ai/aiui/issues/new?body=${body}`, "_blank");
+  }
+
   function statusLabel(t: TunnelStatus | undefined): { text: string; tone: "ok" | "warn" | "err" | "dim" } {
     if (!t) return { text: $_("settings.tunnel.unknown"), tone: "dim" };
     switch (t.state) {
@@ -99,21 +120,20 @@
 
 {#if status}
   <div class="stack">
-    <div>
-      <p class="title" style="margin-bottom: 2px;">{$_("app.title")}</p>
-      <p class="subtitle" style="margin: 0;">
+    <header class="app-header">
+      <img src={logoUrl} alt="aiui" />
+      <div class="header-meta">
+        <span class="status-dot" class:ok={status.claude_config_ok}></span>
         {#if status.claude_config_ok}
           {$_("app.status.connected", { values: { port: status.http_port } })}
         {:else}
           {$_("app.status.not_connected")}
         {/if}
-      </p>
-      <p class="subtitle" style="margin: 4px 0 0 0; opacity: 0.6; font-size: 11px;">
-        {status.build_info}
-      </p>
-    </div>
+      </div>
+      <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
+    </header>
 
-    <div>
+    <section>
       <label>{$_("settings.remotes.title")}</label>
       {#if status.remotes.length === 0}
         <p class="subtitle" style="margin: 4px 0 0 0;">
@@ -126,7 +146,7 @@
             <div class="remote-row">
               <span class="dot {tunnel.tone}"></span>
               <div style="flex: 1; min-width: 0;">
-                <code style="display: block; overflow: hidden; text-overflow: ellipsis;">{h}</code>
+                <code>{h}</code>
                 <div class="tunnel-status {tunnel.tone}">{tunnel.text}</div>
               </div>
               <button onclick={() => removeRemote(h)} disabled={busy}
@@ -136,9 +156,9 @@
           {/each}
         </div>
       {/if}
-    </div>
+    </section>
 
-    <div>
+    <section>
       <label>{$_("settings.remotes.add.title")}</label>
       <div class="row" style="margin-top: 4px;">
         <input
@@ -154,10 +174,10 @@
       <p class="subtitle" style="margin: 6px 0 0 0; font-size: 11.5px;">
         {$_("settings.remotes.add.hint")}
       </p>
-    </div>
+    </section>
 
     {#if log.length > 0}
-      <div>
+      <section>
         <label>{$_("settings.log.title")}</label>
         <div class="stack" style="gap: 3px; margin-top: 4px;">
           {#each log as entry}
@@ -167,13 +187,10 @@
             </div>
           {/each}
         </div>
-      </div>
+      </section>
     {/if}
 
     <div class="footer">
-      <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
-        {$_("settings.updates.check")}
-      </button>
       {#if confirmUninstall}
         <span class="subtitle" style="margin-right: auto; align-self: center;">
           {$_("settings.uninstall.confirm")}
@@ -185,6 +202,15 @@
           >{$_("settings.uninstall.do")}</button
         >
       {:else}
+        <button onclick={openIssue} title={$_("settings.report.hint")}>
+          {$_("settings.report.button")}
+        </button>
+        <button onclick={reinstallSkill} disabled={busy} title={$_("settings.skill.hint")}>
+          {$_("settings.skill.button")}
+        </button>
+        <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
+          {$_("settings.updates.check")}
+        </button>
         <button onclick={() => (confirmUninstall = true)} disabled={busy}
           >{$_("settings.uninstall.button")}</button
         >
@@ -194,6 +220,48 @@
 {/if}
 
 <style>
+  .app-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0 12px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .app-header img {
+    height: 28px;
+    width: auto;
+  }
+  .header-meta {
+    flex: 1;
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex-shrink: 0;
+  }
+  .status-dot.ok { background: var(--success); }
+  .build-info {
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 10px;
+    color: var(--muted);
+    background: var(--surface);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+
+  section {
+    display: flex;
+    flex-direction: column;
+  }
+
   .remote-row {
     display: flex;
     gap: 10px;
@@ -201,14 +269,23 @@
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: 8px;
-    background: var(--surface);
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-sm);
+  }
+  .remote-row code {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: transparent;
+    border: none;
+    padding: 0;
   }
   .tunnel-status {
-    font-size: 11.5px;
+    font-size: 11px;
     margin-top: 2px;
   }
-  .tunnel-status.ok { color: #22c55e; }
-  .tunnel-status.warn { color: #f59e0b; }
+  .tunnel-status.ok { color: var(--success); }
+  .tunnel-status.warn { color: var(--warning); }
   .tunnel-status.err { color: var(--danger); }
   .tunnel-status.dim { color: var(--muted); }
   .dot {
@@ -217,8 +294,8 @@
     border-radius: 50%;
     flex-shrink: 0;
   }
-  .dot.ok { background: #22c55e; }
-  .dot.warn { background: #f59e0b; }
+  .dot.ok { background: var(--success); }
+  .dot.warn { background: var(--warning); }
   .dot.err { background: var(--danger); }
   .dot.dim { background: var(--muted); }
   .log-line {
@@ -229,18 +306,14 @@
     color: var(--muted);
     padding: 2px 0;
   }
-  .log-line.err {
-    color: var(--danger);
-  }
+  .log-line.err { color: var(--danger); }
   .dot-small {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #22c55e;
+    background: var(--success);
     margin-top: 6px;
     flex-shrink: 0;
   }
-  .dot-small.err {
-    background: var(--danger);
-  }
+  .dot-small.err { background: var(--danger); }
 </style>
