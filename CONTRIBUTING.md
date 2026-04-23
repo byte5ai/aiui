@@ -96,7 +96,7 @@ The constraints that shape decisions in this project:
 - **Agents can't make slop.** Rules live both in tool docstrings (always
   visible) and the full skill (auto-installed). Widgets constrain rather
   than expand freedom where that improves outcomes.
-- **No ad-hoc web dashboards.** aiui exists to replace the pattern of the
+- **No ad-hoc web dashboards and apps.** aiui exists to replace the pattern of the
   agent spinning up a temporary local web UI. If a feature request pulls
   in that direction, the answer is usually „more widget primitives" not
   „more escape hatches".
