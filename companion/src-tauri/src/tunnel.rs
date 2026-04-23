@@ -155,7 +155,10 @@ async fn run_tunnel(
             wait_res = child.wait() => {
                 probe.abort();
                 let msg = match wait_res {
-                    Ok(s) => format!("exit {s}"),
+                    Ok(s) => s
+                        .code()
+                        .map(|c| format!("ssh exit code {c}"))
+                        .unwrap_or_else(|| format!("ssh killed by signal")),
                     Err(e) => format!("wait error: {e}"),
                 };
                 trace(&format!("tunnel[{host}]: ssh died: {msg}"));
