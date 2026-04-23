@@ -22,3 +22,6 @@ aiui-*.dmg
 .idea/
 *.swp
 .aider*
+
+# local release credentials
+.env.release
