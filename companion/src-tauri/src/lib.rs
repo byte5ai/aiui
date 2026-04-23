@@ -70,19 +70,22 @@ async fn add_remote(
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
     let mut results = Vec::new();
-    results.push(setup::patch_ssh_config(&host_alias, None, cfg.http_port));
+
+    // Legacy cleanup: earlier versions (≤ v0.1.1) patched the user's
+    // ~/.ssh/config with a RemoteForward line. aiui now owns the tunnel
+    // entirely via its own `ssh -NTR` subprocess; strip any leftover lines
+    // from past installs so we don't fight them over port 7777.
+    let _ = setup::remove_ssh_forward(&host_alias, cfg.http_port);
+
     let token_path = cfg.token_path.display().to_string();
     results.push(setup::push_token_to_remote(&host_alias, &token_path));
 
-    if results[0].ok {
-        let mut list = setup::load_remotes();
-        if !list.contains(&host_alias) {
-            list.push(host_alias.clone());
-            let _ = setup::save_remotes(&list);
-        }
-        // Start the reverse tunnel now.
-        tm.ensure(host_alias).await;
+    let mut list = setup::load_remotes();
+    if !list.contains(&host_alias) {
+        list.push(host_alias.clone());
+        let _ = setup::save_remotes(&list);
     }
+    tm.ensure(host_alias).await;
     Ok(results)
 }
 
@@ -206,6 +209,9 @@ pub fn run() {
                 ])
                 .build(),
         )
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .manage(cfg.clone())
         .manage(dialog_state.clone())
         .manage(tunnel_mgr.clone())
@@ -251,9 +257,14 @@ pub fn run() {
             });
 
             // Auto-start reverse tunnels for every registered remote.
+            // Also: legacy-cleanup — strip any RemoteForward lines that
+            // previous versions patched into ~/.ssh/config, so they don't
+            // compete with our own tunnel manager.
             let tm_for_start = tunnel_mgr.clone();
+            let port_for_start = cfg.http_port;
             rt.spawn(async move {
                 for host in setup::load_remotes() {
+                    let _ = setup::remove_ssh_forward(&host, port_for_start);
                     tm_for_start.ensure(host).await;
                 }
             });

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "aiui",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "de.byte5.aiui",
   "build": {
     "frontendDist": "../dist",
@@ -34,8 +34,17 @@
     },
     "macOSPrivateApi": true
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/byte5ai/aiui/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEyMkM5RDg3QzBDRTQyQzYKUldUR1FzN0FoNTBzb3RxcUZ0bzhITElMK0JWUEVpcHpZRXZkemRuRE5KMnpQanlDNzdCSUl0WkMK"
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app"],
     "icon": [
       "icons/32x32.png",

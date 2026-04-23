@@ -9,6 +9,8 @@ companion/node_modules/
 # packaged release
 aiui-*.zip
 aiui-*.dmg
+aiui-*.tar.gz
+latest.json
 
 # macOS
 .DS_Store

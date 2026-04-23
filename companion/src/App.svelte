@@ -7,6 +7,7 @@
   import Form from "./lib/widgets/Form.svelte";
   import Confirm from "./lib/widgets/Confirm.svelte";
   import Settings from "./lib/Settings.svelte";
+  import { checkForUpdates } from "./lib/updater";
 
   type DialogReq = { id: string; spec: any };
 
@@ -17,6 +18,8 @@
       current = e.payload;
     });
     window.addEventListener("keydown", onKey);
+    // Silent update check on startup — user sees nothing unless there's a new version.
+    void checkForUpdates({ silent: true });
     return async () => {
       (await un)();
       window.removeEventListener("keydown", onKey);

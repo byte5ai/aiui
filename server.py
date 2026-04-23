@@ -39,7 +39,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 
 def _git_sha() -> str:

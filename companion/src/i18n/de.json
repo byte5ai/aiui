@@ -21,7 +21,8 @@
     "uninstall.button": "Uninstall",
     "uninstall.confirm": "Wirklich? Entfernt alle aiui-Einträge aus Configs und Remote-Tokens.",
     "uninstall.back": "Zurück",
-    "uninstall.do": "Alles entfernen"
+    "uninstall.do": "Alles entfernen",
+    "updates.check": "Nach Updates suchen"
   },
   "dialog": {
     "cancel": "Abbrechen",

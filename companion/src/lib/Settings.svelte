@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { _ } from "svelte-i18n";
   import { onMount, onDestroy } from "svelte";
+  import { checkForUpdates } from "./updater";
 
   type StepResult = { ok: boolean; message: string; details: string | null };
   type TunnelStatus =
@@ -170,6 +171,9 @@
     {/if}
 
     <div class="footer">
+      <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
+        {$_("settings.updates.check")}
+      </button>
       {#if confirmUninstall}
         <span class="subtitle" style="margin-right: auto; align-self: center;">
           {$_("settings.uninstall.confirm")}

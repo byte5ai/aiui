@@ -21,7 +21,8 @@
     "uninstall.button": "Uninstall",
     "uninstall.confirm": "Really? Removes all aiui entries from configs and remote tokens.",
     "uninstall.back": "Back",
-    "uninstall.do": "Remove everything"
+    "uninstall.do": "Remove everything",
+    "updates.check": "Check for updates"
   },
   "dialog": {
     "cancel": "Cancel",
