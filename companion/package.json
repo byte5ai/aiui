@@ -1,0 +1,28 @@
+{
+  "name": "aiui-companion",
+  "version": "0.1.0",
+  "description": "aiui companion — renders dialogs for remote Claude Code sessions",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@tauri-apps/cli": "^2.10.1",
+    "@tsconfig/svelte": "^5.0.8",
+    "svelte": "^5.55.4",
+    "svelte-check": "^4.4.6",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.9"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "svelte-i18n": "^4.0.1"
+  }
+}

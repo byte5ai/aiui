@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "aiui": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": [
+        "run",
+        "/Users/customer/Projekte/aiui/server.py",
+        "--stdio"
+      ]
+    }
+  }
+}

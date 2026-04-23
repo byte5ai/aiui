@@ -1,0 +1,36 @@
+{
+  "app": {
+    "title": "aiui",
+    "status.connected": "Registered in Claude Desktop · port {port}",
+    "status.not_connected": "Claude Desktop config will be set automatically on next launch"
+  },
+  "settings": {
+    "remotes.title": "Registered remote hosts",
+    "remotes.empty.hint": "Only needed if you run Claude Code on a remote host. Leave empty for local projects.",
+    "remotes.add.title": "Add a new remote",
+    "remotes.add.placeholder": "user@hostname or SSH alias",
+    "remotes.add.button": "Set up",
+    "remotes.add.hint": "Adds the reverse tunnel to ~/.ssh/config, scp's the auth token to the host, and starts the tunnel.",
+    "remotes.remove": "Remove",
+    "log.title": "Recent",
+    "tunnel.connected": "connected",
+    "tunnel.connecting": "connecting…",
+    "tunnel.stopped": "stopped",
+    "tunnel.failed": "Failed: {reason}",
+    "tunnel.unknown": "unknown",
+    "uninstall.button": "Uninstall",
+    "uninstall.confirm": "Really? Removes all aiui entries from configs and remote tokens.",
+    "uninstall.back": "Back",
+    "uninstall.do": "Remove everything"
+  },
+  "dialog": {
+    "cancel": "Cancel",
+    "submit": "Send",
+    "other_answer": "Other answer",
+    "other_placeholder": "Your answer…",
+    "confirm.yes": "Yes",
+    "confirm.no": "No",
+    "unknown_kind": "Unknown widget kind: {kind}",
+    "close": "Close"
+  }
+}

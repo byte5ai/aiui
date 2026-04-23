@@ -1,0 +1,36 @@
+{
+  "app": {
+    "title": "aiui",
+    "status.connected": "In Claude Desktop eingetragen · Port {port}",
+    "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt"
+  },
+  "settings": {
+    "remotes.title": "Eingerichtete Remote-Hosts",
+    "remotes.empty.hint": "Nur nötig, wenn Du Claude Code auf einem Remote-Host fährst. Für lokale Projekte leer lassen.",
+    "remotes.add.title": "Neuen Remote hinzufügen",
+    "remotes.add.placeholder": "user@hostname oder SSH-Alias",
+    "remotes.add.button": "Einrichten",
+    "remotes.add.hint": "Trägt Reverse-Tunnel in ~/.ssh/config ein, kopiert den Auth-Token per scp zum Host und startet den Tunnel sofort.",
+    "remotes.remove": "Entfernen",
+    "log.title": "Zuletzt",
+    "tunnel.connected": "verbunden",
+    "tunnel.connecting": "verbinde…",
+    "tunnel.stopped": "gestoppt",
+    "tunnel.failed": "Fehler: {reason}",
+    "tunnel.unknown": "unbekannt",
+    "uninstall.button": "Uninstall",
+    "uninstall.confirm": "Wirklich? Entfernt alle aiui-Einträge aus Configs und Remote-Tokens.",
+    "uninstall.back": "Zurück",
+    "uninstall.do": "Alles entfernen"
+  },
+  "dialog": {
+    "cancel": "Abbrechen",
+    "submit": "Senden",
+    "other_answer": "Andere Antwort",
+    "other_placeholder": "Deine Antwort…",
+    "confirm.yes": "Ja",
+    "confirm.no": "Nein",
+    "unknown_kind": "Unbekannter Widget-Typ: {kind}",
+    "close": "Schließen"
+  }
+}

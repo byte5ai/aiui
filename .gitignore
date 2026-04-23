@@ -1,0 +1,24 @@
+# build artifacts
+companion/dist/
+companion/src-tauri/target/
+companion/src-tauri/gen/schemas/
+
+# deps
+companion/node_modules/
+
+# packaged release
+aiui-*.zip
+aiui-*.dmg
+
+# macOS
+.DS_Store
+
+# logs / local state
+*.log
+/tmp/aiui-trace.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.aider*
