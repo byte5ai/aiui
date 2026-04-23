@@ -37,9 +37,10 @@ directly to `127.0.0.1:7777`.
 
 ## Install (macOS, Apple Silicon)
 
-1. Download the latest `aiui.app` release and drop it into `/Applications/`
-   (release bundles are unsigned for now — you need to clear the quarantine
-   flag once):
+1. Download the latest `aiui.app.zip` from
+   [Releases](https://github.com/byte5ai/aiui/releases/latest) and drop
+   `aiui.app` into `/Applications/`. Until v0.1.1 releases are signed, clear
+   the quarantine flag once:
    ```sh
    xattr -dr com.apple.quarantine /Applications/aiui.app
    ```
