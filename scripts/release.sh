@@ -7,8 +7,10 @@
 #   - `gh auth login` (GitHub CLI)
 #
 # Required environment (or .env.release file):
-#   APPLE_SIGNING_IDENTITY   e.g. "Developer ID Application: byte5 GmbH (TEAMID)"
+#   APPLE_SIGNING_IDENTITY   e.g. "Developer ID Application: high5 ventures GmbH (TEAMID)"
 #   NOTARY_PROFILE           name passed to `notarytool store-credentials` (e.g. "aiui-notary")
+#   BUILD_KEYCHAIN           absolute path to the keychain-db that holds the cert + notary creds
+#   BUILD_KEYCHAIN_PASS_FILE path to a file with the keychain password (mode 0600)
 #
 # Usage:
 #   scripts/release.sh 0.1.0          # builds + signs + notarizes + publishes release
@@ -32,6 +34,14 @@ if [[ -f .env.release ]]; then
 fi
 : "${APPLE_SIGNING_IDENTITY:?not set}"
 : "${NOTARY_PROFILE:?not set}"
+: "${BUILD_KEYCHAIN:?not set}"
+: "${BUILD_KEYCHAIN_PASS_FILE:?not set}"
+
+KC_PASS="$(cat "$BUILD_KEYCHAIN_PASS_FILE")"
+echo "→ Unlocking $BUILD_KEYCHAIN"
+security unlock-keychain -p "$KC_PASS" "$BUILD_KEYCHAIN"
+# make sure codesign can find the identity
+security list-keychains -d user -s "$BUILD_KEYCHAIN" $(security list-keychains -d user | tr -d '"' | grep -v "$BUILD_KEYCHAIN")
 
 APP_SRC="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
 ZIP_OUT="${REPO_ROOT}/aiui-${VERSION}-arm64.zip"
@@ -67,6 +77,7 @@ ditto -c -k --sequesterRsrc --keepParent "${APP_SRC}" "${ZIP_OUT}"
 echo "→ Submitting to Apple notary service (this takes a few minutes)"
 xcrun notarytool submit "${ZIP_OUT}" \
   --keychain-profile "${NOTARY_PROFILE}" \
+  --keychain "${BUILD_KEYCHAIN}" \
   --wait
 
 # 6. Staple the ticket into the app, re-zip
