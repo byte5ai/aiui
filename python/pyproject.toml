@@ -1,0 +1,51 @@
+[project]
+name = "aiui-mcp"
+version = "0.2.0"
+description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "byte5 GmbH", email = "cw@byte5.de" },
+]
+keywords = ["mcp", "claude", "ui", "dialog", "macos", "tauri"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: User Interfaces",
+]
+dependencies = [
+    "mcp>=1.26.0",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/byte5ai/aiui"
+Repository = "https://github.com/byte5ai/aiui"
+Issues = "https://github.com/byte5ai/aiui/issues"
+
+[project.scripts]
+aiui-mcp = "aiui_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aiui_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/aiui_mcp/skill.md" = "aiui_mcp/skill.md"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/aiui_mcp",
+    "README.md",
+    "pyproject.toml",
+]

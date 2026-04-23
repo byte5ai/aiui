@@ -1,0 +1,13 @@
+{
+  "title": "aiui",
+  "icon": "../icons/icon.icns",
+  "background": "background.png",
+  "icon-size": 96,
+  "window": {
+    "size": { "width": 540, "height": 360 }
+  },
+  "contents": [
+    { "x": 135, "y": 180, "type": "file", "path": "../target/aarch64-apple-darwin/release/bundle/macos/aiui.app" },
+    { "x": 405, "y": 180, "type": "link", "path": "/Applications" }
+  ]
+}

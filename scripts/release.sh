@@ -94,18 +94,9 @@ xcrun stapler validate "${APP_SRC}"
 rm -f "${DIRECT_ZIP}"
 ditto -c -k --sequesterRsrc --keepParent "${APP_SRC}" "${DIRECT_ZIP}"
 
-echo "→ Building DMG (hdiutil, drag-to-Applications layout)"
-DMG_STAGE="$(mktemp -d)"
-trap "rm -rf ${DMG_STAGE}" EXIT
-cp -a "${APP_SRC}" "${DMG_STAGE}/"
-ln -s /Applications "${DMG_STAGE}/Applications"
+echo "→ Building DMG (appdmg, branded background + drag-to-Applications)"
 rm -f "${DIRECT_DMG}"
-hdiutil create -quiet \
-  -volname "aiui ${VERSION}" \
-  -srcfolder "${DMG_STAGE}" \
-  -ov \
-  -format UDZO \
-  "${DIRECT_DMG}"
+(cd companion && npx appdmg src-tauri/dmg/config.json "${DIRECT_DMG}")
 codesign --force --sign "${APPLE_SIGNING_IDENTITY}" "${DIRECT_DMG}"
 xcrun notarytool submit "${DIRECT_DMG}" \
   --keychain-profile "${NOTARY_PROFILE}" \

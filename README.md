@@ -1,123 +1,135 @@
-# aiui
+<p align="center">
+  <img src="assets/aiui-logo.png" alt="aiui" width="320">
+</p>
 
-A generic UI channel for Claude Code sessions — local or remote. Lets the agent
-render native dialogs on the user's Mac and get structured responses back,
-without polluting the project with ad-hoc web dashboards.
+<p align="center">
+  Native dialogs for Claude Code — ask, confirm, collect — right where you work.
+</p>
 
-## Why
+<p align="center">
+  <a href="https://github.com/byte5ai/aiui/releases/latest">
+    <img alt="Download aiui.app" src="https://img.shields.io/badge/Download-aiui.app-4f46e5?style=for-the-badge&logo=apple">
+  </a>
+  <a href="https://github.com/byte5ai/aiui/blob/main/LICENSE">
+    <img alt="MIT" src="https://img.shields.io/badge/License-MIT-171717?style=for-the-badge">
+  </a>
+</p>
 
-Claude Code has exactly one built-in interactive widget: `AskUserQuestion`.
-Everything else — a form, a list with preview, a confirmation with destructive
-styling, a sortable pick-and-order — has to be worked around with chat prompts.
-Worst of all, when the agent runs on a remote host via SSH, it can't reach any
-UI on the user's Mac at all.
+---
 
-**aiui** plugs that gap with one MCP server (`server.py`) and one Tauri
-companion app. The agent calls a tool like `aiui.form(...)`, the companion
-renders a native window on the Mac, the user interacts, and the structured
-response flows back. Works identically for local and remote setups.
+## Was ist aiui?
 
-## Architecture
+Claude Code ist mächtig im Chat, aber wenn der Agent Dir eine klare Wahl
+vorlegen will, ein Formular mit mehreren Feldern braucht, oder eine
+destruktive Aktion bestätigen lassen muss, zwingt er Dich normalerweise
+wieder ins Tippen. **aiui** baut diese Momente zu echten Dialogen um, die
+direkt auf Deinem Mac erscheinen — egal ob der Agent lokal läuft oder via
+SSH auf einem Remote-Host.
 
-```
-Mac (user)                                      Remote host (optional)
-┌──────────────────────────┐                    ┌──────────────────────────┐
-│ Claude Desktop           │                    │ Claude Code CLI          │
-│   └─ aiui-local MCP      │                    │   └─ aiui MCP server.py  │
-│      (stdio)             │                    │      (stdio)             │
-│         └─ Unix socket   │                    │                          │
-│            └─ aiui.app ◄─┼── SSH -R tunnel ───┤                          │
-│               HTTP :7777 │                    │ HTTP POST 127.0.0.1:7777 │
-│               WKWebView  │                    │                          │
-└──────────────────────────┘                    └──────────────────────────┘
-```
+<p align="center">
+  <img src="assets/aiui-icon.png" alt="aiui app icon" width="200">
+</p>
 
-For purely local use, the SSH tunnel is skipped — the MCP server posts
-directly to `127.0.0.1:7777`.
+Ein Klick, eine Auswahl, eine Antwort — der Agent bekommt sie strukturiert
+zurück und arbeitet weiter. Kein Doppeltippen, keine selbstgebauten
+Web-Dashboards, keine Kontextwechsel.
 
-## Install (macOS, Apple Silicon)
+## Installation
 
-1. Download the latest `aiui.app.zip` from
-   [Releases](https://github.com/byte5ai/aiui/releases/latest) and drop
-   `aiui.app` into `/Applications/`. Until v0.1.1 releases are signed, clear
-   the quarantine flag once:
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/aiui.app
-   ```
-2. Launch it once. On first start the app:
-   - generates a local auth token at `~/.config/aiui/token`
-   - patches `~/Library/Application Support/Claude/claude_desktop_config.json`
-     so Claude Desktop will auto-spawn the MCP child
-   - shows the settings window where you can (optionally) register remote
-     hosts
-3. Restart Claude Desktop. From now on the app lives in the background: it
-   comes up automatically when Claude Desktop starts, terminates itself 60
-   seconds after Claude Desktop quits, and never shows a dock icon unless
-   you launch it manually.
+1. **[aiui.app herunterladen](https://github.com/byte5ai/aiui/releases/latest)**
+   (DMG, Apple Silicon) und per Drag-and-Drop nach **Applications** ziehen.
+2. aiui einmal starten (Finder-Doppelklick).
+   Beim ersten Start richtet aiui sich automatisch in Claude Desktop ein.
+3. Claude Desktop neu starten.
 
-## Use from a Claude Code project
+Das war's. aiui läuft ab jetzt unsichtbar im Hintergrund, sobald Claude
+Desktop offen ist. Beim Schließen von Claude Desktop beendet es sich selbst.
 
-Drop this into `.mcp.json` in your project root:
+Künftige Updates kommen automatisch — aiui meldet sich kurz mit einer
+„Update verfügbar"-Meldung, ein Klick, fertig.
+
+## Nutzung in einem Projekt
+
+Füge in Deinem Projekt eine Datei `.mcp.json` an (oder ergänze eine
+bestehende):
 
 ```json
 {
   "mcpServers": {
     "aiui": {
-      "command": "/opt/homebrew/bin/uv",
-      "args": ["run", "/path/to/aiui/server.py", "--stdio"]
+      "command": "uvx",
+      "args": ["aiui-mcp"]
     }
   }
 }
 ```
 
-Then in the session:
+[`uv`](https://docs.astral.sh/uv/) holt sich die aktuelle Version beim
+ersten Start automatisch — Du musst nichts weiter installieren. Sobald Du
+Claude Code in diesem Projekt öffnest, sind die aiui-Werkzeuge verfügbar:
 
-```
-aiui_health       # sanity check
-aiui_confirm(title="Go ahead?", message="Will deploy to prod.")
-aiui_form(title="Feature brief", fields=[...], actions=[...])
-```
+- **Ask** — Frage mit 2–6 Optionen
+- **Confirm** — Ja/Nein, optional rot für destruktive Aktionen
+- **Form** — Fenster mit mehreren Feldern (Text, Zahl, Liste, Datum,
+  Farbe, Baum, …) und mehreren Buttons
 
-See [`docs/widgets.md`](docs/widgets.md) for the full widget catalog with
-decision rules, patterns, and anti-patterns.
+Probier's mit einer Chat-Zeile wie *„Zeig mir kurz mit aiui drei
+Deploy-Strategien zur Auswahl"*.
 
-## Remote setup
+## Remote-Hosts
 
-If you run Claude Code via SSH on a remote host, open the settings window
-in the companion and add the remote's SSH alias (e.g. `cw@macmini`). The
-companion will:
+Arbeitest Du mit Claude Code auf einem Remote-Server (z.B. über Claude
+Desktop's SSH-Feature)? Öffne `/Applications/aiui.app` per Finder-Klick,
+trag in den Settings den SSH-Alias Deines Hosts ein (oder `user@hostname`)
+und klick „Einrichten". aiui
 
-- add a `RemoteForward 7777 localhost:7777` to `~/.ssh/config` for that host
-- `scp` the auth token to `~/.config/aiui/token` on the remote
-- maintain a persistent `ssh -NTR`-tunnel with automatic reconnect
+- hinterlegt einen Auth-Token auf dem Remote-Host,
+- kopiert die Agent-Regeln dorthin,
+- hält einen verschlüsselten Tunnel zurück zu Deinem Mac,
+- reconnected automatisch bei Netzwechsel oder Suspend.
 
-Repeat for every remote you work against. The companion keeps one tunnel per
-remote alive while it runs.
+Danach läuft der Remote-Agent genauso wie lokal.
 
-## Widgets (v1.1)
+## Für Agents: der Skill
 
-| Tool | Purpose |
+aiui installiert beim Start automatisch ein Skill-Doc
+(`~/.claude/skills/aiui/SKILL.md`), das Claude Code jedesmal lädt. Darin
+stehen klare Regeln, wie der Agent gute Dialoge baut — welches Widget zu
+welchem Zweck, wie Labels klingen, welche Anti-Patterns zu vermeiden sind.
+Das hält Dialoge konsistent und verhindert „UI-Slop".
+
+Auf jedem Remote, den Du einrichtest, landet das Skill-Doc ebenfalls
+automatisch.
+
+## Hilfe & Troubleshooting
+
+| Symptom | Check |
 |---|---|
-| `aiui.confirm` | Yes/no with optional destructive styling |
-| `aiui.ask` | Single- or multi-choice with per-option descriptions and free-text fallback |
-| `aiui.form` | Composite window: mix `text`, `password`, `number`, `select`, `checkbox`, `slider`, `date`, `static_text`, `list` fields with multiple action buttons |
-| `aiui.aiui_health` | Reachability + token check |
+| Dialog kommt nicht | `/Applications/aiui.app` öffnen, Status-Anzeige oben prüfen. Remote muss dort auf „verbunden" stehen. |
+| „aiui companion not reachable" im Agent-Chat | Claude Desktop ist noch nicht offen, oder der Mac ist im Ruhezustand. |
+| „token rejected (401)" | Ein alter aiui-Prozess hält noch Port 7777 auf dem Remote belegt. `pkill -f aiui` auf dem Remote, dann den Remote in aiui-Settings einmal „Entfernen" + neu „Einrichten". |
+| App öffnet nicht (Gatekeeper) | Ab v0.2.0 sind Releases Apple-notarisiert, Gatekeeper lässt sie durch. Wenn Du eine Entwickler-Zip nutzt: `xattr -dr com.apple.quarantine /Applications/aiui.app`. |
 
-The `list` field covers static info lists, checkbox lists, single-choice
-radios, sortable drag-lists, and pick-and-order, all via three flags.
+Bugs oder Wünsche → [**Issue aufmachen**](https://github.com/byte5ai/aiui/issues/new). In
+aiui-Settings gibt's dafür einen Direktbutton, der Version und Build-ID
+vorausfüllt.
 
-## Build from source
+## Datenschutz
 
-Prerequisites: Rust (stable), Node.js ≥ 20, Xcode command-line tools.
+aiui läuft komplett lokal auf Deinem Mac. Es sendet keine Telemetrie,
+keine Nutzungsdaten, keine Content-Snippets. Der Auth-Token bleibt in
+`~/.config/aiui/` (Mode 0600) und wird nur per SSH auf Hosts übertragen,
+die Du explizit eingerichtet hast.
 
-```sh
-cd companion
-npm install
-npx tauri build --target aarch64-apple-darwin
-```
+## Weiter lesen
 
-Output: `companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app`
+- [Widget-Katalog](docs/skill.md) — Entscheidungsregeln, Beispiele,
+  Anti-Patterns (identisch mit dem Skill-Doc, das aiui installiert).
+- [Changelog](CHANGELOG.md) — Alle Änderungen pro Release.
+- [Contributing](CONTRIBUTING.md) — Wenn Du mitbauen willst.
+- [aiui-mcp auf PyPI](https://pypi.org/project/aiui-mcp/) — das Paket,
+  das `uvx aiui-mcp` im Hintergrund zieht.
 
-## License
+## Lizenz
 
-MIT — see [LICENSE](LICENSE).
+MIT — siehe [LICENSE](LICENSE).
