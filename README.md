@@ -37,8 +37,9 @@ There's a better way.
   typing-heavy chat exchange.
 - **"Rank these five tickets in the order you want them."** Drag to
   reorder, the order comes back as a clean list.
-- **"Hand me your API token for a second."** A masked field — never
-  visible in the transcript.
+- **"Hand me your API token for a second."** A masked input so it isn't
+  visible on screen while you type. (The agent still needs the value to
+  act on it — for long-lived secrets use your keychain or env vars.)
 
 The agent gets your answer as structured data and keeps going. No side
 conversations, no throwaway web dashboards cluttering your system — just

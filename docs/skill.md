@@ -67,8 +67,15 @@ drag changes, `selected` reflects checkbox state.
 
 ## Password fields
 
-Never collect credentials via `ask` or chat. Use `form` with a `password`
-field so the value stays out of the transcript.
+For short-lived secrets (one-off API tokens, test passwords), prefer
+`form` with a `password` field over asking in chat: the value is masked
+on screen while the user types, so it doesn't appear in screen
+recordings or shoulder-surfing distance.
+
+Be honest with the user, though — the value still returns to you as
+plaintext in the tool response. For long-lived or high-value secrets,
+tell the user to put them in their keychain or an env var and reference
+them by name instead.
 
 ## Anti-patterns (gut vs. schlecht)
 

@@ -208,7 +208,7 @@ async def form(
 
     FIELD KINDS:
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
-    - password:    {kind, name, label, placeholder?, required?}  — masked, treat as secret
+    - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.
     - number:      {kind, name, label, default?, min?, max?, step?, required?}
     - select:      {kind, name, label, options: [{label, value}], default?, required?}
     - checkbox:    {kind, name, label, default?}

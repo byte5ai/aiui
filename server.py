@@ -233,7 +233,7 @@ async def form(
 
     FIELD KINDS:
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
-    - password:    {kind, name, label, placeholder?, required?}  — value masked, agent must treat it as secret
+    - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext. Short-lived secrets OK; long-lived → send user to keychain/env.
     - number:      {kind, name, label, default?, min?, max?, step?, required?}
     - select:      {kind, name, label, options: [{label, value}], default?, required?}
     - checkbox:    {kind, name, label, default?}
