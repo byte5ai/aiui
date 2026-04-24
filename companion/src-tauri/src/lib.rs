@@ -40,17 +40,6 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
 /// An Accessory-mode app (LSUIElement) doesn't own a Dock entry, and macOS
 /// won't reliably bring its dialogs to the foreground — we temporarily
 /// promote the app to Regular so the prompt actually becomes visible.
-/// Exit the companion immediately. Bypasses the ExitRequested trap
-/// (which otherwise intercepts Cmd-Q / window-close) by going straight
-/// to `std::process::exit`. The tunnel-manager children are killed via
-/// `kill_on_drop`. If Claude Desktop still has an MCP-stdio child
-/// running, that child will spawn the GUI again on its next lifetime-
-/// socket reconnect attempt (usually within a few seconds).
-#[tauri::command]
-fn force_quit() -> Result<(), String> {
-    std::process::exit(0);
-}
-
 #[tauri::command]
 async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -266,7 +255,6 @@ pub fn run() {
             dialog_submit,
             dialog_cancel,
             close_window,
-            force_quit,
             surface_for_dialog,
             status,
             add_remote,
@@ -348,45 +336,23 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                // Dock icon came up because the user brought the window
-                // forward. On close, drop back to Accessory mode so aiui
-                // vanishes from the Dock/Cmd-Tab until next time.
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = window
-                        .app_handle()
-                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
-                }
+            // Red X quits the app outright — the MCP-stdio child's
+            // lifetime-socket loop will resurrect aiui on the next agent
+            // call, so there is no reason to keep a headless process
+            // running once the user asks for it to go away.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
         .run(|app, event| {
-            match event {
-                // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
-                // → Settings-Fenster nach vorn holen.
-                tauri::RunEvent::Reopen { .. } => {
-                    show_settings_window(app);
-                }
-                // User-initiated quit (Cmd-Q, App menu → aiui beenden, dock
-                // right-click → Beenden): block it, hide the window, drop to
-                // Accessory. aiui must keep serving HTTP so the agent can
-                // still open dialogs. The only legitimate exit path is the
-                // lifetime-socket watchdog that calls std::process::exit().
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    api.prevent_exit();
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.hide();
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-                    }
-                }
-                _ => {}
+            // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
+            // → Settings-Fenster nach vorn holen.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_settings_window(app);
             }
+            // Cmd-Q and window-close both just let the app terminate;
+            // auto-resurrect in mcp_attach brings aiui back when needed.
         });
 }

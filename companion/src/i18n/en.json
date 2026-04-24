@@ -26,11 +26,7 @@
     "skill.button": "Install skill",
     "skill.hint": "Copies the aiui skill into ~/.claude/skills/aiui/ — locally and on every registered remote. Gives agents concrete rules so they build clean dialogs.",
     "report.button": "Report issue",
-    "report.hint": "Opens a new GitHub issue with version and build pre-filled.",
-    "quit.button": "Quit",
-    "quit.hint": "Terminates aiui immediately. The next agent call auto-relaunches it — for normal use, just close the window.",
-    "quit.confirm": "Quit? aiui will be offline briefly until an agent accesses it again.",
-    "quit.do": "Quit now"
+    "report.hint": "Opens a new GitHub issue with version and build pre-filled."
   },
   "dialog": {
     "cancel": "Cancel",
