@@ -1,6 +1,7 @@
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Checks the configured endpoint for a new version. If one exists, prompts the
@@ -30,6 +31,11 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     }
     return;
   }
+
+  // When running in Accessory mode (auto-spawned from MCP-stdio), macOS
+  // won't bring a modal dialog to the front on its own. Promote the app to
+  // Regular + surface the window so the user actually sees the prompt.
+  await invoke("surface_for_dialog");
 
   const wantInstall = await ask(
     `Update auf aiui ${update.version} verfügbar.\n\n${update.body ?? ""}\n\nJetzt installieren?`,

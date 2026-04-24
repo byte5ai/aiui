@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  companion:
+    name: Tauri companion (Rust + Svelte)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: companion/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: companion
+        run: npm ci
+
+      - name: Svelte type-check
+        working-directory: companion
+        run: npx svelte-check --tsconfig ./tsconfig.json --threshold error
+
+      - name: Vite build
+        working-directory: companion
+        run: npm run build
+
+      - name: Cargo check
+        working-directory: companion/src-tauri
+        run: cargo check --release --target aarch64-apple-darwin
+
+      - name: Cargo clippy
+        working-directory: companion/src-tauri
+        run: cargo clippy --release --target aarch64-apple-darwin -- -D warnings
+
+  mcp:
+    name: aiui-mcp (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Build wheel + sdist
+        working-directory: python
+        run: uv build
+
+      - name: Install wheel and smoke-check entry point
+        working-directory: python
+        run: |
+          uv tool install --force ./dist/aiui_mcp-*.whl
+          which aiui-mcp
+          # initialize handshake — timeout after 2s
+          (printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'; sleep 1) \
+            | timeout 5 aiui-mcp | head -2
