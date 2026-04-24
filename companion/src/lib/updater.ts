@@ -1,6 +1,6 @@
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
@@ -8,6 +8,11 @@ import { invoke } from "@tauri-apps/api/core";
  * user via a native dialog. On confirm: downloads, verifies signature, swaps,
  * relaunches. Silent if already on latest. Call from onMount of the settings
  * window, or wire to a "Check for updates" button.
+ *
+ * UX note: use `message()` (single OK button) for pure-info outcomes, and
+ * `ask()` (Yes/No) only when the user actually has a decision to make. Using
+ * `ask()` for "you're on the latest version" produces a nonsensical two-
+ * button dialog.
  */
 export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<void> {
   let update: Update | null;
@@ -15,7 +20,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
     update = await check();
   } catch (e) {
     if (!opts.silent) {
-      await ask(`Update-Check fehlgeschlagen:\n${e}`, {
+      await message(`Update-Check fehlgeschlagen:\n${e}`, {
         title: "aiui",
         kind: "warning",
       });
@@ -24,7 +29,7 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   }
   if (!update) {
     if (!opts.silent) {
-      await ask("Du bist auf der aktuellen Version.", {
+      await message("Du bist auf der aktuellen Version.", {
         title: "aiui",
         kind: "info",
       });

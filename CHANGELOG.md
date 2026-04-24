@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] — 2026-04-24
+
+### Fixed
+
+- **Update-Dialog UX.** The "you're on the latest version" info and the
+  "update check failed" warning both used `ask()` (Yes/No), producing a
+  nonsensical two-button dialog where the user had nothing to answer.
+  Switched to `message()` (single OK button) for pure-info outcomes;
+  `ask()` stays on the actual "install update?" prompt where a decision
+  is needed.
+
 ## [0.3.0] — 2026-04-24
 
 ### Added
