@@ -36,6 +36,23 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Called from the frontend right before showing a modal update dialog.
+/// An Accessory-mode app (LSUIElement) doesn't own a Dock entry, and macOS
+/// won't reliably bring its dialogs to the foreground — we temporarily
+/// promote the app to Regular so the prompt actually becomes visible.
+#[tauri::command]
+async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct StatusReport {
     app_binary_path: String,
@@ -110,11 +127,12 @@ async fn remove_remote(
     // Stop the tunnel first so the forward port is freed before we touch
     // ssh config and remote token.
     tm.stop(&host_alias).await;
-    let mut results = Vec::new();
-    results.push(setup::remove_ssh_forward(&host_alias, cfg.http_port));
-    results.push(setup::remove_token_from_remote(&host_alias));
-    results.push(setup::remove_claude_code_config_remote(&host_alias));
-    results.push(skill::remove_from_remote(&host_alias));
+    let results = vec![
+        setup::remove_ssh_forward(&host_alias, cfg.http_port),
+        setup::remove_token_from_remote(&host_alias),
+        setup::remove_claude_code_config_remote(&host_alias),
+        skill::remove_from_remote(&host_alias),
+    ];
     let list: Vec<String> = setup::load_remotes()
         .into_iter()
         .filter(|h| h != &host_alias)
@@ -237,6 +255,7 @@ pub fn run() {
             dialog_submit,
             dialog_cancel,
             close_window,
+            surface_for_dialog,
             status,
             add_remote,
             remove_remote,

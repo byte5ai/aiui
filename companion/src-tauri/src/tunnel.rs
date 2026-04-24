@@ -158,7 +158,7 @@ async fn run_tunnel(
                     Ok(s) => s
                         .code()
                         .map(|c| format!("ssh exit code {c}"))
-                        .unwrap_or_else(|| format!("ssh killed by signal")),
+                        .unwrap_or_else(|| "ssh killed by signal".to_string()),
                     Err(e) => format!("wait error: {e}"),
                 };
                 trace(&format!("tunnel[{host}]: ssh died: {msg}"));

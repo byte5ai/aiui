@@ -51,7 +51,7 @@
     skip_validation?: boolean;
   };
 
-  type Spec = {
+  interface Spec {
     kind: "form";
     title: string;
     description?: string;
@@ -62,9 +62,15 @@
     submitLabel?: string;
     /** @deprecated legacy fallback */
     cancelLabel?: string;
-  };
+  }
 
-  let { spec, onsubmit, oncancel }: { spec: Spec; onsubmit: (r: any) => void; oncancel: () => void } = $props();
+  interface Props {
+    spec: Spec;
+    onsubmit: (r: any) => void;
+    oncancel: () => void;
+  }
+
+  let { spec, onsubmit, oncancel }: Props = $props();
 
   function collectTreeValues(items: TreeItem[]): string[] {
     return items.flatMap((it) => [it.value, ...collectTreeValues(it.children ?? [])]);
@@ -241,7 +247,7 @@
           {#if f.label}<label>{f.label}</label>{/if}
           <div class="list-widget" class:sortable={f.sortable}>
             {#each listValue.order as itemValue, idx (itemValue)}
-              {@const item = f.items.find((x) => x.value === itemValue)}
+              {@const item = f.items.find((x: { label: string; value: string; description?: string }) => x.value === itemValue)}
               {#if item}
                 <div
                   class="list-item"
@@ -255,8 +261,9 @@
                     if (f.sortable && dragFrom?.name === f.name) e.preventDefault();
                   }}
                   ondrop={() => {
-                    if (f.sortable && dragFrom?.name === f.name) {
-                      moveItem(f.name, dragFrom.idx, idx);
+                    const from = dragFrom;
+                    if (f.sortable && from && from.name === f.name) {
+                      moveItem(f.name, from.idx, idx);
                       dragFrom = null;
                     }
                   }}

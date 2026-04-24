@@ -57,6 +57,14 @@ works.
 
 ## Install in 3 minutes
 
+**Prerequisite**: [`uv`](https://docs.astral.sh/uv/) — the fast Python
+tool-runner that pulls the MCP server on demand. If you don't have it:
+```sh
+brew install uv
+```
+
+Then:
+
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon), open it, drag into `Applications`.
 2. **Launch once** from Finder. aiui registers itself with Claude Desktop
@@ -100,6 +108,58 @@ what anti-patterns to avoid. Every remote you register gets the skill
 installed too.
 
 Full catalog: [`docs/skill.md`](docs/skill.md).
+
+## FAQ
+
+**Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
+Developer-ID signed and notarized. It never phones home. The auth token
+stays under `~/.config/aiui/` on your machine and is only copied to
+hosts you explicitly register in settings.
+
+**Why do I need `uv`?** aiui's MCP server runs as a Python package
+published on PyPI. `uvx aiui-mcp` is the one-liner that fetches and runs
+it, with zero global environment pollution. If your Mac doesn't have
+`uv`, `brew install uv` is a one-time 10-second install.
+
+**How much memory does it use?** The companion idles around 30–50 MB.
+The underlying WebKit view loads only while a dialog is on screen.
+
+**Does it work on Intel Macs?** Not in v0.2.x — Apple Silicon
+(arm64) only. Intel support is on the roadmap.
+
+**Does it work on Linux or Windows?** No. aiui renders native macOS
+dialogs; porting would require a different companion per OS. If you want
+this, please [open an issue](https://github.com/byte5ai/aiui/issues/new)
+and vote.
+
+**Can I use aiui without Claude Desktop?** The companion is
+auto-spawned by Claude Desktop via its MCP registration, so in the
+default setup, no. You can launch `aiui.app` manually though — as long
+as `localhost:7777` is reachable, any MCP client can render dialogs.
+
+**Why not just use Claude Desktop's built-in AskUserQuestion?** It's
+great for single yes/no or single-choice questions, but doesn't cover
+multi-field forms, sortable lists, colour pickers, date ranges, or
+hierarchical pickers. aiui complements it.
+
+**Does aiui work in other MCP-capable clients?** The `aiui-mcp` server
+is a standard MCP server, so technically yes. The companion is Claude
+Desktop-specific in how it auto-installs, but the HTTP protocol on
+`localhost:7777` is client-agnostic.
+
+## Known limitations
+
+- **Apple Silicon only** (M1 and later). Intel Macs are not supported
+  in v0.2.x.
+- **macOS 11 (Big Sur) or later.**
+- **One Mac per companion.** If you want dialogs on multiple Macs
+  simultaneously, each needs its own aiui install; tokens and tunnels
+  are per-Mac.
+- **Password fields** mask input while typing but return the value as
+  plaintext to the agent — see the [widget catalog](docs/skill.md#password-fields)
+  for guidance.
+- **No headless rendering.** aiui needs an active macOS GUI session;
+  it won't render dialogs on a server-style headless install.
 
 ## Troubleshooting
 

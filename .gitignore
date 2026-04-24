@@ -27,3 +27,4 @@ latest.json
 
 # local release credentials
 .env.release
+.claude/
