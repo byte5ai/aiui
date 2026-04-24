@@ -1,3 +1,25 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+## [0.2.5] — 2026-04-24
+
+### Fixed
+
+- **Scroll indicator** in dialog windows. macOS's default overlay
+  scrollbars are invisible until you scroll — hiding the fact that
+  there's more content below. aiui now shows a slim persistent
+  scrollbar when a form overflows the window.
+- **Sortable lists** now actually stay in the new order. Drag-drop was
+  missing `preventDefault` + `dataTransfer` setup, so the browser
+  rejected the drop and snapped items back.
+- **Close + quit both hide now.** The red X and Cmd-Q both just hide
+  the window and drop the app back to Accessory (no Dock icon). The
+  HTTP channel to the agent stays alive so dialogs keep working. Only
+  the lifetime watchdog (60s after the last MCP child exits) really
+  terminates aiui — matches users' mental model of "close" and fixes
+  the surprise of accidentally killing the companion via Cmd-Q.
+
 ## [0.2.4] — 2026-04-24
 
 ### Fixed
@@ -5,10 +27,6 @@
 - **App icon**: replaced the brand PNG with the alpha-free macOS variant.
   macOS can now squircle-clip the canvas the way every other app icon
   looks in Launchpad/Dock — no more dark border.
-
-# Changelog
-
-All notable changes to this project are documented here.
 
 ## [0.2.3] — 2026-04-24
 

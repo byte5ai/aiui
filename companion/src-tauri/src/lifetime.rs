@@ -58,8 +58,12 @@ pub async fn gui_serve(sock: PathBuf, app: AppHandle) {
                     _ = tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)) => {
                         if conns.load(Ordering::SeqCst) == 0 {
                             trace("lifetime: grace expired, exiting");
-                            app.exit(0);
-                            break;
+                            // Hard exit bypassing Tauri's ExitRequested dance —
+                            // Cmd-Q and window-close are deliberately blocked
+                            // there, so the only legitimate shutdown path is
+                            // this one.
+                            let _ = app;
+                            std::process::exit(0);
                         }
                     }
                     _ = wake.notified() => {

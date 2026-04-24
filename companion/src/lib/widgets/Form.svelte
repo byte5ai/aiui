@@ -254,18 +254,30 @@
                   class:selected={f.selectable && listValue.selected.includes(item.value)}
                   class:clickable={f.selectable}
                   draggable={f.sortable}
-                  ondragstart={() => {
-                    if (f.sortable) dragFrom = { name: f.name, idx };
+                  ondragstart={(e) => {
+                    if (!f.sortable) return;
+                    dragFrom = { name: f.name, idx };
+                    if (e.dataTransfer) {
+                      // required by Firefox; Safari needs a non-empty payload too
+                      e.dataTransfer.effectAllowed = "move";
+                      e.dataTransfer.setData("text/plain", itemValue);
+                    }
                   }}
                   ondragover={(e) => {
-                    if (f.sortable && dragFrom?.name === f.name) e.preventDefault();
-                  }}
-                  ondrop={() => {
-                    const from = dragFrom;
-                    if (f.sortable && from && from.name === f.name) {
-                      moveItem(f.name, from.idx, idx);
-                      dragFrom = null;
+                    if (f.sortable && dragFrom?.name === f.name) {
+                      e.preventDefault();
+                      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
                     }
+                  }}
+                  ondrop={(e) => {
+                    const from = dragFrom;
+                    if (!f.sortable || !from || from.name !== f.name) return;
+                    e.preventDefault();
+                    moveItem(f.name, from.idx, idx);
+                    dragFrom = null;
+                  }}
+                  ondragend={() => {
+                    dragFrom = null;
                   }}
                   onclick={() =>
                     f.selectable && toggleListItem(f.name, item.value, !!f.multi_select)}

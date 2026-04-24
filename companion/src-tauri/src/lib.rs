@@ -339,15 +339,42 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Dock icon came up because the user brought the window
+                // forward. On close, drop back to Accessory mode so aiui
+                // vanishes from the Dock/Cmd-Tab until next time.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
             }
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
         .run(|app, event| {
-            // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
-            // → Settings-Fenster nach vorn holen.
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_settings_window(app);
+            match event {
+                // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
+                // → Settings-Fenster nach vorn holen.
+                tauri::RunEvent::Reopen { .. } => {
+                    show_settings_window(app);
+                }
+                // User-initiated quit (Cmd-Q, App menu → aiui beenden, dock
+                // right-click → Beenden): block it, hide the window, drop to
+                // Accessory. aiui must keep serving HTTP so the agent can
+                // still open dialogs. The only legitimate exit path is the
+                // lifetime-socket watchdog that calls std::process::exit().
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    api.prevent_exit();
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.hide();
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    }
+                }
+                _ => {}
             }
         });
 }
