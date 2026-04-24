@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "aiui",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "de.byte5.aiui",
   "build": {
     "frontendDist": "../dist",
@@ -45,7 +45,9 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
