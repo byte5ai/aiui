@@ -14,6 +14,7 @@
     "remotes.remove": "Entfernen",
     "log.title": "Zuletzt",
     "tunnel.connected": "verbunden",
+    "tunnel.connected_shared": "verbunden (geteilter Forward)",
     "tunnel.connecting": "verbinde…",
     "tunnel.stopped": "gestoppt",
     "tunnel.failed": "Fehler: {reason}",
