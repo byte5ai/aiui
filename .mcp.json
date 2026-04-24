@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "aiui": {
-      "command": "uvx",
-      "args": ["aiui-mcp"]
-    }
-  }
-}
