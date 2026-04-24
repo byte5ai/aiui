@@ -296,9 +296,10 @@ pub fn run() {
             }
 
             // Auto-register aiui as a global MCP server in Claude Code
-            // (~/.claude.json), so every session sees it without a per-project
-            // .mcp.json file.
-            let _ = setup::patch_claude_code_config();
+            // (~/.claude.json) and auto-migrate any legacy `uvx aiui-mcp`
+            // entries from ≤ v0.2.x installs to the native app binary, so
+            // every session sees aiui without a uv/uvx dependency.
+            let _ = setup::patch_claude_code_config(&bin);
 
             // Auto-install the aiui skill into the local Claude Code skill
             // directory on every GUI launch. Idempotent: overwrites old copies
