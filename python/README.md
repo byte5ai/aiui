@@ -6,11 +6,17 @@ local and remote Claude Code setups.
 
 ## Install
 
-You normally don't need to touch this package directly. Install
-`aiui.app` on the Mac once; it registers aiui as a global MCP server in
-Claude Code's user config (`~/.claude.json`) and pulls this package via
-`uvx aiui-mcp` automatically. From then on, every Claude Code session
-can call `aiui.*` tools without per-project setup.
+You don't normally need to touch this package directly.
+
+**On your Mac**, install [`aiui.app`](https://github.com/byte5ai/aiui/releases/latest)
+— since v0.3.0 the MCP server is bundled as native Rust code inside the
+app. `~/.claude.json` points directly at the app binary. No `uv`, no
+`uvx`, no Python on the onboarding path.
+
+**On a remote SSH host** (no aiui.app there), this package is the right
+tool. aiui registers it automatically when you add the remote in
+settings — `{command: "uvx", args: ["aiui-mcp"]}`. All dialogs tunnel
+back through aiui on your Mac.
 
 See the main repo for the full install flow and companion download:
 <https://github.com/byte5ai/aiui>
