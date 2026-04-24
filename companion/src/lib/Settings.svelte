@@ -9,6 +9,7 @@
   type TunnelStatus =
     | { state: "connecting" }
     | { state: "connected" }
+    | { state: "connected_shared" }
     | { state: "failed"; reason: string }
     | { state: "stopped" };
   type Status = {
@@ -100,6 +101,8 @@
     switch (t.state) {
       case "connected":
         return { text: $_("settings.tunnel.connected"), tone: "ok" };
+      case "connected_shared":
+        return { text: $_("settings.tunnel.connected_shared"), tone: "ok" };
       case "connecting":
         return { text: $_("settings.tunnel.connecting"), tone: "warn" };
       case "stopped":
