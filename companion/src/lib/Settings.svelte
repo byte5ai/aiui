@@ -75,6 +75,13 @@
     }
   }
 
+  let confirmQuit = $state(false);
+
+  async function doQuit() {
+    await invoke("force_quit");
+    // Never returns; app exits.
+  }
+
   async function reinstallSkill() {
     busy = true;
     try {
@@ -201,6 +208,16 @@
         <button class="danger" onclick={doUninstall} disabled={busy}
           >{$_("settings.uninstall.do")}</button
         >
+      {:else if confirmQuit}
+        <span class="subtitle" style="margin-right: auto; align-self: center;">
+          {$_("settings.quit.confirm")}
+        </span>
+        <button onclick={() => (confirmQuit = false)} disabled={busy}
+          >{$_("settings.uninstall.back")}</button
+        >
+        <button class="danger" onclick={doQuit} disabled={busy}
+          >{$_("settings.quit.do")}</button
+        >
       {:else}
         <button onclick={openIssue} title={$_("settings.report.hint")}>
           {$_("settings.report.button")}
@@ -211,6 +228,9 @@
         <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
           {$_("settings.updates.check")}
         </button>
+        <button onclick={() => (confirmQuit = true)} disabled={busy}
+          title={$_("settings.quit.hint")}>{$_("settings.quit.button")}</button
+        >
         <button onclick={() => (confirmUninstall = true)} disabled={busy}
           >{$_("settings.uninstall.button")}</button
         >
