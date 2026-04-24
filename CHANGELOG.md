@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] — 2026-04-24
+
+### Added
+
+- **Shared-forward detection.** A stale `sshd-sess` (commonly an earlier
+  aiui session whose parent died but whose child forward kept running)
+  can hold port 7777 on a remote indefinitely. aiui's own `ssh -NTR`
+  then fails with `ExitOnForwardFailure` (exit 255) — but the forward
+  actually works, we just don't own it. Previously the UI showed a
+  hard red "Failed: ssh exit code 255" in that case, which was
+  misleading. v0.3.2 probes the remote after each ssh failure
+  (`ssh host curl -f http://localhost:7777/ping`); if a `pong` comes
+  back, the tunnel flips to a new `ConnectedShared` state — green,
+  labelled "connected (shared forward)" / "verbunden (geteilter
+  Forward)" — and polls every 30 s instead of spamming `-NTR` retries.
+  When the external owner dies, aiui drops back into the normal retry
+  loop. Closes the most-common "ssh exit 255" support issue.
+
+### Changed
+
+- **Python `aiui-mcp` package (v0.3.1 on PyPI) gains feature-parity
+  with the native Rust MCP.** Adds `version` and `update` tools plus
+  `/aiui:version` and `/aiui:update` prompts. Prompt texts are
+  byte-identical to the Rust implementation so agent behaviour is
+  uniform regardless of whether the MCP lives in the app bundle or on
+  PyPI. Relevant for remote SSH hosts without aiui.app installed
+  locally.
+
 ## [0.3.1] — 2026-04-24
 
 ### Fixed
