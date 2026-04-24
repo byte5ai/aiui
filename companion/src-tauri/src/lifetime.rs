@@ -103,40 +103,55 @@ pub async fn gui_serve(sock: PathBuf, app: AppHandle) {
     }
 }
 
-/// MCP-stdio-side: connect to the GUI socket, launching the GUI first if the
-/// socket isn't there yet. Hold the connection open until the process exits.
+/// MCP-stdio-side: keep the GUI alive for the entire lifetime of this
+/// MCP child process. If the GUI isn't running, launch it. If it dies
+/// (user Cmd-Q'd, crash, whatever), relaunch and reattach. The loop only
+/// exits when this MCP-stdio process itself is terminated — which
+/// happens when Claude Desktop tears down its MCP children.
+///
+/// This is the "auto-resurrect" contract: as long as Claude Desktop is
+/// running, any agent tool call from the remote will find aiui's HTTP
+/// server back up by the time it tries to POST.
 pub async fn mcp_attach(sock: PathBuf) {
-    let mut launched = false;
-    for attempt in 1..=30u32 {
-        match UnixStream::connect(&sock).await {
-            Ok(mut stream) => {
-                trace(&format!(
-                    "lifetime: mcp attached to {} (attempt {attempt})",
-                    sock.display()
-                ));
-                let mut buf = [0u8; 64];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => continue,
-                    }
-                }
-                trace("lifetime: mcp socket closed");
-                return;
-            }
-            Err(e) => {
-                if !launched {
+    loop {
+        // Try to attach. If the socket isn't there, spawn the GUI and retry.
+        let mut attached = false;
+        for attempt in 1..=30u32 {
+            match UnixStream::connect(&sock).await {
+                Ok(mut stream) => {
                     trace(&format!(
-                        "lifetime: gui socket not ready ({e}), launching GUI via `open --auto`"
+                        "lifetime: mcp attached to {} (attempt {attempt})",
+                        sock.display()
                     ));
-                    let _ = std::process::Command::new("open")
-                        .args(["-g", "-a", "aiui", "--args", "--auto"])
-                        .spawn();
-                    launched = true;
+                    attached = true;
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                    trace("lifetime: mcp socket closed — GUI is gone, will relaunch");
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                Err(e) => {
+                    if attempt == 1 {
+                        trace(&format!(
+                            "lifetime: gui socket not ready ({e}), launching GUI via `open --auto`"
+                        ));
+                        let _ = std::process::Command::new("open")
+                            .args(["-g", "-a", "aiui", "--args", "--auto"])
+                            .spawn();
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
+        if !attached {
+            trace("lifetime: mcp gave up waiting for gui socket after 30 attempts; retrying in 5s");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        // GUI was connected and has now closed; loop back to resurrect it
+        // (or wait + retry if launch failed).
     }
-    trace("lifetime: mcp gave up waiting for gui socket after 30 attempts");
 }
