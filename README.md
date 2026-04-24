@@ -44,7 +44,7 @@ conversations, no throwaway web dashboards cluttering your system — just
 a familiar macOS window that does what it looks like.
 
 <p align="center">
-  <img src="assets/aiui-shot2.jpg" alt="aiui dialog window on macOS" width="560">
+  <img src="assets/aiui-shot1.jpg" alt="Claude Code session with an aiui dialog on the Mac desktop" width="720">
 </p>
 
 ## Works locally and remotely
