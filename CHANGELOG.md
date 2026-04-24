@@ -1,3 +1,11 @@
+## [0.2.4] — 2026-04-24
+
+### Fixed
+
+- **App icon**: replaced the brand PNG with the alpha-free macOS variant.
+  macOS can now squircle-clip the canvas the way every other app icon
+  looks in Launchpad/Dock — no more dark border.
+
 # Changelog
 
 All notable changes to this project are documented here.
