@@ -40,6 +40,17 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
 /// An Accessory-mode app (LSUIElement) doesn't own a Dock entry, and macOS
 /// won't reliably bring its dialogs to the foreground — we temporarily
 /// promote the app to Regular so the prompt actually becomes visible.
+/// Exit the companion immediately. Bypasses the ExitRequested trap
+/// (which otherwise intercepts Cmd-Q / window-close) by going straight
+/// to `std::process::exit`. The tunnel-manager children are killed via
+/// `kill_on_drop`. If Claude Desktop still has an MCP-stdio child
+/// running, that child will spawn the GUI again on its next lifetime-
+/// socket reconnect attempt (usually within a few seconds).
+#[tauri::command]
+fn force_quit() -> Result<(), String> {
+    std::process::exit(0);
+}
+
 #[tauri::command]
 async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -255,6 +266,7 @@ pub fn run() {
             dialog_submit,
             dialog_cancel,
             close_window,
+            force_quit,
             surface_for_dialog,
             status,
             add_remote,

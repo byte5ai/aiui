@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.6] — 2026-04-24
+
+### Added
+
+- **Auto-resurrect.** The MCP-stdio child now loops reconnect: if the
+  GUI is gone (user quit, crash) and an agent call arrives, the child
+  spawns aiui back up automatically. Net effect: aiui is always
+  available as long as Claude Desktop is running. No more "I quit it
+  and now the agent can't reach me" paper cut.
+- **Quit button in Settings** (with honest wording that the next agent
+  call will relaunch aiui anyway). Useful for debugging or forcing a
+  clean state; for normal use, the red X is enough.
+
 ## [0.2.5] — 2026-04-24
 
 ### Fixed
