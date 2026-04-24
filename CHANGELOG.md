@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] — 2026-04-24
+
+### Added
+
+- **Unified native MCP server.** aiui.app now ships a full-featured MCP
+  server as native Rust code inside the app bundle — confirm, ask, form,
+  aiui_health, plus the new `update` and `version` tools and three
+  prompts (`widgets`, `update`, `version`). Claude Code points directly
+  at the app binary with `--mcp-stdio`, eliminating the `uv`/`uvx`/Python
+  dependency from the onboarding path. Drag DMG → Applications → Launch
+  is the whole install now.
+- **`/aiui:update` slash-command.** Agent calls the `update` tool, aiui
+  checks the release feed, installs any available update silently, and
+  reports `{updated, current, available}` back to the agent *before*
+  scheduling its own relaunch. Explicit `tokio::sleep` buffer between
+  response and `app.restart()` guarantees the wire response lands before
+  the process exits.
+- **`/aiui:version` slash-command.** Reports the installed version,
+  build info, binary path, and updater endpoint in one call.
+- **`/version` HTTP endpoint** on the companion, returning structured
+  build metadata (bearer-auth protected like `/render`).
+
+### Changed
+
+- `patch_claude_code_config` writes `{command: <aiui.app binary>, args:
+  ["--mcp-stdio"]}` instead of `{command: "uvx", args: ["aiui-mcp"]}`.
+- **Auto-migration** on GUI startup: existing installs from ≤ v0.2.x
+  have their legacy `uvx aiui-mcp` entry in `~/.claude.json` rewritten
+  to the native binary transparently. The Python `aiui-mcp` package
+  stays on PyPI and remains the path of choice for remote SSH hosts
+  where aiui.app isn't installed locally.
+- README install section reduced from a three-step "brew + download +
+  drag" to a single "download + drag + launch". The `uv` FAQ entry now
+  answers "no, you don't need it."
+
 ## [0.2.8] — 2026-04-24
 
 ### Added

@@ -192,8 +192,15 @@ pub fn is_claude_config_current(app_binary_path: &str) -> bool {
 
 /// Patches `~/.claude.json` so Claude Code CLI sees `aiui` as a globally
 /// available MCP server — every session, every project, no per-project
-/// .mcp.json required. Uses the public uvx entrypoint on PyPI.
-pub fn patch_claude_code_config() -> StepResult {
+/// .mcp.json required.
+///
+/// Since v0.3.0 the entry points directly at the aiui.app binary with
+/// `--mcp-stdio`. That eliminates the `uv`/`uvx`/`pipx` dependency from
+/// the onboarding path — the app bundle already ships the MCP server as
+/// native code.
+///
+/// Auto-migrates legacy `uvx aiui-mcp` entries from ≤ v0.2.x installs.
+pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
     let path = home().join(".claude.json");
     let existing: Value = if path.exists() {
         match fs::read_to_string(&path) {
@@ -218,11 +225,14 @@ pub fn patch_claude_code_config() -> StepResult {
         .unwrap_or_default();
 
     let entry = serde_json::json!({
-        "command": "uvx",
-        "args": ["aiui-mcp"]
+        "command": app_binary_path,
+        "args": ["--mcp-stdio"]
     });
-    let was_present = servers.contains_key("aiui");
-    let already_correct = was_present && servers.get("aiui") == Some(&entry);
+
+    let existing_entry = servers.get("aiui");
+    let previous_kind = classify_aiui_entry(existing_entry);
+    let was_present = existing_entry.is_some();
+    let already_correct = existing_entry == Some(&entry);
     if already_correct {
         return StepResult {
             ok: true,
@@ -242,20 +252,51 @@ pub fn patch_claude_code_config() -> StepResult {
     }
     let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
     match fs::write(&path, pretty) {
-        Ok(_) => StepResult {
-            ok: true,
-            message: if was_present {
-                "Updated aiui entry in ~/.claude.json".into()
-            } else {
-                "Added aiui to ~/.claude.json — available in every Claude Code session".into()
-            },
-            details: None,
-        },
+        Ok(_) => {
+            let msg = match (was_present, previous_kind) {
+                (true, Some(AiuiEntryKind::LegacyUvx)) => {
+                    "Migrated aiui in ~/.claude.json from `uvx aiui-mcp` to the native app binary — no uv dependency required anymore".into()
+                }
+                (true, _) => "Updated aiui entry in ~/.claude.json".into(),
+                (false, _) => {
+                    "Added aiui to ~/.claude.json — available in every Claude Code session".into()
+                }
+            };
+            StepResult {
+                ok: true,
+                message: msg,
+                details: None,
+            }
+        }
         Err(e) => StepResult {
             ok: false,
             message: "Writing ~/.claude.json failed".into(),
             details: Some(e.to_string()),
         },
+    }
+}
+
+enum AiuiEntryKind {
+    LegacyUvx,
+    Other,
+}
+
+fn classify_aiui_entry(entry: Option<&Value>) -> Option<AiuiEntryKind> {
+    let entry = entry?;
+    let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let args = entry
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if cmd == "uvx" && args.first().map(String::as_str) == Some("aiui-mcp") {
+        Some(AiuiEntryKind::LegacyUvx)
+    } else {
+        Some(AiuiEntryKind::Other)
     }
 }
 
@@ -595,4 +636,75 @@ pub fn save_remotes(list: &[String]) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&p, serde_json::to_string_pretty(list).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_none() {
+        assert!(classify_aiui_entry(None).is_none());
+    }
+
+    #[test]
+    fn classify_legacy_uvx() {
+        let v = serde_json::json!({"command": "uvx", "args": ["aiui-mcp"]});
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::LegacyUvx)
+        ));
+    }
+
+    #[test]
+    fn classify_legacy_uvx_with_extra_args() {
+        // Extra args after "aiui-mcp" shouldn't disqualify the entry from
+        // being recognized as legacy — first arg is the package name.
+        let v = serde_json::json!({"command": "uvx", "args": ["aiui-mcp", "--verbose"]});
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::LegacyUvx)
+        ));
+    }
+
+    #[test]
+    fn classify_native_binary_is_other() {
+        // The native binary is considered "Other" here; callers compare
+        // to the current binary path and migrate only when it differs.
+        let v = serde_json::json!({
+            "command": "/Applications/aiui.app/Contents/MacOS/aiui",
+            "args": ["--mcp-stdio"]
+        });
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::Other)
+        ));
+    }
+
+    #[test]
+    fn classify_unrelated_command() {
+        let v = serde_json::json!({"command": "python", "args": ["-m", "something"]});
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::Other)
+        ));
+    }
+
+    #[test]
+    fn classify_uvx_but_wrong_package() {
+        let v = serde_json::json!({"command": "uvx", "args": ["some-other-package"]});
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::Other)
+        ));
+    }
+
+    #[test]
+    fn classify_malformed_entry() {
+        let v = serde_json::json!({});
+        assert!(matches!(
+            classify_aiui_entry(Some(&v)),
+            Some(AiuiEntryKind::Other)
+        ));
+    }
 }
