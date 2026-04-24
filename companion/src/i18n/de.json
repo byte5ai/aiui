@@ -26,11 +26,7 @@
     "skill.button": "Skill installieren",
     "skill.hint": "Kopiert das aiui-Skill nach ~/.claude/skills/aiui/ — lokal und auf allen Remote-Hosts. Gibt Agents konkrete Regeln, damit sie saubere Dialoge bauen.",
     "report.button": "Problem melden",
-    "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt.",
-    "quit.button": "Beenden",
-    "quit.hint": "Beendet aiui sofort. Beim nächsten Agent-Zugriff startet sich aiui automatisch wieder — für normale Bedienung reicht das rote Schließen-Kreuz.",
-    "quit.confirm": "Beenden? aiui ist kurz offline, bis ein Agent erneut zugreift.",
-    "quit.do": "Jetzt beenden"
+    "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt."
   },
   "dialog": {
     "cancel": "Abbrechen",

@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.7] — 2026-04-24
+
+### Changed
+
+- **Close + quit now terminate the app** (as any macOS user would
+  expect). The prevent-close / prevent-exit machinery from 0.2.5 is
+  gone. The auto-resurrect loop in 0.2.6 means aiui comes back on the
+  next agent call anyway, so there's no reason to keep a hidden
+  process running after the user asked it to go away.
+
+### Removed
+
+- The "Quit" button in Settings, along with its confirmation flow and
+  associated i18n strings. Redundant now that red X already terminates.
+
 ## [0.2.6] — 2026-04-24
 
 ### Added
