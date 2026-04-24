@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.1] — 2026-04-24
+
+### Added
+
+- **Zero-config Claude Code integration.** aiui registers itself in
+  `~/.claude.json` automatically on every launch, so every Claude Code
+  session sees the `aiui.*` tools without a per-project `.mcp.json`.
+  `add_remote` does the same on the remote host via SSH + python3.
+  `uninstall` and `remove_remote` clean both sides up.
+
+### Changed
+
+- README no longer asks for a `.mcp.json` snippet — install = download +
+  launch + restart Claude Desktop, nothing else.
+- Password-field wording in README and docs: masks while typing, but the
+  value returns as plaintext to the agent. Honest about the scope.
+
 ## [0.2.0] — 2026-04-24
 
 First public release.

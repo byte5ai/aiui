@@ -91,8 +91,9 @@ For bug reports, please include:
 
 The constraints that shape decisions in this project:
 
-- **User installs nothing per project.** The MCP server is on PyPI; a
-  single line in `.mcp.json` is enough for any project.
+- **User installs nothing per project.** aiui registers itself as a
+  global MCP server in Claude Code (`~/.claude.json`) on first launch;
+  the PyPI package is pulled on demand via `uvx`.
 - **Agents can't make slop.** Rules live both in tool docstrings (always
   visible) and the full skill (auto-installed). Widgets constrain rather
   than expand freedom where that improves outcomes.

@@ -1,26 +1,19 @@
 # aiui-mcp
 
-MCP server for [**aiui**](https://github.com/byte5ai/aiui) — lets Claude Code
-sessions render native macOS dialogs on the user's Mac. Works for local and
-remote Claude Code setups.
+MCP server for [**aiui**](https://github.com/byte5ai/aiui) — lets Claude
+Code sessions render native macOS dialogs on the user's Mac. Works for
+local and remote Claude Code setups.
 
 ## Install
 
-Drop this into your project's `.mcp.json`:
+You normally don't need to touch this package directly. Install
+`aiui.app` on the Mac once; it registers aiui as a global MCP server in
+Claude Code's user config (`~/.claude.json`) and pulls this package via
+`uvx aiui-mcp` automatically. From then on, every Claude Code session
+can call `aiui.*` tools without per-project setup.
 
-```json
-{
-  "mcpServers": {
-    "aiui": {
-      "command": "uvx",
-      "args": ["aiui-mcp"]
-    }
-  }
-}
-```
-
-`uvx` pulls the latest version automatically. The companion macOS app is
-distributed separately from <https://github.com/byte5ai/aiui/releases>.
+See the main repo for the full install flow and companion download:
+<https://github.com/byte5ai/aiui>
 
 ## Tools
 
