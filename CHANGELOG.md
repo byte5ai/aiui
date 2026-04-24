@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [0.2.8] — 2026-04-24
 
+### Added
+
+- **`success: true` on form actions** — green buttons for positive-outcome
+  verbs ("Approve", "Publish", "Accept"). Documented in the skill and in the
+  `form` tool docstring. The CSS class, TypeScript type, and skill docs
+  existed in neither repo before, so agents that guessed `success: true`
+  (by analogy to `destructive`) got silently-ignored styling.
+
 ### Fixed
 
 - **Update flow no longer requires a Claude Desktop restart.** Previously,
