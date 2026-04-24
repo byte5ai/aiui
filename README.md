@@ -56,21 +56,18 @@ automatically sets up a tunnel so the remote agent can pop dialogs right
 on your Mac. Register the host once in settings; from then on it just
 works.
 
-## Install in 3 minutes
+## Install
 
-**Prerequisite**: [`uv`](https://docs.astral.sh/uv/) — the fast Python
-tool-runner that pulls the MCP server on demand. If you don't have it:
-```sh
-brew install uv
-```
-
-Then:
+No Terminal. No Homebrew. No Python. No `uv`.
 
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
-   (DMG, Apple Silicon), open it, drag into `Applications`.
-2. **Launch once** from Finder. aiui registers itself with Claude Desktop
-   and Claude Code automatically.
-3. **Restart Claude Desktop.** That's it.
+   (DMG, Apple Silicon).
+2. Drag into `Applications`.
+3. Launch it once from Finder.
+
+That's it. aiui registers itself with Claude Desktop and Claude Code
+automatically. The MCP server ships inside the app bundle as native
+code, so you don't need a Python toolchain on your Mac.
 
 From now on aiui runs silently in the background — only while Claude
 Desktop is open. No dock icon, no menu-bar clutter, no lingering
@@ -81,8 +78,8 @@ Try it straight away in any Claude Code session: *"Ask me with aiui
 which of three deploy strategies we want today."* The agent opens an
 options dialog, you click, it keeps going.
 
-Future updates install themselves: aiui quietly prompts "update
-available", one click, done.
+Future updates: use `/aiui:update` in Claude Code, or wait for the
+auto-check the next time aiui's settings window opens.
 
 ## What you get
 
@@ -99,6 +96,14 @@ aiui runs purely locally on your Mac. No telemetry, no usage data, no
 content leaves your system. A local auth token lives in `~/.config/aiui/`
 (mode 0600) and is only scp'd to hosts you explicitly register in
 settings.
+
+## Slash commands in Claude Code
+
+| Command | What it does |
+|---|---|
+| `/aiui:widgets` | Loads the full widget catalog into the session. Use this right before UI-heavy work so the agent has the rules in context. |
+| `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
+| `/aiui:version` | Reports the currently installed aiui version in one line. |
 
 ## For agents: the skill
 
@@ -117,10 +122,14 @@ Developer-ID signed and notarized. It never phones home. The auth token
 stays under `~/.config/aiui/` on your machine and is only copied to
 hosts you explicitly register in settings.
 
-**Why do I need `uv`?** aiui's MCP server runs as a Python package
-published on PyPI. `uvx aiui-mcp` is the one-liner that fetches and runs
-it, with zero global environment pollution. If your Mac doesn't have
-`uv`, `brew install uv` is a one-time 10-second install.
+**Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships
+inside the aiui.app bundle as native Rust code — drag-and-drop install
+with no outside dependencies.
+
+For the special case of a remote SSH host that doesn't have aiui.app
+locally, the standalone Python package `aiui-mcp` is still on PyPI and
+gets used via `uvx aiui-mcp`. aiui registers that automatically when you
+add the remote in settings.
 
 **How much memory does it use?** The companion idles around 30–50 MB.
 The underlying WebKit view loads only while a dialog is on screen.
