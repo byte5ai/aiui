@@ -37,9 +37,6 @@ There's a better way.
   typing-heavy chat exchange.
 - **"Rank these five tickets in the order you want them."** Drag to
   reorder, the order comes back as a clean list.
-- **"Hand me your API token for a second."** A masked input so it isn't
-  visible on screen while you type. (The agent still needs the value to
-  act on it — for long-lived secrets use your keychain or env vars.)
 
 The agent gets your answer as structured data and keeps going. No side
 conversations, no throwaway web dashboards cluttering your system — just
@@ -63,37 +60,20 @@ works.
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon), open it, drag into `Applications`.
 2. **Launch once** from Finder. aiui registers itself with Claude Desktop
-   automatically.
+   and Claude Code automatically.
 3. **Restart Claude Desktop.** That's it.
 
 From now on aiui runs silently in the background — only while Claude
-Desktop itself is open. No dock icon, no menu-bar clutter, no lingering
-daemons.
+Desktop is open. No dock icon, no menu-bar clutter, no lingering
+daemons. aiui tools are available in **every** Claude Code session
+immediately; no per-project config needed.
+
+Try it straight away in any Claude Code session: *"Ask me with aiui
+which of three deploy strategies we want today."* The agent opens an
+options dialog, you click, it keeps going.
 
 Future updates install themselves: aiui quietly prompts "update
 available", one click, done.
-
-### Use it in a project
-
-Drop a `.mcp.json` into the project root (or extend an existing one):
-
-```json
-{
-  "mcpServers": {
-    "aiui": {
-      "command": "uvx",
-      "args": ["aiui-mcp"]
-    }
-  }
-}
-```
-
-On the next Claude Code start, [`uv`](https://docs.astral.sh/uv/) pulls
-the latest aiui server package automatically — nothing extra to install.
-
-Try it straight away: *"Ask me with aiui which of three deploy
-strategies we want today."* The agent opens an options dialog, you
-click, it keeps going.
 
 ## What you get
 

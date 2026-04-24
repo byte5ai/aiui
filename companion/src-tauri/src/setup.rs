@@ -329,6 +329,122 @@ pub fn is_claude_config_current(app_binary_path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Patches `~/.claude.json` so Claude Code CLI sees `aiui` as a globally
+/// available MCP server — every session, every project, no per-project
+/// .mcp.json required. Uses the public uvx entrypoint on PyPI.
+pub fn patch_claude_code_config() -> StepResult {
+    let path = home().join(".claude.json");
+    let existing: Value = if path.exists() {
+        match fs::read_to_string(&path) {
+            Ok(s) if s.trim().is_empty() => Value::Object(Map::new()),
+            Ok(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Map::new())),
+            Err(e) => {
+                return StepResult {
+                    ok: false,
+                    message: "Could not read ~/.claude.json".into(),
+                    details: Some(e.to_string()),
+                }
+            }
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let mut servers = root
+        .get("mcpServers")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let entry = serde_json::json!({
+        "command": "uvx",
+        "args": ["aiui-mcp"]
+    });
+    let was_present = servers.contains_key("aiui");
+    let already_correct = was_present && servers.get("aiui") == Some(&entry);
+    if already_correct {
+        return StepResult {
+            ok: true,
+            message: "aiui already registered in ~/.claude.json".into(),
+            details: None,
+        };
+    }
+    servers.insert("aiui".into(), entry);
+    root.insert("mcpServers".into(), Value::Object(servers));
+
+    if let Err(e) = backup(&path) {
+        return StepResult {
+            ok: false,
+            message: "~/.claude.json backup failed".into(),
+            details: Some(e.to_string()),
+        };
+    }
+    let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
+    match fs::write(&path, pretty) {
+        Ok(_) => StepResult {
+            ok: true,
+            message: if was_present {
+                "Updated aiui entry in ~/.claude.json".into()
+            } else {
+                "Added aiui to ~/.claude.json — available in every Claude Code session".into()
+            },
+            details: None,
+        },
+        Err(e) => StepResult {
+            ok: false,
+            message: "Writing ~/.claude.json failed".into(),
+            details: Some(e.to_string()),
+        },
+    }
+}
+
+pub fn remove_claude_code_config() -> StepResult {
+    let path = home().join(".claude.json");
+    if !path.exists() {
+        return StepResult {
+            ok: true,
+            message: "~/.claude.json does not exist".into(),
+            details: None,
+        };
+    }
+    let Ok(s) = fs::read_to_string(&path) else {
+        return StepResult {
+            ok: true,
+            message: "~/.claude.json unreadable, skipping".into(),
+            details: None,
+        };
+    };
+    let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::Object(Map::new()));
+    let had = v.pointer("/mcpServers/aiui").is_some();
+    if let Some(servers) = v.get_mut("mcpServers").and_then(|x| x.as_object_mut()) {
+        servers.remove("aiui");
+    }
+    if let Err(e) = backup(&path) {
+        return StepResult {
+            ok: false,
+            message: "~/.claude.json backup failed".into(),
+            details: Some(e.to_string()),
+        };
+    }
+    let pretty = serde_json::to_string_pretty(&v).unwrap();
+    match fs::write(&path, pretty) {
+        Ok(_) => StepResult {
+            ok: true,
+            message: if had {
+                "Removed aiui from ~/.claude.json".into()
+            } else {
+                "aiui was not registered in ~/.claude.json".into()
+            },
+            details: None,
+        },
+        Err(e) => StepResult {
+            ok: false,
+            message: "Writing ~/.claude.json failed".into(),
+            details: Some(e.to_string()),
+        },
+    }
+}
+
 pub fn remove_claude_desktop_config() -> StepResult {
     let path = home()
         .join("Library")
@@ -475,6 +591,98 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
             ok: false,
             message: "Schreiben fehlgeschlagen".into(),
             details: Some(e.to_string()),
+        },
+    }
+}
+
+/// Patch ~/.claude.json on a remote host so aiui is available in every Claude
+/// Code session there. Uses python3 for atomic JSON editing — avoids
+/// shell-quoting pitfalls, universally available on macOS and Linux remotes.
+pub fn patch_claude_code_config_remote(host_alias: &str) -> StepResult {
+    let script = r#"
+import json, os, pathlib, shutil, time
+p = pathlib.Path.home() / ".claude.json"
+data = {}
+if p.exists():
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        data = {}
+    ts = int(time.time())
+    shutil.copy(p, p.with_suffix(f".json.bak.{ts}"))
+servers = data.get("mcpServers") or {}
+servers["aiui"] = {"command": "uvx", "args": ["aiui-mcp"]}
+data["mcpServers"] = servers
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(data, indent=2))
+print("ok")
+"#;
+    let out = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            host_alias,
+            "python3 -c \"$1\"",
+            "--",
+            script,
+        ])
+        .output();
+    match out {
+        Err(e) => StepResult {
+            ok: false,
+            message: format!("ssh {host_alias} could not start"),
+            details: Some(e.to_string()),
+        },
+        Ok(o) if !o.status.success() => StepResult {
+            ok: false,
+            message: format!("Patching ~/.claude.json on {host_alias} failed"),
+            details: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
+        Ok(_) => StepResult {
+            ok: true,
+            message: format!("aiui registered in ~/.claude.json on {host_alias}"),
+            details: None,
+        },
+    }
+}
+
+pub fn remove_claude_code_config_remote(host_alias: &str) -> StepResult {
+    let script = r#"
+import json, pathlib
+p = pathlib.Path.home() / ".claude.json"
+if not p.exists():
+    print("ok")
+else:
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        data = {}
+    servers = data.get("mcpServers") or {}
+    servers.pop("aiui", None)
+    data["mcpServers"] = servers
+    p.write_text(json.dumps(data, indent=2))
+    print("ok")
+"#;
+    let out = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            host_alias,
+            "python3 -c \"$1\"",
+            "--",
+            script,
+        ])
+        .output();
+    match out {
+        Err(e) => StepResult {
+            ok: false,
+            message: format!("ssh {host_alias} could not start"),
+            details: Some(e.to_string()),
+        },
+        Ok(_) => StepResult {
+            ok: true,
+            message: format!("Removed aiui from ~/.claude.json on {host_alias}"),
+            details: None,
         },
     }
 }

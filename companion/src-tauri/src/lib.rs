@@ -81,6 +81,7 @@ async fn add_remote(
     let token_path = cfg.token_path.display().to_string();
     results.push(setup::push_token_to_remote(&host_alias, &token_path));
     results.push(skill::install_to_remote(&host_alias));
+    results.push(setup::patch_claude_code_config_remote(&host_alias));
 
     let mut list = setup::load_remotes();
     if !list.contains(&host_alias) {
@@ -112,6 +113,7 @@ async fn remove_remote(
     let mut results = Vec::new();
     results.push(setup::remove_ssh_forward(&host_alias, cfg.http_port));
     results.push(setup::remove_token_from_remote(&host_alias));
+    results.push(setup::remove_claude_code_config_remote(&host_alias));
     results.push(skill::remove_from_remote(&host_alias));
     let list: Vec<String> = setup::load_remotes()
         .into_iter()
@@ -129,9 +131,11 @@ async fn uninstall_all(
     tm.stop_all().await;
     let mut results = Vec::new();
     results.push(setup::remove_claude_desktop_config());
+    results.push(setup::remove_claude_code_config());
     for host in setup::load_remotes() {
         results.push(setup::remove_ssh_forward(&host, cfg.http_port));
         results.push(setup::remove_token_from_remote(&host));
+        results.push(setup::remove_claude_code_config_remote(&host));
         results.push(skill::remove_from_remote(&host));
     }
     results.push(skill::remove_locally());
@@ -257,6 +261,11 @@ pub fn run() {
             if !setup::is_claude_config_current(&bin) {
                 let _ = setup::patch_claude_desktop_config(&bin);
             }
+
+            // Auto-register aiui as a global MCP server in Claude Code
+            // (~/.claude.json), so every session sees it without a per-project
+            // .mcp.json file.
+            let _ = setup::patch_claude_code_config();
 
             // Auto-install the aiui skill into the local Claude Code skill
             // directory on every GUI launch. Idempotent: overwrites old copies
