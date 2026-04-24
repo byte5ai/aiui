@@ -1,5 +1,6 @@
 mod config;
 mod dialog;
+mod housekeeping;
 mod http;
 mod lifetime;
 mod logging;
@@ -279,6 +280,19 @@ pub fn run() {
             let bin = setup::app_binary_path();
             if !setup::is_claude_config_current(&bin) {
                 let _ = setup::patch_claude_desktop_config(&bin);
+            }
+
+            // Kill any `aiui --mcp-stdio` children left over from an older app
+            // version. Without this, a user who drops a new aiui.app over an
+            // old one would still have the old MCP-stdio children running
+            // under Claude Desktop — which may lack the auto-resurrect loop
+            // and won't reconnect to the new GUI. SIGTERMing them forces
+            // Claude Desktop to respawn against the freshly patched config.
+            let killed = housekeeping::kill_stale_mcp_stdio_children(&bin);
+            if killed > 0 {
+                logging::trace(&format!(
+                    "gui: sent SIGTERM to {killed} stale mcp-stdio child(ren); Claude Desktop will respawn them"
+                ));
             }
 
             // Auto-register aiui as a global MCP server in Claude Code

@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.8] — 2026-04-24
+
+### Added
+
+- **`success: true` on form actions** — green buttons for positive-outcome
+  verbs ("Approve", "Publish", "Accept"). Documented in the skill and in the
+  `form` tool docstring. The CSS class, TypeScript type, and skill docs
+  existed in neither repo before, so agents that guessed `success: true`
+  (by analogy to `destructive`) got silently-ignored styling.
+
+### Fixed
+
+- **Update flow no longer requires a Claude Desktop restart.** Previously,
+  installing a new aiui version left the old `aiui --mcp-stdio` children
+  running under Claude Desktop — bound to the old binary and, for installs
+  from ≤ v0.2.5, without the auto-resurrect loop. The new GUI couldn't be
+  reached until Claude Desktop was restarted. v0.2.8 sweeps those stale
+  children on every GUI startup (SIGTERM against any `aiui --mcp-stdio`
+  process whose executable path differs from the current one), so Claude
+  Desktop respawns them against the fresh binary automatically.
+
 ## [0.2.7] — 2026-04-24
 
 ### Changed

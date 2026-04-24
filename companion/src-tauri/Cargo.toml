@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.2.7"
+version = "0.2.8"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""

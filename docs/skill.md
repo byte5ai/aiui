@@ -47,7 +47,13 @@ well (status reports, tables, code snippets, logs).
 ## Action buttons (form only)
 
 - Verb-based, concrete. `"Create report"` beats `"OK"`.
-- Destructive → `destructive: true`. Never style a save button red.
+- Styling (pick one per button):
+  - `primary: true` → blue, the main action.
+  - `success: true` → green, positive-outcome verbs ("Approve", "Publish").
+  - `destructive: true` → red, irreversible verbs ("Delete", "Rollback").
+  - none → neutral outlined button.
+
+  Never style a save button red; never style a delete button green.
 - Offer an escape hatch (`skip_validation: true`) so required-field validation
   never traps the user.
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.

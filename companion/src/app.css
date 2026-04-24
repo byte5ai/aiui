@@ -91,6 +91,14 @@ button.danger {
   border-color: color-mix(in srgb, var(--danger) 70%, black);
 }
 button.danger:hover:not(:disabled) { background: var(--danger-hover); }
+button.success {
+  background: var(--success);
+  color: #ffffff;
+  border-color: color-mix(in srgb, var(--success) 70%, black);
+}
+button.success:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--success) 88%, black);
+}
 
 input[type="text"],
 input[type="number"],
