@@ -1,3 +1,19 @@
+## [0.2.5] — 2026-04-24
+
+### Fixed
+
+- **Scroll indicator** in dialog windows. macOS's default overlay
+  scrollbars are invisible until you scroll — hiding the fact that
+  there's more content below. aiui now shows a slim persistent
+  scrollbar when a form overflows the window.
+- **Sortable lists** now actually stay in the new order. Drag-drop was
+  missing `preventDefault` + `dataTransfer` setup, so the browser
+  rejected the drop and snapped items back.
+- **Dock icon** disappears when you close the settings window (red X).
+  Previously the app stayed visible in the Dock until the next MCP
+  child connected. Manually-opened sessions now fall back to Accessory
+  mode on close.
+
 ## [0.2.4] — 2026-04-24
 
 ### Fixed

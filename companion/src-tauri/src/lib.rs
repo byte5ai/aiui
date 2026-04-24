@@ -339,6 +339,15 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Dock icon came up because the user brought the window
+                // forward. On close, drop back to Accessory mode so aiui
+                // vanishes from the Dock/Cmd-Tab until next time.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
             }
         })
         .build(tauri::generate_context!())
