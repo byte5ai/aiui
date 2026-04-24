@@ -97,9 +97,11 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
 }
 
 /// Parse a user@host input. Returns (block_match_name, optional user).
-/// - "user@host" → ("host", Some("user"))
-/// - "host"      → ("host", None)
-/// The block match name is what goes into the "Host <name>" line so SSH
+///
+/// - `"user@host"` → `("host", Some("user"))`
+/// - `"host"`      → `("host", None)`
+///
+/// The block match name is what goes into the `Host <name>` line so SSH
 /// config matches on the hostname part of any connection to that host.
 fn split_user_host(input: &str) -> (&str, Option<&str>) {
     match input.split_once('@') {
@@ -108,150 +110,9 @@ fn split_user_host(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-pub fn patch_ssh_config(host_alias: &str, hostname: Option<&str>, port: u16) -> StepResult {
-    let path = home().join(".ssh").join("config");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let (match_name, user_from_alias) = split_user_host(host_alias);
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-
-    // Split into Host blocks. A block starts at a line beginning with "Host ".
-    let lines: Vec<&str> = existing.lines().collect();
-    let mut blocks: Vec<Vec<String>> = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut preamble_done = false;
-
-    for line in &lines {
-        let trimmed = line.trim_start();
-        let is_host_line = trimmed.starts_with("Host ") || trimmed == "Host";
-        if is_host_line {
-            if !current.is_empty() || preamble_done {
-                blocks.push(std::mem::take(&mut current));
-            }
-            preamble_done = true;
-        }
-        current.push(line.to_string());
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-
-    let want_remote_forward = format!("    RemoteForward {port} localhost:{port}");
-    let want_alive = "    ServerAliveInterval 30".to_string();
-    let want_exit_on_fail = "    ExitOnForwardFailure no".to_string();
-
-    let mut found = false;
-    let mut added_lines_in_existing = false;
-    for block in blocks.iter_mut() {
-        // Block header check — match on the hostname part (not the user@ prefix)
-        let header_matches = block.first().is_some_and(|l| {
-            let t = l.trim_start();
-            if let Some(rest) = t.strip_prefix("Host ") {
-                rest.split_whitespace().any(|a| a == match_name)
-            } else {
-                false
-            }
-        });
-        if !header_matches {
-            continue;
-        }
-        found = true;
-
-        let has_line = |prefix: &str| -> bool {
-            block
-                .iter()
-                .any(|l| l.trim_start().to_lowercase().starts_with(&prefix.to_lowercase()))
-        };
-        let has_port = block.iter().any(|l| {
-            let t = l.trim_start().to_lowercase();
-            t.starts_with("remoteforward") && t.contains(&format!("{port} localhost:{port}"))
-        });
-        let has_alive = has_line("ServerAliveInterval");
-        let has_exit = has_line("ExitOnForwardFailure");
-
-        if !has_port {
-            block.push(want_remote_forward.clone());
-            added_lines_in_existing = true;
-        }
-        if !has_alive {
-            block.push(want_alive.clone());
-            added_lines_in_existing = true;
-        }
-        if !has_exit {
-            block.push(want_exit_on_fail.clone());
-            added_lines_in_existing = true;
-        }
-        break;
-    }
-
-    let mut message;
-    if !found {
-        // Append new block
-        let mut new_block: Vec<String> = Vec::new();
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            new_block.push("".into());
-        }
-        new_block.push(format!("Host {match_name}"));
-        if let Some(h) = hostname {
-            new_block.push(format!("    HostName {h}"));
-        }
-        if let Some(u) = user_from_alias {
-            new_block.push(format!("    User {u}"));
-        }
-        new_block.push(want_remote_forward);
-        new_block.push(want_alive);
-        new_block.push(want_exit_on_fail);
-        blocks.push(new_block);
-        message = format!("Neuer Host-Block '{match_name}' in ~/.ssh/config angelegt.");
-    } else if added_lines_in_existing {
-        message = format!("Host-Block '{match_name}' in ~/.ssh/config um RemoteForward ergänzt.");
-    } else {
-        message = format!("Host-Block '{match_name}' hatte bereits alle nötigen Einträge.");
-    }
-
-    let out: String = blocks
-        .into_iter()
-        .map(|b| b.join("\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let out = if out.ends_with('\n') { out } else { format!("{out}\n") };
-
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "Backup der ~/.ssh/config fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        };
-    }
-    match fs::write(&path, out) {
-        Ok(_) => {
-            // chmod 600
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(md) = fs::metadata(&path) {
-                    let mut p = md.permissions();
-                    p.set_mode(0o600);
-                    let _ = fs::set_permissions(&path, p);
-                }
-            }
-            message.push_str(&format!(" ({})", path.display()));
-            StepResult {
-                ok: true,
-                message,
-                details: None,
-            }
-        }
-        Err(e) => StepResult {
-            ok: false,
-            message: "Schreiben fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        },
-    }
-}
+// Note: an earlier version of aiui patched ~/.ssh/config with a
+// RemoteForward line. The tunnel manager now owns the forward directly, so
+// only the remove path remains (to clean up legacy installs).
 
 pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
     // ensure remote dir

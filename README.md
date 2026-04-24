@@ -57,6 +57,14 @@ works.
 
 ## Install in 3 minutes
 
+**Prerequisite**: [`uv`](https://docs.astral.sh/uv/) — the fast Python
+tool-runner that pulls the MCP server on demand. If you don't have it:
+```sh
+brew install uv
+```
+
+Then:
+
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon), open it, drag into `Applications`.
 2. **Launch once** from Finder. aiui registers itself with Claude Desktop
@@ -107,6 +115,11 @@ Full catalog: [`docs/skill.md`](docs/skill.md).
 Developer-ID signed and notarized. It never phones home. The auth token
 stays under `~/.config/aiui/` on your machine and is only copied to
 hosts you explicitly register in settings.
+
+**Why do I need `uv`?** aiui's MCP server runs as a Python package
+published on PyPI. `uvx aiui-mcp` is the one-liner that fetches and runs
+it, with zero global environment pollution. If your Mac doesn't have
+`uv`, `brew install uv` is a one-time 10-second install.
 
 **How much memory does it use?** The companion idles around 30–50 MB.
 The underlying WebKit view loads only while a dialog is on screen.

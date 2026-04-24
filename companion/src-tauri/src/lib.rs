@@ -127,11 +127,12 @@ async fn remove_remote(
     // Stop the tunnel first so the forward port is freed before we touch
     // ssh config and remote token.
     tm.stop(&host_alias).await;
-    let mut results = Vec::new();
-    results.push(setup::remove_ssh_forward(&host_alias, cfg.http_port));
-    results.push(setup::remove_token_from_remote(&host_alias));
-    results.push(setup::remove_claude_code_config_remote(&host_alias));
-    results.push(skill::remove_from_remote(&host_alias));
+    let results = vec![
+        setup::remove_ssh_forward(&host_alias, cfg.http_port),
+        setup::remove_token_from_remote(&host_alias),
+        setup::remove_claude_code_config_remote(&host_alias),
+        skill::remove_from_remote(&host_alias),
+    ];
     let list: Vec<String> = setup::load_remotes()
         .into_iter()
         .filter(|h| h != &host_alias)
