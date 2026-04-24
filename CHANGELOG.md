@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.3] — 2026-04-24
+
+### Fixed
+
+- **App icon**: reverted the auto-padding from 0.2.2 that introduced a
+  dark border around the artwork in dark-background contexts (Launchpad,
+  Dock). Back to the original brand asset — macOS handles the canvas on
+  its own.
+
 ## [0.2.2] — 2026-04-24
 
 ### Added
