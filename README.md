@@ -1,19 +1,20 @@
-<p align="center">
-  <img src="assets/aiui-logo.png" alt="aiui" width="360">
-</p>
+<table>
+<tr>
+<td width="140" valign="middle">
+<img src="assets/aiui-icon2.png" alt="aiui" width="120">
+</td>
+<td valign="middle">
 
-<p align="center">
-  <strong>Claude Code can ask, confirm, and collect input — as real native macOS dialogs.</strong>
-</p>
+# aiui
 
-<p align="center">
-  <a href="https://github.com/byte5ai/aiui/releases/latest">
-    <img alt="Download aiui.app" src="https://img.shields.io/badge/Download%20for%20Mac-aiui.app-4f46e5?style=for-the-badge&logo=apple">
-  </a>
-  <a href="https://github.com/byte5ai/aiui/blob/main/LICENSE">
-    <img alt="MIT License" src="https://img.shields.io/badge/MIT-Open%20Source-171717?style=for-the-badge">
-  </a>
-</p>
+**Claude Code can ask, confirm, and collect input — as real native macOS dialogs.**
+
+[![Download aiui.app](https://img.shields.io/badge/Download%20for%20Mac-aiui.app-4f46e5?style=for-the-badge&logo=apple)](https://github.com/byte5ai/aiui/releases/latest)
+[![MIT License](https://img.shields.io/badge/MIT-Open%20Source-171717?style=for-the-badge)](https://github.com/byte5ai/aiui/blob/main/LICENSE)
+
+</td>
+</tr>
+</table>
 
 ---
 
@@ -43,7 +44,7 @@ conversations, no throwaway web dashboards cluttering your system — just
 a familiar macOS window that does what it looks like.
 
 <p align="center">
-  <img src="assets/aiui-icon.png" alt="aiui app icon" width="180">
+  <img src="assets/aiui-shot1.jpg" alt="Claude Code session with an aiui dialog on the Mac desktop" width="720">
 </p>
 
 ## Works locally and remotely

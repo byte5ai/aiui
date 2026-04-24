@@ -47,6 +47,8 @@
     value: string;
     primary?: boolean;
     destructive?: boolean;
+    /** Positive-outcome styling (green). For "success"-type semantics like "Approve", "Accept", "Publish". */
+    success?: boolean;
     /** If true, field-level required-validation is skipped when this action fires (e.g. "defer"). */
     skip_validation?: boolean;
   };
@@ -353,6 +355,7 @@
       <button
         class:primary={a.primary}
         class:danger={a.destructive}
+        class:success={a.success}
         disabled={!a.skip_validation && !canSubmit && !a.destructive}
         onclick={() => runAction(a)}
       >

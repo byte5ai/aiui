@@ -201,7 +201,12 @@ async def form(
 
     ACTION BUTTONS:
     - Verb-based and concrete ("Create report"), not "OK".
-    - Destructive actions: `destructive: true` — never red a save button.
+    - Styling variants (pick one per button):
+      - `primary: true`  → blue, default emphasis for the main action.
+      - `success: true`  → green, for positive-outcome actions ("Approve", "Publish", "Accept").
+      - `destructive: true` → red, for deletions/force-pushes/rollbacks.
+      - none → neutral outlined button.
+      Never red a save button. Never green a delete button.
     - `skip_validation: true` on escape hatches so required-field validation
       doesn't trap the user.
     - ≤ 3 actions.
@@ -231,7 +236,8 @@ async def form(
         fields: List of field blocks, each with a `kind` from above.
         description: Subtitle, ≤ 2 sentences.
         header: Chip above the title (≤ 14 chars).
-        actions: Footer buttons `[{label, value, primary?, destructive?, skip_validation?}]`.
+        actions: Footer buttons `[{label, value, primary?, success?, destructive?, skip_validation?}]`.
+            Styling variants are mutually exclusive; pick one of primary/success/destructive or leave all off for neutral.
             Without actions, defaults to Cancel + Submit.
         submit_label: Legacy fallback for the default submit button label.
         cancel_label: Legacy fallback for the default cancel button label.
