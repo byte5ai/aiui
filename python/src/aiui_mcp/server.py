@@ -313,6 +313,51 @@ def widgets() -> str:
         )
 
 
+# Prompt texts kept in sync verbatim with the Rust MCP server
+# (companion/src-tauri/src/mcp.rs) so /aiui:update and /aiui:version behave
+# identically whether the user is on the native app MCP or on PyPI via uvx.
+
+_UPDATE_PROMPT = """\
+Check whether an aiui update is available and install it if so. Call the \
+`update` tool now, then report back concisely:
+
+- If `updated: true`, report "aiui updated {current} -> {available}" and \
+  mention that aiui will relaunch itself silently; the next agent call \
+  will hit the new version.
+- If `updated: false` and `note: "already on latest"`, report "aiui is \
+  on the latest version ({current})".
+- If `error` is set, report the error verbatim.
+
+Keep the reply to one short sentence unless the user asked for detail.
+"""
+
+_VERSION_PROMPT = """\
+Report the current aiui version to the user. Call the `version` tool and \
+reply with one short line containing the version plus the build date \
+parsed from `build_info` (format "v{ver} (commit, yyyy-mm-dd)"). If the \
+user asked for more, include the binary path and updater endpoint.
+"""
+
+
+@mcp.prompt()
+def update() -> str:
+    """Instructs the agent to call `update` and report the outcome.
+
+    Wired up so Claude Code exposes `/aiui:update` as a slash-command that
+    triggers a silent update check + install on the user's Mac. Works both
+    locally (MCP talks to aiui on localhost) and remotely (MCP calls reach
+    aiui through the SSH reverse-tunnel — the update runs on the user's Mac,
+    not on the remote host)."""
+    return _UPDATE_PROMPT
+
+
+@mcp.prompt()
+def version() -> str:  # noqa: A001  — shadowing by design; prompt names surface as `/aiui:version`
+    """Instructs the agent to call `version` and report the current aiui
+    companion version in a single line."""
+    return _VERSION_PROMPT
+
+
 @mcp.tool()
 async def aiui_health() -> dict[str, Any]:
     """Reachability + token check against the aiui companion.
@@ -333,6 +378,49 @@ async def aiui_health() -> dict[str, Any]:
     except Exception as e:
         log.warning("health check failed: %s", e)
         return {"ok": False, "error": str(e), "endpoint": ENDPOINT, "server": BUILD_INFO}
+
+
+# Renamed from the FastMCP-decorator `version` prompt — tools use a
+# differently-scoped namespace, so no collision, but this aliasing makes the
+# intent explicit in logs.
+@mcp.tool(name="version")
+async def version_tool() -> dict[str, Any]:
+    """Report aiui companion version, build info, binary path, and updater endpoint.
+
+    Cheap; does not hit the network. Works against both a local companion
+    (on-Mac) and a remote one reached via SSH tunnel.
+    """
+    async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
+        r = await client.get(
+            f"{ENDPOINT}/version",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool(name="update")
+async def update_tool() -> dict[str, Any]:
+    """Check for an aiui update on the user's Mac and install it silently.
+
+    Responds BEFORE the companion schedules its relaunch, so the caller
+    receives `{updated, current, available, note}`. Next agent call hits
+    the new version.
+
+    Runs the updater against the *user's Mac*, regardless of whether the
+    MCP is local or reached via an SSH reverse-tunnel — because the
+    /update HTTP endpoint lives on the aiui.app companion, not on this
+    process.
+    """
+    # Use the long render timeout because download + install of the updater
+    # bundle can take several seconds on a slow network.
+    async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        r = await client.post(
+            f"{ENDPOINT}/update",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+        r.raise_for_status()
+        return r.json()
 
 
 def main() -> None:
