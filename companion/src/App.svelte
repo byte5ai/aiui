@@ -13,16 +13,28 @@
 
   let current = $state<DialogReq | null>(null);
 
+  // Re-check for updates every 6 h in long-running sessions. The initial
+  // startup check alone doesn't cut it: aiui lives for the whole Claude
+  // Desktop session (often multiple days), so without a periodic timer a
+  // user sitting on an outdated build never sees the prompt. Silent —
+  // `checkForUpdates` only surfaces UI when an update is actually available.
+  const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
+  let updateTimer: number | undefined;
+
   onMount(() => {
     const un = listen<DialogReq>("dialog:show", (e) => {
       current = e.payload;
     });
     window.addEventListener("keydown", onKey);
-    // Silent update check on startup — user sees nothing unless there's a new version.
+    // Startup check + recurring poll.
     void checkForUpdates({ silent: true });
+    updateTimer = window.setInterval(() => {
+      void checkForUpdates({ silent: true });
+    }, UPDATE_POLL_MS);
     return async () => {
       (await un)();
       window.removeEventListener("keydown", onKey);
+      if (updateTimer !== undefined) window.clearInterval(updateTimer);
     };
   });
 
