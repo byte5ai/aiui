@@ -38,15 +38,15 @@ well (status reports, tables, code snippets, logs).
 ## Writing labels and copy
 
 - Imperative or noun, ≤ 6 words per label, no punctuation, no emoji.
-- Parallel grammar within a dialog. Mix of styles ("Name" / "Bitte geben Sie
-  Ihr Alter ein" / "What's your role?") reads as AI slop.
-- Defaults that a real user would pick, not `"enter value here"`.
+- Parallel grammar within a dialog. Mixing styles ("Name" / "Please enter
+  your age" / "What's your role?") reads as AI slop.
+- Defaults a real user would actually pick, not `"enter value here"`.
 - `description`/`static_text` only when the label alone is ambiguous —
   avoid redundancy.
 
 ## Action buttons (form only)
 
-- Verb-based, concrete. `"Bericht erstellen"` beats `"OK"`.
+- Verb-based, concrete. `"Create report"` beats `"OK"`.
 - Destructive → `destructive: true`. Never style a save button red.
 - Offer an escape hatch (`skip_validation: true`) so required-field validation
   never traps the user.
@@ -70,52 +70,52 @@ drag changes, `selected` reflects checkbox state.
 For short-lived secrets (one-off API tokens, test passwords), prefer
 `form` with a `password` field over asking in chat: the value is masked
 on screen while the user types, so it doesn't appear in screen
-recordings or shoulder-surfing distance.
+recordings or to a shoulder-surfer.
 
 Be honest with the user, though — the value still returns to you as
 plaintext in the tool response. For long-lived or high-value secrets,
 tell the user to put them in their keychain or an env var and reference
 them by name instead.
 
-## Anti-patterns (gut vs. schlecht)
+## Anti-patterns (slop vs. clean)
 
 | Slop | Clean |
 |---|---|
-| `confirm(title="Sicher?")` | `confirm(title="Tabelle 'orders' löschen?", destructive=True, message="18.432 Zeilen werden entfernt.")` |
-| `ask(question="Wählen", options=[{"label": "Option 1"}, …])` | `ask(question="Welche Strategie für die Migration?", options=[{"label":"In-place","description":"Schnell, kein Rollback."}, …])` |
-| `form` mit 15 `text`-Feldern | Aufteilen in logische Schritte oder ganz in Chat verlagern |
-| Button-Labels "OK" / "Abbrechen" | "Deploy starten" / "Verwerfen" |
-| `static_text` echot den Titel | `static_text` ergänzt Kontext, den die Labels nicht transportieren |
+| `confirm(title="Are you sure?")` | `confirm(title="Drop table 'orders'?", destructive=True, message="18,432 rows will be removed.")` |
+| `ask(question="Choose one", options=[{"label": "Option 1"}, …])` | `ask(question="Which migration strategy?", options=[{"label":"In-place","description":"Fast, no rollback."}, …])` |
+| `form` with 15 `text` fields | Split into logical steps, or push back to chat entirely |
+| Button labels "OK" / "Cancel" | "Deploy" / "Discard" — name what happens |
+| `static_text` echoing the title | `static_text` adds context the labels can't carry alone |
 
-## Quick reference example
+## Quick-reference example
 
 ```python
 aiui.form(
-    title="Neuer Feature-Entwurf",
+    title="New feature draft",
     header="Discovery",
     fields=[
-        {"kind": "text", "name": "job", "label": "User-Job",
+        {"kind": "text", "name": "job", "label": "User job",
          "multiline": True, "required": True},
-        {"kind": "select", "name": "scope", "label": "Umfang",
-         "options": [{"label": "Quick Win", "value": "qw"},
+        {"kind": "select", "name": "scope", "label": "Scope",
+         "options": [{"label": "Quick win", "value": "qw"},
                      {"label": "Feature", "value": "f"},
                      {"label": "Epic", "value": "e"}],
          "default": "f"},
-        {"kind": "list", "name": "stakeholders", "label": "Beteiligte",
-         "items": [{"label": "Produkt", "value": "prod"},
+        {"kind": "list", "name": "stakeholders", "label": "Stakeholders",
+         "items": [{"label": "Product", "value": "prod"},
                    {"label": "Design", "value": "design"},
                    {"label": "Engineering", "value": "eng"}],
          "selectable": True, "multi_select": True,
          "default_selected": ["prod", "eng"]},
-        {"kind": "date", "name": "deadline", "label": "Zieldatum"},
+        {"kind": "date", "name": "deadline", "label": "Target date"},
     ],
     actions=[
-        {"label": "Abbrechen", "value": "cancel", "skip_validation": True},
-        {"label": "Entwurf speichern", "value": "draft", "skip_validation": True},
-        {"label": "Anlegen", "value": "commit", "primary": True},
+        {"label": "Cancel", "value": "cancel", "skip_validation": True},
+        {"label": "Save draft", "value": "draft", "skip_validation": True},
+        {"label": "Create", "value": "commit", "primary": True},
     ],
 )
 ```
 
-Response: `{cancelled: false, action: "commit", values: {job: "...",
-scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "..."}}`.
+Response: `{cancelled: false, action: "commit", values: {job: "…",
+scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.

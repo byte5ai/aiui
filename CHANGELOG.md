@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.2] — 2026-04-24
+
+### Added
+
+- **Icon padding** to the macOS safe-area standard (~80 % active), so aiui
+  lines up visually with other app icons in Launchpad and the Dock.
+- **Update dialog auto-surfaces.** In Accessory (hidden-dock) mode, the
+  updater now temporarily promotes the app to Regular and brings the
+  window forward before showing the "update available" prompt, so the
+  user actually sees it without clicking aiui first.
+
+### Changed
+
+- **Docs language.** `docs/skill.md` is now consistently English (mixed
+  German/English examples removed). Redundant `docs/widgets.md`
+  dropped — skill.md is the single source of truth for agent guidance.
+- `aiui-mcp` bumped to 0.2.2 to ship the English-only skill resource.
+
 ## [0.2.1] — 2026-04-24
 
 ### Added
