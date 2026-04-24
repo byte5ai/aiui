@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.3] — 2026-04-24
+
+### Fixed
+
+- **Long-running installs now actually auto-update.** The updater only
+  ran at app startup (`onMount`), so an aiui instance that had been up
+  for hours or days silently stayed on its install version while new
+  releases shipped. Added a recurring silent check every 6 h on top of
+  the existing startup check. The call stays silent unless an update
+  is actually available.
+
 ## [0.3.2] — 2026-04-24
 
 ### Added
