@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "→ Installing Node deps for the Tauri companion..."
+( cd companion && npm install )
+
+echo "→ Building the Python MCP package (aiui-mcp)..."
+( cd python && uv build )
+
+echo "→ Configuring git hooks..."
+git config core.hooksPath .hooks
+
+echo ""
+echo "Done. Next steps:"
+echo "  - Install Rust (rustup) if not already: https://rustup.rs"
+echo "  - cd companion && npx tauri dev   # live dev of the app"
+echo "  - cd python   && uv run aiui-mcp  # stand-alone MCP stdio test"

@@ -24,8 +24,6 @@ aiui/
 ├── scripts/
 │   └── release.sh            Local sign + notarize + updater feed pipeline
 ├── assets/                   Brand assets (icon, logo, dmg background)
-├── server.py                 Legacy standalone script (for `uv run`) —
-│                             mirrors python/src/aiui_mcp/server.py
 └── CHANGELOG.md
 ```
 

@@ -1,12 +1,22 @@
 <script lang="ts">
   import Self from "./TreeNode.svelte";
 
-  type TreeItem = {
+  interface TreeItem {
     label: string;
     value: string;
     description?: string;
     children?: TreeItem[];
-  };
+  }
+
+  interface Props {
+    item: TreeItem;
+    depth: number;
+    selected: string[];
+    expanded: Set<string>;
+    multiSelect: boolean;
+    onToggleExpand: (value: string) => void;
+    onToggleSelect: (value: string) => void;
+  }
 
   let {
     item,
@@ -16,15 +26,7 @@
     multiSelect,
     onToggleExpand,
     onToggleSelect,
-  }: {
-    item: TreeItem;
-    depth: number;
-    selected: string[];
-    expanded: Set<string>;
-    multiSelect: boolean;
-    onToggleExpand: (value: string) => void;
-    onToggleSelect: (value: string) => void;
-  } = $props();
+  }: Props = $props();
 
   let hasChildren = $derived((item.children ?? []).length > 0);
   let isExpanded = $derived(expanded.has(item.value));

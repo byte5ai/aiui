@@ -60,7 +60,7 @@ pub async fn serve(
     log::info!("[aiui] http listening on {addr}");
     axum::serve(listener, router)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     Ok(())
 }
 
