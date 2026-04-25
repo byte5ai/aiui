@@ -20,6 +20,7 @@
     remotes: string[];
     tunnels: Record<string, TunnelStatus>;
     build_info: string;
+    welcome_pending: boolean;
   };
 
   let status = $state<Status | null>(null);
@@ -86,6 +87,15 @@
     }
   }
 
+  async function dismissWelcome() {
+    try {
+      await invoke("dismiss_welcome");
+    } finally {
+      // Either way, hide locally — server-side state will catch up on next refresh.
+      if (status) status = { ...status, welcome_pending: false };
+    }
+  }
+
   function openIssue() {
     const body = encodeURIComponent(
       `**Version:** ${status?.build_info ?? "unknown"}\n\n` +
@@ -135,6 +145,24 @@
       </div>
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </header>
+
+    {#if status.welcome_pending}
+      <section class="welcome">
+        <div class="welcome-head">
+          <strong>{$_("settings.welcome.title")}</strong>
+          <button class="welcome-dismiss" onclick={dismissWelcome} aria-label={$_("settings.welcome.dismiss")}>×</button>
+        </div>
+        <p class="welcome-body">{$_("settings.welcome.body")}</p>
+        <ul class="welcome-list">
+          <li>{$_("settings.welcome.point.test")}</li>
+          <li>{$_("settings.welcome.point.skill")}</li>
+          <li>{$_("settings.welcome.point.remote")}</li>
+        </ul>
+        <div class="welcome-foot">
+          <button class="primary" onclick={dismissWelcome}>{$_("settings.welcome.cta")}</button>
+        </div>
+      </section>
+    {/if}
 
     <section>
       <label>{$_("settings.remotes.title")}</label>
@@ -323,4 +351,60 @@
     flex-shrink: 0;
   }
   .dot-small.err { background: var(--danger); }
+
+  /* --- first-run welcome --- */
+  .welcome {
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .welcome-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .welcome-head strong {
+    font-size: 14px;
+    color: var(--fg);
+  }
+  .welcome-dismiss {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    padding: 0 4px;
+    cursor: pointer;
+    box-shadow: none;
+    border-radius: 4px;
+  }
+  .welcome-dismiss:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+  .welcome-body {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .welcome-list {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 12.5px;
+    color: var(--fg);
+    line-height: 1.55;
+  }
+  .welcome-list li :global(code) {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .welcome-foot {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
 </style>

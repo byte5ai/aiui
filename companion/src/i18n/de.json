@@ -5,6 +5,13 @@
     "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt"
   },
   "settings": {
+    "welcome.title": "aiui ist eingerichtet",
+    "welcome.body": "Claude Code kann jetzt native Fenster auf diesem Mac öffnen, statt Dich im Chat zu fragen. Probier in einer Claude-Code-Session:",
+    "welcome.point.test": "/aiui:test-dialog — kurzer Demo-Dialog zum Verifizieren.",
+    "welcome.point.skill": "/aiui:widgets — lädt das Agent-Skill, damit künftige Agents von alleine Fenster nutzen.",
+    "welcome.point.remote": "Arbeitest Du via SSH auf einem Dev-Host? Trag ihn unten ein, aiui tunnelt die Dialoge zurück.",
+    "welcome.cta": "Verstanden",
+    "welcome.dismiss": "Schließen",
     "remotes.title": "Eingerichtete Remote-Hosts",
     "remotes.empty.hint": "Nur nötig, wenn Du Claude Code auf einem Remote-Host fährst. Für lokale Projekte leer lassen.",
     "remotes.add.title": "Neuen Remote hinzufügen",
