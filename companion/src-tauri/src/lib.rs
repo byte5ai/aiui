@@ -92,12 +92,17 @@ struct StatusReport {
     /// first launch and on every subsequent launch where they haven't
     /// clicked "Got it" yet.
     welcome_pending: bool,
+    /// `Some(message)` if the HTTP server failed to bind/serve. Drives a
+    /// red banner in Settings so the user knows why dialogs aren't
+    /// landing.
+    http_error: Option<String>,
 }
 
 #[tauri::command]
 async fn status(
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
+    http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<StatusReport, String> {
     let bin = setup::app_binary_path();
     Ok(StatusReport {
@@ -109,6 +114,7 @@ async fn status(
         tunnels: tm.snapshot().await,
         build_info: logging::BUILD_INFO,
         welcome_pending: is_first_run(&cfg),
+        http_error: http_err.lock().ok().and_then(|s| s.clone()),
     })
 }
 
@@ -127,6 +133,23 @@ async fn add_remote(
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    // Validate at the API boundary: anything that doesn't pass
+    // `is_valid_host_alias` is rejected here, before we spawn ssh or
+    // touch persistent state. This is the primary defense against
+    // option-injection via `host_alias`. Per-helper validators below
+    // are defense-in-depth for callers that bypass this entry.
+    if !setup::is_valid_host_alias(&host_alias) {
+        return Ok(vec![setup::StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: Some(
+                "Allowed: letters, digits, '.', '_', '-' (and '+' in the user). \
+                 No leading '-', no whitespace, no shell metacharacters."
+                    .into(),
+            ),
+        }]);
+    }
+
     let mut results = Vec::new();
 
     // Legacy cleanup: earlier versions (≤ v0.1.1) patched the user's
@@ -135,10 +158,39 @@ async fn add_remote(
     // from past installs so we don't fight them over port 7777.
     let _ = setup::remove_ssh_forward(&host_alias, cfg.http_port);
 
+    // Run the three setup steps. Treat token push and config patch as
+    // *blocking* — without them the remote can't talk to us. Skill
+    // install is treated as non-blocking (warn but proceed) since a
+    // missing skill only degrades agent UX, not connectivity.
     let token_path = cfg.token_path.display().to_string();
-    results.push(setup::push_token_to_remote(&host_alias, &token_path));
-    results.push(skill::install_to_remote(&host_alias));
-    results.push(setup::patch_claude_code_config_remote(&host_alias));
+    let token_step = setup::push_token_to_remote(&host_alias, &token_path);
+    let token_ok = token_step.ok;
+    results.push(token_step);
+
+    let skill_step = skill::install_to_remote(&host_alias);
+    results.push(skill_step);
+
+    let config_step = setup::patch_claude_code_config_remote(&host_alias);
+    let config_ok = config_step.ok;
+    results.push(config_step);
+
+    if !(token_ok && config_ok) {
+        // Don't persist the host or start a tunnel for a half-failed
+        // setup. The user sees the per-step error in the log and can
+        // retry. Token may already be on the remote — that's harmless.
+        results.push(setup::StepResult {
+            ok: false,
+            message: format!(
+                "Setup für '{host_alias}' nicht abgeschlossen — Host nicht eingetragen."
+            ),
+            details: Some(
+                "Token-Push und Config-Patch müssen erfolgreich sein. \
+                 Behebe die Ursache und versuche es erneut."
+                    .into(),
+            ),
+        });
+        return Ok(results);
+    }
 
     let mut list = setup::load_remotes();
     if !list.contains(&host_alias) {
@@ -266,6 +318,13 @@ pub fn run() {
     let ui_acks = Arc::new(ack::AckRegistry::new());
     let lifetime_stats = Arc::new(lifetime::LifetimeStats::new());
     let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
+    // Shared cell that records a fatal HTTP-server bind/serve failure (e.g.
+    // port 7777 held by another process). Read by the `status` command and
+    // surfaced as a banner in the Settings UI — without it, a stale
+    // squatter would cause every render/health/version request to fail
+    // later while the window kept *looking* alive.
+    let http_error: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -295,6 +354,7 @@ pub fn run() {
         .manage(ui_acks.clone())
         .manage(lifetime_stats.clone())
         .manage(tunnel_mgr.clone())
+        .manage(http_error.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
@@ -355,7 +415,13 @@ pub fn run() {
             // so skill updates ride with app updates.
             let _ = skill::install_locally();
 
-            // HTTP server on localhost:7777.
+            // HTTP server on localhost:7777. If bind fails (port held by
+            // a stale aiui or unrelated process) we record the error in
+            // the shared `http_error` cell so the Settings UI can surface
+            // a banner — silently logging it left users staring at a
+            // window that *looked* alive but answered no requests.
+            let http_error_for_serve = http_error.clone();
+            let port_for_error = cfg.http_port;
             rt.spawn(async move {
                 if let Err(e) = http::serve(
                     cfg_http,
@@ -367,6 +433,11 @@ pub fn run() {
                 .await
                 {
                     log::error!("[aiui] http server error: {e}");
+                    if let Ok(mut slot) = http_error_for_serve.lock() {
+                        *slot = Some(format!(
+                            "Konnte localhost:{port_for_error} nicht öffnen — Port wahrscheinlich belegt. {e}"
+                        ));
+                    }
                 }
             });
 

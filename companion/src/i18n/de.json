@@ -5,6 +5,8 @@
     "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt"
   },
   "settings": {
+    "http_error.title": "aiui nimmt keine Requests entgegen",
+    "http_error.hint": "Ein anderer Prozess hält Port {port} auf diesem Mac. Beende eine alte aiui-Instanz oder prüfe mit `lsof -nP -iTCP:{port}` welcher Prozess sitzt, dann aiui neu starten.",
     "welcome.title": "aiui ist eingerichtet",
     "welcome.body": "Claude Code kann jetzt native Fenster auf diesem Mac öffnen, statt Dich im Chat zu fragen. Probier in einer Claude-Code-Session:",
     "welcome.point.test": "/aiui:test-dialog — kurzer Demo-Dialog zum Verifizieren.",
