@@ -156,7 +156,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "confirm",
-            "description": "Hard yes/no decision as a native window, with optional destructive styling. Use when 'just proceed' would be unsafe (deletions, force-pushes, rollbacks). For pure information, reply in chat. For 3+ options, use `ask`. Returns {cancelled, confirmed}.",
+            "description": "USE WHEN you would otherwise ask the user a yes/no question in chat — and ALWAYS before any irreversible step (delete, drop, force-push, rollback, prod deploy). Renders a native macOS yes/no window; pass `destructive: true` for a red confirm button on dangerous actions. Returns {cancelled, confirmed}. For 3+ options, use `ask`. For information the user only reads, render in chat.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -172,7 +172,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "ask",
-            "description": "Single- or multi-choice window with per-option descriptions. Use for 2-8 options; for a yes/no, use `confirm`; for ≥ 2 related inputs, use `form`. Returns {cancelled, answers, other?}.",
+            "description": "USE WHEN you would otherwise list options in chat and wait for the user to type back which one — picking a deploy strategy, a migration path, a file to act on, etc. Renders a native macOS choice window with per-option descriptions, optional multi-select and free-text fallback. Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -198,7 +198,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Composite window with multiple typed fields and action buttons. Use for ≥ 2 related inputs, or one input plus context. Fields: text, password, number, select, checkbox, slider, date, date_range, color, static_text, list, tree. Actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}.",
+            "description": "USE WHEN the user needs to give you ≥ 2 related inputs, or any single input that's better entered somewhere other than the chat — secrets (password field, masked on screen), dates (datetime/range), bounded numbers (slider), sortable rankings, multi-selects, color picks. Renders a native macOS form window. Fields: text, password, number, select, checkbox, slider, date, date_range, color, static_text, list, tree. Footer actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one option pick, use `ask`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title", "fields"],

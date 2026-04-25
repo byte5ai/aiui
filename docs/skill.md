@@ -1,6 +1,6 @@
 ---
 name: aiui widgets
-description: Render native macOS dialogs on the user's Mac from any Claude Code session — remote or local. Use when the user benefits from structured input (multi-field forms, sortable lists, sliders) more than from chat.
+description: Open a native macOS dialog on the user's Mac instead of asking via chat — for yes/no decisions, picking between options, multi-field input, sorting, dates, sliders, or secrets. Reach for it whenever you would otherwise put a question or numbered option list into the chat and wait for a typed reply, and *always* before any irreversible step (delete, force-push, drop, deploy to prod).
 ---
 
 # aiui — Dialog design for Claude agents
@@ -11,19 +11,38 @@ aiui exposes three MCP tools that render native dialogs on the user's Mac:
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback
 - `form` — composite window with typed fields and multiple action buttons
 
-## When to reach for a dialog vs. chat
+## Default to a dialog, not to chat
 
-Prefer chat when the answer fits in one line and the user would type it
-anyway. Prefer a dialog when:
+The user installed aiui because they want the agent to *use* it. If you
+catch yourself about to write any of these in chat, stop and use aiui
+instead:
 
-- Structured input beats free-form typing (numbers in a range, dates,
-  multi-select, ordered lists, secrets).
-- You need several related inputs collected in one step.
-- The decision is destructive or high-stakes and benefits from a clearly-framed
-  confirmation.
+- "Would you like me to …?", "Should I proceed?", "Are you sure?" → `confirm`
+- "Do you want option A or B?", numbered lists for the user to pick from → `ask`
+- "Please tell me the …", "What's the …?" with more than one ask → `form`
+- Any step that is **destructive or hard to undo** (delete, drop, force-push,
+  rollback, prod deploy) → `confirm` with `destructive: true`, even if the
+  user already gave loose approval. The dialog makes the consequence
+  explicit and ships the structured answer back, no chat parsing.
+- Any step that needs a **secret** for a moment (token, password) →
+  `form` with a `password` field, never paste in chat.
+- Any step that is a **choice with consequences worth seeing side-by-side**
+  ("which deploy strategy?", "which migration path?") → `ask` with
+  per-option `description`.
+- Any step that wants the user to **rank or sort** items → `form` with a
+  sortable `list` field.
+- Any step that wants a **date, datetime, range, color, or numeric value
+  in a bounded interval** → `form` with the matching field.
 
-Do **not** use a dialog to display information the chat can render just as
-well (status reports, tables, code snippets, logs).
+## When chat actually wins
+
+Skip the dialog for content the user reads, doesn't answer:
+
+- Status reports, summaries, code snippets, logs, error traces — render
+  in chat.
+- Single free-text answers where the user would type the same thing into
+  a dialog box anyway — just ask in chat.
+- Anything where the answer is "go on", and the user is paying attention.
 
 ## Tool choice
 
