@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "aiui",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "identifier": "de.byte5.aiui",
   "build": {
     "frontendDist": "../dist",
@@ -15,11 +15,11 @@
         "label": "main",
         "title": "aiui",
         "width": 520,
-        "height": 560,
+        "height": 480,
         "minWidth": 520,
-        "minHeight": 400,
+        "minHeight": 380,
         "maxWidth": 520,
-        "maxHeight": 560,
+        "maxHeight": 640,
         "resizable": false,
         "fullscreen": false,
         "visible": false,

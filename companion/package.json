@@ -1,7 +1,7 @@
 {
   "name": "aiui-companion",
-  "version": "0.3.3",
-  "description": "aiui companion \u2014 renders dialogs for remote Claude Code sessions",
+  "version": "0.4.0",
+  "description": "aiui companion — renders dialogs for remote Claude Code sessions",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -27,6 +27,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "marked": "^18.0.2",
     "svelte-i18n": "^4.0.1"
   }
 }

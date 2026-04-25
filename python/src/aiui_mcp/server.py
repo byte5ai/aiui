@@ -180,9 +180,10 @@ async def ask(
 @mcp.tool()
 async def form(
     title: str,
-    fields: list[dict[str, Any]],
+    fields: list[dict[str, Any]] | None = None,
     description: str | None = None,
     header: str | None = None,
+    tabs: list[dict[str, Any]] | None = None,
     actions: list[dict[str, Any]] | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
@@ -226,23 +227,39 @@ async def form(
     - checkbox:    {kind, name, label, default?}
     - slider:      {kind, name, label, min, max, step?, default?}
     - date:        {kind, name, label, default?, required?}  — ISO YYYY-MM-DD
+    - datetime:    {kind, name, label, default?, required?}  — ISO YYYY-MM-DDTHH:MM
     - date_range:  {kind, name, label, default?: {from, to}, required?}  — result {from, to}
     - color:       {kind, name, label, default?}  — hex "#RRGGBB"
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
-    - list:        {kind, name, label?, items: [{label, value, description?}],
+    - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
+    - image:       {kind, src, label?, alt?, max_height?}  — read-only image, src is data:URL or path. Use for visual confirmation of agent-generated previews.
+    - image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}
+      Result: {selected: [values]}
+    - list:        {kind, name, label?, items: [{label, value, description?, thumbnail?}],
                     selectable?, multi_select?, sortable?, default_selected?: [values]}
-      Result: {selected: [values], order: [values]}
+      Result: {selected: [values], order: [values]}. Thumbnails optional per item.
+    - table:       {kind, name, label?, columns: [{key, label, align?}], rows: [{value, values}],
+                    multi_select?, sortable_by_column?, default_selected?, required?}
+      Result: {selected: [values], order: [values], sort: {column, dir}}
     - tree:        {kind, name, label?, items: [{label, value, description?, children?: [...]}],
                     multi_select?, default_selected?: [values], default_expanded?: [values]}
       Result: {selected: [values]}
+
+    TABS (optional grouping for long forms):
+    Pass `tabs=[{"label": ..., "fields": [...]}, ...]` instead of (or alongside,
+    but `tabs` wins) `fields`. One submit covers all tabs; validation jumps to
+    the first invalid tab. Tabs structure presentation only — they are not a
+    wizard, no per-tab confirmation.
 
     Returns `{cancelled, action?, values: {name: value, ...}}`.
 
     Args:
         title: Window title. Same rules as labels.
-        fields: List of field blocks, each with a `kind` from above.
+        fields: List of field blocks, each with a `kind` from above. Use this
+            OR `tabs`, not both.
         description: Subtitle, ≤ 2 sentences.
         header: Chip above the title (≤ 14 chars).
+        tabs: Tab-grouped field list `[{label, fields}]` for longer forms.
         actions: Footer buttons `[{label, value, primary?, success?, destructive?, skip_validation?}]`.
             Styling variants are mutually exclusive; pick one of primary/success/destructive or leave all off for neutral.
             Without actions, defaults to Cancel + Submit.
@@ -255,6 +272,7 @@ async def form(
         "description": description,
         "header": header,
         "fields": fields,
+        "tabs": tabs,
         "actions": actions,
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
@@ -366,6 +384,63 @@ def version() -> str:  # noqa: A001  — shadowing by design; prompt names surfa
     """Instructs the agent to call `version` and report the current aiui
     companion version in a single line."""
     return _VERSION_PROMPT
+
+
+_HEALTH_PROMPT = """\
+Run the `aiui_health` tool and report the result in one short sentence:
+
+- If `ready: true`, say "aiui ready (v{version})".
+- If `ready: false`, point at the most likely cause based on the response \
+  body (WebView frozen, dialog backlog, too many children) and suggest the \
+  one-step fix ("open Settings, click Check for updates" or "restart aiui").
+
+Don't dump the raw JSON unless the user asked for it.
+"""
+
+_TEST_DIALOG_PROMPT = """\
+Open a small demo dialog so the user can verify aiui is wired up end to \
+end. Call the `confirm` tool with:
+
+  title: "aiui test dialog"
+  message: "Click any button — this just verifies the wiring."
+  header: "Demo"
+  confirm_label: "It works"
+  cancel_label: "Close"
+
+Report the outcome in one line: "aiui ok — you clicked '{label}'" if the \
+window opened and returned, or the underlying error if it didn't.
+"""
+
+_REMOTES_PROMPT = """\
+Show the user a quick rundown of their registered aiui remotes — same set \
+the Settings window's "Eingerichtete Remote-Hosts" section shows, but in \
+chat. Call `aiui_health` first to confirm aiui is up; if it isn't, just \
+tell the user that and stop. Otherwise read \
+`~/.config/aiui/remotes.json` (JSON array of host strings) and present \
+the entries in a compact list. If the file is missing or empty, say "no \
+remotes registered yet — open Settings to add one".
+"""
+
+
+@mcp.prompt(name="health")
+def health_prompt() -> str:
+    """Instructs the agent to call `aiui_health` and report the result in
+    one short sentence. Surfaces as `/aiui:health` in Claude Code."""
+    return _HEALTH_PROMPT
+
+
+@mcp.prompt(name="test-dialog")
+def test_dialog_prompt() -> str:
+    """Demo dialog so the user can verify aiui is wired up end to end.
+    Surfaces as `/aiui:test-dialog` in Claude Code."""
+    return _TEST_DIALOG_PROMPT
+
+
+@mcp.prompt(name="remotes")
+def remotes_prompt() -> str:
+    """Quick rundown of registered aiui remotes in chat (same set the
+    Settings window shows). Surfaces as `/aiui:remotes` in Claude Code."""
+    return _REMOTES_PROMPT
 
 
 @mcp.tool()

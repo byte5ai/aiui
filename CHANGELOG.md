@@ -2,6 +2,72 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] — 2026-04-25
+
+### Added — new form fields
+
+- **`datetime`** — gap-filler between `date` and `date_range` for cron,
+  scheduling, reminders. Native `<input type="datetime-local">`.
+- **`markdown`** — read-only Markdown block as inline context for
+  following input fields ("here's the diff I generated, now decide…").
+  Skill clarifies: not a standalone display tool.
+- **`image`** — single read-only image preview (`src`: data: URL or
+  path). For visual sign-off on agent-generated charts/screenshots/
+  diagrams before the next decision.
+- **`image_grid`** — n × m image picker, optional multi-select. For
+  "pick one of these N generated logos / thumbnails / asset variants".
+- **`table`** — column-aware row triage with per-column header sort,
+  multi-select, and structured `{rows: [{value, values}], columns:
+  [{key, label, align?}]}` spec. For 30-branch / 50-search-result
+  triage flows that `list` couldn't do.
+- **`list` thumbnails** — existing `list` field gets an optional
+  `thumbnail` per item (data: URL or path). Shotlists, mood boards,
+  carousel-slide ordering with the visual anchor that matters.
+
+### Added — tabbed forms
+
+`form` now accepts `tabs=[{label, fields: [...]}]` instead of the flat
+`fields=…`. One submit covers all tabs; validation jumps to the first
+invalid tab automatically. Tabs are display structure, not a wizard —
+no per-tab confirmation, no per-tab actions, all values in one
+response.
+
+### Added — three new slash-commands
+
+- **`/aiui:health`** — one-line aiui health check (WebView responsive,
+  no dialog backlog, no child-process flood).
+- **`/aiui:test-dialog`** — pops a tiny demo dialog so the user can
+  verify aiui is wired up end to end.
+- **`/aiui:remotes`** — lists registered aiui remotes in chat (same
+  set the Settings window shows).
+
+All three available in both the Rust MCP (aiui.app) and the Python MCP
+(aiui-mcp on PyPI) for parity across local and remote sessions.
+
+### Polish
+
+- **Dark-mode palette warmer.** Replaced the neutral-zinc tones with a
+  warmer brown-tinted dark to match macOS Sonoma feel without
+  introducing a colour cast on text. Light-mode palette unchanged
+  (already tested in marketing screenshots).
+- **Buttons get a subtle macOS gradient and a stronger hover state.**
+  Neutral buttons now have a top-down gradient (AppKit push-button
+  feel) and on hover pick up an accent-tinted shadow + border, so the
+  hover-vs-not distinction is unmistakable. Active state scales 0.97
+  (was 0.98) for snappier feedback.
+- **Settings window default height 480 px** (was 560). Idle Settings
+  no longer sits in a sea of empty space when no remotes are
+  registered. `maxHeight` raised to 640 for forms that need more
+  vertical room. `minHeight` 380.
+- **App-header padding** tightened so the aiui logo doesn't crowd the
+  title-area boundary.
+
+### Notes
+
+- `aiui-mcp` Python package bumped 0.3.1 → 0.4.0 to match the
+  companion. Adds `tabs`, all new field kinds, and the three new
+  slash-commands.
+
 ## [0.3.3] — 2026-04-24
 
 ### Fixed

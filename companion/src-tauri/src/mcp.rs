@@ -43,6 +43,42 @@ parsed from `build_info` (format \"v{ver} (commit, yyyy-mm-dd)\"). If the \
 user asked for more, include the binary path and updater endpoint.
 ";
 
+const HEALTH_PROMPT: &str = "\
+Run the `aiui_health` tool and report the result in one short sentence:
+
+- If `ready: true`, say \"aiui ready (v{version})\".
+- If `ready: false`, point at the most likely cause based on the response \
+  body (WebView frozen, dialog backlog, too many children) and suggest the \
+  one-step fix (\"open Settings, click Check for updates\" or \"restart aiui\").
+
+Don't dump the raw JSON unless the user asked for it.
+";
+
+const TEST_DIALOG_PROMPT: &str = "\
+Open a small demo dialog so the user can verify aiui is wired up end to end. \
+Call the `confirm` tool with:
+
+  title: \"aiui test dialog\"
+  message: \"Click any button — this just verifies the wiring.\"
+  header: \"Demo\"
+  confirm_label: \"It works\"
+  cancel_label: \"Close\"
+
+Report the outcome in one line: \"aiui ok — you clicked '{label}'\" if the \
+window opened and returned, or the underlying error if it didn't.
+";
+
+const REMOTES_PROMPT: &str = "\
+Show the user a quick rundown of their registered aiui remotes — same as \
+the Settings window's \"Eingerichtete Remote-Hosts\" section, but in chat. \
+Hit the companion's GET /health endpoint via `aiui_health` first to make \
+sure aiui is up; if it isn't, just tell the user that and stop. Otherwise \
+read the user's `~/.config/aiui/remotes.json` (one host per line / JSON \
+list) and present them in a compact table with hostname only. If the file \
+is missing or empty, say \"no remotes registered yet — open Settings to \
+add one\".
+";
+
 /// How long mcp-stdio waits for *any* incoming line before assuming the
 /// parent process has gone silent and exiting. This is an event-driven
 /// deadline that resets on activity — equivalent to "no input for 6 h ⇒
@@ -198,13 +234,25 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "USE WHEN the user needs to give you ≥ 2 related inputs, or any single input that's better entered somewhere other than the chat — secrets (password field, masked on screen), dates (datetime/range), bounded numbers (slider), sortable rankings, multi-selects, color picks. Renders a native macOS form window. Fields: text, password, number, select, checkbox, slider, date, date_range, color, static_text, list, tree. Footer actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one option pick, use `ask`.",
+            "description": "USE WHEN the user needs to give you ≥ 2 related inputs, or any single input that's better entered somewhere other than the chat — secrets (password field, masked on screen), dates and ranges (date, datetime, date_range), bounded numbers (slider), sortable rankings (list, also with thumbnails), multi-selects, color picks, table-row triage with column context, image preview/grid for visual confirmation. Renders a native macOS form window. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` instead of `fields` (one submit, all tabs validated together). Footer actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one option pick, use `ask`.",
             "inputSchema": {
                 "type": "object",
-                "required": ["title", "fields"],
+                "required": ["title"],
                 "properties": {
                     "title": { "type": "string" },
-                    "fields": { "type": "array", "items": { "type": "object" } },
+                    "fields": { "type": "array", "items": { "type": "object" }, "description": "Flat field list. Use this OR `tabs`, not both." },
+                    "tabs": {
+                        "type": "array",
+                        "description": "Tab-grouped fields for longer forms. Each tab has its own set of fields. One submit covers all tabs; validation surfaces the first invalid tab automatically.",
+                        "items": {
+                            "type": "object",
+                            "required": ["label", "fields"],
+                            "properties": {
+                                "label": { "type": "string" },
+                                "fields": { "type": "array", "items": { "type": "object" } }
+                            }
+                        }
+                    },
                     "description": { "type": "string" },
                     "header": { "type": "string" },
                     "actions": { "type": "array", "items": { "type": "object" } },
@@ -282,6 +330,7 @@ async fn tools_call(
                 "description": args.get("description"),
                 "header": args.get("header"),
                 "fields": args.get("fields"),
+                "tabs": args.get("tabs"),
                 "actions": args.get("actions"),
                 "submitLabel": args.get("submit_label"),
                 "cancelLabel": args.get("cancel_label")
@@ -456,6 +505,21 @@ fn prompts_list() -> Value {
             "name": "version",
             "description": "Report the currently installed aiui version.",
             "arguments": []
+        },
+        {
+            "name": "health",
+            "description": "One-line aiui health check: WebView responsive, no dialog backlog, no child-process flood.",
+            "arguments": []
+        },
+        {
+            "name": "test-dialog",
+            "description": "Pop a tiny demo dialog so the user can verify aiui is wired up end to end.",
+            "arguments": []
+        },
+        {
+            "name": "remotes",
+            "description": "List the user's registered aiui remotes in chat (same set the Settings window shows).",
+            "arguments": []
         }
     ])
 }
@@ -470,6 +534,9 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
         "widgets" => SKILL_MD,
         "update" => UPDATE_PROMPT,
         "version" => VERSION_PROMPT,
+        "health" => HEALTH_PROMPT,
+        "test-dialog" => TEST_DIALOG_PROMPT,
+        "remotes" => REMOTES_PROMPT,
         _ => {
             return Err(RpcError {
                 code: -32602,
