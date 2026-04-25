@@ -1,6 +1,6 @@
 use crate::ack::AckRegistry;
 use crate::config::AppConfig;
-use crate::dialog::{DialogRequest, DialogState};
+use crate::dialog::{DialogRequest, DialogState, DIALOG_TTL};
 use crate::lifetime::LifetimeStats;
 use axum::{
     extract::State,
@@ -11,8 +11,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use crate::logging::trace;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
@@ -30,6 +30,16 @@ const RELOAD_SETTLE: Duration = Duration::from_millis(300);
 /// before concluding the WebView is unresponsive.
 const UI_PING_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Idle-restart trigger: if the GUI has been alive longer than this AND
+/// hasn't served a render recently (see `IDLE_RESTART_QUIET`), the next
+/// render reloads the WebView before showing — flushes any drift that
+/// accumulated while nobody was watching.
+const IDLE_RESTART_UPTIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Minimum time between renders for the long-uptime reload to trigger.
+/// Prevents reloading mid-burst when many renders fire close together.
+const IDLE_RESTART_QUIET: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<AppConfig>,
@@ -37,6 +47,13 @@ struct AppState {
     ui_acks: Arc<AckRegistry>,
     lifetime: Arc<LifetimeStats>,
     app: AppHandle,
+    /// Process-start timestamp for the GUI. Used to evaluate the
+    /// idle-restart condition without requiring an OS sleep/wake hook.
+    started_at: Instant,
+    /// Last time `/render` produced (or attempted to produce) a dialog.
+    /// Mutex<Instant> is fine here — contention is bounded by the rate of
+    /// /render calls.
+    last_render_at: Arc<Mutex<Instant>>,
 }
 
 #[derive(Deserialize)]
@@ -113,12 +130,15 @@ pub async fn serve(
     app: AppHandle,
 ) -> std::io::Result<()> {
     let port = cfg.http_port;
+    let now = Instant::now();
     let state = AppState {
         cfg,
         dialog,
         ui_acks,
         lifetime,
         app,
+        started_at: now,
+        last_render_at: Arc::new(Mutex::new(now)),
     };
 
     let router = Router::new()
@@ -367,6 +387,30 @@ async fn render(
         spec: req.spec,
     };
 
+    // ── Idle-restart check (#41) ────────────────────────────────────────
+    // If the GUI has been up for a long time and the last render was a
+    // while ago, reload the WebView before serving this one. Catches
+    // accumulated drift (sleep/wake artefacts, stuck event listeners)
+    // *exactly* when it would matter — not on a wall-clock timer.
+    {
+        let last = *state.last_render_at.lock().unwrap();
+        if state.started_at.elapsed() > IDLE_RESTART_UPTIME
+            && last.elapsed() > IDLE_RESTART_QUIET
+        {
+            trace(&format!(
+                "render: idle-restart trigger (uptime {:?}, last_render {:?} ago)",
+                state.started_at.elapsed(),
+                last.elapsed()
+            ));
+            reload_main_webview(&state.app);
+            tokio::time::sleep(RELOAD_SETTLE).await;
+        }
+    }
+
+    // Mark this render attempt — done early so the ack/recreate path
+    // still resets the idle clock even if the user closes the dialog.
+    *state.last_render_at.lock().unwrap() = Instant::now();
+
     // Surface the window from the main thread.
     surface_main_window(&state.app, &id);
 
@@ -435,19 +479,49 @@ async fn render(
     }
 
     // ── Normal path ─────────────────────────────────────────────────────
+    // Wait for the user's submit/cancel — but bounded by `DIALOG_TTL`. A
+    // dialog that nobody answers eventually returns a structured timeout
+    // instead of blocking the caller indefinitely (#36). The same TTL is
+    // used by the registry's opportunistic sweep, so a timed-out entry
+    // gets cancelled regardless of whether this awaiter or the next
+    // `register()` call notices first.
     trace(&format!("render: awaiting user response id={}", id));
-    let result = match result_rx.await {
-        Ok(r) => r,
-        Err(_) => crate::dialog::DialogResult {
+    let result = match tokio::time::timeout(DIALOG_TTL, result_rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => crate::dialog::DialogResult {
             id: id.clone(),
             cancelled: true,
             result: serde_json::Value::Null,
         },
+        Err(_) => {
+            // TTL expired without user response. Cancel the registry
+            // entry (also frees its slot) and return a structured timeout.
+            trace(&format!("render: TTL expired id={}", id));
+            state.dialog.cancel(&id);
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({
+                    "id": id,
+                    "cancelled": true,
+                    "error": "timeout",
+                    "detail": format!("no user response within {:?}", DIALOG_TTL),
+                })),
+            )
+                .into_response();
+        }
     };
     trace(&format!(
         "render: got response id={} cancelled={}",
         result.id, result.cancelled
     ));
+
+    // Lifecycle-driven update check (#42): fire once after every
+    // successful render. Frontend gates with a 30-min cooldown so this is
+    // never noisier than the old 6h timer in active use, and zero load
+    // when nobody is talking to aiui.
+    if let Err(e) = state.app.emit("update:check", "post-render") {
+        trace(&format!("render: emit update:check failed: {e}"));
+    }
 
     Json(RenderResponse {
         id: result.id,

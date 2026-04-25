@@ -43,8 +43,18 @@ parsed from `build_info` (format \"v{ver} (commit, yyyy-mm-dd)\"). If the \
 user asked for more, include the binary path and updater endpoint.
 ";
 
+/// How long mcp-stdio waits for *any* incoming line before assuming the
+/// parent process has gone silent and exiting. This is an event-driven
+/// deadline that resets on activity — equivalent to "no input for 6 h ⇒
+/// exit", with zero idle cost. Catches the failure mode where Claude
+/// Desktop forgets to close our stdin pipe but also never sends another
+/// request, which is how stale mcp-stdio children accumulated in the
+/// 2026-04-25 incident.
+const STDIN_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 /// Top-level entry: read JSON-RPC messages from stdin, dispatch to handlers,
-/// write responses to stdout. Runs until stdin closes.
+/// write responses to stdout. Runs until stdin closes or the idle deadline
+/// expires.
 pub async fn run_stdio(cfg: Arc<AppConfig>) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -56,7 +66,28 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
 
     trace("mcp-stdio: run_stdio entered");
 
-    while let Ok(Some(line)) = reader.next_line().await {
+    loop {
+        let line = tokio::select! {
+            res = reader.next_line() => match res {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    trace("mcp-stdio: stdin closed, exiting");
+                    return;
+                }
+                Err(e) => {
+                    trace(&format!("mcp-stdio: stdin error: {e}, exiting"));
+                    return;
+                }
+            },
+            _ = tokio::time::sleep(STDIN_IDLE_LIMIT) => {
+                trace(&format!(
+                    "mcp-stdio: no input for {:?}, parent likely gone, exiting",
+                    STDIN_IDLE_LIMIT
+                ));
+                return;
+            }
+        };
+
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -83,8 +114,6 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
             .await;
         let _ = stdout.flush().await;
     }
-
-    trace("mcp-stdio: stdin closed, exiting");
 }
 
 struct RpcError {
