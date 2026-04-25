@@ -5,6 +5,8 @@
     "status.not_connected": "Claude Desktop config will be set automatically on next launch"
   },
   "settings": {
+    "http_error.title": "aiui can't accept requests",
+    "http_error.hint": "Something else is holding port {port} on this Mac. Quit any old aiui instance, or check `lsof -nP -iTCP:{port}` for the squatter, then relaunch aiui.",
     "welcome.title": "aiui is set up",
     "welcome.body": "Claude Code can now open native dialogs on this Mac instead of asking you in chat. Try one of these in any Claude Code session:",
     "welcome.point.test": "Type /aiui:test-dialog — pops a small demo window so you can verify the wiring.",

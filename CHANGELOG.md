@@ -2,6 +2,60 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.2] — 2026-04-25
+
+Pre-launch hardening pass: external code review surfaced six substantive
+defects in the SSH-tunnel and remote-setup paths. All fixed.
+
+### Fixed
+
+- **Remote `~/.claude.json` patching/removal silently no-op'd** (#51,
+  blocker). The previous implementation tried to ship the python script
+  through `python3 -c "$1"` over ssh; the remote login shell expanded
+  `$1` to empty *before* python ran, producing a no-op + `print("ok")`
+  the Rust side trusted. `add_remote` claimed success while the remote
+  config was untouched. New implementation pipes the script through
+  ssh's stdin to `python3 -`, and verifies the `"ok"` marker before
+  reporting success.
+- **SSH option injection via `host_alias`** (#52, security/high). User
+  input from "Add Remote" flowed unvalidated into `ssh`/`scp` argv;
+  values starting with `-` were interpreted as ssh options
+  (e.g. `-oProxyCommand=…`). Now validated at the API boundary
+  (`is_valid_host_alias`), with defense-in-depth `--` end-of-options
+  markers everywhere ssh/scp invokes a host. 15 unit tests cover the
+  validator.
+- **Shared-forward detection trusted unauthenticated `/ping`** (#53,
+  security/high). A squatter on remote port 7777 could mask a
+  port-takeover by answering "pong", flipping the tunnel to
+  `ConnectedShared` (green). Replaced with a token-authenticated
+  `/probe` endpoint; the remote-side curl reads
+  `~/.config/aiui/token` and sends it as `Authorization: Bearer …`.
+  Only an aiui that authenticates against the same token is accepted
+  as a shared owner.
+- **`add_remote` was not transactional** (#54). Half-failed setup
+  steps still appended the host to `remotes.json` and started the
+  tunnel manager retrying forever. Now: token-push and config-patch
+  are blocking (must succeed before persistence + tunnel start). Skill
+  install stays non-blocking (warn-only). The user sees per-step
+  results either way.
+- **HTTP bind failure was logged-and-swallowed** (#55). If port 7777
+  was already held when aiui started, the GUI looked alive but every
+  request failed silently. New `http_error` field in the `status`
+  payload + a red banner in Settings ("aiui can't accept requests")
+  that points at the squatter and tells the user how to find it
+  (`lsof -nP -iTCP:7777`).
+- **`/health` reported ready exactly at the dialog hard-cap** (#56).
+  At `len() == HARD_CAP` the next `register()` evicts an in-flight
+  dialog while `/health` still claims ready. Tightened the gate to
+  `< HARD_CAP` so readiness leads eviction.
+
+### Notes
+
+- `aiui-mcp` PyPI version unchanged (no Python-side changes in this
+  release).
+- The Codex review's Windows-port readiness finding (low severity, #57)
+  is tracked but not addressed here.
+
 ## [0.4.1] — 2026-04-25
 
 ### Added
