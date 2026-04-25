@@ -13,15 +13,28 @@
 
   let current = $state<DialogReq | null>(null);
 
-  // Re-check for updates every 6 h in long-running sessions. The initial
-  // startup check alone doesn't cut it: aiui lives for the whole Claude
-  // Desktop session (often multiple days), so without a periodic timer a
-  // user sitting on an outdated build never sees the prompt. Silent —
-  // `checkForUpdates` only surfaces UI when an update is actually available.
-  // (Issue #42 will replace this with lifecycle-driven checks; kept here
-  // for now so behavior doesn't regress before that PR lands.)
-  const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
-  let updateTimer: number | undefined;
+  // Update checks are lifecycle-driven, not interval-driven. Triggers:
+  //  • on mount (initial check at GUI start),
+  //  • on `update:check` event from Rust (fired after each successful
+  //    render — clusters around real user activity),
+  //  • on window focus (covers wake-from-sleep and "user came back to the
+  //    Mac" without needing an OS-level event hook).
+  // A 30-minute cooldown debounces bursts so a chatty session doesn't
+  // hammer the GitHub release endpoint.
+  const UPDATE_COOLDOWN_MS = 30 * 60 * 1000;
+  let lastUpdateCheck = 0;
+
+  function maybeCheckForUpdates(reason: string) {
+    const now = Date.now();
+    if (now - lastUpdateCheck < UPDATE_COOLDOWN_MS) return;
+    lastUpdateCheck = now;
+    console.debug(`[aiui] update check (${reason})`);
+    void checkForUpdates({ silent: true });
+  }
+
+  function onFocus() {
+    maybeCheckForUpdates("window-focus");
+  }
 
   onMount(() => {
     // Dialog event from Rust. We acknowledge receipt back to the Rust side
@@ -40,17 +53,25 @@
       void invoke("ui_pong", { id: e.payload });
     });
 
+    // Update-check trigger from Rust — fired after each successful render.
+    // Frontend gates with the cooldown so we don't actually hit GitHub on
+    // every render.
+    const unUpdate = listen<string>("update:check", (e) => {
+      maybeCheckForUpdates(`rust:${e.payload}`);
+    });
+
     window.addEventListener("keydown", onKey);
-    // Startup check + recurring poll.
-    void checkForUpdates({ silent: true });
-    updateTimer = window.setInterval(() => {
-      void checkForUpdates({ silent: true });
-    }, UPDATE_POLL_MS);
+    window.addEventListener("focus", onFocus);
+
+    // Initial check on mount.
+    maybeCheckForUpdates("startup");
+
     return async () => {
       (await unDialog)();
       (await unPing)();
+      (await unUpdate)();
       window.removeEventListener("keydown", onKey);
-      if (updateTimer !== undefined) window.clearInterval(updateTimer);
+      window.removeEventListener("focus", onFocus);
     };
   });
 

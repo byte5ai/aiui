@@ -211,7 +211,7 @@ mod tests {
         let s = DialogState::new();
         let (id, _rx, ack) = s.register();
         s.ack(&id);
-        let _ = ack.blocking_recv().expect("first ack must arrive");
+        ack.blocking_recv().expect("first ack must arrive");
         // Second ack on the same id is a silent no-op.
         s.ack(&id);
     }
