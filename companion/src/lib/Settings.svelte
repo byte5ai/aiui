@@ -227,7 +227,11 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 4px 0 12px 0;
+    /* `.container` already pads 44 px down from the window edge for the
+     * macOS traffic-light buttons; we only add a hair of breathing room
+     * here so the logo doesn't ride directly against the title-area
+     * gradient line. */
+    padding: 8px 0 12px 0;
     border-bottom: 1px solid var(--border);
   }
   .app-header img {

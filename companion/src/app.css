@@ -22,23 +22,27 @@
   -webkit-font-smoothing: antialiased;
 }
 
+/* Dark mode — warmer than the previous grey-zinc palette. Hue picked to
+ * sit closer to macOS Sonoma's "warm dark" feel without going so far
+ * that text gets a cast.  Border/surface raised slightly for clearer
+ * separation in dim ambient light. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1917;
-    --fg: #f4f4f5;
-    --muted: #a1a1aa;
-    --border: #292524;
-    --accent: #818cf8;
-    --accent-hover: #a5b4fc;
+    --bg: #1b1714;
+    --fg: #f5f1ea;
+    --muted: #a8a29e;
+    --border: #322a25;
+    --accent: #a5b4fc;
+    --accent-hover: #c4cdfd;
     --accent-fg: #1e1b4b;
     --danger: #f87171;
     --danger-hover: #ef4444;
-    --surface: #292524;
-    --surface-raised: #363030;
-    --success: #34d399;
+    --surface: #2a221d;
+    --surface-raised: #362b25;
+    --success: #4ade80;
     --warning: #fbbf24;
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-    --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.4);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.45);
   }
 }
 
@@ -56,7 +60,12 @@ button {
   font: inherit;
   font-weight: 500;
   color: var(--fg);
-  background: var(--surface-raised);
+  /* Subtle top-down gradient mimicking AppKit push buttons — gives
+   * neutral buttons a touch of dimensionality without making them look
+   * like web 1.0 chrome. */
+  background: linear-gradient(180deg,
+    var(--surface-raised),
+    color-mix(in srgb, var(--surface-raised) 92%, var(--fg)));
   border: 1px solid var(--border);
   border-radius: 7px;
   padding: 7px 14px;
@@ -65,11 +74,15 @@ button {
   transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
 }
 button:hover:not(:disabled) {
-  background: var(--surface);
-  border-color: color-mix(in srgb, var(--fg) 15%, var(--border));
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--surface-raised) 95%, var(--accent)),
+    color-mix(in srgb, var(--surface-raised) 85%, var(--accent)));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  box-shadow: var(--shadow-md);
 }
 button:active:not(:disabled) {
-  transform: scale(0.98);
+  transform: scale(0.97);
+  box-shadow: var(--shadow-sm);
 }
 button:disabled {
   opacity: 0.45;

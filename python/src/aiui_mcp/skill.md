@@ -88,7 +88,68 @@ Skip the dialog for content the user reads, doesn't answer:
 | ✓ | ✓ | ✓ | Pick-and-order |
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state.
+drag changes, `selected` reflects checkbox state. Items can carry a
+`thumbnail` (data: URL or path) — perfect for shotlists, mood boards,
+carousel slides where the visual anchor matters more than the label.
+
+## The `table` field — column-aware row triage
+
+When you'd otherwise dump 30 branches / 50 search results / 20 stale
+files into chat, hand it as a `table` instead. Columns carry the context
+(date, size, owner) that `list` can't, rows are clickable for selection,
+and the agent gets back the picked rows by their `value`.
+
+```
+columns: [{key, label, align?: "left"|"right"|"center"}]
+rows:    [{value, values: {<key>: <string|number|null>}}]
+multi_select?: true     # checkbox-per-row
+sortable_by_column?: true   # click headers to sort
+```
+
+Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
+order field reflects user-driven sorts so you can preserve their view if
+you reopen the form.
+
+## Inline-context fields: `markdown`, `image`, `static_text`
+
+These don't ask anything — they sit between input fields to give context
+*for* the inputs that follow.
+
+- `markdown` — rendered Markdown block (lists, code, links, tables). Use
+  for "here's the diff I generated, now decide" patterns. **Not** a
+  standalone display tool — if you'd be tempted to open a window just to
+  show the user a markdown blob, render it in chat instead.
+- `image` — read-only single image preview (`src`: data: URL or path,
+  optional `label`, `alt`, `max_height`). Use when the agent generated
+  a chart, screenshot, or diagram and needs visual sign-off before the
+  next decision.
+- `static_text` — plain styled note with `tone: "info"|"warn"|"muted"`.
+  Lighter weight than `markdown` when no formatting is needed.
+
+## Visual pickers: `image_grid`
+
+For "pick one (or more) of these N generated images" — logo variants,
+thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
+`multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
+
+## `datetime` field
+
+Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
+one field instead of splitting into two `text` fields with manual
+validation. Native `<input type="datetime-local">`, returns ISO
+`YYYY-MM-DDTHH:MM`.
+
+## Tabs — long forms without scroll fatigue
+
+Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
+One submit covers all tabs; validation jumps to the first invalid tab
+automatically. Tabs are *display structure*, not a wizard — no per-tab
+confirmation, no per-tab actions, all values land in one response.
+
+Use when a single dialog naturally falls into 2-4 distinct topical
+groups (e.g. "Identity / Permissions / Notifications" on a user-create
+form). Don't reach for tabs to cram a 30-field form into 5 tabs — split
+into multiple `form` calls instead.
 
 ## Password fields
 
