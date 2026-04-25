@@ -87,6 +87,11 @@ struct StatusReport {
     remotes: Vec<String>,
     tunnels: std::collections::HashMap<String, tunnel::TunnelStatus>,
     build_info: &'static str,
+    /// True until the user dismisses the welcome section. Drives the
+    /// onboarding banner in the Settings UI — they see it on the very
+    /// first launch and on every subsequent launch where they haven't
+    /// clicked "Got it" yet.
+    welcome_pending: bool,
 }
 
 #[tauri::command]
@@ -103,7 +108,17 @@ async fn status(
         remotes: setup::load_remotes(),
         tunnels: tm.snapshot().await,
         build_info: logging::BUILD_INFO,
+        welcome_pending: is_first_run(&cfg),
     })
+}
+
+/// Marks the welcome banner as dismissed so it doesn't reappear on the
+/// next launch. Frontend calls this when the user clicks "Got it" on the
+/// first-run welcome section.
+#[tauri::command]
+fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), String> {
+    mark_first_run_done(&cfg);
+    Ok(())
 }
 
 #[tauri::command]
@@ -291,7 +306,8 @@ pub fn run() {
             add_remote,
             remove_remote,
             reinstall_skill,
-            uninstall_all
+            uninstall_all,
+            dismiss_welcome
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -375,8 +391,14 @@ pub fn run() {
             });
 
             if is_first_run(&cfg) {
+                // First-ever launch: surface the settings window so the user
+                // sees the welcome / pairing instructions. We deliberately
+                // *don't* call `mark_first_run_done` here — that flag stays
+                // true until the user explicitly dismisses the welcome
+                // section in the UI (via `dismiss_welcome` command). If the
+                // user closes the window without dismissing, they'll see
+                // the welcome again next launch — better than missing it.
                 show_settings_window(&app_handle);
-                mark_first_run_done(&cfg);
             } else if !is_auto_launch() {
                 // Manual launch by user (Finder double-click) → show settings,
                 // Dock icon appears. Auto-launch from MCP-stdio stays silent.

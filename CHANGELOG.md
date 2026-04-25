@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] — 2026-04-25
+
+### Added
+
+- **Welcome banner on first run.** The Settings window now shows an
+  onboarding card on the first launch (and on every subsequent launch
+  until the user clicks "Got it"). Tells the user aiui is set up,
+  points at `/aiui:test-dialog` and `/aiui:widgets` for a 30-second
+  smoke test, and prompts SSH users to add their dev host. Replaces
+  the previous behaviour where first-run state was marked done as
+  soon as the window opened — users who closed the window without
+  reading anything had no second chance.
+
+### Changed
+
+- `status` Tauri command returns a new `welcome_pending` boolean.
+- New `dismiss_welcome` command marks the banner dismissed (writes
+  `~/.config/aiui/first_run_done`).
+- The auto-mark-done call moved out of `setup` into the
+  user-controlled dismiss path.
+
 ## [0.4.0] — 2026-04-25
 
 ### Added — new form fields
