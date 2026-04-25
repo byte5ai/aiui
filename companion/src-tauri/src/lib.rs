@@ -1,3 +1,4 @@
+mod ack;
 mod config;
 mod dialog;
 mod housekeeping;
@@ -28,6 +29,29 @@ fn dialog_cancel(
     id: String,
 ) -> Result<(), String> {
     state.cancel(&id);
+    Ok(())
+}
+
+/// Frontend confirms it received the matching `dialog:show` event. The
+/// `/render` handler waits up to 500 ms for this before assuming the WebView
+/// event loop is dead and triggering a recreate.
+#[tauri::command]
+fn dialog_received(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<(), String> {
+    state.ack(&id);
+    Ok(())
+}
+
+/// Frontend response to a `ui:ping` event from `/health`. Same shape as
+/// `dialog_received` but routed to the generic ack registry.
+#[tauri::command]
+fn ui_pong(
+    state: tauri::State<'_, Arc<ack::AckRegistry>>,
+    id: String,
+) -> Result<(), String> {
+    state.ack(&id);
     Ok(())
 }
 
@@ -224,6 +248,8 @@ pub fn run_mcp_stdio_only() {
 pub fn run() {
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     let dialog_state = Arc::new(dialog::DialogState::new());
+    let ui_acks = Arc::new(ack::AckRegistry::new());
+    let lifetime_stats = Arc::new(lifetime::LifetimeStats::new());
     let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -251,10 +277,14 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(cfg.clone())
         .manage(dialog_state.clone())
+        .manage(ui_acks.clone())
+        .manage(lifetime_stats.clone())
         .manage(tunnel_mgr.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
+            dialog_received,
+            ui_pong,
             close_window,
             surface_for_dialog,
             status,
@@ -268,6 +298,9 @@ pub fn run() {
             let cfg_http = cfg.clone();
             let cfg_lt = cfg.clone();
             let ds_http = dialog_state.clone();
+            let ui_acks_http = ui_acks.clone();
+            let lifetime_http = lifetime_stats.clone();
+            let lifetime_lt = lifetime_stats.clone();
             let app_handle_http = app_handle.clone();
             let app_handle_lt = app_handle.clone();
 
@@ -308,15 +341,24 @@ pub fn run() {
 
             // HTTP server on localhost:7777.
             rt.spawn(async move {
-                if let Err(e) = http::serve(cfg_http, ds_http, app_handle_http).await {
+                if let Err(e) = http::serve(
+                    cfg_http,
+                    ds_http,
+                    ui_acks_http,
+                    lifetime_http,
+                    app_handle_http,
+                )
+                .await
+                {
                     log::error!("[aiui] http server error: {e}");
                 }
             });
 
             // Lifetime socket — couples GUI lifetime to MCP-stdio children.
+            // Counter is shared with `/health` via `LifetimeStats`.
             rt.spawn(async move {
                 let sock = lifetime::socket_path(&cfg_lt.config_dir);
-                lifetime::gui_serve(sock, app_handle_lt).await;
+                lifetime::gui_serve(sock, app_handle_lt, lifetime_lt.conns.clone()).await;
             });
 
             // Auto-start reverse tunnels for every registered remote.
