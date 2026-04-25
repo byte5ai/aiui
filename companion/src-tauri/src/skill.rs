@@ -53,6 +53,13 @@ pub fn install_locally() -> StepResult {
 /// scp the skill to a remote host's ~/.claude/skills/aiui/SKILL.md.
 /// Requires passwordless SSH (same requirement as the tunnel manager).
 pub fn install_to_remote(host_alias: &str) -> StepResult {
+    if !crate::setup::is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
     // stage a temp file so scp has a filename to work with
     let stage = std::env::temp_dir().join(format!("aiui-skill-{}.md", std::process::id()));
     if let Err(e) = fs::write(&stage, SKILL_MD) {
@@ -67,6 +74,7 @@ pub fn install_to_remote(host_alias: &str) -> StepResult {
         .args([
             "-o",
             "BatchMode=yes",
+            "--",
             host_alias,
             "mkdir -p ~/.claude/skills/aiui",
         ])
@@ -118,10 +126,18 @@ pub fn remove_locally() -> StepResult {
 
 /// Counterpart remote cleanup, used from uninstall_all and remove_remote.
 pub fn remove_from_remote(host_alias: &str) -> StepResult {
+    if !crate::setup::is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
     let out = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
+            "--",
             host_alias,
             "rm -f ~/.claude/skills/aiui/SKILL.md; rmdir ~/.claude/skills/aiui 2>/dev/null; true",
         ])

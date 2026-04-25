@@ -21,6 +21,7 @@
     tunnels: Record<string, TunnelStatus>;
     build_info: string;
     welcome_pending: boolean;
+    http_error: string | null;
   };
 
   let status = $state<Status | null>(null);
@@ -145,6 +146,14 @@
       </div>
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </header>
+
+    {#if status.http_error}
+      <section class="http-error">
+        <strong>{$_("settings.http_error.title")}</strong>
+        <p>{status.http_error}</p>
+        <p class="http-error-hint">{$_("settings.http_error.hint", { values: { port: status.http_port } })}</p>
+      </section>
+    {/if}
 
     {#if status.welcome_pending}
       <section class="welcome">
@@ -351,6 +360,21 @@
     flex-shrink: 0;
   }
   .dot-small.err { background: var(--danger); }
+
+  /* --- HTTP error banner --- */
+  .http-error {
+    border: 1px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: var(--fg);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .http-error strong { font-size: 13px; color: var(--danger); }
+  .http-error p { margin: 0; font-size: 12.5px; line-height: 1.5; }
+  .http-error-hint { color: var(--muted); }
 
   /* --- first-run welcome --- */
   .welcome {

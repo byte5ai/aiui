@@ -110,17 +110,107 @@ fn split_user_host(input: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Validate that a remote host alias is safe to pass to ssh/scp without it
+/// being misinterpreted as an option (`-oProxyCommand=…` style injection).
+///
+/// Allows `[A-Za-z0-9._-]` for the host part and the same plus `+` for the
+/// user part — i.e. real RFC-style hostnames, IPs, IPv6 in brackets, and
+/// SSH-config aliases. Rejects whitespace, control characters, leading
+/// `-`, shell metacharacters, and anything > 253 chars per part.
+///
+/// Public so the `add_remote` Tauri command can validate at the boundary
+/// before ever spawning ssh.
+pub fn is_valid_host_alias(input: &str) -> bool {
+    if input.is_empty() || input.len() > 256 {
+        return false;
+    }
+    if input.starts_with('-') {
+        return false;
+    }
+    let (host, user) = split_user_host(input);
+    if host.is_empty() || host.starts_with('-') || host.len() > 253 {
+        return false;
+    }
+    if let Some(u) = user {
+        if u.is_empty() || u.starts_with('-') || u.len() > 253 {
+            return false;
+        }
+        if !u.bytes().all(host_alias_user_byte_ok) {
+            return false;
+        }
+    }
+    // Host part: allow alphanumerics, dot, hyphen, underscore, colon (IPv6
+    // separators), and the bracketing chars `[]` for `[::1]`-style input.
+    host.bytes().all(host_alias_host_byte_ok)
+}
+
+fn host_alias_user_byte_ok(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+')
+}
+
+fn host_alias_host_byte_ok(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+}
+
+#[cfg(test)]
+mod host_alias_tests {
+    use super::is_valid_host_alias;
+
+    #[test]
+    fn accepts_plain_host() { assert!(is_valid_host_alias("macmini")); }
+    #[test]
+    fn accepts_user_at_host() { assert!(is_valid_host_alias("customer@macmini")); }
+    #[test]
+    fn accepts_dotted_host() { assert!(is_valid_host_alias("dev.example.com")); }
+    #[test]
+    fn accepts_ipv4() { assert!(is_valid_host_alias("user@10.0.0.1")); }
+    #[test]
+    fn accepts_ipv6_bracketed() { assert!(is_valid_host_alias("[::1]")); }
+
+    #[test]
+    fn rejects_leading_dash() { assert!(!is_valid_host_alias("-oProxyCommand=foo")); }
+    #[test]
+    fn rejects_user_leading_dash() { assert!(!is_valid_host_alias("-evil@host")); }
+    #[test]
+    fn rejects_host_leading_dash() { assert!(!is_valid_host_alias("user@-evil")); }
+    #[test]
+    fn rejects_whitespace() { assert!(!is_valid_host_alias("foo bar")); }
+    #[test]
+    fn rejects_quotes() { assert!(!is_valid_host_alias("foo\"bar")); }
+    #[test]
+    fn rejects_semicolon() { assert!(!is_valid_host_alias("foo;rm -rf /")); }
+    #[test]
+    fn rejects_empty() { assert!(!is_valid_host_alias("")); }
+    #[test]
+    fn rejects_only_at() { assert!(!is_valid_host_alias("@")); }
+    #[test]
+    fn rejects_pipe() { assert!(!is_valid_host_alias("a|b")); }
+    #[test]
+    fn rejects_newline() { assert!(!is_valid_host_alias("a\nb")); }
+}
+
 // Note: an earlier version of aiui patched ~/.ssh/config with a
 // RemoteForward line. The tunnel manager now owns the forward directly, so
 // only the remove path remains (to clean up legacy installs).
 
 pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
-    // ensure remote dir
+    if !is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: Some("Only [A-Za-z0-9._-] in host, no leading '-', no shell metacharacters.".into()),
+        };
+    }
+    // ensure remote dir. `--` keeps host_alias out of ssh option position
+    // even if validation regresses one day.
     let out1 = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(host_alias)
-        .arg("mkdir -p ~/.config/aiui && chmod 700 ~/.config/aiui")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "--",
+            host_alias,
+            "mkdir -p ~/.config/aiui && chmod 700 ~/.config/aiui",
+        ])
         .output();
     match out1 {
         Err(e) => {
@@ -500,6 +590,14 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
 /// Patch ~/.claude.json on a remote host so aiui is available in every Claude
 /// Code session there. Uses python3 for atomic JSON editing — avoids
 /// shell-quoting pitfalls, universally available on macOS and Linux remotes.
+///
+/// Implementation note: the script is fed to `python3 -` over the ssh
+/// connection's stdin. Earlier versions tried `python3 -c "$1" -- <script>`
+/// in argv; the remote login shell expands `$1` to empty before python sees
+/// anything (no positional-argument scope), so the patch silently no-op'd
+/// while reporting success. Stdin avoids that whole class of shell-quoting
+/// trap, and we additionally check that the script printed "ok" so any
+/// future regression can't masquerade as success again.
 pub fn patch_claude_code_config_remote(host_alias: &str) -> StepResult {
     let script = r#"
 import json, os, pathlib, shutil, time
@@ -519,33 +617,102 @@ p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(data, indent=2))
 print("ok")
 "#;
-    let out = Command::new("ssh")
+    run_remote_python(host_alias, script, "Patching ~/.claude.json", |stdout| {
+        let confirmed = stdout.trim() == "ok";
+        StepResult {
+            ok: confirmed,
+            message: if confirmed {
+                format!("aiui registered in ~/.claude.json on {host_alias}")
+            } else {
+                format!("Patching ~/.claude.json on {host_alias} did not confirm 'ok'")
+            },
+            details: if confirmed {
+                None
+            } else {
+                Some(format!("stdout: {}", stdout.trim()))
+            },
+        }
+    })
+}
+
+/// Run a Python script on a remote host via `ssh ... python3 -` with the
+/// script piped on stdin. Captures stdout for the caller to verify a
+/// success marker. We validate `host_alias` and additionally use `--` so
+/// it can't slip into ssh option position even if validation regresses.
+fn run_remote_python(
+    host_alias: &str,
+    script: &str,
+    op: &str,
+    on_success: impl FnOnce(&str) -> StepResult,
+) -> StepResult {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    if !is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
+
+    let child = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
-            host_alias,
-            "python3 -c \"$1\"",
             "--",
-            script,
+            host_alias,
+            "python3 -",
         ])
-        .output();
-    match out {
-        Err(e) => StepResult {
-            ok: false,
-            message: format!("ssh {host_alias} could not start"),
-            details: Some(e.to_string()),
-        },
-        Ok(o) if !o.status.success() => StepResult {
-            ok: false,
-            message: format!("Patching ~/.claude.json on {host_alias} failed"),
-            details: Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        },
-        Ok(_) => StepResult {
-            ok: true,
-            message: format!("aiui registered in ~/.claude.json on {host_alias}"),
-            details: None,
-        },
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: format!("ssh {host_alias} could not start"),
+                details: Some(e.to_string()),
+            };
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(script.as_bytes()) {
+            return StepResult {
+                ok: false,
+                message: format!("{op} on {host_alias}: stdin write failed"),
+                details: Some(e.to_string()),
+            };
+        }
+        // Drop stdin so python3 sees EOF and starts executing.
+        drop(stdin);
     }
+
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: format!("{op} on {host_alias}: wait failed"),
+                details: Some(e.to_string()),
+            };
+        }
+    };
+
+    if !out.status.success() {
+        return StepResult {
+            ok: false,
+            message: format!("{op} on {host_alias} failed"),
+            details: Some(String::from_utf8_lossy(&out.stderr).to_string()),
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    on_success(&stdout)
 }
 
 pub fn remove_claude_code_config_remote(host_alias: &str) -> StepResult {
@@ -565,36 +732,40 @@ else:
     p.write_text(json.dumps(data, indent=2))
     print("ok")
 "#;
+    run_remote_python(host_alias, script, "Removing aiui from ~/.claude.json", |stdout| {
+        let confirmed = stdout.trim() == "ok";
+        StepResult {
+            ok: confirmed,
+            message: if confirmed {
+                format!("Removed aiui from ~/.claude.json on {host_alias}")
+            } else {
+                format!("Removal on {host_alias} did not confirm 'ok'")
+            },
+            details: if confirmed {
+                None
+            } else {
+                Some(format!("stdout: {}", stdout.trim()))
+            },
+        }
+    })
+}
+
+pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
+    if !is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
     let out = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
-            host_alias,
-            "python3 -c \"$1\"",
             "--",
-            script,
+            host_alias,
+            "rm -f ~/.config/aiui/token",
         ])
-        .output();
-    match out {
-        Err(e) => StepResult {
-            ok: false,
-            message: format!("ssh {host_alias} could not start"),
-            details: Some(e.to_string()),
-        },
-        Ok(_) => StepResult {
-            ok: true,
-            message: format!("Removed aiui from ~/.claude.json on {host_alias}"),
-            details: None,
-        },
-    }
-}
-
-pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
-    let out = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(host_alias)
-        .arg("rm -f ~/.config/aiui/token")
         .output();
     match out {
         Err(e) => StepResult {

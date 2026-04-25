@@ -56,6 +56,16 @@ impl TunnelManager {
     }
 
     pub async fn ensure(self: &Arc<Self>, host: String) {
+        // Refuse to even start a tunnel task for a host alias that
+        // would be misinterpreted as an ssh option (defense in depth —
+        // `add_remote` validates at the API boundary, this catches
+        // anything that slips in through an old `remotes.json`).
+        if !crate::setup::is_valid_host_alias(&host) {
+            trace(&format!(
+                "tunnel[{host}]: refusing to start tunnel — host alias rejected by validator"
+            ));
+            return;
+        }
         let mut entries = self.entries.lock().await;
         if entries.contains_key(&host) {
             return;
@@ -112,21 +122,37 @@ impl TunnelManager {
 const SHARED_FORWARD_POLL_SECS: u64 = 30;
 
 /// Ask the remote whether localhost:`port` is already answering `/ping` from
-/// aiui. Uses ssh in batch mode + curl; no-op if either ssh or curl aren't
-/// available. Returns Some(true) on a clean `pong`, Some(false) on a clean
-/// "port is empty", None on inconclusive errors (ssh failed to connect at
-/// all — different failure mode than "port unreachable").
+/// aiui. Returns Some(true) only when an *authenticated* probe to the
+/// remote-side port confirms a same-token aiui is responding (the typical
+/// stale-sshd-sess case where our reverse-forward keeps tunneling to *our*
+/// aiui through a zombie session). Returns Some(false) on a clean "port
+/// is empty" or "answering process isn't aiui or has wrong token".
+/// Returns None when ssh itself failed to connect at all (different
+/// failure mode than "port unreachable") so the retry loop can stay
+/// patient instead of flipping state on every blip.
+///
+/// Token source: `~/.config/aiui/token` on the *remote* host (scp'd
+/// there at remote-registration time). If the file is missing on the
+/// remote, the probe is treated as inconclusive — we don't have enough
+/// to decide.
 async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
-    let url = format!("http://localhost:{port}/ping");
-    // -f makes curl return non-zero on 4xx/5xx; -m 3 caps the total time.
-    // We do NOT need the auth token for /ping; it's public on the companion.
-    let cmd = format!("curl -sS -f -m 3 {url} 2>/dev/null");
+    let url = format!("http://localhost:{port}/probe");
+    // Read the token *on the remote* and auth-bind the curl in one shell
+    // command so the token never appears in our local argv. -f makes curl
+    // return non-zero on 4xx/5xx (so 401 = not-shared); -m 3 caps total
+    // time; --json-out marker makes the success body easy to recognize.
+    let cmd = format!(
+        "T=$(cat ~/.config/aiui/token 2>/dev/null) && \
+         [ -n \"$T\" ] && \
+         curl -sS -f -m 3 -H \"Authorization: Bearer $T\" {url} 2>/dev/null"
+    );
     let out = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=5",
+            "--",
             host,
             &cmd,
         ])
@@ -134,12 +160,17 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
         .await;
     match out {
         Ok(o) if o.status.success() => {
+            // Body must be JSON containing `"aiui":true` — otherwise some
+            // other authed-but-unrelated service answered. (Defensive:
+            // /probe is ours, but be paranoid.)
             let body = String::from_utf8_lossy(&o.stdout);
-            Some(body.trim() == "pong")
+            Some(body.contains("\"aiui\":true") || body.contains("\"aiui\": true"))
         }
         Ok(o) => {
-            // ssh ran, curl returned non-zero (port not answering → not shared).
-            // exit 255 from ssh itself means "connection error" — distinguish.
+            // ssh ran, but the remote command failed (curl 401, port
+            // empty, missing token, …). exit 255 from ssh itself means
+            // "connection error" — keep that as inconclusive so we don't
+            // oscillate.
             if o.status.code() == Some(255) {
                 None
             } else {
@@ -181,6 +212,7 @@ async fn run_tunnel(
                 "BatchMode=yes",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
+                "--",
                 &host,
             ])
             .stdout(std::process::Stdio::null())

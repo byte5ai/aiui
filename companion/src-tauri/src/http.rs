@@ -147,6 +147,7 @@ pub async fn serve(
         .route("/version", get(version))
         .route("/update", post(update))
         .route("/ping", get(ping))
+        .route("/probe", get(probe))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -162,6 +163,30 @@ pub async fn serve(
 async fn ping() -> &'static str {
     trace("ping: hit");
     "pong"
+}
+
+/// Authenticated probe used by the tunnel-manager's shared-forward
+/// detection. Unlike /ping, this requires the bearer token, so it
+/// distinguishes "another aiui with our token is forwarding the port"
+/// from "some random process on :7777 is answering". Without this
+/// distinction a malicious squatter could mask a port-takeover by
+/// answering "pong" and aiui would keep showing connected-shared.
+async fn probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "aiui": true,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
 }
 
 fn auth_ok(headers: &HeaderMap, token: &str) -> bool {
@@ -197,12 +222,17 @@ async fn health(
     };
     let children = ChildrenHealth { attached };
 
-    // Ready criterion: WebView answers, no orphan-dialog backlog, and we
-    // aren't drowning in attached children. Thresholds are intentionally
-    // loose — anything tighter belongs in a separate metric, not in the
-    // ready/not-ready gate.
+    // Ready criterion: WebView answers, room left in the dialog
+    // registry, and we aren't drowning in attached children.
+    //
+    // The dialog check uses *strict* less-than because `register()`
+    // evicts an existing pending dialog when `len() >= HARD_CAP`. If we
+    // reported ready at exactly the cap, the very next /render would
+    // silently cancel an in-flight dialog while /health still claimed
+    // healthy — readiness must lead the eviction signal, not coincide
+    // with it.
     let ready = webview.responsive
-        && dialog_stats.orphan_count <= crate::dialog::DIALOG_HARD_CAP
+        && dialog_stats.orphan_count < crate::dialog::DIALOG_HARD_CAP
         && attached < 32;
 
     let body = HealthResponse {
