@@ -18,13 +18,28 @@
   // Desktop session (often multiple days), so without a periodic timer a
   // user sitting on an outdated build never sees the prompt. Silent —
   // `checkForUpdates` only surfaces UI when an update is actually available.
+  // (Issue #42 will replace this with lifecycle-driven checks; kept here
+  // for now so behavior doesn't regress before that PR lands.)
   const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
   let updateTimer: number | undefined;
 
   onMount(() => {
-    const un = listen<DialogReq>("dialog:show", (e) => {
+    // Dialog event from Rust. We acknowledge receipt back to the Rust side
+    // immediately so the `/render` handler knows the WebView event loop is
+    // alive — this is the per-request liveness check that replaces the
+    // need for any background UI heartbeat.
+    const unDialog = listen<DialogReq>("dialog:show", (e) => {
       current = e.payload;
+      void invoke("dialog_received", { id: e.payload.id });
     });
+
+    // UI ping from Rust (used by /health to verify the event loop). We
+    // pong back synchronously — the Rust side has a 100 ms timeout and a
+    // missed pong is what flips /health to `degraded`.
+    const unPing = listen<string>("ui:ping", (e) => {
+      void invoke("ui_pong", { id: e.payload });
+    });
+
     window.addEventListener("keydown", onKey);
     // Startup check + recurring poll.
     void checkForUpdates({ silent: true });
@@ -32,7 +47,8 @@
       void checkForUpdates({ silent: true });
     }, UPDATE_POLL_MS);
     return async () => {
-      (await un)();
+      (await unDialog)();
+      (await unPing)();
       window.removeEventListener("keydown", onKey);
       if (updateTimer !== undefined) window.clearInterval(updateTimer);
     };

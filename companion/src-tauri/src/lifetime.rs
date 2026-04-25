@@ -24,9 +24,30 @@ pub fn socket_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("gui.sock")
 }
 
+/// Live counter of currently-attached MCP-stdio children. Owned by the Tauri
+/// app via `manage()` and read by `/health` to surface child count in the
+/// composite-health response.
+pub struct LifetimeStats {
+    pub conns: Arc<AtomicUsize>,
+}
+
+impl LifetimeStats {
+    pub fn new() -> Self {
+        Self {
+            conns: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn child_count(&self) -> usize {
+        self.conns.load(Ordering::SeqCst)
+    }
+}
+
 /// GUI-side: bind the socket, accept connections, and self-terminate after a
-/// grace period once all clients are gone.
-pub async fn gui_serve(sock: PathBuf, app: AppHandle) {
+/// grace period once all clients are gone. Increments/decrements the shared
+/// `conns` counter on every connect/disconnect so `/health` can report the
+/// live child count without polling.
+pub async fn gui_serve(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) {
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -37,7 +58,6 @@ pub async fn gui_serve(sock: PathBuf, app: AppHandle) {
     };
     trace(&format!("lifetime: listening on {}", sock.display()));
 
-    let conns = Arc::new(AtomicUsize::new(0));
     let wake = Arc::new(Notify::new());
 
     // Shutdown watcher — armed every time conns hits 0.
