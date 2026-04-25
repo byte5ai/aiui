@@ -141,7 +141,10 @@ async def ask(
     multi_select: bool = False,
     allow_other: bool = True,
 ) -> dict[str, Any]:
-    """Single- or multi-choice picker with optional free-text fallback.
+    """USE WHEN you would otherwise list options in chat and wait for the user
+    to type back which one — picking a deploy strategy, a migration path,
+    a file to act on, etc. Renders a native macOS choice window with
+    per-option descriptions, optional multi-select and free-text fallback.
 
     WHEN TO USE: 2–6 mutually-exclusive options where per-option context helps.
     For yes/no, use `confirm`. For mixed inputs, use `form`.
@@ -184,7 +187,11 @@ async def form(
     submit_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """Composite window: multiple typed fields + multiple action buttons.
+    """USE WHEN the user needs to give you ≥ 2 related inputs, or any single
+    input that's better entered somewhere other than the chat — secrets
+    (password, masked on screen), dates and ranges, bounded numbers (slider),
+    sortable rankings, multi-selects, color picks. Renders a native macOS
+    form window with multiple typed fields + multiple action buttons.
 
     WHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.
     For yes/no, use `confirm`. For a single choice, use `ask`.
@@ -264,7 +271,10 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """Hard yes/no decision with optional destructive styling.
+    """USE WHEN you would otherwise ask the user a yes/no question in chat —
+    and ALWAYS before any irreversible step (delete, drop, force-push,
+    rollback, prod deploy). Renders a native macOS yes/no window; pass
+    `destructive=True` for a red confirm button on dangerous actions.
 
     WHEN TO USE: irreversible or high-stakes step where "just proceed" is
     unsafe. For pure information, respond in chat. For 3+ options, use `ask`.
