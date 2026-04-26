@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.3] — 2026-04-26
+
+### Changed
+
+- **Settings header uses the app icon, not the wordmark.** The wide
+  white-card "aiui" logo at the top of the Settings window has been
+  replaced with the square app icon (32 px, rounded 7 px). Cleaner
+  silhouette, identical visual identity to the Dock/Launchpad/Finder
+  presence, and the title-area is no longer dominated by a graphic
+  that didn't add information.
+
 ## [0.4.2] — 2026-04-25
 
 Pre-launch hardening pass: external code review surfaced six substantive
