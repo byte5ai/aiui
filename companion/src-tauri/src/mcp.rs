@@ -22,6 +22,26 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const SKILL_MD: &str = include_str!("../../../docs/skill.md");
 
+/// Top-level instruction string returned in the `initialize` MCP response.
+/// Loaded by the client (Claude Code / Claude Desktop) as a session-wide
+/// hint, *before* the agent decides how to respond to anything. This is
+/// what shifts the agent's default away from chat-first replies on the
+/// kind of prompts aiui is meant to handle.
+const INSTRUCTIONS: &str = "\
+aiui is connected — you can render native dialogs on the user's Mac \
+instead of asking via chat. Default behaviour for this session:
+
+- Yes/no question (esp. before delete / drop / force-push / deploy) → \
+  call `confirm` instead of asking in chat.
+- Pick-one-of-N options where context per option matters → call `ask`.
+- Multiple related inputs, secret, date, slider, sortable order, \
+  table-row triage, image confirm/grid → call `form`.
+- Pure information the user only reads → keep it in chat.
+
+Type `/aiui:teach` (or `/aiui:widgets`) for the full widget catalog \
+when composing a complex form.
+";
+
 const UPDATE_PROMPT: &str = "\
 Check whether an aiui update is available and install it if so. Call the \
 `update` tool now, then report back concisely:
@@ -173,7 +193,15 @@ async fn dispatch(
             "serverInfo": {
                 "name": "aiui",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            // MCP `instructions` is the only spec-sanctioned way to push a
+            // top-level hint into every session at handshake time. We use it
+            // to break the LLM's chat-first default — without this nudge, the
+            // skill description and tool descriptions are passive triggers
+            // that rarely fire on plain "Should I … ?" prompts. Kept short
+            // (≤ 500 chars) on purpose; the full widget catalog still lives
+            // in `prompts/get widgets`.
+            "instructions": INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({ "tools": tools_list() })),
         "tools/call" => tools_call(params, cfg, http).await,
@@ -192,7 +220,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "confirm",
-            "description": "USE WHEN you would otherwise ask the user a yes/no question in chat — and ALWAYS before any irreversible step (delete, drop, force-push, rollback, prod deploy). Renders a native macOS yes/no window; pass `destructive: true` for a red confirm button on dangerous actions. Returns {cancelled, confirmed}. For 3+ options, use `ask`. For information the user only reads, render in chat.",
+            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -208,7 +236,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "ask",
-            "description": "USE WHEN you would otherwise list options in chat and wait for the user to type back which one — picking a deploy strategy, a migration path, a file to act on, etc. Renders a native macOS choice window with per-option descriptions, optional multi-select and free-text fallback. Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
+            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -234,7 +262,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "USE WHEN the user needs to give you ≥ 2 related inputs, or any single input that's better entered somewhere other than the chat — secrets (password field, masked on screen), dates and ranges (date, datetime, date_range), bounded numbers (slider), sortable rankings (list, also with thumbnails), multi-selects, color picks, table-row triage with column context, image preview/grid for visual confirmation. Renders a native macOS form window. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` instead of `fields` (one submit, all tabs validated together). Footer actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one option pick, use `ask`.",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions support primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -497,6 +525,11 @@ fn prompts_list() -> Value {
             "arguments": []
         },
         {
+            "name": "teach",
+            "description": "Brief the agent on aiui — same content as /aiui:widgets, but with a more discoverable name. Run once per project to give the agent the full widget catalog and design rules.",
+            "arguments": []
+        },
+        {
             "name": "update",
             "description": "Check for an aiui update and install it silently, reporting the outcome.",
             "arguments": []
@@ -531,7 +564,7 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
         .unwrap_or("")
         .to_string();
     let text = match name.as_str() {
-        "widgets" => SKILL_MD,
+        "widgets" | "teach" => SKILL_MD,
         "update" => UPDATE_PROMPT,
         "version" => VERSION_PROMPT,
         "health" => HEALTH_PROMPT,
