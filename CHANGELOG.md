@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.5] — 2026-04-26
+
+### Removed (breaking, pre-1.0)
+
+- **`/aiui:widgets` slash-command.** Replaced by `/aiui:teach` (added
+  in 0.4.4 as an alias). The `widgets` name was a leftover from the
+  era when the command listed widget names; today it briefs the agent
+  on the full design rules. Cleaning up before a wider audience picks
+  up the old name from old blog posts. Same goes for the skill
+  frontmatter `name`: `aiui widgets` → `aiui`.
+
+### Notes
+
+- Anyone who picked up the alias in v0.4.4 only needs to type
+  `/aiui:teach` from now on. Same content, same effect.
+- `aiui-mcp` PyPI 0.4.1 → 0.4.2 for parity.
+
 ## [0.4.4] — 2026-04-26
 
 ### Added
