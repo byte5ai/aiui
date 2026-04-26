@@ -101,7 +101,7 @@ settings.
 
 | Command | What it does |
 |---|---|
-| `/aiui:widgets` | Loads the full widget catalog into the session. Use this right before UI-heavy work so the agent has the rules in context. |
+| `/aiui:teach` | Briefs the agent on aiui — loads the full widget catalog and design rules into the session. Run once per project. |
 | `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
 

@@ -10,7 +10,7 @@
     "welcome.title": "aiui is set up",
     "welcome.body": "Claude Code can now open native dialogs on this Mac instead of asking you in chat. Try one of these in any Claude Code session:",
     "welcome.point.test": "Type /aiui:test-dialog — pops a small demo window so you can verify the wiring.",
-    "welcome.point.skill": "Type /aiui:widgets — loads the agent skill so the next agent uses dialogs without prompting.",
+    "welcome.point.skill": "Type /aiui:teach — briefs the agent on aiui so it reaches for dialogs without prompting.",
     "welcome.point.remote": "Working over SSH? Add the dev host below and aiui tunnels dialogs back to your Mac.",
     "welcome.cta": "Got it",
     "welcome.dismiss": "Dismiss",
