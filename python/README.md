@@ -30,7 +30,7 @@ See the main repo for the full install flow and companion download:
 
 ## Prompts
 
-- `/aiui:widgets` — full widget catalog with rules, patterns, anti-patterns
+- `/aiui:teach` — briefs the agent on aiui (full widget catalog, design rules, anti-patterns)
 
 ## License
 

@@ -10,7 +10,7 @@
     "welcome.title": "aiui ist eingerichtet",
     "welcome.body": "Claude Code kann jetzt native Fenster auf diesem Mac öffnen, statt Dich im Chat zu fragen. Probier in einer Claude-Code-Session:",
     "welcome.point.test": "/aiui:test-dialog — kurzer Demo-Dialog zum Verifizieren.",
-    "welcome.point.skill": "/aiui:widgets — lädt das Agent-Skill, damit künftige Agents von alleine Fenster nutzen.",
+    "welcome.point.skill": "/aiui:teach — briefst den Agent auf aiui, dann greift er von selbst zu Fenstern.",
     "welcome.point.remote": "Arbeitest Du via SSH auf einem Dev-Host? Trag ihn unten ein, aiui tunnelt die Dialoge zurück.",
     "welcome.cta": "Verstanden",
     "welcome.dismiss": "Schließen",

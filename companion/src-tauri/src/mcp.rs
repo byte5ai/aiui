@@ -38,8 +38,8 @@ instead of asking via chat. Default behaviour for this session:
   table-row triage, image confirm/grid → call `form`.
 - Pure information the user only reads → keep it in chat.
 
-Type `/aiui:teach` (or `/aiui:widgets`) for the full widget catalog \
-when composing a complex form.
+Type `/aiui:teach` for the full widget catalog when composing a \
+complex form.
 ";
 
 const UPDATE_PROMPT: &str = "\
@@ -520,13 +520,8 @@ fn format_dialog_result(render: Value) -> Value {
 fn prompts_list() -> Value {
     json!([
         {
-            "name": "widgets",
-            "description": "Full widget catalog, rules, and patterns for building aiui dialogs. Load at the start of UI-heavy work.",
-            "arguments": []
-        },
-        {
             "name": "teach",
-            "description": "Brief the agent on aiui — same content as /aiui:widgets, but with a more discoverable name. Run once per project to give the agent the full widget catalog and design rules.",
+            "description": "Brief the agent on aiui. Loads the full widget catalog, design rules, and anti-patterns into the session. Run once per project so the agent reaches for the right dialog without further prompting.",
             "arguments": []
         },
         {
@@ -564,7 +559,7 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
         .unwrap_or("")
         .to_string();
     let text = match name.as_str() {
-        "widgets" | "teach" => SKILL_MD,
+        "teach" => SKILL_MD,
         "update" => UPDATE_PROMPT,
         "version" => VERSION_PROMPT,
         "health" => HEALTH_PROMPT,

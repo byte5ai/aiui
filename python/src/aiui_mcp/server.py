@@ -65,8 +65,8 @@ instead of asking via chat. Default behaviour for this session:
   table-row triage, image confirm/grid → call `form`.
 - Pure information the user only reads → keep it in chat.
 
-Type `/aiui:teach` (or `/aiui:widgets`) for the full widget catalog \
-when composing a complex form.
+Type `/aiui:teach` for the full widget catalog when composing a \
+complex form.
 """
 
 # `instructions` is the spec-sanctioned way to push a top-level hint
@@ -346,7 +346,11 @@ async def confirm(
     return _format_result(await _post_render(spec))
 
 
-def _widget_catalog() -> str:
+@mcp.prompt(name="teach")
+def teach_prompt() -> str:
+    """Brief the agent on aiui. Loads the full widget catalog, design
+    rules, and anti-patterns into the session. Run once per project so
+    the agent reaches for the right dialog without further prompting."""
     try:
         return (resources.files("aiui_mcp") / "skill.md").read_text()
     except Exception:
@@ -354,22 +358,6 @@ def _widget_catalog() -> str:
             "aiui skill doc not bundled with this install. "
             "See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
         )
-
-
-@mcp.prompt()
-def widgets() -> str:
-    """The full aiui widget catalog — when to use which dialog, copy
-    conventions, anti-patterns, example payloads. Read before composing the
-    first dialog in a session."""
-    return _widget_catalog()
-
-
-@mcp.prompt(name="teach")
-def teach_prompt() -> str:
-    """Brief the agent on aiui — same content as `/aiui:widgets`, but with
-    a more discoverable name. Run once per project to give the agent the
-    full widget catalog and design rules."""
-    return _widget_catalog()
 
 
 # Prompt texts kept in sync verbatim with the Rust MCP server
