@@ -21,6 +21,18 @@ fn local_skill_dir() -> PathBuf {
         .join("aiui")
 }
 
+/// Cheap predicate for the Settings UI: is the local skill file present and
+/// non-empty? Used to drive the "Skill installiert ✓" status row that
+/// replaces the old "Skill installieren" button. Doesn't try to verify
+/// content — just existence — because content stays in sync with the app
+/// version automatically (it's overwritten on every GUI launch).
+pub fn is_installed_locally() -> bool {
+    let path = local_skill_dir().join("SKILL.md");
+    fs::metadata(&path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
 /// Writes SKILL.md into ~/.claude/skills/aiui/ on the local Mac. Idempotent:
 /// overwrites any previous copy so skill updates ride along with app updates.
 pub fn install_locally() -> StepResult {

@@ -62,8 +62,15 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
         "command": app_binary_path,
         "args": ["--mcp-stdio"]
     });
-    let was_present = servers.contains_key("aiui-local");
-    servers.insert("aiui-local".into(), entry);
+    // Migration: ≤ v0.4.5 wrote the entry under the key `aiui-local`. That
+    // mismatched `~/.claude.json`'s `aiui` key, breaking slash commands like
+    // `/aiui:test-dialog` in Claude Desktop (would have needed
+    // `/aiui-local:test-dialog`). Unify on `aiui` and drop the old entry on
+    // every patch — idempotent for fresh installs, healing for upgrades.
+    let had_legacy = servers.contains_key("aiui-local");
+    servers.remove("aiui-local");
+    let was_present = servers.contains_key("aiui");
+    servers.insert("aiui".into(), entry);
     root.insert("mcpServers".into(), Value::Object(servers));
 
     if let Err(e) = backup(&path) {
@@ -81,10 +88,12 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
     match fs::write(&path, pretty) {
         Ok(_) => StepResult {
             ok: true,
-            message: if was_present {
-                "aiui-local in Claude Desktop Config aktualisiert.".into()
-            } else {
-                "aiui-local zu Claude Desktop Config hinzugefügt.".into()
+            message: match (was_present, had_legacy) {
+                (true, _) => "aiui in Claude Desktop Config aktualisiert.".into(),
+                (false, true) => {
+                    "aiui in Claude Desktop Config eingetragen — alter `aiui-local`-Eintrag migriert.".into()
+                }
+                (false, false) => "aiui zu Claude Desktop Config hinzugefügt.".into(),
             },
             details: Some(format!("Datei: {}", path.display())),
         },
@@ -270,7 +279,7 @@ pub fn is_claude_config_current(app_binary_path: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&s) else {
         return false;
     };
-    let Some(entry) = v.pointer("/mcpServers/aiui-local") else {
+    let Some(entry) = v.pointer("/mcpServers/aiui") else {
         return false;
     };
     entry
@@ -278,6 +287,45 @@ pub fn is_claude_config_current(app_binary_path: &str) -> bool {
         .and_then(|v| v.as_str())
         .map(|c| c == app_binary_path)
         .unwrap_or(false)
+}
+
+/// Same shape as `is_claude_config_current`, but for Claude Code's
+/// `~/.claude.json`. Used by the welcome health-check so we can tell the
+/// user *which* Claude variant is wired up vs. missing.
+pub fn is_claude_code_config_current(app_binary_path: &str) -> bool {
+    let path = home().join(".claude.json");
+    let Ok(s) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else {
+        return false;
+    };
+    let Some(entry) = v.pointer("/mcpServers/aiui") else {
+        return false;
+    };
+    entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|c| c == app_binary_path)
+        .unwrap_or(false)
+}
+
+/// Best-effort check whether the Claude Desktop application is currently
+/// running on this Mac. Used to switch the "Restart Claude Desktop" button
+/// label between Start / Restart so we don't ask the user to "restart"
+/// something that isn't running.
+///
+/// Pure read-only — uses `pgrep -f` against the typical install path. If
+/// `pgrep` is missing or errors, we assume "not running" rather than
+/// blocking the UI.
+pub fn is_claude_desktop_running() -> bool {
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "/Applications/Claude.app/"])
+        .output();
+    match out {
+        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Patches `~/.claude.json` so Claude Code CLI sees `aiui` as a globally
@@ -461,10 +509,13 @@ pub fn remove_claude_desktop_config() -> StepResult {
         }
     };
     let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::Object(Map::new()));
-    let had = v
-        .pointer("/mcpServers/aiui-local")
-        .is_some();
+    // Remove both the current `aiui` key and the legacy `aiui-local` key so
+    // Uninstall always leaves a clean state regardless of which version
+    // wrote the entry.
+    let had = v.pointer("/mcpServers/aiui").is_some()
+        || v.pointer("/mcpServers/aiui-local").is_some();
     if let Some(servers) = v.get_mut("mcpServers").and_then(|x| x.as_object_mut()) {
+        servers.remove("aiui");
         servers.remove("aiui-local");
     }
     if let Err(e) = backup(&path) {
@@ -479,9 +530,9 @@ pub fn remove_claude_desktop_config() -> StepResult {
         Ok(_) => StepResult {
             ok: true,
             message: if had {
-                "aiui-local aus Claude Desktop Config entfernt.".into()
+                "aiui aus Claude Desktop Config entfernt.".into()
             } else {
-                "aiui-local war bereits nicht eingetragen.".into()
+                "aiui war bereits nicht eingetragen.".into()
             },
             details: None,
         },
