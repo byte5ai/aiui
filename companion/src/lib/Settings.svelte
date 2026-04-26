@@ -26,18 +26,13 @@
     welcome_pending: boolean;
     http_error: string | null;
   };
-  type TestDialogResponse = {
-    ok: boolean;
-    body?: { cancelled?: boolean; result?: unknown };
-    http_status?: number;
-  };
-
   let status = $state<Status | null>(null);
   let newHost = $state("");
   let busy = $state(false);
   let log = $state<{ text: string; ok: boolean }[]>([]);
   let confirmUninstall = $state(false);
   let uninstallDone = $state(false);
+  let demoCopied = $state(false);
   let timer: number | undefined;
 
   async function refresh() {
@@ -103,34 +98,28 @@
     }
   }
 
-  async function runTestDialog() {
-    busy = true;
+  async function copyDemoPrompt() {
     try {
-      const r = await invoke<TestDialogResponse>("test_dialog");
-      if (r.ok) {
-        const cancelled = r.body?.cancelled === true;
-        pushSingle({
-          ok: !cancelled,
-          message: cancelled ? $_("settings.test.cancelled") : $_("settings.test.ok"),
-          details: null,
-        });
-      } else {
-        pushSingle({
-          ok: false,
-          message: $_("settings.test.fail", {
-            values: { detail: r.http_status ? `HTTP ${r.http_status}` : "no response" },
-          }),
-          details: r.body ? JSON.stringify(r.body) : null,
-        });
-      }
+      await navigator.clipboard.writeText($_("settings.welcome.demo.prompt"));
+      demoCopied = true;
+      window.setTimeout(() => (demoCopied = false), 2000);
+    } catch {
+      // Clipboard API unavailable in some Tauri/macOS combinations — silent
+      // fallback so the UI doesn't lie about success.
+      demoCopied = false;
+    }
+  }
+
+  async function quitApp() {
+    try {
+      await invoke("quit_app");
+      // app.exit(0) tears the WebView down; nothing to do here.
     } catch (e) {
       pushSingle({
         ok: false,
-        message: $_("settings.test.fail", { values: { detail: String(e) } }),
+        message: `Quit failed: ${String(e)}`,
         details: null,
       });
-    } finally {
-      busy = false;
     }
   }
 
@@ -251,12 +240,6 @@
         </ul>
 
         <div class="welcome-action">
-          <span class="welcome-action-label">{$_("settings.welcome.next.test")}</span>
-          <button onclick={runTestDialog} disabled={busy} title={$_("settings.test.hint")}>
-            {$_("settings.welcome.next.test_button")}
-          </button>
-        </div>
-        <div class="welcome-action">
           <span class="welcome-action-label">{$_("settings.welcome.next.restart")}</span>
           <button onclick={restartClaude} disabled={busy} title={$_("settings.restart.hint")}>
             {status.claude_desktop_running
@@ -264,7 +247,25 @@
               : $_("settings.welcome.next.restart_button.start")}
           </button>
         </div>
-        <p class="welcome-slash">{$_("settings.welcome.next.slash")}</p>
+
+        <!-- Demo section. Replaces the old "Test-Dialog jetzt"-button — that
+          one looped back through aiui's own /render endpoint and proved
+          nothing the user couldn't already see (this very window is rendered
+          by the same WebView). What new users actually need is a concrete
+          way to see aiui in action *inside Claude*. Issue #70. -->
+        <div class="demo-block">
+          <div class="demo-title">{$_("settings.welcome.demo.title")}</div>
+          <p class="demo-slash">
+            {$_("settings.welcome.demo.slash_intro")}<code>{$_("settings.welcome.demo.slash_code")}</code>{$_("settings.welcome.demo.slash_outro")}<code>{$_("settings.welcome.demo.slash_teach")}</code>{$_("settings.welcome.demo.slash_after")}
+          </p>
+          <p class="demo-prompt-intro">{$_("settings.welcome.demo.prompt_intro")}</p>
+          <div class="demo-prompt-row">
+            <textarea readonly class="demo-prompt-text" rows="3">{$_("settings.welcome.demo.prompt")}</textarea>
+            <button class="demo-copy" onclick={copyDemoPrompt}>
+              {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
+            </button>
+          </div>
+        </div>
 
         <div class="welcome-foot">
           <button class="primary" onclick={dismissWelcome}>{$_("settings.welcome.cta")}</button>
@@ -358,9 +359,6 @@
         <button onclick={openIssue} title={$_("settings.report.hint")}>
           {$_("settings.report.button")}
         </button>
-        <button onclick={runTestDialog} disabled={busy} title={$_("settings.test.hint")}>
-          {$_("settings.test.button")}
-        </button>
         <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
           {$_("settings.updates.check")}
         </button>
@@ -383,8 +381,8 @@
       <h2>{$_("settings.uninstall.done.title")}</h2>
       <p>{$_("settings.uninstall.done.body")}</p>
       <div class="modal-foot">
-        <button class="primary" onclick={() => (uninstallDone = false)}>
-          {$_("settings.uninstall.done.close")}
+        <button class="primary danger" onclick={quitApp}>
+          {$_("settings.uninstall.done.quit")}
         </button>
       </div>
     </div>
@@ -606,17 +604,61 @@
     color: var(--muted);
     flex: 1;
   }
-  .welcome-slash {
-    margin: 6px 0 0 0;
+
+  .demo-block {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .demo-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .demo-slash {
+    margin: 0;
     font-size: 12px;
     color: var(--muted);
     line-height: 1.5;
   }
-  .welcome-slash :global(code) {
+  .demo-slash code {
     background: color-mix(in srgb, var(--fg) 8%, transparent);
     padding: 1px 5px;
     border-radius: 4px;
+    font-size: 11.5px;
   }
+  .demo-prompt-intro {
+    margin: 4px 0 0 0;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .demo-prompt-row {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+  }
+  .demo-prompt-text {
+    flex: 1;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--fg);
+    resize: none;
+  }
+  .demo-copy {
+    flex-shrink: 0;
+    align-self: flex-start;
+  }
+
   .welcome-foot {
     display: flex;
     justify-content: flex-end;

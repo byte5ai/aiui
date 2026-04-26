@@ -114,6 +114,84 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
     stale.len()
 }
 
+/// Find every `aiui --mcp-stdio` process regardless of executable path,
+/// excluding `own_pid`. Used for the uninstall flow where we want to take
+/// down ALL children — keeping any of them alive would re-launch the GUI
+/// via `mcp_attach`'s auto-resurrect path the moment we exit, defeating
+/// the whole point of "uninstall + drag .app to trash".
+fn find_all_children(ps_stdout: &str, own_pid: u32) -> Vec<StaleChild> {
+    let mut out = Vec::new();
+    for line in ps_stdout.lines() {
+        let line = line.trim_start();
+        let Some((pid_str, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let rest = rest.trim_start();
+        if !rest.contains("--mcp-stdio") {
+            continue;
+        }
+        let exe = rest.split_whitespace().next().unwrap_or("");
+        if !exe.ends_with("/aiui") && exe != "aiui" {
+            continue;
+        }
+        out.push(StaleChild {
+            pid,
+            exe: exe.to_string(),
+        });
+    }
+    out
+}
+
+/// Sibling of `kill_stale_mcp_stdio_children` that doesn't filter by
+/// executable path — every running `aiui --mcp-stdio` (other than our
+/// own pid) gets SIGTERM'd. Bound to the uninstall flow (#72): without
+/// this, the auto-resurrect loop in `mcp_attach` would relaunch the GUI
+/// the moment we call `app.exit(0)`.
+pub fn kill_all_mcp_stdio_children() -> usize {
+    let own_pid = std::process::id();
+
+    let out = match Command::new("ps").args(["-axo", "pid=,command="]).output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            trace(&format!(
+                "housekeeping: ps exited {:?} ({} bytes stderr)",
+                o.status.code(),
+                o.stderr.len()
+            ));
+            return 0;
+        }
+        Err(e) => {
+            trace(&format!("housekeeping: ps failed to start: {e}"));
+            return 0;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let children = find_all_children(&stdout, own_pid);
+
+    for child in &children {
+        trace(&format!(
+            "housekeeping: killing mcp-stdio child pid={} exe={} (uninstall sweep)",
+            child.pid, child.exe
+        ));
+        let _ = Command::new("kill").arg(child.pid.to_string()).output();
+    }
+
+    if !children.is_empty() {
+        trace(&format!(
+            "housekeeping: terminated {} mcp-stdio child(ren) for uninstall",
+            children.len()
+        ));
+    }
+    children.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

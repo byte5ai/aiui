@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.7] — 2026-04-26
+
+### Fixed
+
+- **Settings window popped up every second after a failed render call.**
+  Root cause: the single-instance plugin's callback fired on every
+  invocation (including auto-resurrect attempts via `open -a aiui --args
+  --auto`) and unconditionally surfaced the Settings window. When
+  `mcp_attach`'s 500 ms reconnect loop kicked in (because of any
+  transient companion failure), the user saw Settings flashing forever
+  until they force-quit Claude Desktop. Callback now ignores `--auto`
+  entirely. Closes #71.
+- **Uninstall didn't quit aiui, so the user couldn't drag aiui.app to
+  the Trash.** Modal button changed from "Schließen" to "aiui beenden";
+  it now invokes a new `quit_app` Tauri command that SIGTERMs every
+  `aiui --mcp-stdio` child first (so they can't resurrect the GUI via
+  `mcp_attach`), pauses 300 ms for the kill to land, then `app.exit(0)`.
+  Closes #72.
+
+### Changed
+
+- **"Test-Dialog jetzt"-Button removed.** It looped back through aiui's
+  own `/render` endpoint and proved nothing the user couldn't already
+  see — this Settings window itself is rendered by the same WebView. It
+  was honest noise. Replaced with a "Erste Schritte in Claude" block in
+  the welcome banner that shows the `/aiui:test-dialog` and `/aiui:teach`
+  slash commands plus a copyable demo prompt for any Claude chat. Closes
+  #70.
+
 ## [0.4.6] — 2026-04-26
 
 ### Fixed

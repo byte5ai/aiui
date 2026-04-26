@@ -155,56 +155,23 @@ fn repair_skill() -> Result<setup::StepResult, String> {
     Ok(skill::install_locally())
 }
 
-/// Pop a small confirm dialog so the user can verify the dialog wiring
-/// without going through Claude. The button in Settings calls this — it
-/// loops back through the local HTTP `/render` endpoint so the same
-/// production code path (auth, ack contract, idle-restart, registry sweep)
-/// is exercised, not a parallel one that could drift out of sync.
-///
-/// Returns the structured render response (or the HTTP error) as JSON so
-/// the UI can show "It works" vs. the underlying failure verbatim.
+/// Quit aiui after Uninstall has cleaned up configs/tokens/skill, killing
+/// every `aiui --mcp-stdio` child first so the auto-resurrect path in
+/// `mcp_attach` can't relaunch the GUI behind us. Without this, the user
+/// still couldn't drag aiui.app to the Trash because the process kept
+/// running. Issue #72.
 #[tauri::command]
-async fn test_dialog(
-    cfg: tauri::State<'_, Arc<config::AppConfig>>,
-) -> Result<serde_json::Value, String> {
-    let token = std::fs::read_to_string(&cfg.token_path)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| format!("reading token: {e}"))?;
-    let url = format!("http://127.0.0.1:{}/render", cfg.http_port);
-    let body = serde_json::json!({
-        "spec": {
-            "kind": "confirm",
-            "title": "aiui Test-Dialog",
-            "message": "Klicke einen Button — verifiziert nur die Wiring-Strecke.",
-            "header": "Test",
-            "confirmLabel": "Funktioniert",
-            "cancelLabel": "Abbrechen"
-        }
-    });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("building http client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    let status = resp.status();
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse render response: {e}"))?;
-    if !status.is_success() {
-        return Ok(serde_json::json!({
-            "ok": false,
-            "http_status": status.as_u16(),
-            "body": value,
-        }));
-    }
-    Ok(serde_json::json!({ "ok": true, "body": value }))
+async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    let killed = housekeeping::kill_all_mcp_stdio_children();
+    logging::trace(&format!(
+        "quit_app: killed {killed} mcp-stdio child(ren) before exit"
+    ));
+    // Give the kill commands a moment to deliver SIGTERM before we exit
+    // ourselves. Otherwise an already-running mcp_attach loop on a child
+    // can race the GUI exit and re-launch us.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    app.exit(0);
+    Ok(())
 }
 
 /// Quit + relaunch Claude Desktop so it re-reads `claude_desktop_config.json`
@@ -454,7 +421,16 @@ pub fn run() {
         .expect("tokio rt");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // `--auto` means the second invocation came from mcp_attach's
+            // auto-resurrect path (`open -a aiui --args --auto`). The GUI
+            // is already alive — do nothing, particularly do NOT surface
+            // the Settings window. Without this guard, a stuck mcp_attach
+            // retry loop (500 ms cadence) pops Settings every half-second
+            // until the user force-quits Claude Desktop. Issue #71.
+            if args.iter().any(|a| a == "--auto") {
+                return;
+            }
             show_settings_window(app);
         }))
         .plugin(
@@ -489,9 +465,9 @@ pub fn run() {
             remove_remote,
             reinstall_skill,
             repair_skill,
-            test_dialog,
             restart_claude_desktop,
             uninstall_all,
+            quit_app,
             dismiss_welcome
         ])
         .setup(move |app| {
