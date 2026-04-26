@@ -83,7 +83,22 @@ struct StatusReport {
     app_binary_path: String,
     token_path: String,
     http_port: u16,
+    /// True iff `claude_desktop_config.json` has the current `aiui` MCP
+    /// server entry pointing at this binary. Mirrors what the welcome
+    /// banner uses for its readiness check.
     claude_config_ok: bool,
+    /// True iff `~/.claude.json` has an `aiui` MCP server entry pointing at
+    /// this binary. Separate from `claude_config_ok` because Claude Desktop
+    /// and Claude Code read different config files.
+    claude_code_config_ok: bool,
+    /// True iff `~/.claude/skills/aiui/SKILL.md` exists and is non-empty.
+    /// Drives the skill-status row in Settings — replaces the old
+    /// "Skill installieren" button which suggested optionality.
+    skill_installed: bool,
+    /// True iff the Claude Desktop app is currently running. Lets the
+    /// "Restart Claude Desktop" button switch its label between
+    /// "Start" / "Restart" depending on whether there's something to quit.
+    claude_desktop_running: bool,
     remotes: Vec<String>,
     tunnels: std::collections::HashMap<String, tunnel::TunnelStatus>,
     build_info: &'static str,
@@ -110,6 +125,9 @@ async fn status(
         token_path: cfg.token_path.display().to_string(),
         http_port: cfg.http_port,
         claude_config_ok: setup::is_claude_config_current(&bin),
+        claude_code_config_ok: setup::is_claude_code_config_current(&bin),
+        skill_installed: skill::is_installed_locally(),
+        claude_desktop_running: setup::is_claude_desktop_running(),
         remotes: setup::load_remotes(),
         tunnels: tm.snapshot().await,
         build_info: logging::BUILD_INFO,
@@ -125,6 +143,110 @@ async fn status(
 fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), String> {
     mark_first_run_done(&cfg);
     Ok(())
+}
+
+/// Re-installs the local skill file. Bound to the "Skill reparieren" button
+/// in the Settings status row, which only appears when `skill_installed`
+/// reports false. The auto-install on every GUI launch covers the normal
+/// case; this command is for the rare situation where the file got removed
+/// or corrupted between launches.
+#[tauri::command]
+fn repair_skill() -> Result<setup::StepResult, String> {
+    Ok(skill::install_locally())
+}
+
+/// Pop a small confirm dialog so the user can verify the dialog wiring
+/// without going through Claude. The button in Settings calls this — it
+/// loops back through the local HTTP `/render` endpoint so the same
+/// production code path (auth, ack contract, idle-restart, registry sweep)
+/// is exercised, not a parallel one that could drift out of sync.
+///
+/// Returns the structured render response (or the HTTP error) as JSON so
+/// the UI can show "It works" vs. the underlying failure verbatim.
+#[tauri::command]
+async fn test_dialog(
+    cfg: tauri::State<'_, Arc<config::AppConfig>>,
+) -> Result<serde_json::Value, String> {
+    let token = std::fs::read_to_string(&cfg.token_path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("reading token: {e}"))?;
+    let url = format!("http://127.0.0.1:{}/render", cfg.http_port);
+    let body = serde_json::json!({
+        "spec": {
+            "kind": "confirm",
+            "title": "aiui Test-Dialog",
+            "message": "Klicke einen Button — verifiziert nur die Wiring-Strecke.",
+            "header": "Test",
+            "confirmLabel": "Funktioniert",
+            "cancelLabel": "Abbrechen"
+        }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("building http client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status();
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse render response: {e}"))?;
+    if !status.is_success() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "http_status": status.as_u16(),
+            "body": value,
+        }));
+    }
+    Ok(serde_json::json!({ "ok": true, "body": value }))
+}
+
+/// Quit + relaunch Claude Desktop so it re-reads `claude_desktop_config.json`
+/// and picks up the freshly-patched aiui MCP server entry. This is the
+/// "after-Setup nudge" the user otherwise has to figure out themselves.
+///
+/// Uses AppleScript for the quit (so Claude gets a chance to close cleanly,
+/// not SIGKILL) and `open -a` for the relaunch. If Claude Desktop isn't
+/// installed or isn't running, the quit step quietly no-ops and we just
+/// launch fresh.
+#[tauri::command]
+async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
+    use std::process::Command;
+
+    // Best-effort quit. Status of `osascript` is non-fatal — if Claude isn't
+    // running, AppleScript returns an error that we treat as a no-op.
+    let _ = Command::new("osascript")
+        .args(["-e", "tell application \"Claude\" to quit"])
+        .output();
+
+    // Give Claude a moment to actually shut down before relaunching, so
+    // `open -a` doesn't race with a still-quitting instance.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let out = Command::new("open").args(["-a", "Claude"]).output();
+    match out {
+        Ok(o) if o.status.success() => Ok(setup::StepResult {
+            ok: true,
+            message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+            details: None,
+        }),
+        Ok(o) => Ok(setup::StepResult {
+            ok: false,
+            message: "Konnte Claude Desktop nicht starten.".into(),
+            details: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        }),
+        Err(e) => Ok(setup::StepResult {
+            ok: false,
+            message: "Konnte `open -a Claude` nicht ausführen.".into(),
+            details: Some(e.to_string()),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -366,6 +488,9 @@ pub fn run() {
             add_remote,
             remove_remote,
             reinstall_skill,
+            repair_skill,
+            test_dialog,
+            restart_claude_desktop,
             uninstall_all,
             dismiss_welcome
         ])
