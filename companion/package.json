@@ -1,6 +1,6 @@
 {
   "name": "aiui-companion",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "aiui companion — renders dialogs for remote Claude Code sessions",
   "type": "module",
   "scripts": {

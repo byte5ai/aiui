@@ -3,7 +3,7 @@
   import { _ } from "svelte-i18n";
   import { onMount, onDestroy } from "svelte";
   import { checkForUpdates } from "./updater";
-  import logoUrl from "../assets/logo.png";
+  import iconUrl from "../assets/icon.png";
 
   type StepResult = { ok: boolean; message: string; details: string | null };
   type TunnelStatus =
@@ -135,7 +135,7 @@
 {#if status}
   <div class="stack">
     <header class="app-header">
-      <img src={logoUrl} alt="aiui" />
+      <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <span class="status-dot" class:ok={status.claude_config_ok}></span>
         {#if status.claude_config_ok}
@@ -271,9 +271,12 @@
     padding: 8px 0 12px 0;
     border-bottom: 1px solid var(--border);
   }
-  .app-header img {
-    height: 28px;
-    width: auto;
+  .app-header img.app-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 7px;
+    box-shadow: var(--shadow-sm);
+    flex-shrink: 0;
   }
   .header-meta {
     flex: 1;
