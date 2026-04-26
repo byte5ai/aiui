@@ -1,6 +1,6 @@
 ---
 name: aiui widgets
-description: Open a native macOS dialog on the user's Mac instead of asking via chat — for yes/no decisions, picking between options, multi-field input, sorting, dates, sliders, or secrets. Reach for it whenever you would otherwise put a question or numbered option list into the chat and wait for a typed reply, and *always* before any irreversible step (delete, force-push, drop, deploy to prod).
+description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native macOS dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm.
 ---
 
 # aiui — Dialog design for Claude agents

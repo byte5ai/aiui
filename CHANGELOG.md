@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.4] — 2026-04-26
+
+### Added
+
+- **`initialize.instructions` injection.** The MCP `initialize` response
+  now carries a top-level `instructions` string that Claude Code (and
+  Claude Desktop) feed to the agent before the first turn. Short
+  imperative brief telling the agent to default to dialogs for yes/no,
+  pick-one-of-N, and multi-input prompts. Replaces the previous purely
+  passive trigger model where the agent had to *deduce* aiui-relevance
+  from the skill description.
+- **`/aiui:teach` slash-command** as a discoverable alias for
+  `/aiui:widgets`. Same content (full widget catalog), more telling
+  name. The old `/aiui:widgets` keeps working.
+
+### Changed
+
+- **Tool descriptions on imperative voice** ("Before writing a yes/no
+  question into chat, call this tool instead.") instead of "USE WHEN…".
+  Same content, but framed as a directive — gives the agent a stronger
+  pull out of the chat-first default.
+- **Skill frontmatter description** rewritten to start with the trigger
+  ("Before writing a yes/no question, a numbered option list, or a
+  multi-question request into the chat, …"). Same goal: prime the
+  agent to *use* aiui rather than *consider* aiui.
+- **`aiui-mcp` PyPI 0.4.0 → 0.4.1** for parity (instructions field,
+  imperative docstrings, `/aiui:teach` alias).
+
 ## [0.4.3] — 2026-04-26
 
 ### Changed

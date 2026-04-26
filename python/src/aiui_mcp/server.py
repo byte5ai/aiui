@@ -54,7 +54,26 @@ ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
 TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
 HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
 
-mcp = FastMCP("aiui")
+_INSTRUCTIONS = """\
+aiui is connected — you can render native dialogs on the user's Mac \
+instead of asking via chat. Default behaviour for this session:
+
+- Yes/no question (esp. before delete / drop / force-push / deploy) → \
+  call `confirm` instead of asking in chat.
+- Pick-one-of-N options where context per option matters → call `ask`.
+- Multiple related inputs, secret, date, slider, sortable order, \
+  table-row triage, image confirm/grid → call `form`.
+- Pure information the user only reads → keep it in chat.
+
+Type `/aiui:teach` (or `/aiui:widgets`) for the full widget catalog \
+when composing a complex form.
+"""
+
+# `instructions` is the spec-sanctioned way to push a top-level hint
+# into every session at the MCP handshake — Claude Code (and Claude
+# Desktop) feed it to the agent before the first turn.  Kept short on
+# purpose; the full catalog lives in the `widgets`/`teach` prompts.
+mcp = FastMCP("aiui", instructions=_INSTRUCTIONS)
 
 
 def _token() -> str:
@@ -141,10 +160,10 @@ async def ask(
     multi_select: bool = False,
     allow_other: bool = True,
 ) -> dict[str, Any]:
-    """USE WHEN you would otherwise list options in chat and wait for the user
-    to type back which one — picking a deploy strategy, a migration path,
-    a file to act on, etc. Renders a native macOS choice window with
-    per-option descriptions, optional multi-select and free-text fallback.
+    """Before listing options in chat and waiting for the user to type back
+    which one (deploy strategy, migration path, file to act on …), call
+    this tool instead. Per-option `description` carries the trade-off;
+    `multi_select` and `allow_other` cover the rest.
 
     WHEN TO USE: 2–6 mutually-exclusive options where per-option context helps.
     For yes/no, use `confirm`. For mixed inputs, use `form`.
@@ -188,11 +207,11 @@ async def form(
     submit_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """USE WHEN the user needs to give you ≥ 2 related inputs, or any single
-    input that's better entered somewhere other than the chat — secrets
-    (password, masked on screen), dates and ranges, bounded numbers (slider),
-    sortable rankings, multi-selects, color picks. Renders a native macOS
-    form window with multiple typed fields + multiple action buttons.
+    """Whenever the user needs to provide ≥ 2 related inputs, or any single
+    input that doesn't belong in chat (secret, date/datetime/range,
+    bounded number, sortable ranking, multi-select, color pick,
+    table-row triage with column context, image confirm/grid), call
+    this tool instead of typing the questions one by one.
 
     WHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.
     For yes/no, use `confirm`. For a single choice, use `ask`.
@@ -289,10 +308,10 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
 ) -> dict[str, Any]:
-    """USE WHEN you would otherwise ask the user a yes/no question in chat —
-    and ALWAYS before any irreversible step (delete, drop, force-push,
-    rollback, prod deploy). Renders a native macOS yes/no window; pass
-    `destructive=True` for a red confirm button on dangerous actions.
+    """Before writing any yes/no question into chat, call this tool instead.
+    Pass `destructive=True` (red button) for delete / drop / force-push /
+    rollback / prod-deploy — never trust loose prior approval for
+    irreversible steps; re-confirm in a dialog.
 
     WHEN TO USE: irreversible or high-stakes step where "just proceed" is
     unsafe. For pure information, respond in chat. For 3+ options, use `ask`.
@@ -327,11 +346,7 @@ async def confirm(
     return _format_result(await _post_render(spec))
 
 
-@mcp.prompt()
-def widgets() -> str:
-    """The full aiui widget catalog — when to use which dialog, copy
-    conventions, anti-patterns, example payloads. Read before composing the
-    first dialog in a session."""
+def _widget_catalog() -> str:
     try:
         return (resources.files("aiui_mcp") / "skill.md").read_text()
     except Exception:
@@ -339,6 +354,22 @@ def widgets() -> str:
             "aiui skill doc not bundled with this install. "
             "See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
         )
+
+
+@mcp.prompt()
+def widgets() -> str:
+    """The full aiui widget catalog — when to use which dialog, copy
+    conventions, anti-patterns, example payloads. Read before composing the
+    first dialog in a session."""
+    return _widget_catalog()
+
+
+@mcp.prompt(name="teach")
+def teach_prompt() -> str:
+    """Brief the agent on aiui — same content as `/aiui:widgets`, but with
+    a more discoverable name. Run once per project to give the agent the
+    full widget catalog and design rules."""
+    return _widget_catalog()
 
 
 # Prompt texts kept in sync verbatim with the Rust MCP server
