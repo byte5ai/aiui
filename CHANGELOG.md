@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.6] — 2026-04-26
+
+### Fixed
+
+- **`/aiui:test-dialog` returned "Unknown command" on Claude Desktop.**
+  Root cause: `claude_desktop_config.json` was written under the key
+  `aiui-local` while `~/.claude.json` used `aiui`. Slash commands on
+  Claude Desktop would have needed `/aiui-local:test-dialog`. Both
+  configs now use `aiui`; legacy `aiui-local` entry is removed on every
+  patch (idempotent for fresh installs, healing for upgrades).
+
+### Changed
+
+- **Welcome banner is a live setup health-check.** Replaces the static
+  "everything ready" copy with four real checks read at refresh time:
+  Claude Desktop config registered, Claude Code config registered,
+  skill installed, HTTP server up. Each row shows ✓ / miss in real time.
+  Banner now also tells the user explicitly that aiui does **not**
+  appear in Claude Desktop's Connectors list — that's only for cloud
+  services.
+- **"Skill installieren" button replaced with status row.** The old
+  button suggested optionality where there isn't any (the skill is
+  mandatory and auto-installed every GUI launch). Now a quiet "Skill
+  installiert ✓" row by default; only if the file is missing does a
+  red row + "Skill reparieren" button appear.
+
+### Added
+
+- **"Test-Dialog jetzt" button.** Pops a small confirm dialog through
+  the local aiui server, end-to-end, without going through Claude.
+  Verifies the wiring strecke independently.
+- **"Claude Desktop (neu) starten" button.** Quits + relaunches Claude
+  Desktop so it re-reads the current `claude_desktop_config.json`
+  entry. Label switches between Start / Restart depending on whether
+  Claude is running.
+- **Uninstall completion modal.** After Uninstall removes configs,
+  tokens, and the skill, a modal explains that and points the user at
+  the Finder for the actual `.app` removal — running app self-deleting
+  is fragile, and "Uninstall" is honest about being a configuration
+  cleanup, not self-destruct.
+
 ## [0.4.5] — 2026-04-26
 
 ### Removed (breaking, pre-1.0)
