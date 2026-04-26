@@ -17,11 +17,19 @@
     token_path: string;
     http_port: number;
     claude_config_ok: boolean;
+    claude_code_config_ok: boolean;
+    skill_installed: boolean;
+    claude_desktop_running: boolean;
     remotes: string[];
     tunnels: Record<string, TunnelStatus>;
     build_info: string;
     welcome_pending: boolean;
     http_error: string | null;
+  };
+  type TestDialogResponse = {
+    ok: boolean;
+    body?: { cancelled?: boolean; result?: unknown };
+    http_status?: number;
   };
 
   let status = $state<Status | null>(null);
@@ -29,6 +37,7 @@
   let busy = $state(false);
   let log = $state<{ text: string; ok: boolean }[]>([]);
   let confirmUninstall = $state(false);
+  let uninstallDone = $state(false);
   let timer: number | undefined;
 
   async function refresh() {
@@ -40,6 +49,10 @@
       ...results.map((r) => ({ text: r.message + (r.details ? ` — ${r.details}` : ""), ok: r.ok })),
       ...log,
     ].slice(0, 8);
+  }
+
+  function pushSingle(result: StepResult) {
+    pushLog([result]);
   }
 
   async function addRemote() {
@@ -72,17 +85,61 @@
       const results = await invoke<StepResult[]>("uninstall_all");
       pushLog(results);
       confirmUninstall = false;
+      uninstallDone = true;
       await refresh();
     } finally {
       busy = false;
     }
   }
 
-  async function reinstallSkill() {
+  async function repairSkill() {
     busy = true;
     try {
-      const results = await invoke<StepResult[]>("reinstall_skill");
-      pushLog(results);
+      const result = await invoke<StepResult>("repair_skill");
+      pushSingle(result);
+      await refresh();
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function runTestDialog() {
+    busy = true;
+    try {
+      const r = await invoke<TestDialogResponse>("test_dialog");
+      if (r.ok) {
+        const cancelled = r.body?.cancelled === true;
+        pushSingle({
+          ok: !cancelled,
+          message: cancelled ? $_("settings.test.cancelled") : $_("settings.test.ok"),
+          details: null,
+        });
+      } else {
+        pushSingle({
+          ok: false,
+          message: $_("settings.test.fail", {
+            values: { detail: r.http_status ? `HTTP ${r.http_status}` : "no response" },
+          }),
+          details: r.body ? JSON.stringify(r.body) : null,
+        });
+      }
+    } catch (e) {
+      pushSingle({
+        ok: false,
+        message: $_("settings.test.fail", { values: { detail: String(e) } }),
+        details: null,
+      });
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function restartClaude() {
+    busy = true;
+    try {
+      const result = await invoke<StepResult>("restart_claude_desktop");
+      pushSingle(result);
+      await refresh();
     } finally {
       busy = false;
     }
@@ -156,25 +213,81 @@
     {/if}
 
     {#if status.welcome_pending}
+      <!-- Welcome banner doubles as the live setup health-check. Each row
+        reflects a real condition checked at refresh-time, not just a static
+        promise — fixes the v0.4.x bug where "everything ready" appeared
+        even if the MCP entry hadn't actually been written. -->
       <section class="welcome">
         <div class="welcome-head">
           <strong>{$_("settings.welcome.title")}</strong>
           <button class="welcome-dismiss" onclick={dismissWelcome} aria-label={$_("settings.welcome.dismiss")}>×</button>
         </div>
         <p class="welcome-body">{$_("settings.welcome.body")}</p>
-        <ul class="welcome-list">
-          <li>{$_("settings.welcome.point.test")}</li>
-          <li>{$_("settings.welcome.point.skill")}</li>
-          <li>{$_("settings.welcome.point.remote")}</li>
+        <ul class="check-list">
+          <li class:ok={status.claude_config_ok} class:miss={!status.claude_config_ok}>
+            <span class="check-mark"></span>
+            {status.claude_config_ok
+              ? $_("settings.welcome.check.desktop.ok")
+              : $_("settings.welcome.check.desktop.miss")}
+          </li>
+          <li class:ok={status.claude_code_config_ok} class:miss={!status.claude_code_config_ok}>
+            <span class="check-mark"></span>
+            {status.claude_code_config_ok
+              ? $_("settings.welcome.check.code.ok")
+              : $_("settings.welcome.check.code.miss")}
+          </li>
+          <li class:ok={status.skill_installed} class:miss={!status.skill_installed}>
+            <span class="check-mark"></span>
+            {status.skill_installed
+              ? $_("settings.welcome.check.skill.ok")
+              : $_("settings.welcome.check.skill.miss")}
+          </li>
+          <li class:ok={!status.http_error} class:miss={!!status.http_error}>
+            <span class="check-mark"></span>
+            {status.http_error
+              ? $_("settings.welcome.check.http.miss", { values: { port: status.http_port } })
+              : $_("settings.welcome.check.http.ok")}
+          </li>
         </ul>
+
+        <div class="welcome-action">
+          <span class="welcome-action-label">{$_("settings.welcome.next.test")}</span>
+          <button onclick={runTestDialog} disabled={busy} title={$_("settings.test.hint")}>
+            {$_("settings.welcome.next.test_button")}
+          </button>
+        </div>
+        <div class="welcome-action">
+          <span class="welcome-action-label">{$_("settings.welcome.next.restart")}</span>
+          <button onclick={restartClaude} disabled={busy} title={$_("settings.restart.hint")}>
+            {status.claude_desktop_running
+              ? $_("settings.welcome.next.restart_button.restart")
+              : $_("settings.welcome.next.restart_button.start")}
+          </button>
+        </div>
+        <p class="welcome-slash">{$_("settings.welcome.next.slash")}</p>
+
         <div class="welcome-foot">
           <button class="primary" onclick={dismissWelcome}>{$_("settings.welcome.cta")}</button>
         </div>
       </section>
     {/if}
 
+    <!-- Skill status row. Replaces the old "Skill installieren" button which
+      suggested optionality — the skill is mandatory and auto-installed on
+      every GUI launch, so the only meaningful UI is "is it there?" plus a
+      repair button when it isn't. -->
+    <section class="status-row" class:err={!status.skill_installed}>
+      <span class="dot {status.skill_installed ? 'ok' : 'err'}"></span>
+      <span class="status-text">
+        {status.skill_installed ? $_("settings.skill.status.ok") : $_("settings.skill.status.miss")}
+      </span>
+      {#if !status.skill_installed}
+        <button onclick={repairSkill} disabled={busy}>{$_("settings.skill.repair")}</button>
+      {/if}
+    </section>
+
     <section>
-      <label>{$_("settings.remotes.title")}</label>
+      <span class="section-label">{$_("settings.remotes.title")}</span>
       {#if status.remotes.length === 0}
         <p class="subtitle" style="margin: 4px 0 0 0;">
           {$_("settings.remotes.empty.hint")}
@@ -199,7 +312,7 @@
     </section>
 
     <section>
-      <label>{$_("settings.remotes.add.title")}</label>
+      <span class="section-label">{$_("settings.remotes.add.title")}</span>
       <div class="row" style="margin-top: 4px;">
         <input
           type="text"
@@ -218,7 +331,7 @@
 
     {#if log.length > 0}
       <section>
-        <label>{$_("settings.log.title")}</label>
+        <span class="section-label">{$_("settings.log.title")}</span>
         <div class="stack" style="gap: 3px; margin-top: 4px;">
           {#each log as entry}
             <div class="log-line" class:err={!entry.ok}>
@@ -245,8 +358,8 @@
         <button onclick={openIssue} title={$_("settings.report.hint")}>
           {$_("settings.report.button")}
         </button>
-        <button onclick={reinstallSkill} disabled={busy} title={$_("settings.skill.hint")}>
-          {$_("settings.skill.button")}
+        <button onclick={runTestDialog} disabled={busy} title={$_("settings.test.hint")}>
+          {$_("settings.test.button")}
         </button>
         <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
           {$_("settings.updates.check")}
@@ -255,6 +368,25 @@
           >{$_("settings.uninstall.button")}</button
         >
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if uninstallDone}
+  <!-- Modal overlay confirming the cleanup ran and pointing the user at the
+    Finder for the actual app removal. We deliberately do NOT auto-trash the
+    .app — see RFC discussion: a running app moving its own bundle to Trash
+    is fragile, and the user expectation set by the "Uninstall" button is
+    "configuration removed", not "self-destruct". -->
+  <div class="modal-backdrop" role="presentation" onclick={() => (uninstallDone = false)}>
+    <div class="modal" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+      <h2>{$_("settings.uninstall.done.title")}</h2>
+      <p>{$_("settings.uninstall.done.body")}</p>
+      <div class="modal-foot">
+        <button class="primary" onclick={() => (uninstallDone = false)}>
+          {$_("settings.uninstall.done.close")}
+        </button>
+      </div>
     </div>
   </div>
 {/if}
@@ -308,6 +440,26 @@
     display: flex;
     flex-direction: column;
   }
+  .section-label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-raised);
+    box-shadow: var(--shadow-sm);
+    font-size: 12.5px;
+  }
+  .status-row.err { border-color: var(--danger); }
+  .status-row .status-text { flex: 1; }
 
   .remote-row {
     display: flex;
@@ -417,14 +569,50 @@
     color: var(--muted);
     line-height: 1.5;
   }
-  .welcome-list {
-    margin: 0;
-    padding-left: 18px;
+  .check-list {
+    list-style: none;
+    margin: 4px 0 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
     font-size: 12.5px;
-    color: var(--fg);
-    line-height: 1.55;
   }
-  .welcome-list li :global(code) {
+  .check-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .check-list li.ok { color: var(--fg); }
+  .check-list li.miss { color: var(--muted); }
+  .check-mark {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--muted);
+  }
+  .check-list li.ok .check-mark { background: var(--success); }
+  .check-list li.miss .check-mark { background: var(--warning); }
+
+  .welcome-action {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .welcome-action-label {
+    font-size: 12.5px;
+    color: var(--muted);
+    flex: 1;
+  }
+  .welcome-slash {
+    margin: 6px 0 0 0;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .welcome-slash :global(code) {
     background: color-mix(in srgb, var(--fg) 8%, transparent);
     padding: 1px 5px;
     border-radius: 4px;
@@ -432,6 +620,51 @@
   .welcome-foot {
     display: flex;
     justify-content: flex-end;
-    margin-top: 2px;
+    margin-top: 6px;
+  }
+
+  /* --- modal (uninstall-done) --- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: color-mix(in srgb, black 50%, transparent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal {
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    max-width: 420px;
+    width: calc(100% - 48px);
+    box-shadow: var(--shadow-lg, 0 10px 30px rgba(0,0,0,0.35));
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .modal h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .modal p {
+    margin: 0;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--muted);
+  }
+  .modal p :global(code) {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 11.5px;
+  }
+  .modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 4px;
   }
 </style>
