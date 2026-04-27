@@ -330,6 +330,63 @@ fn tools_list() -> Value {
     ])
 }
 
+/// How long mcp-stdio waits for the aiui HTTP endpoint to become reachable
+/// before giving up on a tool call. The dominant case this catches: the
+/// user closed the GUI via the window's red X (which exits the app),
+/// then immediately triggered a render call — `mcp_attach`'s
+/// auto-resurrect (see `lifetime.rs`) IS firing in parallel and brings
+/// the GUI back, but Claude's tool call would otherwise race ahead and
+/// hit a not-yet-bound port. Eight seconds covers a realistic cold-start
+/// (Tauri init + WebView load + HTTP bind) on a normal Mac.
+const COLDSTART_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Poll `/ping` until the HTTP server answers, or `COLDSTART_WAIT` elapses.
+/// `/ping` is unauthenticated and cheap, returning `pong` in plain text —
+/// any 2xx means aiui is bound and serving. Returns `true` once reachable,
+/// `false` on timeout. Issue surfaced 2026-04-27 when a fresh Claude
+/// session ran the demo prompt right after the user X-closed the GUI.
+async fn wait_for_aiui(http: &reqwest::Client, cfg: &AppConfig) -> bool {
+    let url = format!("http://127.0.0.1:{}/ping", cfg.http_port);
+    let deadline = std::time::Instant::now() + COLDSTART_WAIT;
+    loop {
+        let probe = http
+            .get(&url)
+            .timeout(std::time::Duration::from_millis(800))
+            .send()
+            .await;
+        if let Ok(r) = probe {
+            if r.status().is_success() {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            trace(&format!(
+                "mcp-stdio: aiui /ping not reachable after {:?}, giving up",
+                COLDSTART_WAIT
+            ));
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+/// Tool-call response signaling that the local aiui companion isn't
+/// reachable. Phrased as user-facing guidance rather than a raw error
+/// because Claude tends to relay this verbatim to the user.
+fn aiui_unreachable_result() -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": "aiui companion is not reachable on localhost:7777. \
+                     If you're on the local machine: open aiui from /Applications. \
+                     If you're on a remote dev host: the SSH-reverse-tunnel to your \
+                     Mac is down — check that aiui is running there and the tunnel \
+                     in aiui Settings shows 'connected'."
+        }],
+        "isError": true
+    })
+}
+
 async fn tools_call(
     params: Value,
     cfg: &Arc<AppConfig>,
@@ -341,6 +398,14 @@ async fn tools_call(
         .unwrap_or("")
         .to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // Cold-start gate: every tool we expose hits the local HTTP server.
+    // Wait for it to become reachable instead of returning a connection-
+    // refused error the moment we get one — that masks the auto-resurrect
+    // path's startup window cleanly.
+    if !wait_for_aiui(http, cfg).await {
+        return Ok(aiui_unreachable_result());
+    }
 
     let outcome = match name.as_str() {
         "confirm" => render_dialog(
