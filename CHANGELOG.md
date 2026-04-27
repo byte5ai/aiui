@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.14] — 2026-04-27
+
+### Fixed
+
+- **Literal markdown leaked into the UI.** Two i18n strings used
+  Markdown-style emphasis (`*Quit aiui*` in the uninstall modal,
+  `**not**` in the welcome body) but the modal/banner renders as plain
+  text, so the asterisks showed up verbatim. Replaced with plain prose
+  that lets the visually-prominent buttons / layout carry the emphasis
+  on their own.
+
 ## [0.4.13] — 2026-04-27
 
 Final polish ahead of promotion. Bundles the bugs found while the
