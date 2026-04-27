@@ -22,6 +22,18 @@ All notable changes to this project are documented here.
   inner stderr (PATH dump on `uvx`-not-found, full error from `uvx
   aiui-mcp --help` on resolve failures). Failure details now name the
   exact step and include the remote's diagnostic output verbatim.
+- **"Problem melden"-Button öffnet jetzt tatsächlich GitHub.** The
+  click did nothing because `window.open()` is blocked in Tauri's
+  WebView for security. Replaced with a Tauri command `open_url` that
+  passes the URL to macOS `open`. Defensive: only allows http(s)
+  schemes. Surfaced 2026-04-27 by tester clicking the button for the
+  first time.
+- **Sortable list items no longer snap back after drag-drop.** Tauri
+  windows have file-drop handling enabled by default, which silently
+  swallows HTML5 drag-drop events inside the page — `ondrop` never
+  fired, the list-item visually returned to its original position.
+  `dragDropEnabled: false` on the main window lets HTML5 DnD events
+  through. Surfaced 2026-04-27 in tester's demo-prompt run.
 
 ## [0.4.15] — 2026-04-27
 

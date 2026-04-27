@@ -162,14 +162,18 @@
     }
   }
 
-  function openIssue() {
+  async function openIssue() {
     const body = encodeURIComponent(
       `**Version:** ${status?.build_info ?? "unknown"}\n\n` +
         `**Describe the bug:**\n\n\n` +
         `**Steps to reproduce:**\n1.\n2.\n3.\n\n` +
         `**Expected / actual:**\n\n`,
     );
-    window.open(`https://github.com/byte5ai/aiui/issues/new?body=${body}`, "_blank");
+    // `window.open(url)` is blocked in Tauri's WebView (security). Round
+    // through a Rust command that hands the URL to macOS `open`.
+    await invoke("open_url", {
+      url: `https://github.com/byte5ai/aiui/issues/new?body=${body}`,
+    });
   }
 
   function statusLabel(t: TunnelStatus | undefined): { text: string; tone: "ok" | "warn" | "err" | "dim" } {
