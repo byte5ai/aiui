@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.16] — 2026-04-27
+
+### Fixed
+
+- **Add-remote failures land where the user can see them.** Previously
+  on failure the input field was cleared and the only feedback was a
+  log entry buried below the fold of the Settings window. Now the
+  input keeps its content (so the user can fix and retry), and the
+  first failing step is shown inline as a red banner directly under
+  the input with the full error detail. Issue surfaced 2026-04-27 by
+  tester re-adding their remotes after a fresh install — they thought
+  the host had been added, only noticed the failure when scrolling
+  down later.
+- **Reachability check actually tells you what's wrong.** Old probe
+  silenced both stdout and stderr of every inner command, so failure
+  details surfaced as "SSH stderr: (empty)" — useless. New probe is a
+  multi-stage script that emits tagged STAGE markers and forwards the
+  inner stderr (PATH dump on `uvx`-not-found, full error from `uvx
+  aiui-mcp --help` on resolve failures). Failure details now name the
+  exact step and include the remote's diagnostic output verbatim.
+- **"Problem melden"-Button öffnet jetzt tatsächlich GitHub.** The
+  click did nothing because `window.open()` is blocked in Tauri's
+  WebView for security. Replaced with a Tauri command `open_url` that
+  passes the URL to macOS `open`. Defensive: only allows http(s)
+  schemes. Surfaced 2026-04-27 by tester clicking the button for the
+  first time.
+- **Sortable list items no longer snap back after drag-drop.** Tauri
+  windows have file-drop handling enabled by default, which silently
+  swallows HTML5 drag-drop events inside the page — `ondrop` never
+  fired, the list-item visually returned to its original position.
+  `dragDropEnabled: false` on the main window lets HTML5 DnD events
+  through. Surfaced 2026-04-27 in tester's demo-prompt run.
+
 ## [0.4.15] — 2026-04-27
 
 ### Changed

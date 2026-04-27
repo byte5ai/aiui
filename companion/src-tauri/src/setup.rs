@@ -705,8 +705,29 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
         };
     }
 
-    // `uvx --help` first — verifies uv is installed at all. Then
-    // `uvx aiui-mcp --help` to verify the package can be resolved.
+    // Multi-step diagnostic probe: reports WHICH step failed so the user
+    // gets actionable feedback instead of a generic "not reachable". The
+    // earlier silent `>/dev/null 2>&1` redirects swallowed any inner
+    // stderr, leaving us with "SSH stderr: (empty)" as the entire
+    // diagnostic — useless. Now each step writes a tagged marker on
+    // success and the inner stderr flows through on failure.
+    let probe_script = r#"
+        set +e
+        if ! command -v uvx >/dev/null 2>&1; then
+            echo "STAGE:NO_UVX" >&2
+            echo "PATH=$PATH" >&2
+            exit 11
+        fi
+        echo "STAGE:UVX_FOUND $(command -v uvx)"
+        if ! uvx aiui-mcp --help >/dev/null 2>uvx_err; then
+            echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
+            cat uvx_err >&2
+            rm -f uvx_err
+            exit 12
+        fi
+        rm -f uvx_err
+        echo "STAGE:OK"
+    "#;
     let out = Command::new("ssh")
         .args([
             "-o",
@@ -715,38 +736,73 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
             "ConnectTimeout=10",
             "--",
             host_alias,
-            // bash -lc to source ~/.zshrc / ~/.bashrc so uv on the
-            // user's PATH is found even if SSH starts a non-login shell.
             "bash",
             "-lc",
-            "command -v uvx >/dev/null 2>&1 && uvx aiui-mcp --help >/dev/null 2>&1 && echo ok",
+            probe_script,
         ])
         .output();
 
     match out {
-        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" => {
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("STAGE:OK") => {
+            // Pull the uvx path out of the STAGE:UVX_FOUND line for the
+            // success message — confirms WHERE uvx was found, useful
+            // when the user is debugging PATH issues.
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let uvx_path = stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("STAGE:UVX_FOUND ").map(str::to_string))
+                .unwrap_or_default();
             StepResult {
                 ok: true,
-                message: format!("uvx aiui-mcp reachable on {host_alias}"),
-                details: None,
+                message: format!("uvx aiui-mcp erreichbar auf {host_alias}"),
+                details: if uvx_path.is_empty() {
+                    None
+                } else {
+                    Some(format!("uvx-Pfad auf Remote: {uvx_path}"))
+                },
             }
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let exit = o.status.code().unwrap_or(-1);
+            // Diagnose by exit code from the probe script
+            let (msg, hint) = match exit {
+                11 => (
+                    format!("uv ist auf {host_alias} nicht installiert"),
+                    format!(
+                        "Auf dem Remote installieren: `curl -LsSf https://astral.sh/uv/install.sh | sh`. \
+                         PATH-Diagnose:\n{stderr}"
+                    ),
+                ),
+                12 => (
+                    format!("`uvx aiui-mcp` lässt sich auf {host_alias} nicht ausführen"),
+                    format!(
+                        "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
+                         Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
+                         Detail-Output vom Remote:\n{stderr}"
+                    ),
+                ),
+                _ => (
+                    format!("Pre-Flight-Check auf {host_alias} schlug fehl (exit {exit})"),
+                    if stderr.is_empty() {
+                        "Keine Fehler-Ausgabe vom Remote. Prüfe SSH-Login zu der Maschine manuell.".into()
+                    } else {
+                        format!("SSH-Output:\n{stderr}")
+                    },
+                ),
+            };
             StepResult {
                 ok: false,
-                message: format!("uvx aiui-mcp not reachable on {host_alias}"),
-                details: Some(format!(
-                    "Install uv on the remote (https://docs.astral.sh/uv/) so `uvx aiui-mcp` resolves. \
-                     SSH stderr: {}",
-                    if stderr.is_empty() { "(empty)".to_string() } else { stderr }
-                )),
+                message: msg,
+                details: Some(hint),
             }
         }
         Err(e) => StepResult {
             ok: false,
-            message: format!("ssh probe to {host_alias} failed"),
-            details: Some(e.to_string()),
+            message: format!("SSH-Verbindung zu {host_alias} schlug fehl"),
+            details: Some(format!(
+                "Konnte ssh nicht starten: {e}. Prüfe ~/.ssh/config und Schlüssel-Auth zum Host."
+            )),
         },
     }
 }
