@@ -738,8 +738,14 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> (StepResult, Option<RemoteUvxL
         );
     }
 
-    let probe_script = r#"
+    let probe_script = r#"echo "STAGE:STARTED"
 set +e
+
+# STAGE:STARTED is the very first line so any earlier failure (set +e
+# unexpected error, environment glitch, redirect-init issue) shows up
+# as "no STAGE:STARTED" and we can tell the script never got past line
+# one. Subsequent diagnostics about host/shell/user follow.
+echo "STAGE:HOST $(hostname 2>/dev/null) shell:$0 user:$(id -un 2>/dev/null)"
 
 # uv installs into one of these locations depending on installer:
 #   /opt/homebrew/bin/uvx        Homebrew on Apple Silicon
@@ -766,31 +772,44 @@ fi
 
 echo "STAGE:UVX_FOUND $UVX"
 
-if ! "$UVX" aiui-mcp --help >/dev/null 2>uvx_err; then
+# mktemp instead of cwd-relative — current dir of an ssh-login may not
+# be writable, causing a redirect-error that aborts the script before
+# the actual uvx call.
+ERR_FILE="$(mktemp -t aiui-probe.XXXXXX)"
+if ! "$UVX" aiui-mcp --help >/dev/null 2>"$ERR_FILE"; then
     echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
-    cat uvx_err >&2
-    rm -f uvx_err
+    cat "$ERR_FILE" >&2
+    rm -f "$ERR_FILE"
     exit 12
 fi
-rm -f uvx_err
+rm -f "$ERR_FILE"
 echo "STAGE:OK"
 "#;
 
-    // Pipe the script via stdin so ssh doesn't word-split a multi-line
-    // command argument on the remote shell. `bash -ls`: -l for login
-    // shell (sources /etc/profile + ~/.profile), -s to read the script
-    // from stdin. Without -s, bash starts interactively and the piped
-    // script never reaches it — exit 0, empty output, mystery failure.
+    // Pipe the script via stdin to avoid ssh word-splitting multi-line
+    // command arguments on the remote shell. Invocation choices:
+    //   /bin/bash        absolute path — no PATH dependency before bash
+    //                    initializes its own environment
+    //   --login          source /etc/profile + ~/.profile; equivalent to
+    //                    -l but unambiguously named
+    //   -s               read script from stdin
+    //   --               end-of-options sentinel; defends against a future
+    //                    `--` interpretation of the first script byte
+    //   -T               disable TTY allocation; ssh would refuse PTY when
+    //                    stdin is a pipe anyway, but this is explicit
     let mut child = match Command::new("ssh")
         .args([
+            "-T",
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
             "--",
             host_alias,
-            "bash",
-            "-ls",
+            "/bin/bash",
+            "--login",
+            "-s",
+            "--",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -812,8 +831,15 @@ echo "STAGE:OK"
         }
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    // Take stdin out of the Child explicitly and drop it after writing.
+    // Dropping closes the pipe write-side, so bash sees EOF and exits
+    // its read loop. wait_with_output() *should* drop stdin too via the
+    // owned Self argument, but `as_mut()` keeps it alive in some
+    // versions/configurations and that's the kind of subtle pipe-stays-
+    // open bug that produces hangs or empty-output mysteries.
+    if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(probe_script.as_bytes());
+        drop(stdin);
     }
 
     let out = match child.wait_with_output() {
@@ -857,12 +883,26 @@ echo "STAGE:OK"
     }
 
     let exit = out.status.code().unwrap_or(-1);
+    let script_started = stdout.contains("STAGE:STARTED");
+    // Collapse multi-line dumps to fit the inline error banner without
+    // becoming a wall. Truncate generously enough to show the actual
+    // failure detail, but cap so we don't break the layout.
+    let truncate_at = 1500;
+    let dump = |s: &str| -> String {
+        let s = s.trim();
+        if s.len() <= truncate_at {
+            s.to_string()
+        } else {
+            format!("{}\n... (truncated, {} bytes total)", &s[..truncate_at], s.len())
+        }
+    };
     let (msg, hint) = match exit {
         11 => (
             format!("uv ist auf {host_alias} nicht installiert"),
             format!(
                 "Auf dem Remote installieren: `curl -LsSf https://astral.sh/uv/install.sh | sh`. \
-                 Diagnose:\n{stderr}"
+                 Remote-Diagnose:\n{}",
+                dump(&stderr)
             ),
         ),
         12 => (
@@ -870,16 +910,31 @@ echo "STAGE:OK"
             format!(
                 "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
                  Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
-                 Detail-Output vom Remote:\n{stderr}"
+                 Detail-Output vom Remote:\n{}",
+                dump(&stderr)
+            ),
+        ),
+        _ if !script_started => (
+            format!("Probe-Script kam nicht beim Remote an (exit {exit})"),
+            format!(
+                "Der ssh-Aufruf war erfolgreich, aber das Probe-Script hat keine Markierung ausgegeben — \
+                 vermutlich wird die Login-Shell auf {host_alias} durch eine ProxyCommand-, ForceCommand- \
+                 oder andere ssh-Wrapper-Konfiguration umgeleitet, die unseren `bash -ls`-Aufruf \
+                 nicht ausführt. Probier auf dem Mac: \
+                 `ssh -o BatchMode=yes {host_alias} bash -ls </dev/null` — sollte ohne Fehler beenden.\n\n\
+                 stdout vom ssh-Aufruf:\n{}\n\nstderr vom ssh-Aufruf:\n{}",
+                dump(&stdout),
+                dump(&stderr)
             ),
         ),
         _ => (
             format!("Pre-Flight-Check auf {host_alias} schlug fehl (exit {exit})"),
-            if stderr.is_empty() {
-                "Keine Fehler-Ausgabe vom Remote. Prüfe SSH-Login zu der Maschine manuell.".into()
-            } else {
-                format!("SSH-Output:\n{stderr}")
-            },
+            format!(
+                "Probe-Script lief an, hat aber kein STAGE:OK ausgegeben.\n\n\
+                 stdout vom Remote:\n{}\n\nstderr vom Remote:\n{}",
+                dump(&stdout),
+                dump(&stderr)
+            ),
         ),
     };
     (
