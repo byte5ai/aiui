@@ -34,6 +34,7 @@
   let confirmUninstall = $state(false);
   let uninstallDone = $state(false);
   let demoCopied = $state(false);
+  let step1Expanded = $state(false);
   let timer: number | undefined;
 
   async function refresh() {
@@ -220,70 +221,105 @@
     {/if}
 
     {#if status.welcome_pending}
-      <!-- Welcome banner doubles as the live setup health-check. Each row
-        reflects a real condition checked at refresh-time, not just a static
-        promise — fixes the v0.4.x bug where "everything ready" appeared
-        even if the MCP entry hadn't actually been written. -->
+      <!-- Welcome banner is a 3-step wizard on a single pane. Each step
+        is its own visually-distinct row with a numbered marker, a title,
+        a one-line body, and (for steps 2-3) a primary CTA button.
+        Step 1 collapses to a one-liner when all four checks pass —
+        avoids vertical bloat in the common case. Issue raised by tester
+        2026-04-27: "viel zu scrollen … vielleicht wäre ein Wizard". -->
+      {@const checks = [
+        { ok: status.claude_config_ok, key: "desktop" },
+        { ok: status.claude_code_config_ok, key: "code" },
+        { ok: status.skill_installed, key: "skill" },
+        { ok: !status.http_error, key: "http" },
+      ]}
+      {@const failingCount = checks.filter((c) => !c.ok).length}
+      {@const allOk = failingCount === 0}
       <section class="welcome">
         <div class="welcome-head">
           <strong>{$_("settings.welcome.title")}</strong>
           <button class="welcome-dismiss" onclick={dismissWelcome} aria-label={$_("settings.welcome.dismiss")}>×</button>
         </div>
-        <p class="welcome-body">{$_("settings.welcome.body")}</p>
-        <ul class="check-list">
-          <li class:ok={status.claude_config_ok} class:miss={!status.claude_config_ok}>
-            <span class="check-mark"></span>
-            {status.claude_config_ok
-              ? $_("settings.welcome.check.desktop.ok")
-              : $_("settings.welcome.check.desktop.miss")}
-          </li>
-          <li class:ok={status.claude_code_config_ok} class:miss={!status.claude_code_config_ok}>
-            <span class="check-mark"></span>
-            {status.claude_code_config_ok
-              ? $_("settings.welcome.check.code.ok")
-              : $_("settings.welcome.check.code.miss")}
-          </li>
-          <li class:ok={status.skill_installed} class:miss={!status.skill_installed}>
-            <span class="check-mark"></span>
-            {status.skill_installed
-              ? $_("settings.welcome.check.skill.ok")
-              : $_("settings.welcome.check.skill.miss")}
-          </li>
-          <li class:ok={!status.http_error} class:miss={!!status.http_error}>
-            <span class="check-mark"></span>
-            {status.http_error
-              ? $_("settings.welcome.check.http.miss", { values: { port: status.http_port } })
-              : $_("settings.welcome.check.http.ok")}
-          </li>
-        </ul>
+        <p class="welcome-intro">{$_("settings.welcome.intro")}</p>
 
-        <div class="welcome-action">
-          <span class="welcome-action-label">{$_("settings.welcome.next.restart")}</span>
-          <button onclick={restartClaude} disabled={busy} title={$_("settings.restart.hint")}>
-            {status.claude_desktop_running
-              ? $_("settings.welcome.next.restart_button.restart")
-              : $_("settings.welcome.next.restart_button.start")}
-          </button>
+        <!-- Step 1 — setup checks. Collapsed to summary when all green. -->
+        <div class="step" class:step-ok={allOk} class:step-fail={!allOk}>
+          <div class="step-marker">1</div>
+          <div class="step-content">
+            <div class="step-title-row">
+              <span class="step-title">{$_("settings.welcome.step1.title")}</span>
+              <span class="step-summary">
+                {allOk
+                  ? $_("settings.welcome.step1.summary_ok")
+                  : $_("settings.welcome.step1.summary_fail", { values: { n: failingCount } })}
+              </span>
+              {#if !allOk || step1Expanded}
+                <button class="step-toggle" onclick={() => (step1Expanded = !step1Expanded)}>
+                  {step1Expanded
+                    ? $_("settings.welcome.step1.collapse")
+                    : $_("settings.welcome.step1.expand")}
+                </button>
+              {:else}
+                <button class="step-toggle" onclick={() => (step1Expanded = true)}>
+                  {$_("settings.welcome.step1.expand")}
+                </button>
+              {/if}
+            </div>
+            {#if step1Expanded || !allOk}
+              <ul class="check-list">
+                {#each checks as c}
+                  <li class:ok={c.ok} class:miss={!c.ok}>
+                    <span class="check-mark"></span>
+                    {#if c.key === "desktop"}
+                      {c.ok ? $_("settings.welcome.check.desktop.ok") : $_("settings.welcome.check.desktop.miss")}
+                    {:else if c.key === "code"}
+                      {c.ok ? $_("settings.welcome.check.code.ok") : $_("settings.welcome.check.code.miss")}
+                    {:else if c.key === "skill"}
+                      {c.ok ? $_("settings.welcome.check.skill.ok") : $_("settings.welcome.check.skill.miss")}
+                    {:else}
+                      {c.ok
+                        ? $_("settings.welcome.check.http.ok")
+                        : $_("settings.welcome.check.http.miss", { values: { port: status.http_port } })}
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
         </div>
 
-        <!-- Demo section. Tells the user what aiui can do *in Claude*, gives
-          them a copyable prompt that exercises the main widgets (tabs +
-          sortable + checkboxes + slider + color + action-buttons), and
-          flags the most common gotcha (forgetting to restart Claude
-          Desktop after install). The prompt itself is not displayed —
-          the user copies, pastes, runs, sees the wow. Issue #70 (revised
-          for v0.4.11). -->
-        <div class="demo-block">
-          <div class="demo-title">{$_("settings.welcome.demo.title")}</div>
-          <p class="demo-intro">{$_("settings.welcome.demo.intro")}</p>
-          <button class="demo-copy primary" onclick={copyDemoPrompt}>
-            {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
-          </button>
-          <p class="demo-scope">{$_("settings.welcome.demo.scope")}</p>
+        <!-- Step 2 — Claude Desktop restart. Imperative, primary blue
+          button. This is the must-do action after fresh install; tester
+          missed it on v0.4.13 because it looked optional. -->
+        <div class="step">
+          <div class="step-marker">2</div>
+          <div class="step-content">
+            <div class="step-title">{$_("settings.welcome.step2.title")}</div>
+            <p class="step-body">{$_("settings.welcome.step2.body")}</p>
+            <button class="primary" onclick={restartClaude} disabled={busy} title={$_("settings.restart.hint")}>
+              {status.claude_desktop_running
+                ? $_("settings.welcome.step2.button.restart")
+                : $_("settings.welcome.step2.button.start")}
+            </button>
+          </div>
+        </div>
+
+        <!-- Step 3 — copy demo prompt and paste in Claude. Verification
+          step; primary blue button, matches step 2 hierarchy. -->
+        <div class="step">
+          <div class="step-marker">3</div>
+          <div class="step-content">
+            <div class="step-title">{$_("settings.welcome.step3.title")}</div>
+            <p class="step-body">{$_("settings.welcome.step3.body")}</p>
+            <button class="primary" onclick={copyDemoPrompt}>
+              {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
+            </button>
+            <p class="step-tail">{$_("settings.welcome.step3.tail")}</p>
+          </div>
         </div>
 
         <div class="welcome-foot">
-          <button class="primary" onclick={dismissWelcome}>{$_("settings.welcome.cta")}</button>
+          <button class="welcome-cta" onclick={dismissWelcome}>{$_("settings.welcome.cta")}</button>
         </div>
       </section>
     {/if}
@@ -587,20 +623,88 @@
     border-radius: 4px;
   }
   .welcome-dismiss:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
-  .welcome-body {
-    margin: 0;
+  .welcome-intro {
+    margin: 0 0 4px 0;
     font-size: 12.5px;
     color: var(--muted);
     line-height: 1.5;
   }
+
+  /* --- numbered step rows --- */
+  .step {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .step-marker {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: white;
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+  }
+  .step-ok .step-marker { background: var(--success); }
+  .step-fail .step-marker { background: var(--warning); }
+  .step-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .step-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .step-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .step-summary {
+    flex: 1;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .step-toggle {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: var(--accent);
+    font-size: 11.5px;
+    padding: 0;
+    cursor: pointer;
+  }
+  .step-toggle:hover { text-decoration: underline; }
+  .step-body {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .step-tail {
+    margin: 4px 0 0 0;
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
   .check-list {
     list-style: none;
-    margin: 4px 0 0 0;
+    margin: 0;
     padding: 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12.5px;
+    font-size: 12px;
   }
   .check-list li {
     display: flex;
@@ -619,54 +723,21 @@
   .check-list li.ok .check-mark { background: var(--success); }
   .check-list li.miss .check-mark { background: var(--warning); }
 
-  .welcome-action {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 6px;
-  }
-  .welcome-action-label {
-    font-size: 12.5px;
-    color: var(--muted);
-    flex: 1;
-  }
-
-  .demo-block {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-    padding: 10px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 4px;
-  }
-  .demo-title {
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--fg);
-  }
-  .demo-intro {
-    margin: 0;
-    font-size: 12.5px;
-    color: var(--fg);
-    line-height: 1.5;
-  }
-  .demo-copy {
-    align-self: flex-start;
-  }
-  .demo-scope {
-    margin: 4px 0 0 0;
-    font-size: 11.5px;
-    color: var(--muted);
-    line-height: 1.45;
-  }
-
   .welcome-foot {
     display: flex;
     justify-content: flex-end;
-    margin-top: 6px;
+    margin-top: 4px;
   }
+  .welcome-cta {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: var(--muted);
+    font-size: 11.5px;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  .welcome-cta:hover { color: var(--fg); text-decoration: underline; }
 
   /* --- modal (uninstall-done) --- */
   .modal-backdrop {
