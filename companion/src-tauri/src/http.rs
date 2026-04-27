@@ -68,6 +68,12 @@ struct RenderResponse {
     id: String,
     cancelled: bool,
     result: serde_json::Value,
+    /// Cancellation reason if the dialog ended without a user submit —
+    /// `ttl_expired`, `evicted`, `channel_dropped`. Omitted on normal
+    /// user-driven submit/cancel. Lets MCP callers distinguish "user
+    /// said no" from "we gave up". Issue #H-5 in v0.4.10 review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Composite health response. `ready` is true only when every sub-check is
@@ -448,18 +454,34 @@ async fn render(
     // while ago, reload the WebView before serving this one. Catches
     // accumulated drift (sleep/wake artefacts, stuck event listeners)
     // *exactly* when it would matter — not on a wall-clock timer.
+    //
+    // Important: never reload while a previous dialog is still pending.
+    // The reload tears down the WebView's JS state including any active
+    // dialog the user might be looking at, and the still-awaiting
+    // `/render` handler would get a `channel_dropped` cancellation
+    // instead of the user's actual answer. Only reload when the registry
+    // is empty. Issue #H-6 in v0.4.10 review.
     {
         let last = *state.last_render_at.lock().unwrap();
+        let pending = state.dialog.stats().orphan_count;
         if state.started_at.elapsed() > IDLE_RESTART_UPTIME
             && last.elapsed() > IDLE_RESTART_QUIET
+            && pending == 0
         {
             trace(&format!(
-                "render: idle-restart trigger (uptime {:?}, last_render {:?} ago)",
+                "render: idle-restart trigger (uptime {:?}, last_render {:?} ago, registry empty)",
                 state.started_at.elapsed(),
                 last.elapsed()
             ));
             reload_main_webview(&state.app);
             tokio::time::sleep(RELOAD_SETTLE).await;
+        } else if state.started_at.elapsed() > IDLE_RESTART_UPTIME
+            && last.elapsed() > IDLE_RESTART_QUIET
+        {
+            trace(&format!(
+                "render: idle-restart suppressed — {} pending dialog(s) in registry",
+                pending
+            ));
         }
     }
 
@@ -548,6 +570,7 @@ async fn render(
             id: id.clone(),
             cancelled: true,
             result: serde_json::Value::Null,
+            reason: Some("channel_dropped".into()),
         },
         Err(_) => {
             // TTL expired without user response. Cancel the registry
@@ -583,6 +606,7 @@ async fn render(
         id: result.id,
         cancelled: result.cancelled,
         result: result.result,
+        reason: result.reason,
     })
     .into_response()
 }

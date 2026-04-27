@@ -1,6 +1,7 @@
 mod ack;
 mod config;
 mod dialog;
+mod fsutil;
 mod housekeeping;
 mod http;
 mod lifetime;
@@ -126,7 +127,7 @@ async fn status(
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<StatusReport, String> {
     let bin = setup::app_binary_path();
-    let http_alive = probe_http_self(cfg.http_port).await;
+    let http_alive = probe_http_self(&cfg).await;
     Ok(StatusReport {
         app_binary_path: bin.clone(),
         token_path: cfg.token_path.display().to_string(),
@@ -144,21 +145,40 @@ async fn status(
     })
 }
 
-/// Quick TCP self-connect to verify our own HTTP server is actually
-/// accepting connections. Done from Rust because a WebView `fetch()`
-/// would be ATS-blocked on macOS for plaintext localhost. 200ms timeout
-/// is plenty for loopback — if the server can't accept in that window
-/// we treat it as down. Issue #77.
-async fn probe_http_self(port: u16) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+/// Authenticated HTTP self-probe to verify our own HTTP server is
+/// actually serving aiui. A naked TCP connect would lie positive when an
+/// SSH-session squatter or any other process happens to hold the port in
+/// LISTEN — the kernel answers SYN regardless of who's behind it. Issue
+/// #77 (revised in v0.4.10): we hit `/probe` with our bearer token and
+/// verify the response carries the aiui marker. Anything else (squatter
+/// without our token, non-aiui content, timeout) reads as "down".
+///
+/// 500 ms timeout to cover token-read + HTTP round-trip + JSON parse
+/// over loopback; this stays well under the Settings refresh interval.
+async fn probe_http_self(cfg: &config::AppConfig) -> bool {
+    let token = match std::fs::read_to_string(&cfg.token_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+    let url = format!("http://127.0.0.1:{}/probe", cfg.http_port);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let resp = match client.get(&url).bearer_auth(&token).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return false,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    body.get("aiui")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Marks the welcome banner as dismissed so it doesn't reappear on the
@@ -265,6 +285,30 @@ async fn add_remote(
     }
 
     let mut results = Vec::new();
+
+    // Pre-flight: verify `uvx aiui-mcp` actually resolves on the remote
+    // before we touch any persistent state. Without this, add_remote
+    // silently writes `{"command": "uvx", "args": ["aiui-mcp"]}` to a
+    // ~/.claude.json on a host that has no uv installed — every Claude
+    // tool call afterwards errors with a confusing "command not found".
+    // Issue #H-3 in v0.4.10 review (also part of #81 Linux-devhost).
+    let reach_step = setup::check_remote_aiui_mcp(&host_alias);
+    let reach_ok = reach_step.ok;
+    results.push(reach_step);
+    if !reach_ok {
+        // Bail before persisting. Token push, ssh-config edit, tunnel
+        // start — none of it is useful if the MCP entry won't resolve.
+        results.push(setup::StepResult {
+            ok: false,
+            message: format!(
+                "Setup für '{host_alias}' abgebrochen — uvx aiui-mcp ist auf dem Host nicht erreichbar."
+            ),
+            details: Some(
+                "Installiere uv auf dem Remote (https://docs.astral.sh/uv/) und versuche es erneut.".into(),
+            ),
+        });
+        return Ok(results);
+    }
 
     // Legacy cleanup: earlier versions (≤ v0.1.1) patched the user's
     // ~/.ssh/config with a RemoteForward line. aiui now owns the tunnel

@@ -20,6 +20,10 @@
 #   scripts/release.sh 0.1.2
 #   scripts/release.sh 0.1.2 --dry
 set -euo pipefail
+# Pipefail surfaces silent failures in any stage of a `|`-chain
+# (e.g. `grep | head` where grep failed). `nounset` catches typos in
+# variable names. `errexit` aborts on first command failure. All three
+# together = no half-run releases. Issue #L-1 in v0.4.10 review.
 
 VERSION="${1:-}"
 DRY="${2:-}"
@@ -58,9 +62,21 @@ DIRECT_DMG="${REPO_ROOT}/aiui-${VERSION}-arm64.dmg"
 UPDATER_BUNDLE="${APP_DIR}/aiui.app.tar.gz"
 UPDATER_SIG="${UPDATER_BUNDLE}.sig"
 
-echo "→ Checking Cargo.toml version"
+echo "→ Checking version sync (Cargo.toml ↔ tauri.conf.json)"
+# Three places need to agree on the version:
+#   - Cargo.toml `version` (drives the build)
+#   - tauri.conf.json `version` (drives the bundled Info.plist)
+#   - the `${VERSION}` argument to this script (drives the tag/release)
+# Any drift produces a bundle whose CFBundleShortVersionString doesn't
+# match what the in-app updater reports — that's how #82 happened.
+# Issue C-3 in v0.4.10 review.
 if ! grep -q "^version = \"${VERSION}\"" companion/src-tauri/Cargo.toml; then
   echo "  Cargo.toml version does not match ${VERSION} — bump it first." >&2
+  exit 1
+fi
+TAURI_CONF_VERSION="$(python3 -c 'import json,sys;print(json.load(open("companion/src-tauri/tauri.conf.json"))["version"])')"
+if [[ "${TAURI_CONF_VERSION}" != "${VERSION}" ]]; then
+  echo "  tauri.conf.json version is ${TAURI_CONF_VERSION}, expected ${VERSION} — bump it." >&2
   exit 1
 fi
 
@@ -69,6 +85,16 @@ echo "→ Building frontend"
 
 echo "→ Building Tauri release (signs .app + emits .app.tar.gz + .sig for updater)"
 (cd companion && npx tauri build --target aarch64-apple-darwin)
+
+# Verify the bundled Info.plist actually carries the expected version. The
+# in-app updater reads CFBundleShortVersionString to decide what's
+# "current"; a mismatch reproduces #82 as soon as the next update lands.
+PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_SRC}/Contents/Info.plist")"
+if [[ "${PLIST_VERSION}" != "${VERSION}" ]]; then
+  echo "  Bundled Info.plist version is ${PLIST_VERSION}, expected ${VERSION} — Tauri produced a drifted bundle. Aborting." >&2
+  exit 1
+fi
+echo "  ✓ Info.plist version = ${PLIST_VERSION}"
 
 echo "→ Codesigning ${APP_SRC}"
 codesign --force --deep --options runtime \

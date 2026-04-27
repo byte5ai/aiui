@@ -122,10 +122,21 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
 
     trace("mcp-stdio: run_stdio entered");
 
+    // Track the wall-clock instant of the last incoming line so we can
+    // double-check the idle deadline after a sleep. `tokio::time::sleep`
+    // is monotonic-clock based and *should* compose correctly across
+    // suspend/resume on macOS, but we've seen reports of timer-drift
+    // edge cases — verifying with `Instant::now()` on wake is cheap
+    // insurance against premature exit. Issue #H-4 in v0.4.10 review.
+    let mut last_activity = std::time::Instant::now();
+
     loop {
         let line = tokio::select! {
             res = reader.next_line() => match res {
-                Ok(Some(l)) => l,
+                Ok(Some(l)) => {
+                    last_activity = std::time::Instant::now();
+                    l
+                }
                 Ok(None) => {
                     trace("mcp-stdio: stdin closed, exiting");
                     return;
@@ -136,11 +147,23 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
                 }
             },
             _ = tokio::time::sleep(STDIN_IDLE_LIMIT) => {
+                // Double-check actual elapsed time before exiting. If the
+                // host suspended for a long stretch, the sleep can fire
+                // earlier than expected after wake; bail out only if the
+                // wall-clock confirms we've actually been idle.
+                let elapsed = last_activity.elapsed();
+                if elapsed >= STDIN_IDLE_LIMIT {
+                    trace(&format!(
+                        "mcp-stdio: no input for {:?}, parent likely gone, exiting",
+                        elapsed
+                    ));
+                    return;
+                }
                 trace(&format!(
-                    "mcp-stdio: no input for {:?}, parent likely gone, exiting",
-                    STDIN_IDLE_LIMIT
+                    "mcp-stdio: idle-timer fired but only {:?} elapsed (likely post-suspend); rearming",
+                    elapsed
                 ));
-                return;
+                continue;
             }
         };
 

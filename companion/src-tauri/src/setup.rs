@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
+use crate::fsutil::atomic_write;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -81,11 +82,8 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
         };
     }
 
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
     let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
-    match fs::write(&path, pretty) {
+    match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
             message: match (was_present, had_legacy) {
@@ -389,7 +387,7 @@ pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
         };
     }
     let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
-    match fs::write(&path, pretty) {
+    match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => {
             let msg = match (was_present, previous_kind) {
                 (true, Some(AiuiEntryKind::LegacyUvx)) => {
@@ -467,7 +465,7 @@ pub fn remove_claude_code_config() -> StepResult {
         };
     }
     let pretty = serde_json::to_string_pretty(&v).unwrap();
-    match fs::write(&path, pretty) {
+    match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
             message: if had {
@@ -526,7 +524,7 @@ pub fn remove_claude_desktop_config() -> StepResult {
         };
     }
     let pretty = serde_json::to_string_pretty(&v).unwrap();
-    match fs::write(&path, pretty) {
+    match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
             message: if had {
@@ -620,7 +618,7 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
             details: Some(e.to_string()),
         };
     }
-    match fs::write(&path, out) {
+    match atomic_write(&path, out.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
             message: if changed {
@@ -684,6 +682,73 @@ print("ok")
             },
         }
     })
+}
+
+/// Probe whether `uvx aiui-mcp` actually works on the remote BEFORE we
+/// persist the host. Without this check, `add_remote` happily writes the
+/// `~/.claude.json` entry pointing at `uvx aiui-mcp` even on hosts where
+/// `uv`/`uvx` aren't installed — Claude Code then errors at every tool
+/// call with a confusing "command not found" the user has to chase
+/// through logs. Issue #H-3 in v0.4.10 review.
+///
+/// Returns Ok if `uvx aiui-mcp --help` (lightweight, doesn't do network)
+/// returns successfully on the remote. Returns Err with a hint on what's
+/// missing otherwise.
+pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
+    use std::process::Command;
+
+    if !is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
+
+    // `uvx --help` first — verifies uv is installed at all. Then
+    // `uvx aiui-mcp --help` to verify the package can be resolved.
+    let out = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "--",
+            host_alias,
+            // bash -lc to source ~/.zshrc / ~/.bashrc so uv on the
+            // user's PATH is found even if SSH starts a non-login shell.
+            "bash",
+            "-lc",
+            "command -v uvx >/dev/null 2>&1 && uvx aiui-mcp --help >/dev/null 2>&1 && echo ok",
+        ])
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" => {
+            StepResult {
+                ok: true,
+                message: format!("uvx aiui-mcp reachable on {host_alias}"),
+                details: None,
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            StepResult {
+                ok: false,
+                message: format!("uvx aiui-mcp not reachable on {host_alias}"),
+                details: Some(format!(
+                    "Install uv on the remote (https://docs.astral.sh/uv/) so `uvx aiui-mcp` resolves. \
+                     SSH stderr: {}",
+                    if stderr.is_empty() { "(empty)".to_string() } else { stderr }
+                )),
+            }
+        }
+        Err(e) => StepResult {
+            ok: false,
+            message: format!("ssh probe to {host_alias} failed"),
+            details: Some(e.to_string()),
+        },
+    }
 }
 
 /// Run a Python script on a remote host via `ssh ... python3 -` with the
@@ -854,10 +919,8 @@ pub fn load_remotes() -> Vec<String> {
 
 pub fn save_remotes(list: &[String]) -> std::io::Result<()> {
     let p = remotes_path();
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&p, serde_json::to_string_pretty(list).unwrap())
+    let json = serde_json::to_string_pretty(list).unwrap();
+    atomic_write(&p, json.as_bytes())
 }
 
 #[cfg(test)]
