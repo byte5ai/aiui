@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.18] — 2026-04-27
+
+### Fixed
+
+- **Reachability probe actually runs the script.** v0.4.17 changed the
+  invocation to pipe the script via SSH stdin and switched to `bash -l`,
+  but missed the `-s` flag — without it, bash doesn't read the script
+  from stdin, starts interactively (or hangs until TTY timeout), exits
+  0 with empty output. User saw "Pre-Flight-Check schlug fehl
+  (exit 0)" with no diagnostic. Now `bash -ls` (login + read-from-stdin),
+  matching the existing `python3 -` pattern in `run_remote_python`.
+
 ## [0.4.17] — 2026-04-27
 
 ### Fixed
