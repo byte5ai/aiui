@@ -738,14 +738,13 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> (StepResult, Option<RemoteUvxL
         );
     }
 
-    let probe_script = r#"
+    let probe_script = r#"echo "STAGE:STARTED"
 set +e
 
-# Visibility marker so the rust side knows the script reached and
-# entered the remote bash. If this never lands in stdout, the issue is
-# upstream of the script (ssh transport, shell wrapper rewriting cmd,
-# etc) — not in our logic.
-echo "STAGE:STARTED $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# STAGE:STARTED is the very first line so any earlier failure (set +e
+# unexpected error, environment glitch, redirect-init issue) shows up
+# as "no STAGE:STARTED" and we can tell the script never got past line
+# one. Subsequent diagnostics about host/shell/user follow.
 echo "STAGE:HOST $(hostname 2>/dev/null) shell:$0 user:$(id -un 2>/dev/null)"
 
 # uv installs into one of these locations depending on installer:
@@ -787,21 +786,30 @@ rm -f "$ERR_FILE"
 echo "STAGE:OK"
 "#;
 
-    // Pipe the script via stdin so ssh doesn't word-split a multi-line
-    // command argument on the remote shell. `bash -ls`: -l for login
-    // shell (sources /etc/profile + ~/.profile), -s to read the script
-    // from stdin. Without -s, bash starts interactively and the piped
-    // script never reaches it — exit 0, empty output, mystery failure.
+    // Pipe the script via stdin to avoid ssh word-splitting multi-line
+    // command arguments on the remote shell. Invocation choices:
+    //   /bin/bash        absolute path — no PATH dependency before bash
+    //                    initializes its own environment
+    //   --login          source /etc/profile + ~/.profile; equivalent to
+    //                    -l but unambiguously named
+    //   -s               read script from stdin
+    //   --               end-of-options sentinel; defends against a future
+    //                    `--` interpretation of the first script byte
+    //   -T               disable TTY allocation; ssh would refuse PTY when
+    //                    stdin is a pipe anyway, but this is explicit
     let mut child = match Command::new("ssh")
         .args([
+            "-T",
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
             "--",
             host_alias,
-            "bash",
-            "-ls",
+            "/bin/bash",
+            "--login",
+            "-s",
+            "--",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -823,8 +831,15 @@ echo "STAGE:OK"
         }
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    // Take stdin out of the Child explicitly and drop it after writing.
+    // Dropping closes the pipe write-side, so bash sees EOF and exits
+    // its read loop. wait_with_output() *should* drop stdin too via the
+    // owned Self argument, but `as_mut()` keeps it alive in some
+    // versions/configurations and that's the kind of subtle pipe-stays-
+    // open bug that produces hangs or empty-output mysteries.
+    if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(probe_script.as_bytes());
+        drop(stdin);
     }
 
     let out = match child.wait_with_output() {

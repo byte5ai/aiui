@@ -6,21 +6,31 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
-- **Reachability probe is now actually diagnostic.** v0.4.18 still
-  produced `(exit 0)` with empty output for the macmini test case.
-  The catchall error path was hiding stdout (only stderr was shown).
-  Now: probe emits a `STAGE:STARTED` marker at the top so we can tell
-  if the script reached the remote at all; the error UI shows BOTH
-  stdout and stderr (truncated to 1500 chars each); and the catchall
-  branches into "script never reached the remote" vs "script ran but
-  no STAGE:OK", with the former pointing at SSH-wrapper-configurations
-  (ProxyCommand / ForceCommand) as a likely cause.
-- **Probe writes its temp error-file via `mktemp`** instead of
-  current-working-directory. ssh-login may land in a directory that's
-  not writable, in which case the bare `2>uvx_err` redirect would
-  abort the script — silently — before the actual uvx call. Fixes
-  exactly the scenario where the script ran but produced no STAGE
-  output.
+- **Reachability probe diagnostics rewritten end-to-end.** v0.4.18 still
+  produced `(exit 0)` with empty output for the macmini test case;
+  Codex code review identified the cwd-relative `2>uvx_err` redirect
+  as the most likely silent-abort cause. Hardenings, in order of how
+  much each one mattered:
+  - Probe emits `STAGE:STARTED` as the very first line, before `set +e`
+    even runs. If this marker is missing, the script never made it
+    past line one and the failure is upstream of our logic.
+  - Temp-file for `uvx aiui-mcp --help` stderr now goes through
+    `mktemp` instead of cwd. ssh-login may land in a directory that's
+    not writable, in which case `2>uvx_err` would silently abort the
+    script before any STAGE marker gets emitted.
+  - SSH invocation is now `ssh -T ... /bin/bash --login -s --`:
+    absolute bash path (no PATH dependency before bash sets up its
+    env), explicit `--login` long form, `-s` for stdin, `--`
+    end-of-options sentinel, `-T` to disable PTY allocation
+    explicitly.
+  - Rust takes `child.stdin` out and drops it explicitly after
+    writing, so bash on the remote sees EOF immediately. Previous
+    code used `as_mut()` which kept the pipe open through
+    wait_with_output and could produce hangs / empty output in some
+    runtime configurations.
+  - Catchall error path now shows BOTH stdout and stderr (truncated to
+    1500 chars each), with separate branches for "script never reached
+    the remote" (no STAGE:STARTED) vs "script ran but no STAGE:OK".
 
 ## [0.4.18] — 2026-04-27
 
