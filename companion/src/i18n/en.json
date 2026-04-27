@@ -2,7 +2,8 @@
   "app": {
     "title": "aiui",
     "status.connected": "Registered in Claude Desktop · port {port}",
-    "status.not_connected": "Claude Desktop config will be set automatically on next launch"
+    "status.not_connected": "Claude Desktop config will be set automatically on next launch",
+    "status.background": "Runs in the background — close this window any time"
   },
   "settings": {
     "http_error.title": "aiui can't accept requests",
@@ -23,7 +24,7 @@
     "welcome.demo.title": "First steps in Claude",
     "welcome.demo.intro": "Fastest path: copy the demo prompt and paste it into a Claude Code or Claude Desktop session. Shows a sortable list, select box, checkboxes, slider, color picker and colored action buttons — all in one window with tabs.",
     "welcome.demo.scope": "Reaches Claude Code and Claude Desktop. If a fresh chat doesn't respond with a window: restart Claude Desktop via the button above — MCP tools are only loaded at app launch.",
-    "welcome.demo.prompt": "Build me an aiui demo. Use `form` with tabs.\n\nTab 1 “Game”: A sortable list with 8 random world cities in wrong order. Task: sort them by population, descending.\n\nTab 2 “About me”: Select for my mood today, two checkboxes with everyday self-statements, slider 0–10 for something personal, color picker for my favorite color.\n\nTab 3 “Action”: Three action buttons with different styles — Submit (success green), Cancel (neutral), Destructive (red) “Reset everything”.\n\nMake up the concrete content (city list, checkbox statements, slider question, mood options) yourself and use the language of this session. When I answer, tell me how close I was to the correct city order and give a short witty take on the rest of my answers.",
+    "welcome.demo.prompt": "Build me an aiui demo with `form` and two tabs:\n\n“Game” — sortable list (`kind: \"list\"`, `sortable: true`, `items: [{label, value}, …]`) with 8 random world cities in wrong order. Task: sort them by population, descending.\n\n“About me” — select for my mood, two checkboxes with everyday self-statements, slider 0–10 for something personal, color picker for my favorite color.\n\nPlus three buttons in the form-level `actions` array (bottom row): Submit (success), Cancel (neutral), Destructive (red) “Reset everything”.\n\nMake up the concrete content yourself, in the language of this session. When I answer: tell me how close I was to the correct city order and give a short witty take on the rest of my answers.",
     "welcome.demo.copy": "Copy demo prompt",
     "welcome.demo.copied": "Copied ✓",
     "welcome.cta": "Got it",

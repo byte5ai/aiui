@@ -2,7 +2,8 @@
   "app": {
     "title": "aiui",
     "status.connected": "In Claude Desktop eingetragen · Port {port}",
-    "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt"
+    "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt",
+    "status.background": "Läuft im Hintergrund — Fenster jederzeit schließbar"
   },
   "settings": {
     "http_error.title": "aiui nimmt keine Requests entgegen",
@@ -23,7 +24,7 @@
     "welcome.demo.title": "Erste Schritte in Claude",
     "welcome.demo.intro": "Das Schnellste: kopier den Demo-Prompt und füg ihn in eine Claude-Code- oder Claude-Desktop-Session ein. Zeigt sortable Liste, Selectbox, Checkboxen, Slider, Color-Picker und bunte Action-Buttons — alles in einem Fenster mit Tabs.",
     "welcome.demo.scope": "Erreicht Claude Code und Claude Desktop. Wenn ein neuer Chat nicht mit einem Fenster reagiert: einmal Claude Desktop über den Button oben neu starten — MCP-Tools werden nur beim App-Start eingelesen.",
-    "welcome.demo.prompt": "Bau mir eine aiui-Demo. Nutze `form` mit Tabs.\n\nTab 1 „Spiel\": Eine sortable Liste mit 8 zufälligen Weltstädten in falscher Reihenfolge. Aufgabe: nach Einwohnerzahl absteigend sortieren.\n\nTab 2 „Über mich\": Selectbox für meine Stimmung heute, zwei Checkboxen mit alltäglichen Selbst-Aussagen, Slider 0–10 für etwas Persönliches, Color-Picker für meine Lieblingsfarbe.\n\nTab 3 „Aktion\": Drei Action-Buttons mit unterschiedlichen Stilen — Submit (success-grün), Cancel (neutral), Destructive (rot) „Reset alles\".\n\nGeneriere die konkreten Inhalte (Städte-Liste, Checkbox-Aussagen, Slider-Frage, Mood-Optionen) selbst und nutze die Sprache dieser Session. Wenn ich antworte, sag mir wie nah ich an der korrekten Städte-Sortierung war und gib eine kurze witzige Auswertung der restlichen Antworten.",
+    "welcome.demo.prompt": "Bau mir eine aiui-Demo mit `form` und zwei Tabs:\n\n„Spiel\" — sortierbare Liste (`kind: \"list\"`, `sortable: true`, `items: [{label, value}, …]`) mit 8 zufälligen Weltstädten in falscher Reihenfolge. Aufgabe: nach Einwohnerzahl absteigend sortieren.\n\n„Über mich\" — Selectbox für meine Stimmung, zwei Checkboxen mit alltäglichen Selbst-Aussagen, Slider 0–10 zu etwas Persönlichem, Color-Picker für meine Lieblingsfarbe.\n\nDazu drei Buttons im Form-`actions`-Array (form-level, untere Button-Zeile): Submit (success), Cancel (neutral), Destructive (rot) „Reset alles\".\n\nInhalte selbst generieren, in der Sprache dieser Session. Wenn ich antworte: sag mir wie nah ich an der korrekten Städte-Sortierung war und gib eine kurze witzige Auswertung der restlichen Antworten.",
     "welcome.demo.copy": "Demo-Prompt kopieren",
     "welcome.demo.copied": "Kopiert ✓",
     "welcome.cta": "Verstanden",
