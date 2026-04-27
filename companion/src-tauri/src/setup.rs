@@ -772,15 +772,21 @@ fi
 
 echo "STAGE:UVX_FOUND $UVX"
 
-# mktemp instead of cwd-relative — current dir of an ssh-login may not
-# be writable, causing a redirect-error that aborts the script before
-# the actual uvx call.
+# Verify uvx itself is callable. Earlier versions tried `uvx aiui-mcp
+# --help` here as a "does the package resolve from PyPI" probe — but
+# aiui-mcp has no `--help` handler; the flag gets ignored and the full
+# MCP server starts, blocking on stdin. Bash hangs on the child, ssh
+# eventually truncates output, the script never reaches STAGE:OK.
+# Better: trust that if `uvx` itself is healthy, `uvx aiui-mcp` will
+# resolve at first-tool-call time — and fail there with a clear error
+# from Claude Code if PyPI is unreachable. Cheap, idempotent, no
+# server side-effects.
 ERR_FILE="$(mktemp -t aiui-probe.XXXXXX)"
-if ! "$UVX" aiui-mcp --help >/dev/null 2>"$ERR_FILE"; then
-    echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
+if ! "$UVX" --version >/dev/null 2>"$ERR_FILE"; then
+    echo "STAGE:UVX_BROKEN" >&2
     cat "$ERR_FILE" >&2
     rm -f "$ERR_FILE"
-    exit 12
+    exit 13
 fi
 rm -f "$ERR_FILE"
 echo "STAGE:OK"
@@ -905,12 +911,11 @@ echo "STAGE:OK"
                 dump(&stderr)
             ),
         ),
-        12 => (
-            format!("`uvx aiui-mcp` lässt sich auf {host_alias} nicht ausführen"),
+        13 => (
+            format!("uvx auf {host_alias} ist nicht ausführbar"),
             format!(
-                "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
-                 Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
-                 Detail-Output vom Remote:\n{}",
+                "uvx wurde gefunden, aber `uvx --version` schlug fehl. \
+                 Vermutlich beschädigte uv-Installation. Detail vom Remote:\n{}",
                 dump(&stderr)
             ),
         ),
