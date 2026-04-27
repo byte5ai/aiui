@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.8] — 2026-04-27
+
+### Fixed
+
+- **Port binding now survives restarts.** Tokio's default `TcpListener::bind`
+  did not set `SO_REUSEADDR` before bind. On macOS that means after every
+  aiui exit the kernel held the socket in TIME_WAIT for 30–60 s, and any
+  fresh aiui starting in that window failed to bind with "Address already
+  in use" — even though no real squatter existed. Combined with the
+  never-reset `http_error` mutex (next bullet), users saw a permanent red
+  banner from a transient race. Now we go through `socket2`, set
+  `SO_REUSEADDR`, then hand the listener to Tokio. Restarts within the
+  TIME_WAIT window bind cleanly. Closes #75.
+- **HTTP-error banner is no longer stale.** The banner used to read
+  `status.http_error`, a one-shot Rust-side string set when the initial
+  bind failed and never reset. The Settings refresh now probes
+  `localhost:7777/ping` directly every 2 s and shows the banner only when
+  the probe actually fails. The `http_error` text from the original
+  failure is still surfaced as explanatory detail when the probe is dead,
+  but it doesn't keep the banner alive after the server recovers. Closes
+  #74.
+
 ## [0.4.7] — 2026-04-26
 
 ### Fixed

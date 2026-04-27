@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.4.7"
+version = "0.4.8"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""
@@ -42,3 +42,8 @@ futures = "0.3"
 regex = "1"
 chrono = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Direct dep so we can set SO_REUSEADDR/SO_REUSEPORT before bind. Without
+# those flags, macOS keeps the socket in TIME_WAIT for 30–60s after every
+# aiui exit, causing the next bind to fail with "Address already in use"
+# even when no real squatter is around. Issue #75.
+socket2 = "0.5"

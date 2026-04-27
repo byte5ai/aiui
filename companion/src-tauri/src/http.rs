@@ -151,13 +151,39 @@ pub async fn serve(
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind_with_reuse(addr)?;
     trace(&format!("serve: listening on {addr}"));
     log::info!("[aiui] http listening on {addr}");
     axum::serve(listener, router)
         .await
         .map_err(std::io::Error::other)?;
     Ok(())
+}
+
+/// Bind a TCP listener with `SO_REUSEADDR` (and `SO_REUSEPORT` on macOS)
+/// set *before* `bind()`, so a fresh aiui can take the port over a
+/// just-exited instance without waiting for the kernel's 30–60s TIME_WAIT
+/// window. Without this, every restart-within-a-minute hits "Address
+/// already in use" — the dominant cause of the user-perceived "aiui
+/// klemmt oft mit Port belegt". Issue #75.
+fn bind_with_reuse(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    // SO_REUSEADDR alone is sufficient on macOS to bind over a port that's
+    // in TIME_WAIT from a previous listener — Linux's stricter semantics
+    // would also need SO_REUSEPORT, but aiui only ships on macOS.
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 async fn ping() -> &'static str {
