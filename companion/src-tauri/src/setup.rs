@@ -777,7 +777,10 @@ echo "STAGE:OK"
 "#;
 
     // Pipe the script via stdin so ssh doesn't word-split a multi-line
-    // command argument on the remote shell.
+    // command argument on the remote shell. `bash -ls`: -l for login
+    // shell (sources /etc/profile + ~/.profile), -s to read the script
+    // from stdin. Without -s, bash starts interactively and the piped
+    // script never reaches it — exit 0, empty output, mystery failure.
     let mut child = match Command::new("ssh")
         .args([
             "-o",
@@ -787,7 +790,7 @@ echo "STAGE:OK"
             "--",
             host_alias,
             "bash",
-            "-l",
+            "-ls",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
