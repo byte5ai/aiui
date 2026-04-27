@@ -146,6 +146,18 @@
     return items.flatMap((it) => [it.value, ...collectTreeValues(it.children ?? [])]);
   }
 
+  // Be forgiving when an MCP caller hands us list items as plain strings
+  // (`items: ["A", "B", "C"]`) instead of the documented
+  // `items: [{label, value}]` shape. Without this, the agent's first
+  // attempt at a sortable list often produces an empty render — the
+  // documented shape isn't easy to discover from the tool's input
+  // schema. Normalize once and use everywhere.
+  function listItems(f: Extract<Field, { kind: "list" }>): ListItem[] {
+    return (f.items as unknown as Array<ListItem | string>).map((it) =>
+      typeof it === "string" ? { label: it, value: it } : it,
+    );
+  }
+
   function initialValue(f: Field): any {
     switch (f.kind) {
       case "static_text":
@@ -163,7 +175,7 @@
       case "list":
         return {
           selected: [...(f.default_selected ?? [])],
-          order: f.items.map((it) => it.value),
+          order: listItems(f).map((it) => it.value),
         };
       case "table":
         return {
@@ -451,7 +463,7 @@
           {#if f.label}<label>{f.label}</label>{/if}
           <div class="list-widget" class:sortable={f.sortable}>
             {#each listValue.order as itemValue, idx (itemValue)}
-              {@const item = f.items.find((x: ListItem) => x.value === itemValue)}
+              {@const item = listItems(f).find((x: ListItem) => x.value === itemValue)}
               {#if item}
                 <div
                   class="list-item"
@@ -579,7 +591,14 @@
         </div>
       {:else}
         <div>
-          <label>{f.label}{"required" in f && f.required ? " *" : ""}</label>
+          <!-- Most field kinds want a label *above* the input. Checkbox is
+            the exception: the standard checkbox layout pairs the label
+            inline next to the box, and rendering an additional outer
+            label produces a visible duplicate (seen in user testing of
+            the v0.4.11 demo). Skip the outer label for checkbox. -->
+          {#if f.kind !== "checkbox"}
+            <label>{f.label}{"required" in f && f.required ? " *" : ""}</label>
+          {/if}
           {#if f.kind === "text"}
             {#if f.multiline}
               <textarea placeholder={f.placeholder ?? ""} bind:value={values[f.name]} rows="4"></textarea>

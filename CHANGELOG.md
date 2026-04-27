@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.13] — 2026-04-27
+
+Final polish ahead of promotion. Bundles the bugs found while the
+tester actually used the demo prompt end-to-end.
+
+### Fixed
+
+- **Sortable list field comes back empty when items were plain strings.**
+  Form field `kind: "list"` documents `items: [{label, value}, …]`, but
+  agents commonly emit plain string items (`["Tokyo", "Delhi", …]`)
+  because the tool's input schema doesn't surface ListItem's shape.
+  Result: list rendered empty, submit returned `""`. Form widget now
+  normalizes string items to `{label, value}` so both shapes work.
+- **Checkbox label rendered twice.** The generic `<label>` rendered
+  above every form field, plus the inline label next to the checkbox
+  itself. Outer label is now suppressed for `kind: "checkbox"`.
+- **Form-tool description now spells out the most error-prone field
+  shape.** A concrete sortable-list example is included in the tool
+  description so the agent has a working spec to mimic instead of
+  guessing.
+
+### Changed
+
+- **Settings header carries a quiet "runs in the background" line.** The
+  tester closed aiui with the window X expecting the app to stop, then
+  was confused when it auto-resurrected. Single dim line under the
+  green status row makes the daemon-like behavior explicit, in plain
+  language ("Läuft im Hintergrund — Fenster jederzeit schließbar"), no
+  protocol vocabulary.
+- **Demo prompt updated.** Drops the awkward "Tab 3 Aktion" framing
+  (action buttons live at the form's bottom row, not inside a tab) and
+  spells out the sortable-list spec inline so the agent can copy it
+  verbatim.
+
 ## [0.4.12] — 2026-04-27
 
 ### Fixed

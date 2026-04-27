@@ -188,12 +188,18 @@
     <header class="app-header">
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
-        <span class="status-dot" class:ok={status.claude_config_ok}></span>
-        {#if status.claude_config_ok}
-          {$_("app.status.connected", { values: { port: status.http_port } })}
-        {:else}
-          {$_("app.status.not_connected")}
-        {/if}
+        <div class="header-status-line">
+          <span class="status-dot" class:ok={status.claude_config_ok}></span>
+          {#if status.claude_config_ok}
+            {$_("app.status.connected", { values: { port: status.http_port } })}
+          {:else}
+            {$_("app.status.not_connected")}
+          {/if}
+        </div>
+        <!-- Reassures the user that closing this window doesn't kill aiui:
+          mcp_attach's auto-resurrect path relaunches the GUI on next demand.
+          Single dim line, Apple-style, no command-flow vocabulary. -->
+        <div class="header-tagline">{$_("app.status.background")}</div>
       </div>
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </header>
@@ -422,8 +428,19 @@
     font-size: 12px;
     color: var(--muted);
     display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .header-status-line {
+    display: flex;
     align-items: center;
     gap: 6px;
+  }
+  .header-tagline {
+    font-size: 11px;
+    color: var(--muted);
+    opacity: 0.75;
   }
   .status-dot {
     width: 7px;
