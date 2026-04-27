@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.12] — 2026-04-27
+
+### Fixed
+
+- **Cold-start race after closing aiui via the window X.** Closing the
+  GUI by the red X exits the process — fine — and `mcp_attach`'s
+  auto-resurrect path then re-spawns the GUI on the next tool call.
+  But the GUI takes a beat to bind port 7777, and Claude's tool call
+  was hitting that port before the bind landed, getting connection-
+  refused, and reporting "aiui not reachable" even though aiui was in
+  fact coming up half a second later. mcp-stdio now polls `/ping` for
+  up to 8 s on every tool call before dispatching — masks the cold-
+  start window invisibly. If the HTTP endpoint really doesn't come up
+  in time (e.g. the user is on a remote dev host whose SSH-reverse-
+  tunnel is genuinely down), the response is a clear, actionable
+  message instead of a raw connection error.
+
 ## [0.4.11] — 2026-04-27
 
 ### Changed
