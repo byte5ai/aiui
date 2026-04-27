@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.20] — 2026-04-27
+
+### Fixed
+
+- **Reachability probe doesn't try to launch the aiui-mcp server
+  anymore.** v0.4.19's diagnostic output revealed the actual macmini
+  bug: `uvx aiui-mcp --help` was meant as a "does the package resolve
+  from PyPI" probe, but aiui-mcp ignores `--help` and starts the full
+  MCP server which then waits for stdin. Bash hangs on the subprocess,
+  ssh eventually truncates output, the script never reaches STAGE:OK.
+  Probe now uses `uvx --version` instead — idempotent, no server
+  side-effects, tells us uvx is reachable. The "does aiui-mcp resolve
+  from PyPI" question is deferred to first-tool-call time, where any
+  failure shows up as a structured Claude error with full stderr.
+
 ## [0.4.19] — 2026-04-27
 
 ### Fixed
