@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.11] — 2026-04-27
+
+### Changed
+
+- **Demo prompt rewritten as a real show-off.** Old prompt produced a
+  form with four near-identical select boxes — boring, didn't sell what
+  aiui actually does. New prompt asks the agent to build a tabbed form
+  exercising sortable list (sort 8 random world cities by population),
+  selectbox, checkboxes, slider, color picker, and three action buttons
+  with destructive/success variants. Agent makes up the concrete content
+  itself and follows the session language. Triggered as natural prose
+  rather than via slash command — the wow effect is bigger when Claude
+  reaches for the tools on its own.
+- **Welcome banner trimmed.** The demo prompt no longer renders as a
+  read-only textarea; just a one-line description of what the demo
+  contains plus a "Copy demo prompt" button. Cleaner, faster scan.
+- **Scope hint added.** New users were trying the demo in fresh Claude
+  Desktop chats and wondering why nothing happened. Most likely cause:
+  Claude Desktop was already running when aiui got installed, so it
+  hadn't picked up the new MCP server. Banner now points directly at
+  the existing "Restart Claude Desktop" button for that case.
+
 ## [0.4.10] — 2026-04-27
 
 Release-grade pass. Codex-assisted code review (`docs/reviews/v0.4.10-codex-review.md`)

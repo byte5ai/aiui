@@ -260,23 +260,20 @@
           </button>
         </div>
 
-        <!-- Demo section. Replaces the old "Test-Dialog jetzt"-button — that
-          one looped back through aiui's own /render endpoint and proved
-          nothing the user couldn't already see (this very window is rendered
-          by the same WebView). What new users actually need is a concrete
-          way to see aiui in action *inside Claude*. Issue #70. -->
+        <!-- Demo section. Tells the user what aiui can do *in Claude*, gives
+          them a copyable prompt that exercises the main widgets (tabs +
+          sortable + checkboxes + slider + color + action-buttons), and
+          flags the most common gotcha (forgetting to restart Claude
+          Desktop after install). The prompt itself is not displayed —
+          the user copies, pastes, runs, sees the wow. Issue #70 (revised
+          for v0.4.11). -->
         <div class="demo-block">
           <div class="demo-title">{$_("settings.welcome.demo.title")}</div>
-          <p class="demo-slash">
-            {$_("settings.welcome.demo.slash_intro")}<code>{$_("settings.welcome.demo.slash_code")}</code>{$_("settings.welcome.demo.slash_outro")}<code>{$_("settings.welcome.demo.slash_teach")}</code>{$_("settings.welcome.demo.slash_after")}
-          </p>
-          <p class="demo-prompt-intro">{$_("settings.welcome.demo.prompt_intro")}</p>
-          <div class="demo-prompt-row">
-            <textarea readonly class="demo-prompt-text" rows="3">{$_("settings.welcome.demo.prompt")}</textarea>
-            <button class="demo-copy" onclick={copyDemoPrompt}>
-              {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
-            </button>
-          </div>
+          <p class="demo-intro">{$_("settings.welcome.demo.intro")}</p>
+          <button class="demo-copy primary" onclick={copyDemoPrompt}>
+            {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
+          </button>
+          <p class="demo-scope">{$_("settings.welcome.demo.scope")}</p>
         </div>
 
         <div class="welcome-foot">
@@ -624,7 +621,7 @@
     padding: 10px 12px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     margin-top: 4px;
   }
   .demo-title {
@@ -632,43 +629,20 @@
     font-weight: 600;
     color: var(--fg);
   }
-  .demo-slash {
+  .demo-intro {
     margin: 0;
-    font-size: 12px;
-    color: var(--muted);
+    font-size: 12.5px;
+    color: var(--fg);
     line-height: 1.5;
   }
-  .demo-slash code {
-    background: color-mix(in srgb, var(--fg) 8%, transparent);
-    padding: 1px 5px;
-    border-radius: 4px;
-    font-size: 11.5px;
-  }
-  .demo-prompt-intro {
-    margin: 4px 0 0 0;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .demo-prompt-row {
-    display: flex;
-    gap: 6px;
-    align-items: stretch;
-  }
-  .demo-prompt-text {
-    flex: 1;
-    font-family: inherit;
-    font-size: 12px;
-    line-height: 1.45;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--fg);
-    resize: none;
-  }
   .demo-copy {
-    flex-shrink: 0;
     align-self: flex-start;
+  }
+  .demo-scope {
+    margin: 4px 0 0 0;
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.45;
   }
 
   .welcome-foot {
