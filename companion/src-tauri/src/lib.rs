@@ -317,8 +317,10 @@ async fn add_remote(
     // silently writes `{"command": "uvx", "args": ["aiui-mcp"]}` to a
     // ~/.claude.json on a host that has no uv installed — every Claude
     // tool call afterwards errors with a confusing "command not found".
-    // Issue #H-3 in v0.4.10 review (also part of #81 Linux-devhost).
-    let reach_step = setup::check_remote_aiui_mcp(&host_alias);
+    // The probe also surfaces the absolute uvx path discovered on the
+    // remote so we can pin the ~/.claude.json entry to that path,
+    // sidestepping any PATH-issues at Claude-Code-spawn time.
+    let (reach_step, uvx_loc) = setup::check_remote_aiui_mcp(&host_alias);
     let reach_ok = reach_step.ok;
     results.push(reach_step);
     if !reach_ok {
@@ -354,7 +356,10 @@ async fn add_remote(
     let skill_step = skill::install_to_remote(&host_alias);
     results.push(skill_step);
 
-    let config_step = setup::patch_claude_code_config_remote(&host_alias);
+    let config_step = setup::patch_claude_code_config_remote(
+        &host_alias,
+        uvx_loc.as_ref().map(|l| l.uvx_path.as_str()),
+    );
     let config_ok = config_step.ok;
     results.push(config_step);
 

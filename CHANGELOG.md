@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.17] — 2026-04-27
+
+### Fixed
+
+- **Reachability probe finds `uvx` even when it's installed via Homebrew.**
+  Tester's `customer@macmini` had `uv` installed at `/opt/homebrew/bin/uvx`,
+  but Homebrew's `brew shellenv` only writes to `~/.zprofile`, not the
+  bash login profile that SSH uses. Result: `command -v uvx` came back
+  empty in the probe's bash login shell, even though uvx was right
+  there. Probe now checks four well-known install locations
+  (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`)
+  in addition to `command -v` lookup.
+- **Probe script no longer mangled by SSH word-splitting.** Previously
+  passed as a multi-line `bash -lc <script>` argv, the script got
+  word-split on the remote shell — producing `bash: -c: option requires
+  an argument` mixed into the diagnostic output. Probe is now piped via
+  stdin (same pattern as `run_remote_python`) so the script reaches
+  bash unmangled.
+- **Remote `~/.claude.json` records the absolute uvx path.** Previously
+  written as `{"command": "uvx", "args": ["aiui-mcp"]}`, which depends
+  on Claude Code's process PATH at spawn time including a directory
+  with uvx — fragile (Claude launched from Finder via launchd may have
+  a minimal PATH). The reachability probe now returns the absolute
+  uvx path it discovered, and `patch_claude_code_config_remote` embeds
+  it directly: `{"command": "/opt/homebrew/bin/uvx", "args": [...]}`.
+  No more PATH-dependence.
+
 ## [0.4.16] — 2026-04-27
 
 ### Fixed

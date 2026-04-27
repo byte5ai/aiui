@@ -647,25 +647,37 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
 /// while reporting success. Stdin avoids that whole class of shell-quoting
 /// trap, and we additionally check that the script printed "ok" so any
 /// future regression can't masquerade as success again.
-pub fn patch_claude_code_config_remote(host_alias: &str) -> StepResult {
-    let script = r#"
+pub fn patch_claude_code_config_remote(
+    host_alias: &str,
+    uvx_path: Option<&str>,
+) -> StepResult {
+    // If we know the absolute uvx path from the reachability probe, use
+    // it. Otherwise fall back to the bare "uvx" name (which depends on
+    // Claude-Code's process PATH being right at spawn time — fragile,
+    // but the only option if the probe didn't find an absolute path).
+    // JSON-escape via serde so paths with unusual characters don't break
+    // the Python script's string literal.
+    let uvx_command_lit = serde_json::to_string(uvx_path.unwrap_or("uvx"))
+        .unwrap_or_else(|_| "\"uvx\"".to_string());
+    let script = format!(r#"
 import json, os, pathlib, shutil, time
 p = pathlib.Path.home() / ".claude.json"
-data = {}
+data = {{}}
 if p.exists():
     try:
         data = json.loads(p.read_text())
     except Exception:
-        data = {}
+        data = {{}}
     ts = int(time.time())
-    shutil.copy(p, p.with_suffix(f".json.bak.{ts}"))
-servers = data.get("mcpServers") or {}
-servers["aiui"] = {"command": "uvx", "args": ["aiui-mcp"]}
+    shutil.copy(p, p.with_suffix(f".json.bak.{{ts}}"))
+servers = data.get("mcpServers") or {{}}
+servers["aiui"] = {{"command": {uvx_command_lit}, "args": ["aiui-mcp"]}}
 data["mcpServers"] = servers
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(data, indent=2))
 print("ok")
-"#;
+"#);
+    let script = script.as_str();
     run_remote_python(host_alias, script, "Patching ~/.claude.json", |stdout| {
         let confirmed = stdout.trim() == "ok";
         StepResult {
@@ -684,51 +696,89 @@ print("ok")
     })
 }
 
+/// Result of a successful reachability probe — carries the absolute
+/// uvx path discovered on the remote so subsequent setup steps can
+/// embed it into `~/.claude.json` instead of relying on the remote's
+/// PATH being right at Claude-Code-spawn time.
+pub struct RemoteUvxLocation {
+    pub uvx_path: String,
+}
+
 /// Probe whether `uvx aiui-mcp` actually works on the remote BEFORE we
 /// persist the host. Without this check, `add_remote` happily writes the
 /// `~/.claude.json` entry pointing at `uvx aiui-mcp` even on hosts where
 /// `uv`/`uvx` aren't installed — Claude Code then errors at every tool
 /// call with a confusing "command not found" the user has to chase
-/// through logs. Issue #H-3 in v0.4.10 review.
+/// through logs.
 ///
-/// Returns Ok if `uvx aiui-mcp --help` (lightweight, doesn't do network)
-/// returns successfully on the remote. Returns Err with a hint on what's
-/// missing otherwise.
-pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
-    use std::process::Command;
+/// Returns `(StepResult, Some(RemoteUvxLocation))` on success — the
+/// uvx_path is the absolute path discovered on the remote, suitable for
+/// embedding into the remote's `~/.claude.json`.
+///
+/// The probe script is piped via stdin (rather than passed as `bash -lc
+/// <script>` argv), avoiding ssh's word-splitting of multi-line script
+/// arguments. Same pattern as `run_remote_python` below.
+///
+/// uvx discovery walks four well-known install locations in addition to
+/// `command -v uvx`, so brew-installed `uv` is found even if the remote's
+/// bash login shell has a minimal PATH (the common case — `/opt/homebrew/bin`
+/// is added by `brew shellenv` to `~/.zprofile`, not `~/.profile`).
+pub fn check_remote_aiui_mcp(host_alias: &str) -> (StepResult, Option<RemoteUvxLocation>) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     if !is_valid_host_alias(host_alias) {
-        return StepResult {
-            ok: false,
-            message: format!("Refusing unsafe host alias '{host_alias}'"),
-            details: None,
-        };
+        return (
+            StepResult {
+                ok: false,
+                message: format!("Refusing unsafe host alias '{host_alias}'"),
+                details: None,
+            },
+            None,
+        );
     }
 
-    // Multi-step diagnostic probe: reports WHICH step failed so the user
-    // gets actionable feedback instead of a generic "not reachable". The
-    // earlier silent `>/dev/null 2>&1` redirects swallowed any inner
-    // stderr, leaving us with "SSH stderr: (empty)" as the entire
-    // diagnostic — useless. Now each step writes a tagged marker on
-    // success and the inner stderr flows through on failure.
     let probe_script = r#"
-        set +e
-        if ! command -v uvx >/dev/null 2>&1; then
-            echo "STAGE:NO_UVX" >&2
-            echo "PATH=$PATH" >&2
-            exit 11
-        fi
-        echo "STAGE:UVX_FOUND $(command -v uvx)"
-        if ! uvx aiui-mcp --help >/dev/null 2>uvx_err; then
-            echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
-            cat uvx_err >&2
-            rm -f uvx_err
-            exit 12
-        fi
-        rm -f uvx_err
-        echo "STAGE:OK"
-    "#;
-    let out = Command::new("ssh")
+set +e
+
+# uv installs into one of these locations depending on installer:
+#   /opt/homebrew/bin/uvx        Homebrew on Apple Silicon
+#   /usr/local/bin/uvx           Homebrew on Intel / manual /usr/local install
+#   $HOME/.local/bin/uvx         astral.sh/uv install script (Linux/macOS)
+#   $HOME/.cargo/bin/uvx         `cargo install uv` (rare)
+# Check all of them, plus PATH lookup, before declaring "not found".
+UVX=""
+for p in /opt/homebrew/bin/uvx /usr/local/bin/uvx "$HOME/.local/bin/uvx" "$HOME/.cargo/bin/uvx"; do
+    if [ -x "$p" ]; then
+        UVX="$p"
+        break
+    fi
+done
+if [ -z "$UVX" ]; then
+    UVX="$(command -v uvx 2>/dev/null)"
+fi
+if [ -z "$UVX" ]; then
+    echo "STAGE:NO_UVX" >&2
+    echo "Searched: /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/.cargo/bin, and PATH" >&2
+    echo "PATH=$PATH" >&2
+    exit 11
+fi
+
+echo "STAGE:UVX_FOUND $UVX"
+
+if ! "$UVX" aiui-mcp --help >/dev/null 2>uvx_err; then
+    echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
+    cat uvx_err >&2
+    rm -f uvx_err
+    exit 12
+fi
+rm -f uvx_err
+echo "STAGE:OK"
+"#;
+
+    // Pipe the script via stdin so ssh doesn't word-split a multi-line
+    // command argument on the remote shell.
+    let mut child = match Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
@@ -737,21 +787,55 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
             "--",
             host_alias,
             "bash",
-            "-lc",
-            probe_script,
+            "-l",
         ])
-        .output();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StepResult {
+                    ok: false,
+                    message: format!("SSH-Verbindung zu {host_alias} schlug fehl"),
+                    details: Some(format!(
+                        "Konnte ssh nicht starten: {e}. Prüfe ~/.ssh/config und Schlüssel-Auth zum Host."
+                    )),
+                },
+                None,
+            );
+        }
+    };
 
-    match out {
-        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("STAGE:OK") => {
-            // Pull the uvx path out of the STAGE:UVX_FOUND line for the
-            // success message — confirms WHERE uvx was found, useful
-            // when the user is debugging PATH issues.
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let uvx_path = stdout
-                .lines()
-                .find_map(|l| l.strip_prefix("STAGE:UVX_FOUND ").map(str::to_string))
-                .unwrap_or_default();
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(probe_script.as_bytes());
+    }
+
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StepResult {
+                    ok: false,
+                    message: format!("SSH zu {host_alias} brach ab"),
+                    details: Some(format!("ssh wait error: {e}")),
+                },
+                None,
+            );
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
+    if out.status.success() && stdout.contains("STAGE:OK") {
+        let uvx_path = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("STAGE:UVX_FOUND ").map(str::to_string))
+            .unwrap_or_default();
+        return (
             StepResult {
                 ok: true,
                 message: format!("uvx aiui-mcp erreichbar auf {host_alias}"),
@@ -760,51 +844,49 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> StepResult {
                 } else {
                     Some(format!("uvx-Pfad auf Remote: {uvx_path}"))
                 },
-            }
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let exit = o.status.code().unwrap_or(-1);
-            // Diagnose by exit code from the probe script
-            let (msg, hint) = match exit {
-                11 => (
-                    format!("uv ist auf {host_alias} nicht installiert"),
-                    format!(
-                        "Auf dem Remote installieren: `curl -LsSf https://astral.sh/uv/install.sh | sh`. \
-                         PATH-Diagnose:\n{stderr}"
-                    ),
-                ),
-                12 => (
-                    format!("`uvx aiui-mcp` lässt sich auf {host_alias} nicht ausführen"),
-                    format!(
-                        "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
-                         Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
-                         Detail-Output vom Remote:\n{stderr}"
-                    ),
-                ),
-                _ => (
-                    format!("Pre-Flight-Check auf {host_alias} schlug fehl (exit {exit})"),
-                    if stderr.is_empty() {
-                        "Keine Fehler-Ausgabe vom Remote. Prüfe SSH-Login zu der Maschine manuell.".into()
-                    } else {
-                        format!("SSH-Output:\n{stderr}")
-                    },
-                ),
-            };
-            StepResult {
-                ok: false,
-                message: msg,
-                details: Some(hint),
-            }
-        }
-        Err(e) => StepResult {
-            ok: false,
-            message: format!("SSH-Verbindung zu {host_alias} schlug fehl"),
-            details: Some(format!(
-                "Konnte ssh nicht starten: {e}. Prüfe ~/.ssh/config und Schlüssel-Auth zum Host."
-            )),
-        },
+            },
+            if uvx_path.is_empty() {
+                None
+            } else {
+                Some(RemoteUvxLocation { uvx_path })
+            },
+        );
     }
+
+    let exit = out.status.code().unwrap_or(-1);
+    let (msg, hint) = match exit {
+        11 => (
+            format!("uv ist auf {host_alias} nicht installiert"),
+            format!(
+                "Auf dem Remote installieren: `curl -LsSf https://astral.sh/uv/install.sh | sh`. \
+                 Diagnose:\n{stderr}"
+            ),
+        ),
+        12 => (
+            format!("`uvx aiui-mcp` lässt sich auf {host_alias} nicht ausführen"),
+            format!(
+                "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
+                 Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
+                 Detail-Output vom Remote:\n{stderr}"
+            ),
+        ),
+        _ => (
+            format!("Pre-Flight-Check auf {host_alias} schlug fehl (exit {exit})"),
+            if stderr.is_empty() {
+                "Keine Fehler-Ausgabe vom Remote. Prüfe SSH-Login zu der Maschine manuell.".into()
+            } else {
+                format!("SSH-Output:\n{stderr}")
+            },
+        ),
+    };
+    (
+        StepResult {
+            ok: false,
+            message: msg,
+            details: Some(hint),
+        },
+        None,
+    )
 }
 
 /// Run a Python script on a remote host via `ssh ... python3 -` with the
