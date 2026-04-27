@@ -1,11 +1,11 @@
 ---
 name: aiui
-description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native macOS dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm.
+description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation.
 ---
 
 # aiui — Dialog design for Claude agents
 
-aiui exposes three MCP tools that render native dialogs on the user's Mac:
+aiui exposes three MCP tools that render native dialogs on the user's machine:
 
 - `confirm` — irreversible yes/no
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback

@@ -2,6 +2,80 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.10] — 2026-04-27
+
+Release-grade pass. Codex-assisted code review (`docs/reviews/v0.4.10-codex-review.md`)
+plus structural fixes addressing several real defects that survived the
+v0.4.5 → v0.4.9 reactive cycle.
+
+### Fixed
+
+- **No more phantom GUIs on remote hosts.** `mcp_attach`'s auto-resurrect
+  loop now suppresses `open -a aiui --args --auto` when running in a
+  non-interactive session (SSH detected via `SSH_CONNECTION` /
+  `SSH_CLIENT` / `SSH_TTY`). On macmini and other dev hosts the MCP-stdio
+  child trusts the SSH-reverse-tunnel back to the user's machine instead
+  of spawning a window nobody can see. (#80)
+- **HTTP self-probe verifies the server is actually aiui.** Previous
+  v0.4.9 probe was a naked `TcpStream::connect` that any port-7777
+  squatter (sshd-session, unrelated process) would answer with TCP-SYN,
+  silently lying "healthy". Probe now hits `/probe` with the bearer
+  token and verifies the `aiui: true` marker. Anything else reads as
+  down. (#74, #77 revised)
+- **Bundle drift detector in release pipeline.** `scripts/release.sh`
+  now sanity-checks the `version` field across `Cargo.toml`,
+  `tauri.conf.json`, and the bundled `Info.plist` after `tauri build`.
+  Mismatch aborts the release before any tag/upload. (#82)
+- **Stale dialog state no longer leaks between consecutive renders.**
+  Dialog widgets (Confirm/Ask/Form) get a `{#key dialog.id}` wrapper so
+  Svelte unmounts the previous instance and remounts a fresh one for
+  every new render call. Previously, two consecutive same-kind dialogs
+  could carry over field values from the first into the second —
+  silently corrupting answers sent back to the caller.
+- **XSS surface closed.** Markdown fields in `form` are now piped
+  through DOMPurify before `{@html}`, with `<script>`, `<iframe>`,
+  `<form>`, `<input>`, `<button>` and inline event handlers stripped. A
+  meaningful CSP (`default-src 'self'; script-src 'self'; …`) replaces
+  the previous `csp: null`.
+- **Linux dev-host setup verifies `uvx aiui-mcp` reachability.**
+  `add_remote` does an SSH probe (`bash -lc 'uvx aiui-mcp --help'`)
+  before persisting a host. Hosts without `uv` installed fail fast with
+  a pointer to the install instructions instead of producing a broken
+  `~/.claude.json` entry. (#81)
+- **Idle-deadline survives suspend/resume.** mcp-stdio's 6 h
+  no-input-exit now double-checks the wall-clock elapsed time before
+  exiting; if a Tokio timer fires early after a long suspend, the loop
+  rearms instead of bailing.
+- **Idle-restart respects pending dialogs.** The 24h+ uptime + 10min
+  quiet WebView reload no longer fires while a dialog is still
+  registered — would have killed the user's open dialog mid-interaction
+  and dropped the answer.
+- **Cancellation reasons are now structured.** `RenderResponse` (and the
+  internal `DialogResult`) carries an optional `reason` field
+  (`ttl_expired`, `evicted`, `channel_dropped`) so MCP callers can
+  distinguish a user cancel from a registry-side timeout/eviction.
+- **Atomic writes for all user-config files.** `claude_desktop_config.json`,
+  `~/.claude.json`, `~/.ssh/config`, `~/.config/aiui/remotes.json`, and
+  the auth token now go through `fsutil::atomic_write` (sibling temp
+  file + fsync + rename). Crash mid-write leaves either the old file or
+  the new one — never a half-written corrupted destination.
+- **Trace log rotation.** `/tmp/aiui-trace.log` rotates to `.log.1` once
+  it crosses 4 MiB, on next process start. Prevents unbounded growth
+  under long auto-resurrect / multi-mcp-stdio fan-out.
+- **Release script is fail-fast.** `set -euo pipefail` at the top so a
+  half-finished release (jq missing, codesign failure, plist mismatch)
+  doesn't quietly continue to push tags or upload broken artifacts.
+
+### Changed
+
+- `is_interactive_session()` in `lifetime.rs` is the single decision
+  point for "should we ever launch a GUI here?". Cross-platform from the
+  start so the planned Windows port can extend without re-architecting.
+- Skill description (`docs/skill.md` frontmatter) reads cleanly in the
+  Claude slash-command help. No platform-specific copy in the
+  description; user-facing copy throughout has been swept for
+  unnecessary "macOS"/"Mac" mentions in preparation for the Windows port.
+
 ## [0.4.9] — 2026-04-27
 
 ### Fixed

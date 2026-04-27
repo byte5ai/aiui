@@ -97,21 +97,29 @@
 
 <main class="container">
   {#if current}
-    {#if current.spec.kind === "ask"}
-      <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-    {:else if current.spec.kind === "form"}
-      <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-    {:else if current.spec.kind === "confirm"}
-      <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-    {:else}
-      <div class="stack">
-        <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
-        <pre>{JSON.stringify(current.spec, null, 2)}</pre>
-        <div class="footer">
-          <button onclick={handleCancel}>{$_("dialog.close")}</button>
+    <!-- {#key current.id} forces a fresh widget instance for every new
+      dialog, even when two consecutive renders are the same kind (e.g.
+      two `confirm`s). Without it, Svelte recycles the component and
+      stale field/checkbox/radio state from the previous dialog can bleed
+      into the current one — silently sending wrong answers back to the
+      caller. Issue #H-1 in v0.4.10 review. -->
+    {#key current.id}
+      {#if current.spec.kind === "ask"}
+        <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+      {:else if current.spec.kind === "form"}
+        <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+      {:else if current.spec.kind === "confirm"}
+        <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+      {:else}
+        <div class="stack">
+          <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
+          <pre>{JSON.stringify(current.spec, null, 2)}</pre>
+          <div class="footer">
+            <button onclick={handleCancel}>{$_("dialog.close")}</button>
+          </div>
         </div>
-      </div>
-    {/if}
+      {/if}
+    {/key}
   {:else}
     <Settings />
   {/if}

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
   import { marked } from "marked";
+  import DOMPurify from "dompurify";
   import TreeNode from "./TreeNode.svelte";
 
   type SelectOption = { label: string; value: string; description?: string };
@@ -366,13 +367,25 @@
   // --- markdown rendering -------------------------------------------------
   // Configured once, used by all `markdown` fields. We keep it sync (no
   // remote includes, no async resolvers) so reactivity is straightforward.
+  // Output is piped through DOMPurify before `{@html}` so an MCP caller
+  // (potentially a compromised remote host reaching us through the
+  // SSH-reverse-tunnel) cannot inject `<script>` or event handlers.
+  // Issue #H-2 in v0.4.10 review.
   marked.setOptions({ gfm: true, breaks: true });
   function renderMd(src: string): string {
+    let raw: string;
     try {
-      return marked.parse(src, { async: false }) as string;
+      raw = marked.parse(src, { async: false }) as string;
     } catch {
-      return `<pre>${src.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]!))}</pre>`;
+      raw = `<pre>${src.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]!))}</pre>`;
     }
+    return DOMPurify.sanitize(raw, {
+      // No <script>, no event handlers, no javascript: URLs, no <iframe>.
+      // Keep links + basic markup. Defaults are conservative; we explicitly
+      // forbid form-related tags to prevent autofill-driven exfiltration.
+      FORBID_TAGS: ["script", "iframe", "form", "input", "button"],
+      FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus"],
+    });
   }
 </script>
 

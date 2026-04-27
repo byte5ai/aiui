@@ -57,7 +57,7 @@
     "uninstall.back": "Zurück",
     "uninstall.do": "Alles entfernen",
     "uninstall.done.title": "aiui-Konfiguration entfernt",
-    "uninstall.done.body": "Alle Config-Einträge, Tokens und das lokale Skill sind weg. Klick auf *aiui beenden*, dann zieh `aiui.app` im Finder aus dem Programme-Ordner in den Papierkorb — solange aiui läuft, lässt macOS die App nicht löschen.",
+    "uninstall.done.body": "Alle Config-Einträge, Tokens und das lokale Skill sind weg. Klick auf *aiui beenden*, dann lösche das aiui-Programm-Bundle manuell — eine laufende App kann sich nicht selbst entfernen.",
     "uninstall.done.quit": "aiui beenden",
     "updates.check": "Nach Updates suchen",
     "report.button": "Problem melden",
