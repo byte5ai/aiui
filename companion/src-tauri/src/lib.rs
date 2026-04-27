@@ -111,6 +111,12 @@ struct StatusReport {
     /// red banner in Settings so the user knows why dialogs aren't
     /// landing.
     http_error: Option<String>,
+    /// Live result of a TCP self-probe to `localhost:http_port`. The Rust
+    /// side does this for us because a WebView `fetch()` would be blocked
+    /// by macOS App Transport Security (ATS) on plaintext localhost
+    /// requests — that's how v0.4.8 ended up showing a permanent red
+    /// banner on a perfectly healthy server. Issue #77.
+    http_alive: bool,
 }
 
 #[tauri::command]
@@ -120,6 +126,7 @@ async fn status(
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<StatusReport, String> {
     let bin = setup::app_binary_path();
+    let http_alive = probe_http_self(cfg.http_port).await;
     Ok(StatusReport {
         app_binary_path: bin.clone(),
         token_path: cfg.token_path.display().to_string(),
@@ -133,7 +140,25 @@ async fn status(
         build_info: logging::BUILD_INFO,
         welcome_pending: is_first_run(&cfg),
         http_error: http_err.lock().ok().and_then(|s| s.clone()),
+        http_alive,
     })
+}
+
+/// Quick TCP self-connect to verify our own HTTP server is actually
+/// accepting connections. Done from Rust because a WebView `fetch()`
+/// would be ATS-blocked on macOS for plaintext localhost. 200ms timeout
+/// is plenty for loopback — if the server can't accept in that window
+/// we treat it as down. Issue #77.
+async fn probe_http_self(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Marks the welcome banner as dismissed so it doesn't reappear on the

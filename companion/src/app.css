@@ -193,12 +193,32 @@ label {
 }
 
 .footer {
+  /* `margin-top: auto` keeps the footer pinned to the bottom of the
+     visible viewport when content fits. `position: sticky; bottom: 0`
+     keeps it pinned there even when the content above scrolls. Without
+     this, the welcome banner pushes the footer (with Uninstall etc.)
+     below the fold — and macOS settings windows aren't typically
+     scrollable, so users miss the buttons entirely. Issue #78. */
   margin-top: auto;
+  position: sticky;
+  bottom: 0;
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   padding-top: 12px;
+  /* Opaque background so scrolled content doesn't show through. Use the
+     same color as `.container`'s parent background to blend in. */
+  background: var(--bg);
   border-top: 1px solid var(--border);
+  /* Pull-out below the container's bottom padding so the border sits
+     flush with the window edge while the buttons keep their breathing
+     room above. */
+  margin-left: -20px;
+  margin-right: -20px;
+  padding-left: 20px;
+  padding-right: 20px;
+  margin-bottom: -16px;
+  padding-bottom: 16px;
 }
 
 code {

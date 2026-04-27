@@ -25,6 +25,7 @@
     build_info: string;
     welcome_pending: boolean;
     http_error: string | null;
+    http_alive: boolean;
   };
   let status = $state<Status | null>(null);
   let newHost = $state("");
@@ -33,32 +34,14 @@
   let confirmUninstall = $state(false);
   let uninstallDone = $state(false);
   let demoCopied = $state(false);
-  /** Live result of the last `/ping` probe. The Rust-side `http_error`
-   *  field in the status report is set only at startup and never reset,
-   *  so it can lie if the server later recovered (or if a transient
-   *  squatter is gone now). We therefore probe every refresh and treat
-   *  THIS as the source of truth for "is the server actually alive?".
-   *  Issue #74. */
-  let httpAlive = $state(true);
   let timer: number | undefined;
 
-  async function probeHttp(port: number): Promise<boolean> {
-    try {
-      const resp = await fetch(`http://127.0.0.1:${port}/ping`, {
-        // /ping is unauthenticated and returns "pong" plain-text; a 200
-        // proves the HTTP server is bound and responsive.
-        signal: AbortSignal.timeout(800),
-      });
-      return resp.ok;
-    } catch {
-      return false;
-    }
-  }
-
   async function refresh() {
-    const next = await invoke<Status>("status");
-    httpAlive = await probeHttp(next.http_port);
-    status = next;
+    // The status report carries `http_alive` from a Rust-side TCP
+    // self-probe — WebView `fetch()` would be ATS-blocked on macOS for
+    // plaintext localhost, which is how v0.4.8 ended up with a permanent
+    // false-positive banner. Issue #77.
+    status = await invoke<Status>("status");
   }
 
   function pushLog(results: StepResult[]) {
@@ -215,12 +198,12 @@
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </header>
 
-    <!-- Show the banner only when the LIVE probe says the HTTP server is
-      actually unreachable. The Rust-side `status.http_error` is the
-      original bind-failure reason if any — useful as the explanatory
-      hint, but on its own it's a stale flag once the server later
-      recovers. Issue #74. -->
-    {#if !httpAlive}
+    <!-- Show the banner only when the live Rust-side TCP self-probe says
+      the HTTP server isn't accepting connections. `status.http_error` is
+      the explanatory text from the original bind-failure if any — but
+      it's not the source of truth for whether to show the banner; that's
+      `http_alive`. Issue #77. -->
+    {#if !status.http_alive}
       <section class="http-error">
         <strong>{$_("settings.http_error.title")}</strong>
         {#if status.http_error}

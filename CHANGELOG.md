@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.9] — 2026-04-27
+
+### Fixed
+
+- **HTTP-server liveness probe now actually works on macOS.** v0.4.8's
+  fix for the stale `http_error` banner used a WebView `fetch()` to
+  poll `/ping`. macOS App Transport Security blocks plaintext HTTP
+  requests from WKWebView by default — including to localhost — so the
+  probe always failed and the banner stayed permanently red on healthy
+  servers. The probe now runs Rust-side: a quick TCP connect to
+  `localhost:cfg.http_port` with 200 ms timeout, result delivered as
+  `http_alive: bool` in the existing `StatusReport`. Tokio doesn't go
+  through WebView's net stack, so ATS is irrelevant. Closes #77.
+- **Settings footer no longer rolls under the fold.** With the welcome
+  banner expanded the content exceeded the fixed 560 px window and the
+  Uninstall / Updates / Report buttons disappeared below the bottom
+  edge — invisible without scrolling, which macOS settings panes
+  conventionally don't have. Footer is now `position: sticky; bottom: 0`
+  with an opaque background, pinned to the visible viewport while
+  content scrolls above. Closes #78.
+
 ## [0.4.8] — 2026-04-27
 
 ### Fixed
