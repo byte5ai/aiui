@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.15] — 2026-04-27
+
+### Changed
+
+- **Welcome banner restructured as a 3-step stack.** Tester feedback on
+  v0.4.14: "viel zu scrollen … vielleicht wäre ein Wizard". The four
+  sections of the old banner (status checks + restart action + demo
+  block + dismiss) reshaped into three numbered, visually-distinct
+  steps:
+  1. **Setup geprüft** — collapses to one line ("Alles bereit ✓") when
+     all four health checks pass; auto-expands with the failing checks
+     called out when something needs attention.
+  2. **Claude Desktop neu starten** — primary blue CTA, imperative
+     copy. No longer reads as optional. This is the must-do step after
+     fresh install.
+  3. **Demo-Prompt in Claude einfügen** — primary blue copy button,
+     short tail explaining what happens after pasting.
+- Footer dismiss is now a quiet text link ("Fertig — nicht wieder
+  anzeigen") so it doesn't compete with the two primary actions for
+  attention.
+
 ## [0.4.14] — 2026-04-27
 
 ### Fixed
