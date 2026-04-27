@@ -741,6 +741,13 @@ pub fn check_remote_aiui_mcp(host_alias: &str) -> (StepResult, Option<RemoteUvxL
     let probe_script = r#"
 set +e
 
+# Visibility marker so the rust side knows the script reached and
+# entered the remote bash. If this never lands in stdout, the issue is
+# upstream of the script (ssh transport, shell wrapper rewriting cmd,
+# etc) — not in our logic.
+echo "STAGE:STARTED $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "STAGE:HOST $(hostname 2>/dev/null) shell:$0 user:$(id -un 2>/dev/null)"
+
 # uv installs into one of these locations depending on installer:
 #   /opt/homebrew/bin/uvx        Homebrew on Apple Silicon
 #   /usr/local/bin/uvx           Homebrew on Intel / manual /usr/local install
@@ -766,13 +773,17 @@ fi
 
 echo "STAGE:UVX_FOUND $UVX"
 
-if ! "$UVX" aiui-mcp --help >/dev/null 2>uvx_err; then
+# mktemp instead of cwd-relative — current dir of an ssh-login may not
+# be writable, causing a redirect-error that aborts the script before
+# the actual uvx call.
+ERR_FILE="$(mktemp -t aiui-probe.XXXXXX)"
+if ! "$UVX" aiui-mcp --help >/dev/null 2>"$ERR_FILE"; then
     echo "STAGE:UVX_AIUI_MCP_FAILED" >&2
-    cat uvx_err >&2
-    rm -f uvx_err
+    cat "$ERR_FILE" >&2
+    rm -f "$ERR_FILE"
     exit 12
 fi
-rm -f uvx_err
+rm -f "$ERR_FILE"
 echo "STAGE:OK"
 "#;
 
@@ -857,12 +868,26 @@ echo "STAGE:OK"
     }
 
     let exit = out.status.code().unwrap_or(-1);
+    let script_started = stdout.contains("STAGE:STARTED");
+    // Collapse multi-line dumps to fit the inline error banner without
+    // becoming a wall. Truncate generously enough to show the actual
+    // failure detail, but cap so we don't break the layout.
+    let truncate_at = 1500;
+    let dump = |s: &str| -> String {
+        let s = s.trim();
+        if s.len() <= truncate_at {
+            s.to_string()
+        } else {
+            format!("{}\n... (truncated, {} bytes total)", &s[..truncate_at], s.len())
+        }
+    };
     let (msg, hint) = match exit {
         11 => (
             format!("uv ist auf {host_alias} nicht installiert"),
             format!(
                 "Auf dem Remote installieren: `curl -LsSf https://astral.sh/uv/install.sh | sh`. \
-                 Diagnose:\n{stderr}"
+                 Remote-Diagnose:\n{}",
+                dump(&stderr)
             ),
         ),
         12 => (
@@ -870,16 +895,31 @@ echo "STAGE:OK"
             format!(
                 "uv ist da, aber das aiui-mcp-Package konnte nicht aufgelöst/gestartet werden. \
                  Häufige Ursachen: kein Internet auf dem Remote, PyPI blockiert, alte uv-Version. \
-                 Detail-Output vom Remote:\n{stderr}"
+                 Detail-Output vom Remote:\n{}",
+                dump(&stderr)
+            ),
+        ),
+        _ if !script_started => (
+            format!("Probe-Script kam nicht beim Remote an (exit {exit})"),
+            format!(
+                "Der ssh-Aufruf war erfolgreich, aber das Probe-Script hat keine Markierung ausgegeben — \
+                 vermutlich wird die Login-Shell auf {host_alias} durch eine ProxyCommand-, ForceCommand- \
+                 oder andere ssh-Wrapper-Konfiguration umgeleitet, die unseren `bash -ls`-Aufruf \
+                 nicht ausführt. Probier auf dem Mac: \
+                 `ssh -o BatchMode=yes {host_alias} bash -ls </dev/null` — sollte ohne Fehler beenden.\n\n\
+                 stdout vom ssh-Aufruf:\n{}\n\nstderr vom ssh-Aufruf:\n{}",
+                dump(&stdout),
+                dump(&stderr)
             ),
         ),
         _ => (
             format!("Pre-Flight-Check auf {host_alias} schlug fehl (exit {exit})"),
-            if stderr.is_empty() {
-                "Keine Fehler-Ausgabe vom Remote. Prüfe SSH-Login zu der Maschine manuell.".into()
-            } else {
-                format!("SSH-Output:\n{stderr}")
-            },
+            format!(
+                "Probe-Script lief an, hat aber kein STAGE:OK ausgegeben.\n\n\
+                 stdout vom Remote:\n{}\n\nstderr vom Remote:\n{}",
+                dump(&stdout),
+                dump(&stderr)
+            ),
         ),
     };
     (

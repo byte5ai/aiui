@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.19] — 2026-04-27
+
+### Fixed
+
+- **Reachability probe is now actually diagnostic.** v0.4.18 still
+  produced `(exit 0)` with empty output for the macmini test case.
+  The catchall error path was hiding stdout (only stderr was shown).
+  Now: probe emits a `STAGE:STARTED` marker at the top so we can tell
+  if the script reached the remote at all; the error UI shows BOTH
+  stdout and stderr (truncated to 1500 chars each); and the catchall
+  branches into "script never reached the remote" vs "script ran but
+  no STAGE:OK", with the former pointing at SSH-wrapper-configurations
+  (ProxyCommand / ForceCommand) as a likely cause.
+- **Probe writes its temp error-file via `mktemp`** instead of
+  current-working-directory. ssh-login may land in a directory that's
+  not writable, in which case the bare `2>uvx_err` redirect would
+  abort the script — silently — before the actual uvx call. Fixes
+  exactly the scenario where the script ran but produced no STAGE
+  output.
+
 ## [0.4.18] — 2026-04-27
 
 ### Fixed
