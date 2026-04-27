@@ -35,6 +35,10 @@
   let uninstallDone = $state(false);
   let demoCopied = $state(false);
   let step1Expanded = $state(false);
+  /** When add_remote fails, we keep the input populated and surface the
+   *  failure inline so the user can fix and retry without scrolling.
+   *  Cleared on next attempt or successful add. */
+  let addRemoteError = $state<{ message: string; details: string | null } | null>(null);
   let timer: number | undefined;
 
   async function refresh() {
@@ -59,10 +63,19 @@
   async function addRemote() {
     if (!newHost.trim() || busy) return;
     busy = true;
+    addRemoteError = null;
     try {
       const results = await invoke<StepResult[]>("add_remote", { hostAlias: newHost.trim() });
       pushLog(results);
-      newHost = "";
+      // Clear the input only on full success — otherwise keep what the
+      // user typed so they can fix and retry. Surface the first failing
+      // step inline so they don't have to hunt through the log.
+      const firstFailure = results.find((r) => !r.ok);
+      if (firstFailure) {
+        addRemoteError = { message: firstFailure.message, details: firstFailure.details };
+      } else {
+        newHost = "";
+      }
       await refresh();
     } finally {
       busy = false;
@@ -149,14 +162,18 @@
     }
   }
 
-  function openIssue() {
+  async function openIssue() {
     const body = encodeURIComponent(
       `**Version:** ${status?.build_info ?? "unknown"}\n\n` +
         `**Describe the bug:**\n\n\n` +
         `**Steps to reproduce:**\n1.\n2.\n3.\n\n` +
         `**Expected / actual:**\n\n`,
     );
-    window.open(`https://github.com/byte5ai/aiui/issues/new?body=${body}`, "_blank");
+    // `window.open(url)` is blocked in Tauri's WebView (security). Round
+    // through a Rust command that hands the URL to macOS `open`.
+    await invoke("open_url", {
+      url: `https://github.com/byte5ai/aiui/issues/new?body=${body}`,
+    });
   }
 
   function statusLabel(t: TunnelStatus | undefined): { text: string; tone: "ok" | "warn" | "err" | "dim" } {
@@ -376,6 +393,22 @@
           {$_("settings.remotes.add.button")}
         </button>
       </div>
+      <!-- Inline failure banner. Stays put under the input the user just
+        typed into, so they don't have to scroll down to the log to find
+        out what went wrong. Tester on v0.4.15: input field cleared on
+        failure, error landed only in the scroll-buried log block. -->
+      {#if addRemoteError}
+        <div class="add-remote-error">
+          <strong>{addRemoteError.message}</strong>
+          {#if addRemoteError.details}
+            <pre>{addRemoteError.details}</pre>
+          {/if}
+          <button
+            class="add-remote-error-dismiss"
+            onclick={() => (addRemoteError = null)}
+            aria-label="Schließen">×</button>
+        </div>
+      {/if}
       <p class="subtitle" style="margin: 6px 0 0 0; font-size: 11.5px;">
         {$_("settings.remotes.add.hint")}
       </p>
@@ -575,6 +608,52 @@
     flex-shrink: 0;
   }
   .dot-small.err { background: var(--danger); }
+
+  /* --- inline error banner under add-remote input --- */
+  .add-remote-error {
+    position: relative;
+    margin-top: 6px;
+    padding: 8px 32px 8px 10px;
+    border: 1px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--fg);
+    line-height: 1.45;
+  }
+  .add-remote-error strong {
+    display: block;
+    color: var(--danger);
+    font-size: 12.5px;
+    margin-bottom: 2px;
+  }
+  .add-remote-error pre {
+    margin: 4px 0 0 0;
+    padding: 6px 8px;
+    background: var(--surface);
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--muted);
+  }
+  .add-remote-error-dismiss {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+    padding: 2px 6px;
+    cursor: pointer;
+    box-shadow: none;
+    border-radius: 4px;
+  }
+  .add-remote-error-dismiss:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 
   /* --- HTTP error banner --- */
   .http-error {

@@ -200,6 +200,32 @@ fn repair_skill() -> Result<setup::StepResult, String> {
     Ok(skill::install_locally())
 }
 
+/// Open a URL in the user's default browser. Tauri's WebView blocks
+/// `window.open()` calls from JavaScript for security, so the
+/// "Problem melden"-button (and any other future external-link case)
+/// has to round-trip through Rust. Issue surfaced 2026-04-27 by tester
+/// clicking the button for the first time.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    // Sanity-check: only allow http(s) so a compromised renderer can't
+    // smuggle file:// or shell URIs through this command.
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("refusing non-http(s) URL: {url}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("open {url}: {e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = url; // silence unused on non-macos until ports land
+    }
+    Ok(())
+}
+
 /// Quit aiui after Uninstall has cleaned up configs/tokens/skill, killing
 /// every `aiui --mcp-stdio` child first so the auto-resurrect path in
 /// `mcp_attach` can't relaunch the GUI behind us. Without this, the user
@@ -537,7 +563,8 @@ pub fn run() {
             restart_claude_desktop,
             uninstall_all,
             quit_app,
-            dismiss_welcome
+            dismiss_welcome,
+            open_url
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
