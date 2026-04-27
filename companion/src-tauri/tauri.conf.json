@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "aiui",
-  "version": "0.4.16",
+  "version": "0.4.17",
   "identifier": "de.byte5.aiui",
   "build": {
     "frontendDist": "../dist",
