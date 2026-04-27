@@ -1,3 +1,4 @@
+use crate::fsutil::atomic_write;
 use rand::RngCore;
 use std::fs;
 use std::io;
@@ -25,7 +26,7 @@ impl AppConfig {
             let mut bytes = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut bytes);
             let t = hex::encode(bytes);
-            fs::write(&token_path, &t)?;
+            atomic_write(&token_path, t.as_bytes())?;
             // chmod 600
             #[cfg(unix)]
             {

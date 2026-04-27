@@ -16,6 +16,16 @@ pub struct DialogResult {
     pub id: String,
     pub cancelled: bool,
     pub result: serde_json::Value,
+    /// Why the dialog ended. `None` for normal user-driven submit/cancel
+    /// (the existing semantics — `cancelled` alone tells you which).
+    /// `Some("ttl_expired")` when the registry sweep cancelled an entry
+    /// that sat unresolved past `DIALOG_TTL`. `Some("evicted")` when the
+    /// hard-cap kicked in and the oldest entry got pushed out. Lets
+    /// callers distinguish "user said no" from "we gave up on this
+    /// dialog" — and lets the tracelog explain why a render-call ended
+    /// without user input. Issue #H-5 in v0.4.10 review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// How long an unresolved dialog may sit in the registry before opportunistic
@@ -84,11 +94,11 @@ impl DialogState {
             .collect();
         for stale_id in expired {
             if let Some(entry) = map.remove(&stale_id) {
-                // Cancel the waiter with the same shape `cancel()` would use.
                 let _ = entry.result_tx.send(DialogResult {
                     id: stale_id,
                     cancelled: true,
                     result: serde_json::Value::Null,
+                    reason: Some("ttl_expired".into()),
                 });
             }
         }
@@ -105,6 +115,7 @@ impl DialogState {
                         id: oldest_id,
                         cancelled: true,
                         result: serde_json::Value::Null,
+                        reason: Some("evicted".into()),
                     });
                 }
             }
@@ -140,6 +151,7 @@ impl DialogState {
                 id: id.to_string(),
                 cancelled: false,
                 result,
+                reason: None,
             });
         }
     }
@@ -151,6 +163,7 @@ impl DialogState {
                 id: id.to_string(),
                 cancelled: true,
                 result: serde_json::Value::Null,
+                reason: None,
             });
         }
     }

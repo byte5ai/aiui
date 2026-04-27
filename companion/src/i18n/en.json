@@ -57,7 +57,7 @@
     "uninstall.back": "Back",
     "uninstall.do": "Remove everything",
     "uninstall.done.title": "aiui configuration removed",
-    "uninstall.done.body": "All config entries, tokens, and the local skill are gone. Click *Quit aiui*, then drag `aiui.app` from Applications to the Trash in Finder — macOS won't let you trash a running app.",
+    "uninstall.done.body": "All config entries, tokens, and the local skill are gone. Click *Quit aiui*, then delete the aiui app bundle manually — a running application can't remove itself.",
     "uninstall.done.quit": "Quit aiui",
     "updates.check": "Check for updates",
     "report.button": "Report issue",
