@@ -56,10 +56,24 @@ present) or read the script; the required environment variables are:
 - `APPLE_SIGNING_IDENTITY`, `NOTARY_PROFILE`,
   `BUILD_KEYCHAIN`, `BUILD_KEYCHAIN_PASS_FILE` — Apple codesign + notary
 - `TAURI_SIGNING_PRIVATE_KEY_PATH` — Ed25519 key for the updater feed
+- `UV_PUBLISH_TOKEN` — PyPI API token (project-scoped to `aiui-mcp`).
+  Without it, `scripts/release.sh` aborts before any work is done — that
+  guard exists because shipping the Tauri side without the matching PyPI
+  bump produces silent slash-command-mismatch on remote hosts.
 
-Running `scripts/release.sh 0.2.3` builds, signs, notarizes, creates a
-DMG + updater artifacts + `latest.json`, tags, pushes, and creates the
-GitHub release via `gh`.
+A single run of `scripts/release.sh 0.2.3` performs the full pipeline:
+
+1. Pre-flight checks — `.env.release` loaded, all required env present,
+   versions agree across `Cargo.toml`, `tauri.conf.json`, and
+   `python/pyproject.toml`.
+2. Tauri companion: build, codesign, notarize, staple, DMG, updater
+   bundle + signature, `latest.json`.
+3. Python `aiui-mcp`: `uv build` produces wheel + sdist into
+   `python/dist/`. Done before the dry-run gate so dry runs catch
+   packaging breakage too.
+4. Tag, push, GitHub release.
+5. `uv publish` from `python/` — pushes the wheel + sdist to PyPI so
+   `uvx aiui-mcp` resolves to the matching version on remote hosts.
 
 ## Issues
 
