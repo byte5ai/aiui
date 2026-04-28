@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- **Release pipeline now publishes the PyPI side in lockstep.**
+  `scripts/release.sh` gained a fourth version-sync gate
+  (`python/pyproject.toml`), runs `uv build` alongside the Tauri build
+  (covered by `--dry`), and runs `uv publish` after the GitHub release.
+  Required `UV_PUBLISH_TOKEN` is checked up-front, so a missing token
+  fails the run before any Tauri work happens. Background: `aiui-mcp`
+  0.4.2 stayed pinned on PyPI long after the Tauri side had moved past
+  the `widgets` → `teach` rename, leaving every remote-host install in
+  the old prompt world. This closes that gap structurally — next
+  release the two sides ship or fail together.
+
 ## [0.4.21] — 2026-04-28
 
 ### Added
