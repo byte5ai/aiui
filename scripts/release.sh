@@ -15,6 +15,12 @@
 #   BUILD_KEYCHAIN_PASS_FILE         path to file holding keychain password
 #   TAURI_SIGNING_PRIVATE_KEY_PATH   minisign private key for updater feed
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (optional; empty if no password)
+#   UV_PUBLISH_TOKEN                 PyPI API token for publishing aiui-mcp.
+#                                    Generate at https://pypi.org/manage/account/token/
+#                                    (scope: project = aiui-mcp). Without this, the
+#                                    Tauri side ships but the Python side stays stale
+#                                    on PyPI — exactly how the v0.4.2/v0.4.21 split
+#                                    happened on 2026-04-28.
 #
 # Usage:
 #   scripts/release.sh 0.1.2
@@ -44,6 +50,8 @@ fi
 : "${BUILD_KEYCHAIN:?not set}"
 : "${BUILD_KEYCHAIN_PASS_FILE:?not set}"
 : "${TAURI_SIGNING_PRIVATE_KEY_PATH:?not set}"
+: "${UV_PUBLISH_TOKEN:?not set — needed for publishing aiui-mcp to PyPI. Put it in .env.release or export before running. See script header for details.}"
+export UV_PUBLISH_TOKEN
 # Tauri bundler reads TAURI_SIGNING_PRIVATE_KEY (literal key content) during
 # `tauri build`, not the _PATH variant. Load the file content here.
 export TAURI_SIGNING_PRIVATE_KEY="$(cat "${TAURI_SIGNING_PRIVATE_KEY_PATH}")"
@@ -62,14 +70,18 @@ DIRECT_DMG="${REPO_ROOT}/aiui-${VERSION}-arm64.dmg"
 UPDATER_BUNDLE="${APP_DIR}/aiui.app.tar.gz"
 UPDATER_SIG="${UPDATER_BUNDLE}.sig"
 
-echo "→ Checking version sync (Cargo.toml ↔ tauri.conf.json)"
-# Three places need to agree on the version:
+echo "→ Checking version sync (Cargo.toml ↔ tauri.conf.json ↔ python/pyproject.toml)"
+# Four places need to agree on the version:
 #   - Cargo.toml `version` (drives the build)
 #   - tauri.conf.json `version` (drives the bundled Info.plist)
+#   - python/pyproject.toml `version` (drives the PyPI artifact and
+#     therefore what `uvx aiui-mcp` resolves to on remote hosts)
 #   - the `${VERSION}` argument to this script (drives the tag/release)
 # Any drift produces a bundle whose CFBundleShortVersionString doesn't
 # match what the in-app updater reports — that's how #82 happened.
-# Issue C-3 in v0.4.10 review.
+# Drift between Tauri and PyPI is how the v0.4.2/v0.4.21 widgets-vs-teach
+# split happened on 2026-04-28: Tauri shipped, PyPI didn't, remotes kept
+# resolving the old prompt names. Issue C-3 in v0.4.10 review.
 if ! grep -q "^version = \"${VERSION}\"" companion/src-tauri/Cargo.toml; then
   echo "  Cargo.toml version does not match ${VERSION} — bump it first." >&2
   exit 1
@@ -77,6 +89,11 @@ fi
 TAURI_CONF_VERSION="$(python3 -c 'import json,sys;print(json.load(open("companion/src-tauri/tauri.conf.json"))["version"])')"
 if [[ "${TAURI_CONF_VERSION}" != "${VERSION}" ]]; then
   echo "  tauri.conf.json version is ${TAURI_CONF_VERSION}, expected ${VERSION} — bump it." >&2
+  exit 1
+fi
+PYPI_VERSION="$(grep -E '^version = ' python/pyproject.toml | awk -F'"' '{print $2}')"
+if [[ "${PYPI_VERSION}" != "${VERSION}" ]]; then
+  echo "  python/pyproject.toml version is ${PYPI_VERSION}, expected ${VERSION} — bump it." >&2
   exit 1
 fi
 
@@ -166,12 +183,30 @@ echo "✓ Wrote ${LATEST_JSON}"
 UPDATER_NAMED="${REPO_ROOT}/aiui-${VERSION}-updater-arm64.tar.gz"
 cp "${UPDATER_BUNDLE}" "${UPDATER_NAMED}"
 
+# Build the Python package alongside the Tauri artifacts. Done before the
+# --dry exit so dry runs catch packaging regressions (missing files,
+# version-string drift inside the wheel) too.
+echo "→ Building Python package (aiui-mcp ${VERSION})"
+PY_DIST_DIR="${REPO_ROOT}/python/dist"
+rm -rf "${PY_DIST_DIR}"
+(cd python && uv build)
+PY_WHEEL="$(ls "${PY_DIST_DIR}"/aiui_mcp-${VERSION}-*.whl 2>/dev/null | head -1)"
+PY_SDIST="${PY_DIST_DIR}/aiui_mcp-${VERSION}.tar.gz"
+if [[ -z "${PY_WHEEL}" || ! -f "${PY_SDIST}" ]]; then
+  echo "  uv build did not produce expected artifacts in ${PY_DIST_DIR}" >&2
+  ls -l "${PY_DIST_DIR}" >&2 || true
+  exit 1
+fi
+echo "  ✓ Python artifacts: $(basename "${PY_WHEEL}"), $(basename "${PY_SDIST}")"
+
 if [[ "$DRY" == "--dry" ]]; then
   echo "Dry run — artifacts:"
   echo "  ${DIRECT_DMG}"
   echo "  ${DIRECT_ZIP}"
   echo "  ${UPDATER_NAMED}"
   echo "  ${LATEST_JSON}"
+  echo "  ${PY_WHEEL}"
+  echo "  ${PY_SDIST}"
   exit 0
 fi
 
@@ -205,3 +240,12 @@ gh release create "${TAG}" \
   --notes-file "${NOTES_FILE}"
 
 echo "✓ Released ${TAG} on GitHub"
+
+# PyPI publish AFTER the GitHub release succeeds. If this step fails the
+# Tauri side is already shipped and the manual recovery is `cd python &&
+# uv publish dist/*` once the credential issue is fixed. The pre-flight
+# token check at the top of this script is what stops us from getting
+# here without a token.
+echo "→ Publishing aiui-mcp ${VERSION} to PyPI"
+(cd python && uv publish)
+echo "✓ Published aiui-mcp ${VERSION} to PyPI"
