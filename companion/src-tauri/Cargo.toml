@@ -47,3 +47,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # aiui exit, causing the next bind to fail with "Address already in use"
 # even when no real squatter is around. Issue #75.
 socket2 = "0.5"
+# Used by imageresolve to convert fetched http(s) image bytes into
+# `data:` URLs so the WebView can render them under the strict img-src
+# CSP. See companion/src-tauri/src/imageresolve.rs.
+base64 = "0.22"

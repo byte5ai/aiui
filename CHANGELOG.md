@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Image fields now accept `http(s)://` URLs.** A new `imageresolve`
+  pass on the companion fetches any `http(s)://` value found in
+  `src` / `thumbnail` properties on the user's Mac, encodes the bytes
+  as a `data:` URL, and inlines the result before the WebView ever
+  sees the spec. The CSP stays strict (`img-src 'self' data: …`) and
+  agents no longer have to base64-encode images by hand. 5-second
+  timeout, 10 MB cap, parallel fetch for grids; on failure the
+  original URL is left in place (broken image, logged as
+  `imageresolve: fetch failed for …`).
+
+### Documentation
+
+- **Skill catalog clarifies image source formats.** Adds a dedicated
+  "Image sources (`src` / `thumbnail`)" section explaining the two
+  accepted formats (`data:` URLs, `http(s)://` URLs) and the common
+  footguns (plain file paths silently broken; markdown image links
+  not auto-resolved). The previous "data: URL or path" wording was
+  misleading — local paths never worked. Also extends the `form`
+  tool's MCP description with a one-line image-source hint, so
+  agents that haven't run `/aiui:teach` still get the rule.
+
 ## [0.4.20] — 2026-04-27
 
 ### Fixed

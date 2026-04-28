@@ -4,6 +4,7 @@ mod dialog;
 mod fsutil;
 mod housekeeping;
 mod http;
+mod imageresolve;
 mod lifetime;
 mod logging;
 mod mcp;
