@@ -433,7 +433,7 @@ async fn render(
         trace("render: auth FAILED");
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
     }
-    let req: RenderRequest = match serde_json::from_str(&body) {
+    let mut req: RenderRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
             trace(&format!("render: body parse failed: {e}"));
@@ -441,6 +441,13 @@ async fn render(
         }
     };
     trace(&format!("render: auth ok, spec={}", req.spec));
+
+    // Resolve any http(s):// values in `src` / `thumbnail` fields to
+    // `data:` URLs before the spec hits the WebView. The WebView's
+    // CSP only permits `data:` for img-src; without this pass an
+    // agent's plain URL would silently render as a broken image.
+    // See companion/src-tauri/src/imageresolve.rs for failure modes.
+    crate::imageresolve::resolve_image_srcs(&mut req.spec).await;
 
     let (id, result_rx, ack_rx) = state.dialog.register();
     trace(&format!("render: registered id={}", id));

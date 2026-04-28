@@ -89,7 +89,8 @@ Skip the dialog for content the user reads, doesn't answer:
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
 drag changes, `selected` reflects checkbox state. Items can carry a
-`thumbnail` (data: URL or path) — perfect for shotlists, mood boards,
+`thumbnail` — see [Image sources](#image-sources-src--thumbnail) below
+for the accepted URL formats. Perfect for shotlists, mood boards,
 carousel slides where the visual anchor matters more than the label.
 
 ## The `table` field — column-aware row triage
@@ -119,10 +120,11 @@ These don't ask anything — they sit between input fields to give context
   for "here's the diff I generated, now decide" patterns. **Not** a
   standalone display tool — if you'd be tempted to open a window just to
   show the user a markdown blob, render it in chat instead.
-- `image` — read-only single image preview (`src`: data: URL or path,
-  optional `label`, `alt`, `max_height`). Use when the agent generated
-  a chart, screenshot, or diagram and needs visual sign-off before the
-  next decision.
+- `image` — read-only single image preview. `src` accepts a `data:` URL
+  or any `http(s)://` URL — see [Image sources](#image-sources-src--thumbnail)
+  below. Optional `label`, `alt`, `max_height`. Use when the agent
+  generated a chart, screenshot, or diagram and needs visual sign-off
+  before the next decision.
 - `static_text` — plain styled note with `tone: "info"|"warn"|"muted"`.
   Lighter weight than `markdown` when no formatting is needed.
 
@@ -131,6 +133,43 @@ These don't ask anything — they sit between input fields to give context
 For "pick one (or more) of these N generated images" — logo variants,
 thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
 `multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
+Each `src` follows the same rules as `image` — see below.
+
+## Image sources (`src` / `thumbnail`)
+
+Anywhere aiui takes a `src` or `thumbnail` (the `image` field, the
+`image_grid.images[]` entries, the `list.items[].thumbnail`), only two
+input formats actually render:
+
+- **`data:` URL** — `data:image/png;base64,…`. The straightforward
+  format if you're emitting a generated image: encode bytes once,
+  inline the result. Watch the size — a `data:` URL that's much over
+  ~2 MB starts to feel laggy in the MCP transport.
+- **`http(s)://` URL** — aiui fetches it on the user's Mac and inlines
+  it as a `data:` URL before the dialog renders. 5-second timeout, 10
+  MB cap, parallel fetch for grids. Use this when the image already
+  lives on a reachable web server and you don't want to base64-encode
+  it manually. Note: the *user's* Mac contacts the URL, not aiui's
+  infrastructure (aiui itself never phones home).
+
+What does **not** work — known footguns:
+
+- **Plain local file paths** (`/Users/me/foo.png`, `~/Pictures/x.jpg`).
+  The WebView's CSP blocks `file://` and aiui doesn't expose Tauri's
+  asset protocol. If your image is on disk, base64-encode it into a
+  `data:` URL.
+- **Bare URLs in `markdown` field text.** Markdown's `![alt](url)`
+  follows the same CSP — the URL has to resolve to `data:` somehow.
+  The resolver only walks `src` / `thumbnail` properties, not the
+  bodies of markdown blocks.
+- **Linking out** with `<a href="https://...">` from `markdown` —
+  works as a click target, but opens in the user's default browser
+  (we explicitly intercept it). It's not an image-rendering question.
+
+If you tried a URL and the user reports a broken image, ask them once
+whether anything appeared at all — a CSP block looks identical to a
+404. The companion logs the failure (`imageresolve: fetch failed for
+…`) but agents can't read those logs.
 
 ## `datetime` field
 
@@ -172,6 +211,7 @@ them by name instead.
 | `form` with 15 `text` fields | Split into logical steps, or push back to chat entirely |
 | Button labels "OK" / "Cancel" | "Deploy" / "Discard" — name what happens |
 | `static_text` echoing the title | `static_text` adds context the labels can't carry alone |
+| `image(src="/Users/me/shot.png")` (file path silently broken) | `image(src="data:image/png;base64,…")` or `image(src="https://…")` — both inline correctly |
 
 ## Quick-reference example
 
