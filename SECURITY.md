@@ -2,8 +2,11 @@
 
 ## Supported Versions
 
-Only the latest `0.2.x` release is supported with security fixes. The
-in-app updater delivers patches automatically to installed clients.
+Only the latest released version is supported with security fixes. The
+in-app updater delivers patches automatically to installed clients —
+keep aiui up to date (it auto-checks; you can also force a check via
+`/aiui:update` in Claude Code or the „Check for updates" button in
+Settings).
 
 ## Reporting a vulnerability
 

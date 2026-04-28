@@ -74,12 +74,28 @@ Desktop is open. No dock icon, no menu-bar clutter, no lingering
 daemons. aiui tools are available in **every** Claude Code session
 immediately; no per-project config needed.
 
-Try it straight away in any Claude Code session: *"Ask me with aiui
-which of three deploy strategies we want today."* The agent opens an
-options dialog, you click, it keeps going.
+Updates install themselves in the background. If you want to force a
+check, use `/aiui:update` in Claude Code, or open aiui's settings
+window.
 
-Future updates: use `/aiui:update` in Claude Code, or wait for the
-auto-check the next time aiui's settings window opens.
+## Quickstart
+
+Open any Claude Code session and try one of these — just write it as a
+normal message:
+
+> *"Ask me with aiui which of three deploy strategies we want today."*
+
+> *"Confirm with aiui before you delete the test files."*
+
+> *"Use aiui to collect a new user's name, role, and start date."*
+
+That's the whole idea. The agent picks the right kind of dialog —
+yes/no, pick-from-options, or a multi-field form — opens it on your
+Mac, you click, it carries on with your answer.
+
+The first time you do this in a fresh project, run `/aiui:teach` once.
+That briefs the agent on *when* to reach for aiui versus just typing
+back in chat — without it, the agent might forget aiui exists.
 
 ## What you get
 
@@ -105,16 +121,6 @@ settings.
 | `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
 
-## For agents: the skill
-
-To keep agents from producing generic "UI slop", aiui installs a
-skill document into Claude Code's skill directory on startup. It
-carries the rules: which widget for which job, how labels should read,
-what anti-patterns to avoid. Every remote you register gets the skill
-installed too.
-
-Full catalog: [`docs/skill.md`](docs/skill.md).
-
 ## FAQ
 
 **Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
@@ -134,8 +140,9 @@ add the remote in settings.
 **How much memory does it use?** The companion idles around 30–50 MB.
 The underlying WebKit view loads only while a dialog is on screen.
 
-**Does it work on Intel Macs?** Not in v0.2.x — Apple Silicon
-(arm64) only. Intel support is on the roadmap.
+**Does it work on Intel Macs?** Currently Apple Silicon (arm64) only.
+Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
+if you need it.
 
 **Does it work on Linux or Windows?** No. aiui renders native macOS
 dialogs; porting would require a different companion per OS. If you want
@@ -159,8 +166,8 @@ Desktop-specific in how it auto-installs, but the HTTP protocol on
 
 ## Known limitations
 
-- **Apple Silicon only** (M1 and later). Intel Macs are not supported
-  in v0.2.x.
+- **Apple Silicon only** (M1 and later). Intel Macs are not yet
+  supported.
 - **macOS 11 (Big Sur) or later.**
 - **One Mac per companion.** If you want dialogs on multiple Macs
   simultaneously, each needs its own aiui install; tokens and tunnels
@@ -185,8 +192,20 @@ The "Report issue" button in settings pre-fills version and build SHA.
 ## Open source
 
 aiui is MIT-licensed, hosted at [byte5ai/aiui](https://github.com/byte5ai/aiui).
-Pull requests and issues are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
-for the build layout and design principles.
+Pull requests and issues are welcome.
 
-Python server package: [`aiui-mcp`](https://pypi.org/project/aiui-mcp/)
-on PyPI.
+## For developers & curious users
+
+A bit more depth, in roughly increasing nerd-level:
+
+- [`docs/skill.md`](docs/skill.md) — the agent-facing widget catalog.
+  aiui installs this as a skill on first launch so Claude knows *when*
+  to use which dialog and how to write the labels. Worth a skim if you
+  want to understand what aiui can render.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — repository layout, build flow,
+  release pipeline, design principles.
+- [`docs/strategy.md`](docs/strategy.md) — the product thinking behind
+  aiui's V1/V2 split and what we deliberately don't build.
+- [`aiui-mcp`](https://pypi.org/project/aiui-mcp/) on PyPI — the Python
+  MCP server, used automatically for remote SSH hosts that don't have
+  aiui.app installed locally.
