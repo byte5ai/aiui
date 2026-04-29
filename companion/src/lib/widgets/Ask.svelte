@@ -5,6 +5,7 @@
     label: string;
     description?: string;
     value?: string;
+    thumbnail?: string; // data: URL, http(s) URL, or absolute / `~/` local path — bridge-resolved
   };
   type Spec = {
     kind: "ask";
@@ -58,8 +59,12 @@
         type="button"
         class="option"
         class:selected={selected.has(i)}
+        class:has-thumbnail={!!opt.thumbnail}
         onclick={() => toggle(i)}
       >
+        {#if opt.thumbnail}
+          <img class="option-thumb" src={opt.thumbnail} alt="" />
+        {/if}
         <div>
           <div class="label">{opt.label}</div>
           {#if opt.description}<div class="description">{opt.description}</div>{/if}
