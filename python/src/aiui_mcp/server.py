@@ -236,7 +236,7 @@ def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 async def ask(
     question: str,
-    options: list[dict[str, str]],
+    options: list[dict[str, Any]],
     header: str | None = None,
     multi_select: bool = False,
     allow_other: bool = True,
@@ -253,6 +253,10 @@ async def ask(
     - Label: noun or short imperative, ≤ 5 words, no punctuation, no emoji.
     - Description: one sentence stating the trade-off or consequence.
     - Keep options parallel in grammar.
+    - For visual choice ("which of these images?") add `thumbnail` per
+      option — same `src` rules as everywhere else (data: URL, http(s)
+      URL, or absolute / `~/` local path on YOUR host). aiui resolves
+      paths and URLs to data: URLs before render.
 
     ANTI-PATTERNS: > 8 options (use `form` with a `list` field); generic labels
     like "Option 1"; redundant descriptions that just restate the label.
@@ -261,7 +265,8 @@ async def ask(
 
     Args:
         question: Full question, imperative or interrogative.
-        options: List of `{"label": str, "description"?: str, "value"?: str}`.
+        options: List of `{"label": str, "description"?: str, "value"?: str,
+            "thumbnail"?: str}`.
         header: Short chip above the question (≤ 14 chars).
         multi_select: Allow selecting multiple options.
         allow_other: Offer a free-text fallback.
@@ -388,6 +393,7 @@ async def confirm(
     destructive: bool = False,
     confirm_label: str | None = None,
     cancel_label: str | None = None,
+    image: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Before writing any yes/no question into chat, call this tool instead.
     Pass `destructive=True` (red button) for delete / drop / force-push /
@@ -396,6 +402,7 @@ async def confirm(
 
     WHEN TO USE: irreversible or high-stakes step where "just proceed" is
     unsafe. For pure information, respond in chat. For 3+ options, use `ask`.
+    For visual sign-off ("is this generated image OK?"), pass `image`.
 
     WRITE:
     - Title: the decision as a question, ≤ 10 words.
@@ -403,6 +410,8 @@ async def confirm(
     - `destructive=True` for deletions/force-pushes/rollbacks — never for
       saves or creates.
     - Custom `confirm_label`/`cancel_label` when verbs clarify.
+    - `image` for visual confirmation — same `src` rules as elsewhere
+      (data: URL, http(s) URL, or absolute / `~/` local path on YOUR host).
 
     Returns `{cancelled, confirmed}`. `cancelled=True` means Escape or window
     close. `cancelled=False, confirmed=False` means the explicit No button.
@@ -414,6 +423,9 @@ async def confirm(
         destructive: Red confirm button.
         confirm_label: Defaults to "Ja".
         cancel_label: Defaults to "Nein".
+        image: `{"src": str, "alt"?: str, "max_height"?: int}`. Shown above
+            the title for visual confirmation. `src` follows the standard
+            aiui resolution rules.
     """
     spec = {
         "kind": "confirm",
@@ -423,6 +435,7 @@ async def confirm(
         "destructive": destructive,
         "confirmLabel": confirm_label,
         "cancelLabel": cancel_label,
+        "image": image,
     }
     return _format_result(await _post_render(spec))
 

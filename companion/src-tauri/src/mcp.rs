@@ -243,7 +243,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "confirm",
-            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat.",
+            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. For visual sign-off (\"is this image OK?\", \"keep this generated diagram?\") pass `image: {src, alt?, max_height?}` — `src` accepts data: URLs, http(s) URLs, or absolute / `~/`-rooted local paths (resolved on YOUR host). Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -253,13 +253,23 @@ fn tools_list() -> Value {
                     "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
                     "destructive": { "type": "boolean", "default": false, "description": "Red confirm button — for deletions/rollbacks only." },
                     "confirm_label": { "type": "string" },
-                    "cancel_label": { "type": "string" }
+                    "cancel_label": { "type": "string" },
+                    "image": {
+                        "type": "object",
+                        "description": "Optional image shown between header and title for visual sign-off.",
+                        "required": ["src"],
+                        "properties": {
+                            "src": { "type": "string", "description": "data: URL, http(s):// URL, or absolute / ~/ local path on YOUR host. Same resolution rules as the form `image` field." },
+                            "alt": { "type": "string" },
+                            "max_height": { "type": "number" }
+                        }
+                    }
                 }
             }
         },
         {
             "name": "ask",
-            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
+            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. For visual choice (\"which of these images?\") pass `thumbnail: <src>` per option — same resolution rules as anywhere else in aiui (data:, http(s)://, or absolute local path). Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -272,7 +282,8 @@ fn tools_list() -> Value {
                             "properties": {
                                 "label": { "type": "string" },
                                 "description": { "type": "string" },
-                                "value": { "type": "string" }
+                                "value": { "type": "string" },
+                                "thumbnail": { "type": "string", "description": "Optional image src shown next to the option label. Same resolution rules as the form image field." }
                             },
                             "required": ["label"]
                         }
@@ -416,7 +427,8 @@ async fn tools_call(
                 "header": args.get("header"),
                 "destructive": args.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false),
                 "confirmLabel": args.get("confirm_label"),
-                "cancelLabel": args.get("cancel_label")
+                "cancelLabel": args.get("cancel_label"),
+                "image": args.get("image")
             }),
             cfg,
             http,
