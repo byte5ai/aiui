@@ -535,8 +535,22 @@ pub fn run() {
             show_settings_window(app);
         }))
         .plugin(
+            // Persistent TRACE logging for aiui's own modules so a hung
+            // dialog leaves a forensic trail. Bumped from Info → Trace
+            // for `aiui_lib::*` only; dependencies (tauri, hyper, …)
+            // stay at Info to keep the volume manageable. Log rotates
+            // at 5 MB, one previous file kept — covers a multi-hour
+            // session at TRACE without filling up disk.
+            //
+            // Investigated 2026-04-29: a 4-minute MCP timeout on a
+            // trivial form spec was unrecoverable from logs because
+            // the entire render pipeline (`render: …` traces in
+            // http.rs / mcp.rs / dialog.rs) only emits at Trace level.
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
+                .level_for("aiui_lib", log::LevelFilter::Trace)
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
