@@ -285,7 +285,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` must be a `data:` URL or an `http(s)://` URL — aiui auto-fetches the URL on the user's Mac and inlines it. Plain local file paths (`/Users/.../foo.png`) do NOT work — the WebView's CSP blocks them silently. See the aiui skill for the full field catalog.",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. See the aiui skill for the full field catalog.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -499,6 +499,16 @@ async fn render_dialog(
 ) -> Result<Value, String> {
     let token = load_token(cfg)?;
     let url = format!("{}/render", base_url(cfg));
+    // Resolve any absolute / `~/`-rooted file paths in `src` /
+    // `thumbnail` to `data:` URLs *here* — at the bridge — because
+    // this code runs on whichever host the agent is talking to. For
+    // local Mac use that's the same host as the GUI server; for
+    // SSH-tunneled remotes the agent and this binary live on the
+    // remote, where the actual files are. The Mac-side server-resolver
+    // (imageresolve::resolve_image_srcs) only knows about HTTPS — it
+    // would never see the remote's filesystem.
+    let mut spec = spec;
+    crate::imageresolve::resolve_local_paths(&mut spec);
     let body = json!({ "spec": spec });
     let resp = http
         .post(&url)

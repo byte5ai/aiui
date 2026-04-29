@@ -2,11 +2,38 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.4.22] — 2026-04-28
+
+### Added
+
+- **Image fields accept local filesystem paths.** `src` (and the
+  `list.items[].thumbnail` slot) now resolve absolute or `~/`-rooted
+  paths on the host where the agent runs — Mac for local Claude Code,
+  the remote host for SSH-tunneled remotes. The bridge reads the file,
+  base64-encodes it, and inlines it as a `data:` URL before the spec
+  leaves the agent's host. The Mac-side WebView only ever sees `data:`
+  URLs, so the strict CSP is preserved. 10 MB cap, MIME guessed from
+  the extension. Resolves the awkward base64-by-hand or
+  `data:`-via-shell-pipeline workflow that agents kept tripping over.
+- **Symmetrical Python implementation in `aiui-mcp`.** The Rust bridge
+  (used in local Mac sessions) and the Python bridge (used by every
+  remote that resolves `uvx aiui-mcp`) share behaviour 1:1 — same
+  accepted formats, same caps, same fail-soft semantics. Drift between
+  them would produce "works locally, broken on remote" bugs; mirrored
+  unit tests on both sides guard against that.
 
 ### Changed
 
-- **Release pipeline now publishes the PyPI side in lockstep.**
+- **Skill catalog rewrites the image-source guidance.** "Pick the
+  simplest format that works" — path > URL > `data:`. Adds the
+  shell-pipeline anti-pattern explicitly (terminal renders the
+  `data:image/...` prefix and eats the rest of the call). Calls out
+  cross-host paths as a non-resolving case so agents on remotes know
+  to use `http(s)://` for Mac-side files.
+- **Python CI now runs `pytest`.** New `python/tests/` directory holds
+  the local-path resolver tests; CI installs the `dev` extra and runs
+  the suite before the build step.
+- **Release pipeline publishes the PyPI side in lockstep.**
   `scripts/release.sh` gained a fourth version-sync gate
   (`python/pyproject.toml`), runs `uv build` alongside the Tauri build
   (covered by `--dry`), and runs `uv publish` after the GitHub release.
@@ -15,7 +42,8 @@ All notable changes to this project are documented here.
   0.4.2 stayed pinned on PyPI long after the Tauri side had moved past
   the `widgets` → `teach` rename, leaving every remote-host install in
   the old prompt world. This closes that gap structurally — next
-  release the two sides ship or fail together.
+  release the two sides ship or fail together. (Landed on main between
+  0.4.21 and 0.4.22; first release that exercises it is 0.4.22.)
 
 ## [0.4.21] — 2026-04-28
 

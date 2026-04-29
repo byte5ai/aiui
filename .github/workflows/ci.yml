@@ -64,6 +64,10 @@ jobs:
         with:
           version: latest
 
+      - name: Run unit tests
+        working-directory: python
+        run: uv run --extra dev pytest tests/ -v
+
       - name: Build wheel + sdist
         working-directory: python
         run: uv build
