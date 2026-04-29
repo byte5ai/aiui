@@ -16,9 +16,11 @@ registered in the companion's settings window.
 """
 from __future__ import annotations
 
+import base64
 import importlib.metadata
 import importlib.resources as resources
 import logging
+import mimetypes
 import os
 import sys
 from datetime import datetime, timezone
@@ -126,10 +128,89 @@ async def _preflight() -> None:
             )
 
 
+_SRC_KEYS = {"src", "thumbnail"}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB — mirrors the Rust resolver
+_LOCAL_PATH_MIME_OVERRIDES = {
+    # mimetypes.guess_type returns None for SVG without a hint on some
+    # Pythons, and `image/svg` (without `+xml`) on others. Lock it down
+    # so the WebView always sees the canonical `image/svg+xml`.
+    ".svg": "image/svg+xml",
+}
+
+
+def _looks_like_local_path(s: str) -> bool:
+    """Mirror of `imageresolve::looks_like_local_path` in the Rust bridge.
+
+    Accepts absolute paths and `~/`-rooted paths. Rejects `data:` URLs,
+    `http(s)://` URLs, relative paths (no stable cwd contract on MCP
+    bridges), and anything else.
+    """
+    if not s:
+        return False
+    if s.startswith(("data:", "http://", "https://")):
+        return False
+    return s.startswith("/") or s.startswith("~")
+
+
+def _read_path_as_data_url(raw: str) -> str:
+    """Read a local file and return it as `data:<mime>;base64,…`.
+
+    Raises ValueError on anything that should make the resolver leave
+    the original `src` value alone (missing file, oversize, not a file).
+    """
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(f"too large: {size} bytes (max {_MAX_IMAGE_BYTES})")
+    ext = path.suffix.lower()
+    mime = _LOCAL_PATH_MIME_OVERRIDES.get(ext)
+    if mime is None:
+        mime, _ = mimetypes.guess_type(str(path))
+    if mime is None:
+        mime = "application/octet-stream"
+    data = path.read_bytes()
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _resolve_local_paths(node: Any) -> None:
+    """Walk a render spec in place, replacing absolute / `~/` paths in
+    `src` / `thumbnail` properties with `data:` URLs. The bridge-side
+    counterpart to the Mac's HTTPS resolver — runs wherever this MCP
+    server runs (local or remote), which is by definition the host
+    that holds the agent's files.
+
+    Fail-soft: read errors are logged, the original value is kept (the
+    WebView will eventually show a broken image rather than the call
+    blowing up).
+    """
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key in _SRC_KEYS and isinstance(value, str) and _looks_like_local_path(value):
+                try:
+                    node[key] = _read_path_as_data_url(value)
+                except (OSError, ValueError) as e:
+                    log.warning("local path skipped for %s: %s", value, e)
+            else:
+                _resolve_local_paths(value)
+    elif isinstance(node, list):
+        for item in node:
+            _resolve_local_paths(item)
+
+
 async def _post_render(spec: dict[str, Any]) -> dict[str, Any]:
     await _preflight()
     t0 = datetime.now(timezone.utc)
     log.info("render → kind=%s", spec.get("kind"))
+    # Resolve any absolute / `~/`-rooted file paths *before* shipping
+    # the spec down the HTTP wire. This bridge runs on the same host
+    # as the agent — local for Mac use, remote for SSH-tunneled
+    # remotes — so this is the only point in the chain where the
+    # agent's filesystem actually exists. The Mac-side server resolver
+    # only handles HTTPS.
+    _resolve_local_paths(spec)
     async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
         r = await client.post(
             f"{ENDPOINT}/render",
@@ -251,7 +332,7 @@ async def form(
     - color:       {kind, name, label, default?}  — hex "#RRGGBB"
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
     - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
-    - image:       {kind, src, label?, alt?, max_height?}  — read-only image, src is data:URL or path. Use for visual confirmation of agent-generated previews.
+    - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the Mac), or a `data:` URL. Use for visual confirmation of agent-generated previews.
     - image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}
       Result: {selected: [values]}
     - list:        {kind, name, label?, items: [{label, value, description?, thumbnail?}],

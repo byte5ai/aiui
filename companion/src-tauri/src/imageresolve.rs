@@ -32,6 +32,7 @@
 //! warnings into the tool response is a separate concern.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
@@ -121,6 +122,111 @@ fn rewrite_urls(spec: &mut Value, map: &HashMap<String, String>) {
             *value = Value::String(replacement.clone());
         }
     });
+}
+
+/// Resolve local filesystem paths in `src` / `thumbnail` properties to
+/// `data:` URLs.
+///
+/// This is the *bridge-side* counterpart to [`resolve_image_srcs`].
+/// Where [`resolve_image_srcs`] runs at the HTTP server (the Mac) and
+/// fetches `http(s)://` URLs, this one runs at the MCP bridge (the host
+/// the agent is talking to — Mac for local Claude Code, the remote host
+/// for SSH-tunneled remotes). That's the only place the agent's
+/// filesystem actually exists.
+///
+/// Accepted inputs:
+/// - absolute path: `/Users/me/foo.png`
+/// - tilde-prefixed path: `~/Pictures/foo.png` — expanded to `$HOME`
+///
+/// Rejected inputs (left untouched, the server-side resolver gets them):
+/// - `data:` URLs — already inline
+/// - `http://` / `https://` — handled by [`resolve_image_srcs`]
+/// - relative paths (`./foo.png`, `foo.png`) — `cwd` is not a stable
+///   contract on MCP bridges, especially when launched via `uvx` or as
+///   a Tauri subprocess. Demanding absolute paths makes failure mode
+///   loud rather than silent-but-wrong.
+///
+/// Fail-soft like [`resolve_image_srcs`]: read errors and oversize
+/// files are logged, the original `src` is left in place (the WebView
+/// will eventually show a broken image — not an aiui crash).
+pub fn resolve_local_paths(spec: &mut Value) {
+    walk_mut(spec, &mut |key, value| {
+        if !SRC_KEYS.contains(&key) {
+            return;
+        }
+        let Some(s) = value.as_str() else { return };
+        if !looks_like_local_path(s) {
+            return;
+        }
+        match read_path_as_data_url(s) {
+            Ok(data_url) => {
+                *value = Value::String(data_url);
+            }
+            Err(e) => {
+                eprintln!("imageresolve: local path failed for {s}: {e}");
+            }
+        }
+    });
+}
+
+fn looks_like_local_path(s: &str) -> bool {
+    if s.starts_with("data:") || s.starts_with("http://") || s.starts_with("https://") {
+        return false;
+    }
+    s.starts_with('/') || s.starts_with('~')
+}
+
+fn expand_tilde(s: &str) -> Option<PathBuf> {
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = dirs::home_dir()?;
+        Some(home.join(rest))
+    } else if s == "~" {
+        dirs::home_dir()
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+fn read_path_as_data_url(raw: &str) -> Result<String, String> {
+    let path = expand_tilde(raw).ok_or_else(|| "no $HOME for ~ expansion".to_string())?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("not a file: {}", path.display()));
+    }
+    if metadata.len() as usize > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "too large: {} bytes (max {MAX_IMAGE_BYTES})",
+            metadata.len()
+        ));
+    }
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mime = guess_mime_from_extension(&path);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+fn guess_mime_from_extension(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        // Unknown extension: hand it to the WebView as octet-stream.
+        // It will likely fail to render, but that's a clear "your file
+        // isn't an image" signal rather than a misleading mime guess.
+        _ => "application/octet-stream",
+    }
 }
 
 fn walk(value: &Value, f: &mut impl FnMut(&str, &Value)) {
@@ -261,6 +367,83 @@ mod tests {
         assert!(
             s.matches("data:image/png;base64,XX").count() == 2,
             "expected 2 replacements: {s}"
+        );
+    }
+
+    #[test]
+    fn looks_like_local_path_classifies_correctly() {
+        assert!(looks_like_local_path("/Users/me/foo.png"));
+        assert!(looks_like_local_path("~/Pictures/foo.png"));
+        assert!(!looks_like_local_path("data:image/png;base64,AAAA"));
+        assert!(!looks_like_local_path("https://a.test/x.png"));
+        assert!(!looks_like_local_path("http://a.test/x.png"));
+        assert!(!looks_like_local_path("./relative.png"));
+        assert!(!looks_like_local_path("relative.png"));
+        assert!(!looks_like_local_path(""));
+    }
+
+    #[test]
+    fn resolve_local_paths_inlines_real_file_and_skips_others() {
+        // Write a tiny PNG-ish file. Content doesn't have to be a real
+        // PNG — we only assert the resolver wraps it in `data:image/png;base64,…`.
+        let tmpdir = std::env::temp_dir();
+        let f = tmpdir.join(format!("aiui-imageresolve-test-{}.png", std::process::id()));
+        std::fs::write(&f, b"\x89PNG\r\n\x1a\nfake bytes").unwrap();
+        let path_str = f.to_string_lossy().to_string();
+
+        let mut spec = json!({
+            "fields": [
+                {"kind": "image", "src": path_str},
+                {"kind": "image", "src": "https://leave.me/alone.png"},
+                {"kind": "image", "src": "data:image/png;base64,UNCHANGED"},
+                {"kind": "list", "items": [
+                    {"label": "L", "value": "l", "thumbnail": path_str}
+                ]}
+            ]
+        });
+        resolve_local_paths(&mut spec);
+
+        let s = serde_json::to_string(&spec).unwrap();
+        // The local path got rewritten — original string should be gone
+        // from both the image src and the list-item thumbnail.
+        assert!(
+            !s.contains(&path_str),
+            "path string survived in spec: {s}"
+        );
+        // It got rewritten to a data: URL with image/png mime.
+        assert!(
+            s.matches("data:image/png;base64,").count() >= 2,
+            "expected ≥ 2 data: URLs (image + thumbnail): {s}"
+        );
+        // HTTPS URL was left untouched (server-side resolver's job).
+        assert!(s.contains("https://leave.me/alone.png"));
+        // Pre-existing data: URL untouched.
+        assert!(s.contains("data:image/png;base64,UNCHANGED"));
+
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn resolve_local_paths_fails_soft_on_missing_file() {
+        let original = "/this/path/should/not/exist/aiui-test-missing.png";
+        let mut spec = json!({"src": original});
+        // Should not panic; should leave the value as-is.
+        resolve_local_paths(&mut spec);
+        assert_eq!(spec["src"].as_str(), Some(original));
+    }
+
+    #[test]
+    fn guess_mime_handles_common_extensions() {
+        assert_eq!(guess_mime_from_extension(Path::new("a.png")), "image/png");
+        assert_eq!(guess_mime_from_extension(Path::new("a.JPG")), "image/jpeg");
+        assert_eq!(guess_mime_from_extension(Path::new("a.svg")), "image/svg+xml");
+        assert_eq!(
+            guess_mime_from_extension(Path::new("a.unknown")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            guess_mime_from_extension(Path::new("noext")),
+            "application/octet-stream"
         );
     }
 }

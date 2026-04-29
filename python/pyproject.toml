@@ -1,6 +1,6 @@
 [project]
 name = "aiui-mcp"
-version = "0.4.21"
+version = "0.4.22"
 description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,11 @@ classifiers = [
 dependencies = [
     "mcp>=1.26.0",
     "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
 ]
 
 [project.urls]
