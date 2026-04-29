@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.24] — 2026-04-29
+
+### Changed
+
+- **Persistent TRACE logging for aiui's own modules.** Bumps the
+  `aiui_lib::*` log level from Info to Trace by default; everything
+  else stays at Info to keep volume manageable. Log rotates at 5 MB
+  with one previous file kept — covers a multi-hour session without
+  filling up disk. Diagnosed after a 4-minute MCP-timeout on a trivial
+  form spec where the existing log gave us nothing because the entire
+  render pipeline emits only at Trace level. Next time something
+  hangs, the log under `~/Library/Logs/de.byte5.aiui/` will show
+  exactly which phase stuck.
+
 ## [0.4.23] — 2026-04-28
 
 ### Added
