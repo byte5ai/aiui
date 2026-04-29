@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.23] — 2026-04-28
+
+### Added
+
+- **`confirm` accepts an `image`.** Pass `image: {src, alt?, max_height?}`
+  to fold a visual sign-off into a plain yes/no — no more `form`-with-
+  one-image-and-two-buttons workaround for "is this generated logo OK?".
+  `src` follows the standard aiui resolution rules (data: URL, http(s)
+  URL, or absolute / `~/`-rooted local path on the host the agent runs
+  on).
+- **`ask` options accept a `thumbnail`.** Each option in the array can
+  now carry a `thumbnail: <src>` rendered as a 56 × 56 preview to the
+  left of the label. Same resolution rules. Closes the gap between
+  text-only `ask` and full-blown `image_grid`: 2–6 visual options
+  belong here, not in a `form` wrapper.
+
+### Changed
+
+- **Skill catalog calls out the visual variants.** Tool-choice table
+  gains explicit rows for "yes/no on a generated image" → `confirm`
+  with `image`, and "pick one of 2–6 images" → `ask` with `thumbnail`.
+  Removes the implicit pressure to reach for `form` for either case.
+
 ## [0.4.22] — 2026-04-28
 
 ### Added

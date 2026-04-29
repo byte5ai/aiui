@@ -424,6 +424,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_local_paths_walks_confirm_image_and_ask_thumbnail() {
+        // confirm.image.src and ask.options[].thumbnail are new image
+        // slots in 0.4.23. The resolver is shape-agnostic — it walks
+        // any `src`/`thumbnail` key regardless of which tool spec it
+        // sits under — but pin that down with a test so a future
+        // refactor can't accidentally narrow it.
+        let tmpdir = std::env::temp_dir();
+        let f = tmpdir.join(format!("aiui-confirm-ask-test-{}.png", std::process::id()));
+        std::fs::write(&f, b"\x89PNG\r\n\x1a\nfake bytes").unwrap();
+        let path_str = f.to_string_lossy().to_string();
+
+        let mut spec = json!({
+            "kind": "confirm",
+            "title": "OK?",
+            "image": {"src": path_str.clone()}
+        });
+        resolve_local_paths(&mut spec);
+        assert!(spec["image"]["src"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        let mut spec = json!({
+            "kind": "ask",
+            "question": "Which?",
+            "options": [
+                {"label": "A", "thumbnail": path_str.clone()},
+                {"label": "B", "thumbnail": "https://leave.me/b.png"},
+                {"label": "C"},
+            ]
+        });
+        resolve_local_paths(&mut spec);
+        assert!(spec["options"][0]["thumbnail"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert_eq!(
+            spec["options"][1]["thumbnail"].as_str(),
+            Some("https://leave.me/b.png")
+        );
+        assert!(spec["options"][2].get("thumbnail").is_none());
+
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
     fn resolve_local_paths_fails_soft_on_missing_file() {
         let original = "/this/path/should/not/exist/aiui-test-missing.png";
         let mut spec = json!({"src": original});

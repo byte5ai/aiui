@@ -33,6 +33,12 @@ instead:
   sortable `list` field.
 - Any step that wants a **date, datetime, range, color, or numeric value
   in a bounded interval** → `form` with the matching field.
+- Any step that asks **"is this generated image OK?"** → `confirm`
+  with `image: {src}`. Don't fall back to a `form`-with-image-and-two-
+  buttons when the question is a plain yes/no.
+- Any step that asks **"which of these images?"** with 2–6 candidates
+  → `ask` with `thumbnail` per option. Use `form` + `image_grid` only
+  when there are many candidates (≥ 7) or the picker needs multi-select.
 
 ## When chat actually wins
 
@@ -49,8 +55,11 @@ Skip the dialog for content the user reads, doesn't answer:
 | Intent | Tool |
 |---|---|
 | Yes/no, especially destructive | `confirm` |
+| Yes/no on a generated image ("is this OK?") | `confirm` with `image: {src}` |
 | 2–6 options, possibly with per-option context | `ask` |
+| Pick one of N images ("A or B or C") | `ask` with `thumbnail` per option |
 | Multi-field input, multi-action footer | `form` |
+| Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -137,9 +146,15 @@ Each `src` follows the same rules as `image` — see below.
 
 ## Image sources (`src` / `thumbnail`)
 
-Anywhere aiui takes a `src` or `thumbnail` (the `image` field, the
-`image_grid.images[]` entries, the `list.items[].thumbnail`), three
-input formats render correctly:
+aiui takes an image source in five places:
+
+- `confirm` → `image: {src, alt?, max_height?}` — visual yes/no
+- `ask` → `options[].thumbnail` — visual pick-one-of-N
+- `form` → `image` field → `src`
+- `form` → `image_grid` → `images[].src`
+- `form` → `list` → `items[].thumbnail`
+
+In all of them the same three input formats render correctly:
 
 - **Local filesystem path** (`/Users/me/foo.png`, `~/Pictures/x.jpg`)
   — *the natural choice when the file is already on disk*. The aiui

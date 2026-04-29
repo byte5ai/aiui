@@ -110,3 +110,35 @@ def test_resolve_local_paths_ignores_non_src_keys() -> None:
     # though the values would qualify if they were under the right key.
     assert spec["title"].endswith("/src.png")
     assert spec["label"] == "/this/is/just/text"
+
+
+def test_resolve_local_paths_walks_confirm_image_and_ask_thumbnail(tmp_path: Path) -> None:
+    """`confirm.image.src` and `ask.options[].thumbnail` are new image slots
+    in 0.4.23. The resolver walks any `src`/`thumbnail` key regardless of
+    tool spec — pin that down so a future refactor can't narrow it.
+    """
+    f = tmp_path / "tiny.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\nfake bytes")
+    path_str = str(f)
+
+    confirm_spec = {
+        "kind": "confirm",
+        "title": "OK?",
+        "image": {"src": path_str},
+    }
+    _resolve_local_paths(confirm_spec)
+    assert confirm_spec["image"]["src"].startswith("data:image/png;base64,")
+
+    ask_spec = {
+        "kind": "ask",
+        "question": "Which?",
+        "options": [
+            {"label": "A", "thumbnail": path_str},
+            {"label": "B", "thumbnail": "https://leave.me/b.png"},
+            {"label": "C"},
+        ],
+    }
+    _resolve_local_paths(ask_spec)
+    assert ask_spec["options"][0]["thumbnail"].startswith("data:image/png;base64,")
+    assert ask_spec["options"][1]["thumbnail"] == "https://leave.me/b.png"
+    assert "thumbnail" not in ask_spec["options"][2]

@@ -273,6 +273,15 @@ pre {
   font-size: 12px;
   margin-top: 2px;
 }
+.option-thumb {
+  width: 56px;
+  height: 56px;
+  flex: 0 0 56px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
 
 /* subtle entrance animation for dialog content */
 @keyframes aiui-enter {
