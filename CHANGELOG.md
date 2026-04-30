@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.25] — 2026-04-29
+
+### Changed
+
+- **Setup window and dialog window are now separate Tauri windows.**
+  The single-window-with-two-views design produced a class of bugs
+  where the agent's dialog ended up stacked behind the user's open
+  settings window — invisible, blocking every subsequent render call
+  for the rest of the session. Splitting them eliminates that
+  structurally: settings live in a `setup` window, dialogs in a
+  `dialog` window, both independently movable and stackable in the
+  normal macOS sense. Closing one no longer cancels the other.
+- **Windows are draggable from anywhere along the top edge.** Each
+  window has an invisible 28 px `data-tauri-drag-region` strip
+  layered over the macOS overlay title bar so the user can grab the
+  window and move it without aiming at the actual title-bar pixel
+  row. Reported by early testers when an agent dialog covered work.
+
+### Fixed
+
+- **HTTP-bind failure now exits the second instance.** Earlier
+  versions left a half-zombie aiui running when `localhost:7777` was
+  already taken — a window that looked alive but answered no
+  requests. Combined with the old single-window design that produced
+  the 2026-04-29 hung-dialog incident: a stale instance held the
+  pending dialog while a freshly started one masked it with its
+  settings view. The new behaviour is to exit(1) on bind failure,
+  surface the existing instance via tauri-plugin-single-instance,
+  and let mcp_attach's auto-resurrect bring things back cleanly.
+- **Window close on the setup window no longer kills an in-flight
+  dialog.** The close handler now checks whether any other window is
+  still visible before quitting the app. Dialog windows stay alive
+  when the user closes settings; the app only quits when the last
+  window goes away. Auto-resurrect on the next tool call still works
+  the same way.
+
+### Internal
+
+- `surface_main_window` / `reload_main_webview` now operate on the
+  `dialog` window label specifically. `dialog:show` and `ui:ping`
+  events are routed via `emit_to(DIALOG_WINDOW_LABEL, …)` so the
+  setup window never sees them.
+- New `DialogShell.svelte` holds the dialog-specific listeners and
+  routing; `App.svelte` branches on `getCurrentWebviewWindow().label`
+  and renders Settings or DialogShell accordingly.
+
 ## [0.4.24] — 2026-04-29
 
 ### Changed

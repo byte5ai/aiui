@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "aiui",
-  "version": "0.4.24",
+  "version": "0.4.25",
   "identifier": "de.byte5.aiui",
   "build": {
     "frontendDist": "../dist",
@@ -10,26 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "aiui",
-        "width": 520,
-        "height": 480,
-        "minWidth": 520,
-        "minHeight": 380,
-        "maxWidth": 520,
-        "maxHeight": 640,
-        "resizable": false,
-        "fullscreen": false,
-        "visible": false,
-        "decorations": true,
-        "center": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "dragDropEnabled": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
     },

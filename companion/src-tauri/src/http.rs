@@ -288,7 +288,25 @@ async fn health(
 async fn probe_webview(state: &AppState) -> WebviewHealth {
     let (id, rx) = state.ui_acks.register();
     let started = std::time::Instant::now();
-    if let Err(e) = state.app.emit("ui:ping", &id) {
+    // Probe the dialog window's webview specifically — the setup
+    // window is user-driven and irrelevant for render-pipeline health.
+    // If no dialog window exists yet, we report `responsive: true`
+    // because there's nothing to be unresponsive *about*.
+    if state
+        .app
+        .get_webview_window(crate::DIALOG_WINDOW_LABEL)
+        .is_none()
+    {
+        state.ui_acks.forget(&id);
+        return WebviewHealth {
+            responsive: true,
+            rtt_ms: Some(0),
+        };
+    }
+    if let Err(e) = state
+        .app
+        .emit_to(crate::DIALOG_WINDOW_LABEL, "ui:ping", &id)
+    {
         trace(&format!("health: emit ui:ping failed: {e}"));
         state.ui_acks.forget(&id);
         return WebviewHealth {
@@ -500,7 +518,10 @@ async fn render(
     surface_main_window(&state.app, &id);
 
     // Emit the dialog to the frontend.
-    if let Err(e) = state.app.emit("dialog:show", &dr) {
+    if let Err(e) = state
+        .app
+        .emit_to(crate::DIALOG_WINDOW_LABEL, "dialog:show", &dr)
+    {
         trace(&format!("render: emit FAILED: {e}"));
     } else {
         trace(&format!("render: emitted dialog:show id={}", id));
@@ -535,14 +556,19 @@ async fn render(
             // to a small generic ack via the AckRegistry for the second
             // round. That keeps DialogState simple.
             let (probe_id, probe_rx) = state.ui_acks.register();
-            if let Err(e) = state.app.emit("ui:ping", &probe_id) {
+            if let Err(e) = state
+                .app
+                .emit_to(crate::DIALOG_WINDOW_LABEL, "ui:ping", &probe_id)
+            {
                 trace(&format!("render: post-reload ui:ping emit failed: {e}"));
                 state.ui_acks.forget(&probe_id);
             }
             match tokio::time::timeout(DIALOG_ACK_TIMEOUT, probe_rx).await {
                 Ok(Ok(())) => {
                     trace("render: post-reload webview is responsive, re-emitting dialog:show");
-                    if let Err(e) = state.app.emit("dialog:show", &dr) {
+                    if let Err(e) =
+                        state.app.emit_to(crate::DIALOG_WINDOW_LABEL, "dialog:show", &dr)
+                    {
                         trace(&format!("render: re-emit FAILED: {e}"));
                     }
                 }
@@ -618,22 +644,22 @@ async fn render(
     .into_response()
 }
 
-/// Bring the main webview window to the front from any thread. All Tauri
-/// window operations have to run on the main thread, so we hop there via
-/// `run_on_main_thread`.
+/// Surface the dialog window for the incoming render. If the window
+/// already exists, show + focus + unminimize; otherwise build it.
+/// All Tauri window operations have to run on the main thread, so we
+/// hop there via `run_on_main_thread`.
 fn surface_main_window(app: &AppHandle, id: &str) {
     let app_for_show = app.clone();
     let id_for_log = id.to_string();
     let rc = app.clone().run_on_main_thread(move || {
         trace(&format!("render: main-thread callback id={}", id_for_log));
-        if let Some(win) = app_for_show.get_webview_window("main") {
-            trace("render: main-thread got window, calling show()");
-            let _ = win.show();
-            let _ = win.set_focus();
-            let _ = win.unminimize();
-            trace("render: main-thread show() returned");
-        } else {
-            trace("render: main-thread window MISSING");
+        match crate::ensure_dialog_window(&app_for_show) {
+            Ok(_win) => {
+                trace("render: main-thread dialog window ready (show/build)");
+            }
+            Err(e) => {
+                trace(&format!("render: main-thread dialog window FAILED: {e}"));
+            }
         }
     });
     trace(&format!("render: run_on_main_thread returned {:?}", rc.is_ok()));
@@ -648,8 +674,8 @@ fn surface_main_window(app: &AppHandle, id: &str) {
 fn reload_main_webview(app: &AppHandle) {
     let app_for_reload = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
-        if let Some(win) = app_for_reload.get_webview_window("main") {
-            trace("render: reloading main webview");
+        if let Some(win) = app_for_reload.get_webview_window(crate::DIALOG_WINDOW_LABEL) {
+            trace("render: reloading dialog webview");
             if let Err(e) = win.eval("location.reload()") {
                 trace(&format!("render: reload eval failed: {e}"));
             }
