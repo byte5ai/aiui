@@ -15,6 +15,25 @@ All notable changes to this project are documented here.
   state the user can act on. Less vertical real estate, more density
   for the remotes list below.
 
+### Fixed
+
+- **Stale `mcp-stdio` subprocess detects itself across in-place `.app`
+  replacement.** macOS keeps the previous binary's code-pages alive in
+  any already-running process even after the on-disk file is replaced
+  by the in-app updater or a manual DMG drop. Claude Desktop holds its
+  spawned `aiui --mcp-stdio` child alive across the update, so it ends
+  up answering tool calls with stale logic. Symptom on 2026-04-30: a
+  Form tool call crashed the in-memory binary 2 ms after receipt with
+  no stderr output, while a fresh aiui v0.4.26 sat unused on disk.
+  The GUI-side sweep couldn't catch this because the executable path
+  matched. New behaviour: `run_mcp_stdio_only` reads
+  `CFBundleShortVersionString` from the on-disk `Info.plist` two
+  directories up from `argv[0]` and compares it with our compile-time
+  `CARGO_PKG_VERSION`. Mismatch → `exit(0)`. Claude Desktop sees the
+  broken pipe and respawns against the freshly installed binary.
+  Self-healing — no user-facing dialog, no doc note, no manual
+  Claude-Desktop restart needed after future updates.
+
 ## [0.4.26] — 2026-04-29
 
 ### Fixed
