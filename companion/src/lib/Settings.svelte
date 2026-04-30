@@ -203,7 +203,13 @@
 
 {#if status}
   <div class="stack">
-    <header class="app-header">
+    <!-- Header acts as a second drag region — the 36 px App.svelte
+      overlay only covers the OS title-bar zone. The header below
+      it (logo + status text + version chip) has no click targets
+      worth protecting, so the whole row picks up window-drag. The
+      `header-action` button (skill repair, only visible when the
+      skill is missing) opts out via -webkit-app-region: no-drag. -->
+    <header class="app-header" data-tauri-drag-region>
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
@@ -494,14 +500,30 @@
      * gradient line. */
     padding: 8px 0 12px 0;
     border-bottom: 1px solid var(--border);
+    /* Whole header acts as a window-drag handle. Children inherit
+       this via the universal selector below; interactive children
+       (today: only `.header-action`) opt out explicitly. */
+    -webkit-app-region: drag;
   }
-  .app-header img.app-icon {
-    /* 64×64 — at least 2× the original 32 px so the brand mark
-       actually carries weight in the chrome. The header-meta column
-       grows in line height to match, status lines breathe. */
-    width: 64px;
-    height: 64px;
-    border-radius: 14px;
+  .app-header > *,
+  .app-header :global(*) {
+    -webkit-app-region: drag;
+  }
+  .app-header :global(.header-action) {
+    -webkit-app-region: no-drag;
+  }
+  .app-header .app-icon {
+    /* 80×80 — well past 2× the original 32 px. Tester noted that
+       the previous 64×80 attempt did not visibly enlarge the icon
+       in the rendered window; using `display:block` + explicit
+       min-width/min-height defends against inline-image layout
+       quirks that can squish the rendered size below the spec. */
+    display: block;
+    width: 80px;
+    height: 80px;
+    min-width: 80px;
+    min-height: 80px;
+    border-radius: 18px;
     box-shadow: var(--shadow-sm);
     flex-shrink: 0;
   }
