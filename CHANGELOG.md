@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.26] — 2026-04-29
+
+### Fixed
+
+- **Window content no longer overlaps the macOS traffic-light buttons.**
+  The 0.4.25 multi-window refactor accidentally dropped the
+  `<main class="container">` wrapper from `App.svelte` — that's the
+  element that supplies the 44 px Apple-HIG top padding so content
+  starts below the title-bar buttons. Settings.svelte rendered
+  straight into the body, so the aiui logo collided with the traffic
+  lights. Wrapper and the drag region now live in `App.svelte`,
+  shared by both windows; Settings.svelte and DialogShell.svelte
+  render directly into it.
+
 ## [0.4.25] — 2026-04-29
 
 ### Changed

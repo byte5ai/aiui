@@ -65,13 +65,9 @@
   }
 </script>
 
-<!-- Drag region: invisible 28px strip at the very top, lets the user
-     pick the window up by anywhere not covered by an interactive
-     control. Tauri reads `data-tauri-drag-region` on every event. -->
-<div class="drag-region" data-tauri-drag-region></div>
-
-<main class="container">
-  {#if current}
+<!-- App.svelte provides the outer container with Apple-HIG title-bar
+     padding and the drag region. We render straight into it. -->
+{#if current}
     <!-- {#key current.id} forces a fresh widget instance for every new
       dialog, even when two consecutive renders are the same kind (e.g.
       two `confirm`s). Without it, Svelte recycles the component and
@@ -95,24 +91,13 @@
         </div>
       {/if}
     {/key}
-  {:else}
-    <!-- Brief idle state — only visible during the few hundred ms
-         between window-show and the dialog:show event arriving. -->
-    <div class="idle"></div>
-  {/if}
-</main>
+{:else}
+  <!-- Brief idle state — only visible during the few hundred ms
+       between window-show and the dialog:show event arriving. -->
+  <div class="idle"></div>
+{/if}
 
 <style>
-  .drag-region {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 28px;
-    z-index: 1;
-    /* Stay invisible — the macOS overlay title bar is already there;
-       this just guarantees the *interior* top stripe is grabbable too. */
-  }
   .idle {
     min-height: 80px;
   }
