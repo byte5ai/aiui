@@ -591,6 +591,33 @@ fn is_auto_launch() -> bool {
 /// attaches to the GUI process via the lifetime socket so the GUI knows we're
 /// alive (and can self-terminate when we die).
 pub fn run_mcp_stdio_only() {
+    // Stale-binary self-check (runs before any state is touched). On
+    // macOS, an in-place `.app` replacement (in-app updater, manual DMG
+    // drop) leaves any already-running mcp-stdio child holding the
+    // *previous* binary in memory while the on-disk path now points at
+    // the new one. The GUI-side sweep can't see that: the path matches.
+    // Result: stale logic answering tool calls until Claude Desktop
+    // restarts, manifesting as silent crashes during dispatch.
+    //
+    // We compare our compile-time `CARGO_PKG_VERSION` with the bundle's
+    // on-disk `CFBundleShortVersionString`. Mismatch → exit so Claude
+    // Desktop respawns us against the fresh binary. Investigated
+    // 2026-04-30: Claude-Desktop child kept v0.4.25 logic alive across
+    // a v0.4.26 update, then crashed silently on a Form tool call.
+    if let Some(disk_version) = housekeeping::disk_version_if_stale() {
+        eprintln!(
+            "[aiui] mcp-stdio: in-memory binary v{} != on-disk v{}; \
+             exiting so Claude Desktop respawns the fresh build.",
+            env!("CARGO_PKG_VERSION"),
+            disk_version
+        );
+        // No `logging::trace` here — the trace path itself might have
+        // been moved by the new bundle. eprintln lands in
+        // `~/Library/Logs/Claude/mcp-server-aiui.log` exactly where the
+        // user is most likely to look.
+        std::process::exit(0);
+    }
+
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     logging::trace(&format!(
         "mcp-stdio: entering run loop, token_path={}",

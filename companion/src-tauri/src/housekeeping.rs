@@ -7,10 +7,26 @@
 //! v0.2.5) or otherwise incompatible, so the user ends up with a stale MCP
 //! server that refuses to reconnect to the new GUI.
 //!
-//! On every GUI startup we therefore scan for `aiui --mcp-stdio` processes
-//! whose executable path differs from ours and SIGTERM them. Claude Desktop
-//! will respawn them against the freshly patched config — pointing at the
-//! new binary.
+//! Two complementary mechanisms exist:
+//!
+//!  1. **GUI-side sweep** (`kill_stale_mcp_stdio_children`): on every GUI
+//!     startup we scan for `aiui --mcp-stdio` processes whose executable
+//!     path differs from ours and SIGTERM them. This only catches the case
+//!     where the *path* changed — useless when the user dragged a new
+//!     `aiui.app` over the old one in place.
+//!
+//!  2. **Subprocess-side self-check** (`disk_version_if_stale`): every
+//!     `--mcp-stdio` invocation reads `CFBundleShortVersionString` from
+//!     the on-disk `Info.plist` two directories up from `argv[0]` and
+//!     compares it with `CARGO_PKG_VERSION` baked in at compile time. If
+//!     they disagree, the in-memory binary is stale — the bundle on disk
+//!     was replaced after this process loaded — and we exit so Claude
+//!     Desktop respawns us against the fresh binary.
+//!
+//! Together those two layers catch the in-place-replace scenario that
+//! produced the 2026-04-30 form-tool-call crash: a Claude-Desktop-spawned
+//! mcp-stdio child kept the previous version in memory across an
+//! updater-driven replacement of `/Applications/aiui.app`.
 //!
 //! macOS-specific: we use `ps -axo pid=,command=` to enumerate processes
 //! (there is no /proc on macOS). The executable path is the first whitespace-
@@ -23,6 +39,7 @@
 //! a no-op.
 
 use crate::logging::trace;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// A stale `aiui --mcp-stdio` process that should be terminated.
@@ -112,6 +129,52 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
         ));
     }
     stale.len()
+}
+
+/// Pure decision: given our compile-time version string and the version
+/// string read from the on-disk `Info.plist`, return `true` when this
+/// in-memory binary is stale (i.e. should exit so it can be respawned).
+///
+/// Empty / whitespace `disk` is treated as "unknown" → not stale: better
+/// to keep running than abort a working subprocess on a transient
+/// `plutil` glitch.
+pub(crate) fn is_disk_version_stale(own: &str, disk: &str) -> bool {
+    let disk = disk.trim();
+    !disk.is_empty() && disk != own
+}
+
+/// True iff the bundle on disk (one bundle level up from `argv[0]`)
+/// reports a `CFBundleShortVersionString` that differs from our own
+/// compile-time `CARGO_PKG_VERSION`. Returns the on-disk version when
+/// stale so the caller can log it; `None` when fresh, when running
+/// outside an `.app` bundle (dev build, `cargo run`), or when the
+/// lookup itself fails (no `Info.plist`, `plutil` missing, …).
+///
+/// Self-detection at the subprocess side is what closes the gap that
+/// the path-based GUI sweep can't see: an in-place `.app` replacement
+/// leaves the running child with stale code at the unchanged path.
+pub fn disk_version_if_stale() -> Option<String> {
+    let own = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe().ok()?;
+    // .../aiui.app/Contents/MacOS/aiui  →  .../aiui.app/Contents/Info.plist
+    let plist: PathBuf = exe.parent()?.parent()?.join("Info.plist");
+    if !plist.exists() {
+        return None;
+    }
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let disk = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if is_disk_version_stale(own, &disk) {
+        Some(disk)
+    } else {
+        None
+    }
 }
 
 /// Find every `aiui --mcp-stdio` process regardless of executable path,
@@ -225,6 +288,31 @@ mod tests {
     fn skips_own_pid_even_if_path_differs() {
         let ps = "12345 /old/path/aiui --mcp-stdio\n";
         assert!(find_stale(ps, CURRENT, 12345).is_empty());
+    }
+
+    #[test]
+    fn disk_version_check_treats_match_as_fresh() {
+        assert!(!is_disk_version_stale("0.4.26", "0.4.26"));
+        // Trailing whitespace from `plutil` output is normal.
+        assert!(!is_disk_version_stale("0.4.26", "0.4.26\n"));
+        assert!(!is_disk_version_stale("0.4.26", "  0.4.26  "));
+    }
+
+    #[test]
+    fn disk_version_check_treats_mismatch_as_stale() {
+        assert!(is_disk_version_stale("0.4.25", "0.4.26"));
+        assert!(is_disk_version_stale("0.4.26", "0.4.27"));
+        assert!(is_disk_version_stale("0.4.26", "1.0.0"));
+    }
+
+    #[test]
+    fn disk_version_check_treats_empty_disk_as_unknown_not_stale() {
+        // If `plutil` returns nothing — bundle missing, dev build,
+        // permissions issue — we'd rather keep running than abort.
+        // The GUI-side sweep is the safety net for that path.
+        assert!(!is_disk_version_stale("0.4.26", ""));
+        assert!(!is_disk_version_stale("0.4.26", "   "));
+        assert!(!is_disk_version_stale("0.4.26", "\n\n"));
     }
 
     #[test]
