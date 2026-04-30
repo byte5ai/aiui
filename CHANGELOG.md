@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [0.4.27] — 2026-04-30
 
+### Added
+
+- **`mermaid` field renders schematic diagrams to SVG.** Drop
+  `{kind: "mermaid", source: "graph TD; A --> B"}` into a form and
+  aiui runs the Mermaid DSL through `mermaid.render()`, sanitises the
+  resulting SVG with DOMPurify, and embeds it inline as an
+  inline-context block (sibling of `markdown` / `image`). Covers
+  flowcharts, sequence diagrams, state diagrams, gantt, ER, mind-maps,
+  pie charts. Closes the gap that has had agents reaching for ASCII
+  box-and-arrow art whenever they want to *show* a flow rather than
+  describe one — the result in any proportional-font surface is
+  predictably awful. `securityLevel: 'strict'` on the Mermaid side
+  rejects HTML-in-labels; the DOMPurify pass is the second line of
+  defence (no `<script>`, no `<foreignObject>`, no event attrs).
+
 ### Changed
 
 - **Setup-Window-Header polish.** The aiui logo doubles in size (32 →

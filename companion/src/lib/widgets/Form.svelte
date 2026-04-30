@@ -3,6 +3,7 @@
   import { marked } from "marked";
   import DOMPurify from "dompurify";
   import TreeNode from "./TreeNode.svelte";
+  import MermaidView from "./MermaidView.svelte";
 
   type SelectOption = { label: string; value: string; description?: string };
 
@@ -50,6 +51,7 @@
     | { kind: "static_text"; text: string; tone?: "info" | "warn" | "muted" }
     | { kind: "markdown"; text: string }
     | { kind: "image"; src: string; label?: string; alt?: string; max_height?: number }
+    | { kind: "mermaid"; source: string; label?: string; max_height?: number }
     | {
         kind: "image_grid";
         name: string;
@@ -163,6 +165,7 @@
       case "static_text":
       case "markdown":
       case "image":
+      case "mermaid":
         return undefined;
       case "checkbox":
         return f.default ?? false;
@@ -197,7 +200,11 @@
 
   function valueFields(fs: Field[]): Field[] {
     return fs.filter(
-      (f) => f.kind !== "static_text" && f.kind !== "markdown" && f.kind !== "image"
+      (f) =>
+        f.kind !== "static_text" &&
+        f.kind !== "markdown" &&
+        f.kind !== "image" &&
+        f.kind !== "mermaid"
     );
   }
 
@@ -304,7 +311,13 @@
 
   // --- validation ---------------------------------------------------------
   function isFieldComplete(f: Field): boolean {
-    if (f.kind === "static_text" || f.kind === "markdown" || f.kind === "image") return true;
+    if (
+      f.kind === "static_text" ||
+      f.kind === "markdown" ||
+      f.kind === "image" ||
+      f.kind === "mermaid"
+    )
+      return true;
     if (f.kind === "checkbox" || f.kind === "slider") return true;
     if (f.kind === "list" || f.kind === "tree") return true;
     if (f.kind === "table") {
@@ -439,6 +452,8 @@
           <img src={f.src} alt={f.alt ?? f.label ?? ""} />
           {#if f.label}<figcaption>{f.label}</figcaption>{/if}
         </figure>
+      {:else if f.kind === "mermaid"}
+        <MermaidView source={f.source} label={f.label} max_height={f.max_height} />
       {:else if f.kind === "tree"}
         {@const treeValue = values[f.name] as { selected: string[]; expanded: Set<string> }}
         <div>

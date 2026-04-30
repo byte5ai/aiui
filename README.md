@@ -38,6 +38,9 @@ There's a better way.
   typing-heavy chat exchange.
 - **"Rank these five tickets in the order you want them."** Drag to
   reorder, the order comes back as a clean list.
+- **"Here's the flow I'm proposing — does it look right?"** A real
+  diagram (Mermaid → SVG) instead of ASCII boxes-and-arrows that
+  collapse into nonsense in proportional fonts.
 
 The agent gets your answer as structured data and keeps going. No side
 conversations, no throwaway web dashboards cluttering your system — just

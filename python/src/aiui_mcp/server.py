@@ -338,6 +338,7 @@ async def form(
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
     - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
     - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the Mac), or a `data:` URL. Use for visual confirmation of agent-generated previews.
+    - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders to SVG and DOMPurify-sanitises before display.
     - image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}
       Result: {selected: [values]}
     - list:        {kind, name, label?, items: [{label, value, description?, thumbnail?}],
