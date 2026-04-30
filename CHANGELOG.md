@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.27] — 2026-04-30
+
+### Changed
+
+- **Setup-Window-Header polish.** The aiui logo doubles in size (32 →
+  64 px) to actually carry the brand mark instead of being a thumb-
+  nail next to text. The Skill-installed indicator moves out of its
+  own full-width row up into the header status stack, sharing the
+  dot+label visual with the Claude-Desktop connection line. Repair
+  button only appears when the skill is missing — that's the only
+  state the user can act on. Less vertical real estate, more density
+  for the remotes list below.
+
 ## [0.4.26] — 2026-04-29
 
 ### Fixed

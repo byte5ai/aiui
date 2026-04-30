@@ -214,6 +214,24 @@
             {$_("app.status.not_connected")}
           {/if}
         </div>
+        <!-- Skill status sits next to the connection status: both are
+          "is aiui plumbed in correctly?" signals, both are dot+text, and
+          neither needs a full-width row. Repair button only surfaces
+          when the skill is actually missing — which is the only time
+          the user can act on it. -->
+        <div class="header-status-line">
+          <span class="status-dot" class:ok={status.skill_installed}></span>
+          <span>
+            {status.skill_installed
+              ? $_("settings.skill.status.ok")
+              : $_("settings.skill.status.miss")}
+          </span>
+          {#if !status.skill_installed}
+            <button class="header-action" onclick={repairSkill} disabled={busy}>
+              {$_("settings.skill.repair")}
+            </button>
+          {/if}
+        </div>
         <!-- Reassures the user that closing this window doesn't kill aiui:
           mcp_attach's auto-resurrect path relaunches the GUI on next demand.
           Single dim line, Apple-style, no command-flow vocabulary. -->
@@ -341,19 +359,11 @@
       </section>
     {/if}
 
-    <!-- Skill status row. Replaces the old "Skill installieren" button which
-      suggested optionality — the skill is mandatory and auto-installed on
-      every GUI launch, so the only meaningful UI is "is it there?" plus a
-      repair button when it isn't. -->
-    <section class="status-row" class:err={!status.skill_installed}>
-      <span class="dot {status.skill_installed ? 'ok' : 'err'}"></span>
-      <span class="status-text">
-        {status.skill_installed ? $_("settings.skill.status.ok") : $_("settings.skill.status.miss")}
-      </span>
-      {#if !status.skill_installed}
-        <button onclick={repairSkill} disabled={busy}>{$_("settings.skill.repair")}</button>
-      {/if}
-    </section>
+    <!-- Skill status moved into the header (`.header-status-line`)
+      alongside the connection dot. Both are "is aiui correctly
+      plumbed?" signals; presenting them side-by-side instead of in a
+      full-width row keeps the chrome compact and saves a row of
+      vertical scroll for the remotes list. -->
 
     <section>
       <span class="section-label">{$_("settings.remotes.title")}</span>
@@ -486,11 +496,22 @@
     border-bottom: 1px solid var(--border);
   }
   .app-header img.app-icon {
-    width: 32px;
-    height: 32px;
-    border-radius: 7px;
+    /* 64×64 — at least 2× the original 32 px so the brand mark
+       actually carries weight in the chrome. The header-meta column
+       grows in line height to match, status lines breathe. */
+    width: 64px;
+    height: 64px;
+    border-radius: 14px;
     box-shadow: var(--shadow-sm);
     flex-shrink: 0;
+  }
+  .header-action {
+    /* Inline action that only surfaces when a status line needs
+       fixing (today: skill repair). Smaller than a full button so it
+       fits in the header-status-line without reflowing the column. */
+    margin-left: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
   }
   .header-meta {
     flex: 1;
@@ -540,19 +561,8 @@
     letter-spacing: 0.04em;
   }
 
-  .status-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--surface-raised);
-    box-shadow: var(--shadow-sm);
-    font-size: 12.5px;
-  }
-  .status-row.err { border-color: var(--danger); }
-  .status-row .status-text { flex: 1; }
+  /* `.status-row` styles removed — the skill status moved into the
+     header-status-line stack. Kept the comment for future-history. */
 
   .remote-row {
     display: flex;
