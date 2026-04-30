@@ -33,6 +33,11 @@ instead:
   sortable `list` field.
 - Any step that wants a **date, datetime, range, color, or numeric value
   in a bounded interval** → `form` with the matching field.
+- Any step where you'd sketch a **flow, sequence, state, hierarchy or
+  schedule in ASCII** ("Step A → Step B → ...") → `form` with a
+  `mermaid` field. ASCII boxes-and-arrows look terrible in any
+  proportional-font surface; the `mermaid` field renders to clean
+  SVG. See the dedicated section below.
 - Any step that asks **"is this generated image OK?"** → `confirm`
   with `image: {src}`. Don't fall back to a `form`-with-image-and-two-
   buttons when the question is a plain yes/no.
@@ -119,6 +124,39 @@ sortable_by_column?: true   # click headers to sort
 Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
 order field reflects user-driven sorts so you can preserve their view if
 you reopen the form.
+
+## Schematic diagrams: `mermaid`
+
+When you'd otherwise reach for ASCII boxes-and-arrows, draw flowcharts
+in `+--+`-style art, or sketch a sequence diagram with `-->` and `|`,
+**stop**. Use the `mermaid` field in a `form` instead.
+
+Spec: `{kind: "mermaid", source: "<DSL>", label?: string, max_height?: number}`.
+
+The `source` is a Mermaid-DSL string. aiui pipes it through `mermaid.render()`,
+DOMPurify-sanitises the resulting SVG, and embeds it inline. Covers
+flowcharts, sequence diagrams, state diagrams, class diagrams, gantt,
+ER, mind-maps, and pie charts — pick the one that fits the situation.
+
+```
+{
+  "kind": "mermaid",
+  "source": "graph TD; Start --> Probe; Probe -- ok --> Render; Probe -- fail --> Retry; Retry --> Probe"
+}
+```
+
+Read-only — like `markdown` and `image`, it sits between input fields
+to give context, not to ask anything. Result-handling unchanged.
+
+**Anti-patterns:**
+
+- ASCII / box-drawing art for any flow, sequence, state, or
+  hierarchy — that's exactly the slop this field replaces.
+- Trying to render a *picture* as Mermaid — Mermaid is structured
+  diagrams (nodes, edges, swimlanes), not free drawing. For arbitrary
+  images use `image` with a real source.
+- Embedding HTML in node labels — Mermaid's `securityLevel: strict`
+  rejects it (which we want). Keep labels plain text.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 

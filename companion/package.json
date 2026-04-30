@@ -29,6 +29,7 @@
     "@tauri-apps/plugin-updater": "^2.10.1",
     "dompurify": "^3.4.1",
     "marked": "^18.0.2",
+    "mermaid": "^11.14.0",
     "svelte-i18n": "^4.0.1"
   }
 }
