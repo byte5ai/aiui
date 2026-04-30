@@ -202,6 +202,12 @@
 </script>
 
 {#if status}
+  <!-- Drag region: invisible 28px strip at the very top so the user
+       can grab the window from anywhere along its top edge, not just
+       the platform-rendered title bar. Doesn't capture clicks on the
+       app-header below because the header sits *under* it in z-order
+       once a real interactive element is in place. -->
+  <div class="drag-region" data-tauri-drag-region></div>
   <div class="stack">
     <header class="app-header">
       <img src={iconUrl} alt="aiui" class="app-icon" />
@@ -817,6 +823,16 @@
     cursor: pointer;
   }
   .welcome-cta:hover { color: var(--fg); text-decoration: underline; }
+
+  /* --- drag region --- */
+  .drag-region {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 28px;
+    z-index: 1;
+  }
 
   /* --- modal (uninstall-done) --- */
   .modal-backdrop {

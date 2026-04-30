@@ -13,7 +13,17 @@ mod skill;
 mod tunnel;
 
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+/// Tauri window labels. Setup and dialog live in *separate* windows so:
+///  • the agent's dialog never visually overlaps the user's settings,
+///  • neither window can hide behind the other in macOS' z-stack,
+///  • each gets its own movable title bar without weird re-layout
+///    artefacts when the content kind changes.
+/// See the v0.4.25 multi-window refactor in lib.rs for the lifecycle
+/// rules that govern when each is created and torn down.
+pub const SETUP_WINDOW_LABEL: &str = "setup";
+pub const DIALOG_WINDOW_LABEL: &str = "dialog";
 
 #[tauri::command]
 fn dialog_submit(
@@ -59,7 +69,18 @@ fn ui_pong(
 
 #[tauri::command]
 async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
-    let _ = window.hide();
+    // The frontend calls this after a dialog submit/cancel. We *destroy*
+    // the dialog window (not hide) so the next render starts from a clean
+    // slate — no stale Svelte state, no z-order quirks, no visible frame
+    // sitting empty. The setup window calls this too if the user clicks
+    // its custom close button (none today, but the contract should be
+    // symmetric).
+    let label = window.label().to_string();
+    let _ = window.close();
+    // If that was the last visible window and nothing else is pending,
+    // the OS-level CloseRequested handler will fire next and decide
+    // whether the app should quit.
+    log::debug!("[aiui] close_window: closed {label}");
     Ok(())
 }
 
@@ -73,7 +94,14 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
-    if let Some(win) = app.get_webview_window("main") {
+    // The update dialog is surfaced from whichever window is alive when
+    // the check fires — usually the setup window (frontend triggers it
+    // from there). We just need *some* visible window to attach the OS
+    // dialog to.
+    let win = app
+        .get_webview_window(SETUP_WINDOW_LABEL)
+        .or_else(|| app.get_webview_window(DIALOG_WINDOW_LABEL));
+    if let Some(win) = win {
         let _ = win.show();
         let _ = win.set_focus();
     }
@@ -471,10 +499,87 @@ fn show_settings_window(app: &tauri::AppHandle) {
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
-    if let Some(win) = app.get_webview_window("main") {
+    if let Some(win) = app.get_webview_window(SETUP_WINDOW_LABEL) {
         let _ = win.show();
         let _ = win.set_focus();
+        let _ = win.unminimize();
+        return;
     }
+    if let Err(e) = build_setup_window(app) {
+        log::error!("[aiui] failed to build setup window: {e}");
+    }
+}
+
+/// Build the setup (settings) window. Same dimensions as the legacy
+/// single-window setup: 520×480, fixed width, height capped at 640.
+/// `dragDropEnabled: false` because Sortable.js uses HTML5 DnD and
+/// Tauri's window-level file-drop interception steals those events.
+pub(crate) fn build_setup_window(
+    app: &tauri::AppHandle,
+) -> tauri::Result<tauri::WebviewWindow> {
+    WebviewWindowBuilder::new(
+        app,
+        SETUP_WINDOW_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("aiui")
+    .inner_size(520.0, 480.0)
+    .min_inner_size(520.0, 380.0)
+    .max_inner_size(520.0, 640.0)
+    .resizable(false)
+    .center()
+    .decorations(true)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .disable_drag_drop_handler()
+    .visible(true)
+    .build()
+}
+
+/// Build (or surface) the dialog window. Called from the render path
+/// when a `confirm` / `ask` / `form` arrives. Same look as the setup
+/// window so the user gets a consistent aiui chrome regardless of
+/// which view they're seeing — the *content* is what differs.
+///
+/// Reused across renders: if a dialog window already exists, we just
+/// surface it. The frontend handles the actual content swap when the
+/// `dialog:show` event arrives.
+pub(crate) fn ensure_dialog_window(
+    app: &tauri::AppHandle,
+) -> tauri::Result<tauri::WebviewWindow> {
+    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
+        let _ = win.show();
+        let _ = win.set_focus();
+        let _ = win.unminimize();
+        return Ok(win);
+    }
+    WebviewWindowBuilder::new(
+        app,
+        DIALOG_WINDOW_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("aiui")
+    .inner_size(520.0, 480.0)
+    .min_inner_size(520.0, 380.0)
+    .max_inner_size(520.0, 640.0)
+    .resizable(false)
+    .center()
+    .decorations(true)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .disable_drag_drop_handler()
+    .visible(true)
+    .build()
+}
+
+/// True when no aiui window is currently visible to the user. Used by
+/// the close-event handler to decide whether to keep the app alive
+/// (something else is open, e.g. a still-pending dialog) or to quit.
+#[allow(dead_code)]
+fn no_visible_windows(app: &tauri::AppHandle) -> bool {
+    app.webview_windows()
+        .values()
+        .all(|w| !w.is_visible().unwrap_or(false))
 }
 
 fn is_auto_launch() -> bool {
@@ -632,13 +737,22 @@ pub fn run() {
             // so skill updates ride with app updates.
             let _ = skill::install_locally();
 
-            // HTTP server on localhost:7777. If bind fails (port held by
-            // a stale aiui or unrelated process) we record the error in
-            // the shared `http_error` cell so the Settings UI can surface
-            // a banner — silently logging it left users staring at a
-            // window that *looked* alive but answered no requests.
+            // HTTP server on localhost:7777. If bind fails the most
+            // likely cause is a stale aiui already holding the port —
+            // exactly the multi-instance race that produced the
+            // 2026-04-29 hung-dialog incident. Rather than letting
+            // this instance run as a half-zombie (no server, but a
+            // window that *looks* alive), we exit hard. The other
+            // instance keeps serving; tauri-plugin-single-instance
+            // will surface its setup window if the user retried.
+            //
+            // The `http_error` cell stays for the rare case where the
+            // failure is something other than EADDRINUSE — we still
+            // want a banner to fire before exit, and the Settings UI
+            // reads this on its first tick.
             let http_error_for_serve = http_error.clone();
             let port_for_error = cfg.http_port;
+            let app_handle_for_exit = app_handle_http.clone();
             rt.spawn(async move {
                 if let Err(e) = http::serve(
                     cfg_http,
@@ -649,12 +763,19 @@ pub fn run() {
                 )
                 .await
                 {
-                    log::error!("[aiui] http server error: {e}");
+                    log::error!(
+                        "[aiui] http server error on :{port_for_error}: {e} — exiting (other instance owns the port)"
+                    );
                     if let Ok(mut slot) = http_error_for_serve.lock() {
                         *slot = Some(format!(
                             "Konnte localhost:{port_for_error} nicht öffnen — Port wahrscheinlich belegt. {e}"
                         ));
                     }
+                    // Hop to main thread to call exit cleanly.
+                    let app_for_exit = app_handle_for_exit.clone();
+                    let _ = app_handle_for_exit.run_on_main_thread(move || {
+                        app_for_exit.exit(1);
+                    });
                 }
             });
 
@@ -703,12 +824,52 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Red X quits the app outright — the MCP-stdio child's
-            // lifetime-socket loop will resurrect aiui on the next agent
-            // call, so there is no reason to keep a headless process
-            // running once the user asks for it to go away.
+            // Multi-window lifecycle (v0.4.25):
+            //
+            // The setup window and the dialog window are independent.
+            // Closing one shouldn't kill the other — and definitely
+            // shouldn't kill an in-flight dialog the agent is still
+            // waiting on.
+            //
+            //  • Red X on setup window: setup goes away. If a dialog is
+            //    visible *or* something is pending, the app stays alive.
+            //    Otherwise the app quits, and `mcp_attach`'s
+            //    auto-resurrect path brings it back on the next tool
+            //    call. Same UX promise as before, just without the
+            //    cross-window damage.
+            //  • Red X on dialog window: the dialog is treated as
+            //    cancelled (the frontend's CloseRequested-listener fires
+            //    `dialog_cancel` first; this branch runs after).
+            //    Otherwise identical to setup-window close.
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                window.app_handle().exit(0);
+                let app = window.app_handle();
+                let closed_label = window.label().to_string();
+                // Tauri lets the close proceed unless we set
+                // api.prevent_close(); we want the close to happen.
+                // Schedule the quit-check on the next tick so it runs
+                // *after* this window is actually destroyed.
+                let app_for_check = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    // Filter out the just-closed window — at this point
+                    // it may still appear in the registry briefly.
+                    let any_visible = app_for_check
+                        .webview_windows()
+                        .iter()
+                        .any(|(label, w)| {
+                            label.as_str() != closed_label
+                                && w.is_visible().unwrap_or(false)
+                        });
+                    if !any_visible {
+                        log::info!(
+                            "[aiui] last visible window ({closed_label}) closed — quitting; auto-resurrect will bring us back on next tool call"
+                        );
+                        app_for_check.exit(0);
+                    } else {
+                        log::debug!(
+                            "[aiui] {closed_label} closed, but other windows still visible — staying alive"
+                        );
+                    }
+                });
             }
         })
         .build(tauri::generate_context!())
