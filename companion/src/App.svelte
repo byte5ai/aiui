@@ -59,12 +59,36 @@
   });
 </script>
 
-{#if label === "setup"}
-  <Settings />
-{:else if label === "dialog"}
-  <DialogShell />
-{:else}
+<!-- The drag-region sits at the very top, OVER the macOS overlay
+     title bar. Tauri lets the traffic-light buttons capture clicks
+     even when our region overlaps them, so the user can grab the
+     window from anywhere along the top edge except directly on the
+     buttons. Position fixed so it doesn't push container content
+     down. -->
+<div class="drag-region" data-tauri-drag-region></div>
+
+<!-- Container provides the Apple-HIG-compliant 44 px top breathing
+     room so content never collides with the traffic-light buttons,
+     plus side padding and scroll behaviour. Both setup and dialog
+     windows share this chrome. -->
+<main class="container">
+  {#if label === "setup"}
+    <Settings />
+  {:else if label === "dialog"}
+    <DialogShell />
+  {/if}
   <!-- During the first paint label is null — render nothing rather
        than guess wrong. Tauri sets the label synchronously, so this
        lasts only one micro-task. -->
-{/if}
+</main>
+
+<style>
+  .drag-region {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 28px;
+    z-index: 1;
+  }
+</style>
