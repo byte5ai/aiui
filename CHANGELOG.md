@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.28] — 2026-04-30
+
+### Fixed
+
+- **Window can actually be dragged.** The 0.4.25 attempt at making
+  the window movable (`data-tauri-drag-region` overlay) didn't
+  produce a working drag in Tauri 2.10 + macOS 26 — and likely
+  blocked the native title-bar drag on top of it. The fix uses
+  *both* mechanisms: the Tauri attribute for cross-platform
+  correctness, and `-webkit-app-region: drag` as the WebKit-native
+  fallback that actually works on this OS/runtime combo. Drag-zone
+  also extends across the setup window's full header (logo, status
+  text, version chip — none of those are click targets), with the
+  Skill-repair button opting out via `no-drag`. Tester reproduced
+  the failure on 0.4.27; this release fixes it for real.
+- **Setup-window logo is genuinely larger now.** The 0.4.27 bump
+  to 64×64 didn't visibly enlarge the rendered icon — the selector
+  `.app-header img.app-icon` apparently didn't beat whatever was
+  squishing the inline image. Switched to `.app-header .app-icon`
+  with `display: block` and explicit `min-width`/`min-height`,
+  bumped to 80×80, border-radius proportional. The brand mark now
+  carries actual visual weight in the chrome.
+
 ## [0.4.27] — 2026-04-30
 
 ### Added

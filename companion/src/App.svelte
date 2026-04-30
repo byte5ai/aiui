@@ -59,12 +59,13 @@
   });
 </script>
 
-<!-- The drag-region sits at the very top, OVER the macOS overlay
-     title bar. Tauri lets the traffic-light buttons capture clicks
-     even when our region overlaps them, so the user can grab the
-     window from anywhere along the top edge except directly on the
-     buttons. Position fixed so it doesn't push container content
-     down. -->
+<!-- Window-drag overlay along the top edge.
+     Two redundant mechanisms because Tauri 2's `data-tauri-drag-region`
+     attribute alone has been unreliable on macOS 26 / WebKit in our
+     testing — `-webkit-app-region: drag` is the WebKit-native way
+     and works as a fallback. The traffic-light buttons capture
+     their own clicks even with this overlay above them. Container
+     padding (44 px top) keeps content off the drag zone. -->
 <div class="drag-region" data-tauri-drag-region></div>
 
 <!-- Container provides the Apple-HIG-compliant 44 px top breathing
@@ -88,7 +89,11 @@
     top: 0;
     left: 0;
     right: 0;
-    height: 28px;
+    height: 36px;
     z-index: 1;
+    /* WebKit-native drag fallback. The Tauri data-attribute above is
+       the cross-platform path; this is the belt-and-braces version
+       that actually works on macOS 26. */
+    -webkit-app-region: drag;
   }
 </style>
