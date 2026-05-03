@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.30] — 2026-05-03
+
+### Fixed
+
+- **Window can finally be moved.** Replaced the previous setup of
+  `titleBarStyle: Overlay` + `hiddenTitle: true` + `data-tauri-drag-region`
+  overlay + `-webkit-app-region: drag` CSS — that combination was
+  unreliable on Tauri 2 + WKWebView (macOS 26): the Tauri attribute
+  drops mousedown depending on z-order, and `-webkit-app-region` is a
+  Chromium-only CSS property that WKWebView simply ignores. The
+  fix is structural: drop the overlay setup, use the standard native
+  visible title bar that macOS owns and drags itself. Slightly less
+  flush look, but a window the user can actually grab and reposition.
+  Tester reported this regression three times across 0.4.25 → 0.4.28;
+  this finally resolves it.
+- **First-render-of-session race resolved.** When the dialog window
+  was built fresh (first tool call of a session), the backend used
+  to emit `dialog:show` before the Svelte frontend had mounted +
+  registered its listeners — the event was lost, the 500 ms ack
+  timeout fired, the WebView reloaded, and depending on timing the
+  user could end up with a blank window for the entire 2-minute
+  Claude-Desktop tool-timeout. Reproduction in trace from
+  2026-05-03 18:05.
+
+  Window-ready handshake added: the dialog window's frontend
+  signals via a new `dialog_window_ready` Tauri command once both
+  `dialog:show` and `ui:ping` listeners are installed. The render
+  path waits on a `tokio::sync::watch<bool>` for that signal
+  *before* emitting (3 s timeout, falls back to existing ack
+  contract if the signal doesn't arrive). The reload-recovery path
+  resets the flag and re-waits after the WebView reload, so the
+  same race can't reappear after a recovery cycle.
+
+### Internal
+
+- `App.svelte` no longer carries the manual drag-region overlay.
+- `Settings.svelte` no longer carries `data-tauri-drag-region` /
+  `-webkit-app-region` styles on the header. Native title bar
+  handles dragging.
+- `app.css` `.container` top-padding reduced from 44 px to 14 px
+  (no overlay title bar to clear anymore).
+- New Tauri command `dialog_window_ready` and shared
+  `Arc<tokio::sync::watch::Sender<bool>>` for the handshake.
+
 ## [0.4.29] — 2026-05-03
 
 ### Fixed

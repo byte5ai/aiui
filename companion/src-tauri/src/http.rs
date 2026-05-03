@@ -514,8 +514,18 @@ async fn render(
     // still resets the idle clock even if the user closes the dialog.
     *state.last_render_at.lock().unwrap() = Instant::now();
 
-    // Surface the window from the main thread.
+    // Surface the window from the main thread. If the window is being
+    // built fresh (first render of this session, or after the user
+    // closed it), `ensure_dialog_window` reset the ready flag.
     surface_main_window(&state.app, &id);
+
+    // Window-ready handshake: wait until the frontend signals that
+    // its `dialog:show` listener is registered. Without this gate
+    // we'd race against Vite-bundle-load + Svelte-mount + tauri-listen,
+    // and on the first render of a session the emit would land before
+    // the listener — silent loss, 500 ms ack timeout, webview reload
+    // and a confused user staring at a blank window.
+    wait_for_dialog_ready(&state.app, "pre-emit").await;
 
     // Emit the dialog to the frontend.
     if let Err(e) = state
@@ -542,8 +552,22 @@ async fn render(
                 "render: no ack within {:?}; reloading webview and retrying",
                 DIALOG_ACK_TIMEOUT
             ));
+            // Reset ready flag — after reload the listeners need to
+            // re-register. We'll wait on the handshake again before
+            // re-emitting.
+            if let Some(tx) = state
+                .app
+                .try_state::<std::sync::Arc<tokio::sync::watch::Sender<bool>>>()
+            {
+                let _ = tx.inner().send(false);
+            }
             reload_main_webview(&state.app);
             tokio::time::sleep(RELOAD_SETTLE).await;
+
+            // Wait for the freshly-mounted Svelte to signal listeners
+            // are wired up again. Without this the same race that got
+            // us here would just repeat after reload.
+            wait_for_dialog_ready(&state.app, "post-reload").await;
 
             // After reload the previous ack receiver was consumed. We need a
             // fresh handshake on the same dialog id — register a new ack
@@ -642,6 +666,52 @@ async fn render(
         reason: result.reason,
     })
     .into_response()
+}
+
+/// Wait until the dialog window's frontend signals via the
+/// `dialog_window_ready` Tauri command that its `dialog:show` and
+/// `ui:ping` listeners are registered. Times out after
+/// `DIALOG_READY_TIMEOUT` and returns either way — the caller still
+/// emits, falling back to the existing ack/reload contract if the
+/// frontend turns out to be slower than expected.
+///
+/// Called twice in the render path: once before the initial emit
+/// (covers the cold-start race when the window is built fresh), once
+/// after a webview reload (covers the same race after the recovery
+/// path tears down the JS state).
+const DIALOG_READY_TIMEOUT: Duration = Duration::from_millis(3000);
+
+async fn wait_for_dialog_ready(app: &AppHandle, phase: &str) {
+    let Some(tx_state) = app.try_state::<std::sync::Arc<tokio::sync::watch::Sender<bool>>>()
+    else {
+        trace(&format!("render: dialog_ready_tx state missing ({phase})"));
+        return;
+    };
+    let mut rx = tx_state.inner().subscribe();
+    if *rx.borrow() {
+        trace(&format!("render: dialog already ready ({phase})"));
+        return;
+    }
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(DIALOG_READY_TIMEOUT, async {
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    if waited.is_ok() && *rx.borrow() {
+        trace(&format!(
+            "render: dialog ready ({phase}) after {:?}",
+            started.elapsed()
+        ));
+    } else {
+        trace(&format!(
+            "render: dialog-ready timeout ({phase}) after {:?} — proceeding anyway",
+            started.elapsed()
+        ));
+    }
 }
 
 /// Surface the dialog window for the incoming render. If the window

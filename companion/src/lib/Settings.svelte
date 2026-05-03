@@ -203,13 +203,7 @@
 
 {#if status}
   <div class="stack">
-    <!-- Header acts as a second drag region — the 36 px App.svelte
-      overlay only covers the OS title-bar zone. The header below
-      it (logo + status text + version chip) has no click targets
-      worth protecting, so the whole row picks up window-drag. The
-      `header-action` button (skill repair, only visible when the
-      skill is missing) opts out via -webkit-app-region: no-drag. -->
-    <header class="app-header" data-tauri-drag-region>
+    <header class="app-header">
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
@@ -494,23 +488,11 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    /* `.container` already pads 44 px down from the window edge for the
-     * macOS traffic-light buttons; we only add a hair of breathing room
-     * here so the logo doesn't ride directly against the title-area
-     * gradient line. */
-    padding: 8px 0 12px 0;
+    /* Native title bar (v0.4.30) supplies its own height; container
+       already pads 14 px on top. A small inner padding here lets the
+       header content breathe without pressing against the title bar. */
+    padding: 4px 0 12px 0;
     border-bottom: 1px solid var(--border);
-    /* Whole header acts as a window-drag handle. Children inherit
-       this via the universal selector below; interactive children
-       (today: only `.header-action`) opt out explicitly. */
-    -webkit-app-region: drag;
-  }
-  .app-header > *,
-  .app-header :global(*) {
-    -webkit-app-region: drag;
-  }
-  .app-header :global(.header-action) {
-    -webkit-app-region: no-drag;
   }
   .app-header .app-icon {
     /* 80×80 — well past 2× the original 32 px. Tester noted that
