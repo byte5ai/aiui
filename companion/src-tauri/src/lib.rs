@@ -385,12 +385,22 @@ async fn add_remote(
     let skill_step = skill::install_to_remote(&host_alias);
     results.push(skill_step);
 
-    let config_step = setup::patch_claude_code_config_remote(
+    let (config_step, config_patch) = setup::patch_claude_code_config_remote(
         &host_alias,
         uvx_loc.as_ref().map(|l| l.uvx_path.as_str()),
+        env!("CARGO_PKG_VERSION"),
     );
     let config_ok = config_step.ok;
     results.push(config_step);
+    // Fresh add — there shouldn't be a running child yet, but a
+    // re-add (Remove + Add the same host) leaves stale ones; sweep
+    // them so the first tool call respawns clean against the new pin.
+    if matches!(config_patch, Some(setup::RemoteConfigPatch::Patched)) {
+        let sweep = setup::kill_remote_mcp_stdio(&host_alias);
+        if !sweep.ok {
+            results.push(sweep);
+        }
+    }
 
     if !(token_ok && config_ok) {
         // Don't persist the host or start a tunnel for a half-failed
@@ -823,6 +833,64 @@ pub fn run() {
                 for host in setup::load_remotes() {
                     let _ = setup::remove_ssh_forward(&host, port_for_start);
                     tm_for_start.ensure(host).await;
+                }
+            });
+
+            // Re-sync the aiui-mcp version pin in `~/.claude.json` on
+            // every registered remote. Without this a remote can drift
+            // arbitrarily far behind the local companion — uvx caches
+            // the once-installed version of `aiui-mcp` indefinitely
+            // unless we pin it. The 2026-04-30 incident: a v0.4.27
+            // companion talking to a v0.3.1 mcp-stdio on macmini
+            // because the pin was missing.
+            //
+            // We deliberately spawn this as a background task with a
+            // small per-host stagger: setup() returns straight to the
+            // UI without waiting on SSH round-trips. If the pin is
+            // already correct (steady state), the script reads it and
+            // exits without writing — the SSH cost is a single login +
+            // one Python invocation. When the pin needs updating, we
+            // also pkill any in-flight child so the next tool call
+            // respawns clean against the new version.
+            rt.spawn(async move {
+                let our_version = env!("CARGO_PKG_VERSION");
+                for host in setup::load_remotes() {
+                    let host_for_task = host.clone();
+                    let our_version_owned = our_version.to_string();
+                    // Each remote in its own blocking task — the
+                    // SSH/Python pipeline is sync. Ordering across
+                    // hosts is irrelevant; pin-syncs are independent.
+                    tokio::task::spawn_blocking(move || {
+                        let (step, patch) = setup::patch_claude_code_config_remote(
+                            &host_for_task,
+                            None,
+                            &our_version_owned,
+                        );
+                        if step.ok {
+                            logging::trace(&format!(
+                                "remote-pin: {host_for_task}: {} ({})",
+                                step.message,
+                                match patch {
+                                    Some(setup::RemoteConfigPatch::Patched) => "patched",
+                                    Some(setup::RemoteConfigPatch::AlreadyCurrent) => "current",
+                                    None => "unknown",
+                                }
+                            ));
+                            if matches!(patch, Some(setup::RemoteConfigPatch::Patched)) {
+                                let sweep = setup::kill_remote_mcp_stdio(&host_for_task);
+                                logging::trace(&format!(
+                                    "remote-pin: {host_for_task}: sweep {}",
+                                    if sweep.ok { "ok" } else { "failed" }
+                                ));
+                            }
+                        } else {
+                            logging::trace(&format!(
+                                "remote-pin: {host_for_task} sync failed: {} ({})",
+                                step.message,
+                                step.details.as_deref().unwrap_or("no details")
+                            ));
+                        }
+                    });
                 }
             });
 
