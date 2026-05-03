@@ -67,6 +67,21 @@ fn ui_pong(
     Ok(())
 }
 
+/// Frontend signals that the dialog window is mounted and its
+/// `dialog:show` / `ui:ping` listeners are registered. The render
+/// path on the Rust side waits on this watch *before* emitting, so
+/// a freshly-built dialog window never receives a `dialog:show`
+/// event before the listener is up. Without this handshake we hit
+/// the 500 ms ack timeout, reload the WebView, and lose the user's
+/// dialog (the failure mode reported on 2026-05-03).
+#[tauri::command]
+fn dialog_window_ready(
+    tx: tauri::State<'_, Arc<tokio::sync::watch::Sender<bool>>>,
+) -> Result<(), String> {
+    let _ = tx.send(true);
+    Ok(())
+}
+
 #[tauri::command]
 async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     // The frontend calls this after a dialog submit/cancel. We *destroy*
@@ -538,9 +553,18 @@ pub(crate) fn build_setup_window(
     .max_inner_size(520.0, 640.0)
     .resizable(false)
     .center()
+    // Native, fully-visible title bar so macOS handles window-drag
+    // for us. Tauri's `data-tauri-drag-region` HTML attribute and
+    // Chromium's `-webkit-app-region: drag` CSS are *both* unreliable
+    // on Tauri 2 + WKWebView (macOS 26): the first sometimes drops
+    // mousedown depending on z-order, the second is a Chromium-only
+    // CSS property that WKWebView doesn't honour at all. The only
+    // robust path is to let macOS run its own title-bar drag, which
+    // means a visible title bar (the previous "Overlay + hiddenTitle"
+    // setup hid the title-bar pixels but kept its drag behaviour
+    // half-broken). We accept the slightly-less-flush look in
+    // exchange for a window the user can actually move.
     .decorations(true)
-    .title_bar_style(tauri::TitleBarStyle::Overlay)
-    .hidden_title(true)
     .disable_drag_drop_handler()
     .visible(true)
     .build()
@@ -563,6 +587,12 @@ pub(crate) fn ensure_dialog_window(
         let _ = win.unminimize();
         return Ok(win);
     }
+    // Window is being built fresh — its frontend listeners aren't up
+    // yet. Reset the ready flag so the render path waits for the
+    // `dialog_window_ready` signal before emitting `dialog:show`.
+    if let Some(tx) = app.try_state::<Arc<tokio::sync::watch::Sender<bool>>>() {
+        let _ = tx.inner().send(false);
+    }
     WebviewWindowBuilder::new(
         app,
         DIALOG_WINDOW_LABEL,
@@ -574,9 +604,18 @@ pub(crate) fn ensure_dialog_window(
     .max_inner_size(520.0, 640.0)
     .resizable(false)
     .center()
+    // Native, fully-visible title bar so macOS handles window-drag
+    // for us. Tauri's `data-tauri-drag-region` HTML attribute and
+    // Chromium's `-webkit-app-region: drag` CSS are *both* unreliable
+    // on Tauri 2 + WKWebView (macOS 26): the first sometimes drops
+    // mousedown depending on z-order, the second is a Chromium-only
+    // CSS property that WKWebView doesn't honour at all. The only
+    // robust path is to let macOS run its own title-bar drag, which
+    // means a visible title bar (the previous "Overlay + hiddenTitle"
+    // setup hid the title-bar pixels but kept its drag behaviour
+    // half-broken). We accept the slightly-less-flush look in
+    // exchange for a window the user can actually move.
     .decorations(true)
-    .title_bar_style(tauri::TitleBarStyle::Overlay)
-    .hidden_title(true)
     .disable_drag_drop_handler()
     .visible(true)
     .build()
@@ -658,6 +697,18 @@ pub fn run() {
     let http_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
 
+    // Window-ready handshake: the dialog window's frontend signals
+    // here (via the `dialog_window_ready` Tauri command) once its
+    // listeners are wired up. The render path *waits* on this watch
+    // before emitting `dialog:show`, so a freshly-built dialog window
+    // never receives an event before its listener is registered. The
+    // 0.4.30 fix — without it, a 500 ms ack timeout could fire before
+    // the WebView even finished mounting Svelte (especially on the
+    // very first render of a session, when the window is built fresh
+    // and Vite has to load the bundle).
+    let (dialog_ready_tx, _dialog_ready_rx) = tokio::sync::watch::channel(false);
+    let dialog_ready_tx = Arc::new(dialog_ready_tx);
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -710,11 +761,13 @@ pub fn run() {
         .manage(lifetime_stats.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
+        .manage(dialog_ready_tx.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
             dialog_received,
             ui_pong,
+            dialog_window_ready,
             close_window,
             surface_for_dialog,
             status,
