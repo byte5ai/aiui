@@ -18,7 +18,7 @@
     // replaces the need for any background UI heartbeat. Backend emits
     // this event with `emit_to("dialog", ...)`, so the setup window
     // never sees it.
-    const unDialog = listen<DialogReq>("dialog:show", (e) => {
+    const dialogPromise = listen<DialogReq>("dialog:show", (e) => {
       current = e.payload;
       void invoke("dialog_received", { id: e.payload.id });
     });
@@ -26,15 +26,27 @@
     // UI ping from Rust (used by /health to verify the event loop). We
     // pong back synchronously — the Rust side has a 100 ms timeout and
     // a missed pong is what flips /health to `degraded`.
-    const unPing = listen<string>("ui:ping", (e) => {
+    const pingPromise = listen<string>("ui:ping", (e) => {
       void invoke("ui_pong", { id: e.payload });
     });
 
     window.addEventListener("keydown", onKey);
 
+    // Window-ready handshake (v0.4.30): tell the Rust render path
+    // that our `dialog:show` listener is installed and we can safely
+    // receive events. Without this, the backend would emit before
+    // Tauri actually wired up the listener — the very-first render of
+    // a fresh window would lose its event, hit the 500 ms ack timeout,
+    // and the user would see a blank window. We await both subscribe
+    // promises to ensure the listeners are *really* up before
+    // signalling, not just queued.
+    void Promise.all([dialogPromise, pingPromise]).then(() => {
+      void invoke("dialog_window_ready");
+    });
+
     return async () => {
-      (await unDialog)();
-      (await unPing)();
+      (await dialogPromise)();
+      (await pingPromise)();
       window.removeEventListener("keydown", onKey);
     };
   });

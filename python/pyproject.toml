@@ -1,6 +1,6 @@
 [project]
 name = "aiui-mcp"
-version = "0.4.29"
+version = "0.4.30"
 description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
 readme = "README.md"
 requires-python = ">=3.10"

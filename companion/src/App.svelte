@@ -59,19 +59,11 @@
   });
 </script>
 
-<!-- Window-drag overlay along the top edge.
-     Two redundant mechanisms because Tauri 2's `data-tauri-drag-region`
-     attribute alone has been unreliable on macOS 26 / WebKit in our
-     testing — `-webkit-app-region: drag` is the WebKit-native way
-     and works as a fallback. The traffic-light buttons capture
-     their own clicks even with this overlay above them. Container
-     padding (44 px top) keeps content off the drag zone. -->
-<div class="drag-region" data-tauri-drag-region></div>
-
-<!-- Container provides the Apple-HIG-compliant 44 px top breathing
-     room so content never collides with the traffic-light buttons,
-     plus side padding and scroll behaviour. Both setup and dialog
-     windows share this chrome. -->
+<!-- No drag overlay needed: the window now uses macOS' native title
+     bar (lib.rs::build_setup_window / ensure_dialog_window dropped
+     `titleBarStyle: Overlay` + `hiddenTitle: true` in v0.4.30). The
+     OS handles window-drag from the title bar itself, which is the
+     only path that actually works in Tauri 2 + WKWebView. -->
 <main class="container">
   {#if label === "setup"}
     <Settings />
@@ -82,18 +74,3 @@
        than guess wrong. Tauri sets the label synchronously, so this
        lasts only one micro-task. -->
 </main>
-
-<style>
-  .drag-region {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 36px;
-    z-index: 1;
-    /* WebKit-native drag fallback. The Tauri data-attribute above is
-       the cross-platform path; this is the belt-and-braces version
-       that actually works on macOS 26. */
-    -webkit-app-region: drag;
-  }
-</style>

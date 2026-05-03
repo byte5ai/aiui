@@ -165,7 +165,11 @@ label {
 }
 
 .container {
-  padding: 44px 20px 16px 20px;
+  /* Native title bar handles the top-of-window real estate now (see
+     v0.4.30 drag fix). Content can sit close to the title-bar
+     boundary; 14 px gives visual breathing room without wasting
+     vertical space. */
+  padding: 14px 20px 16px 20px;
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
