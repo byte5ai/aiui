@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.29] — 2026-05-03
+
+### Fixed
+
+- **Remote `aiui-mcp` versions are kept in lockstep with the local
+  companion.** Until now, the companion's setup wrote
+  `args: ["aiui-mcp"]` into the remote's `~/.claude.json` without a
+  version pin. uvx then cached whatever version of `aiui-mcp` happened
+  to be installed first, indefinitely — no upgrade ever, even after
+  the local aiui app was updated dozens of times. This is what
+  produced the 2026-04-30 incident: a v0.4.27 companion talking to a
+  v0.3.1 mcp-stdio on `customer@macmini` because the pin was missing
+  and uvx clung to the originally-cached version. Slash-commands
+  added between 0.3.1 and 0.4.27 (e.g. `teach`) were therefore
+  invisible on the remote, even though they were live in the local
+  binary.
+
+  The fix is structural and entirely code-driven (no SSH commands the
+  user has to run by hand):
+
+  1. **Pin in `~/.claude.json`** — the companion now writes
+     `args: ["aiui-mcp==<companion-version>"]`. uvx is forced to
+     fetch the exact matching wheel before spawning. The patch script
+     is idempotent: if the pin is already correct (steady state), no
+     rewrite happens.
+  2. **Stale-mcp-stdio sweep** — when the pin is *changed*, the
+     companion sends `pkill -f 'aiui-mcp'` to the remote. Any
+     in-flight child running the old version is taken down so the
+     next tool call respawns cleanly against the new pin. Tool calls
+     that arrive in the brief replacement window get answered by the
+     soon-to-die child (still works) and the one after lands on the
+     fresh version.
+  3. **Resync on every aiui-app launch** — the setup phase iterates
+     all registered remotes in a non-blocking background task and
+     applies (1) + (2) per host. The user sees the setup window
+     immediately; the SSH round-trips happen out-of-band. Steady
+     state (all pins correct) costs ~200 ms per remote; an actual
+     update is ~600 ms per remote with a clean kill-sweep.
+
+  Net effect: every update of aiui.app on the user's Mac propagates
+  automatically to every registered remote on the next aiui-app
+  launch. No manual `uvx tool upgrade aiui-mcp` over SSH, no
+  Claude-Desktop restart instruction, no version drift.
+
 ## [0.4.28] — 2026-04-30
 
 ### Fixed

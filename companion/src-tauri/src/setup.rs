@@ -647,10 +647,24 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
 /// while reporting success. Stdin avoids that whole class of shell-quoting
 /// trap, and we additionally check that the script printed "ok" so any
 /// future regression can't masquerade as success again.
+/// Outcome of a `~/.claude.json` patch run on a remote — tells the
+/// caller whether the file was actually rewritten or already carried
+/// the expected pin. The caller uses this to decide whether to also
+/// SIGTERM any in-flight mcp-stdio child on the remote (so the next
+/// tool call respawns with the freshly pinned version).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteConfigPatch {
+    /// File already carried the expected pin — no rewrite, no kill needed.
+    AlreadyCurrent,
+    /// File was rewritten — caller should sweep stale mcp-stdio children.
+    Patched,
+}
+
 pub fn patch_claude_code_config_remote(
     host_alias: &str,
     uvx_path: Option<&str>,
-) -> StepResult {
+    pinned_version: &str,
+) -> (StepResult, Option<RemoteConfigPatch>) {
     // If we know the absolute uvx path from the reachability probe, use
     // it. Otherwise fall back to the bare "uvx" name (which depends on
     // Claude-Code's process PATH being right at spawn time — fragile,
@@ -659,8 +673,19 @@ pub fn patch_claude_code_config_remote(
     // the Python script's string literal.
     let uvx_command_lit = serde_json::to_string(uvx_path.unwrap_or("uvx"))
         .unwrap_or_else(|_| "\"uvx\"".to_string());
+    // Pin to the exact aiui-mcp version that matches the local
+    // companion. Without the pin, uvx silently caches whichever version
+    // happened to be installed first on the remote — that's how a v0.3.1
+    // mcp-stdio kept talking to a v0.4.27 companion (incident
+    // 2026-04-30). With the pin, uvx is forced to fetch / install the
+    // matching wheel before spawning. Idempotent: if the pin is already
+    // correct, no rewrite happens (`ok:current`), and the caller skips
+    // the kill-sweep on the remote.
+    let pkg_spec = format!("aiui-mcp=={pinned_version}");
+    let pkg_spec_lit = serde_json::to_string(&pkg_spec)
+        .unwrap_or_else(|_| format!("\"{pkg_spec}\""));
     let script = format!(r#"
-import json, os, pathlib, shutil, time
+import json, pathlib, shutil, time
 p = pathlib.Path.home() / ".claude.json"
 data = {{}}
 if p.exists():
@@ -668,32 +693,88 @@ if p.exists():
         data = json.loads(p.read_text())
     except Exception:
         data = {{}}
-    ts = int(time.time())
-    shutil.copy(p, p.with_suffix(f".json.bak.{{ts}}"))
 servers = data.get("mcpServers") or {{}}
-servers["aiui"] = {{"command": {uvx_command_lit}, "args": ["aiui-mcp"]}}
+existing = servers.get("aiui") or {{}}
+expected = {{"command": {uvx_command_lit}, "args": [{pkg_spec_lit}]}}
+if (existing.get("command") == expected["command"]
+        and existing.get("args") == expected["args"]):
+    print("ok:current")
+    raise SystemExit(0)
+ts = int(time.time())
+if p.exists():
+    shutil.copy(p, p.with_suffix(f".json.bak.{{ts}}"))
+servers["aiui"] = expected
 data["mcpServers"] = servers
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(data, indent=2))
-print("ok")
+print("ok:patched")
 "#);
     let script = script.as_str();
-    run_remote_python(host_alias, script, "Patching ~/.claude.json", |stdout| {
-        let confirmed = stdout.trim() == "ok";
-        StepResult {
-            ok: confirmed,
-            message: if confirmed {
-                format!("aiui registered in ~/.claude.json on {host_alias}")
-            } else {
-                format!("Patching ~/.claude.json on {host_alias} did not confirm 'ok'")
-            },
-            details: if confirmed {
-                None
-            } else {
-                Some(format!("stdout: {}", stdout.trim()))
+    let mut patch: Option<RemoteConfigPatch> = None;
+    let step = run_remote_python(host_alias, script, "Patching ~/.claude.json", |stdout| {
+        let trimmed = stdout.trim();
+        match trimmed {
+            "ok:patched" => {
+                patch = Some(RemoteConfigPatch::Patched);
+                StepResult {
+                    ok: true,
+                    message: format!("aiui pinned to {pinned_version} in ~/.claude.json on {host_alias}"),
+                    details: None,
+                }
+            }
+            "ok:current" => {
+                patch = Some(RemoteConfigPatch::AlreadyCurrent);
+                StepResult {
+                    ok: true,
+                    message: format!("aiui in ~/.claude.json on {host_alias} already pinned to {pinned_version}"),
+                    details: None,
+                }
+            }
+            other => StepResult {
+                ok: false,
+                message: format!("Patching ~/.claude.json on {host_alias} did not confirm 'ok'"),
+                details: Some(format!("stdout: {other}")),
             },
         }
-    })
+    });
+    (step, patch)
+}
+
+/// SIGTERM any `aiui-mcp` child still running on `host_alias` — used
+/// after a pin update so Claude Desktop / Claude Code respawns the
+/// child against the freshly pinned version on its next tool call.
+/// Idempotent: succeeds silently when no matching process is running.
+///
+/// `pkill -f` on macOS / Linux exit-codes: 0 = killed at least one,
+/// 1 = nothing matched. Both are success from our perspective; only
+/// the SSH layer or shell-not-found counts as a real failure.
+pub fn kill_remote_mcp_stdio(host_alias: &str) -> StepResult {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "--",
+            host_alias,
+            "pkill -f 'aiui-mcp' 2>/dev/null; true",
+        ])
+        .output();
+    match out {
+        Err(e) => StepResult {
+            ok: false,
+            message: format!("ssh {host_alias} konnte nicht gestartet werden"),
+            details: Some(e.to_string()),
+        },
+        Ok(o) if !o.status.success() => StepResult {
+            ok: false,
+            message: format!("Stale-mcp-stdio-Sweep auf {host_alias} fehlgeschlagen"),
+            details: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
+        Ok(_) => StepResult {
+            ok: true,
+            message: format!("Stale aiui-mcp children on {host_alias} swept"),
+            details: None,
+        },
+    }
 }
 
 /// Result of a successful reachability probe — carries the absolute
