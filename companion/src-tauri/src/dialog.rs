@@ -58,6 +58,16 @@ pub struct DialogStats {
     pub oldest_age_secs: Option<u64>,
 }
 
+/// Returned by `try_register` when a dialog is already in flight.
+/// Surfaced via /render as a 409 so the calling agent can distinguish
+/// "companion not reachable" from "companion is busy with someone
+/// else's dialog right now". v0.4.36.
+#[derive(Debug, Clone, Copy)]
+pub struct BusyInfo {
+    pub pending_count: usize,
+    pub oldest_age_secs: u64,
+}
+
 impl DialogState {
     pub fn new() -> Self {
         Self {
@@ -72,6 +82,13 @@ impl DialogState {
     /// Performs an opportunistic sweep before insert: TTL-expired entries
     /// are cancelled and removed, and if the hard cap would be exceeded
     /// the oldest entry is evicted. No background reaper is needed.
+    ///
+    /// As of v0.4.36 the production /render path uses `try_register`
+    /// instead, which rejects rather than evicts when a dialog is
+    /// already in flight. `register` is retained as the
+    /// hard-cap-defense fallback for tests and any future call site
+    /// that legitimately wants eviction semantics.
+    #[allow(dead_code)]
     pub fn register(
         &self,
     ) -> (
@@ -168,6 +185,74 @@ impl DialogState {
         }
     }
 
+    /// Like `register` but rejects with `BusyInfo` if a dialog is already
+    /// in flight after the TTL sweep. Used by `/render` so that two
+    /// parallel callers (multiple aiui calls in one assistant turn,
+    /// two Claude sessions hitting the same companion, a stale window
+    /// from a previous timeout) can't silently overlay each other —
+    /// the second caller gets a clear conflict response instead of
+    /// having its predecessor's dialog evicted underfoot. v0.4.36.
+    ///
+    /// `register` is kept for tests and for any future call site that
+    /// genuinely wants the eviction-based behaviour, but the
+    /// production /render path uses `try_register` exclusively.
+    pub fn try_register(
+        &self,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<DialogResult>,
+            oneshot::Receiver<()>,
+        ),
+        BusyInfo,
+    > {
+        let mut map = self.pending.lock().unwrap();
+
+        // Sweep TTL-expired entries first — those don't count as
+        // "in flight" any more. Same logic as `register`.
+        let now = Instant::now();
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.created_at) > DIALOG_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for stale_id in expired {
+            if let Some(entry) = map.remove(&stale_id) {
+                let _ = entry.result_tx.send(DialogResult {
+                    id: stale_id,
+                    cancelled: true,
+                    result: serde_json::Value::Null,
+                    reason: Some("ttl_expired".into()),
+                });
+            }
+        }
+
+        if !map.is_empty() {
+            let oldest_age_secs = map
+                .values()
+                .map(|e| now.duration_since(e.created_at).as_secs())
+                .max()
+                .unwrap_or(0);
+            return Err(BusyInfo {
+                pending_count: map.len(),
+                oldest_age_secs,
+            });
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let (result_tx, result_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        map.insert(
+            id.clone(),
+            PendingEntry {
+                result_tx,
+                ack_tx: Some(ack_tx),
+                created_at: now,
+            },
+        );
+        Ok((id, result_rx, ack_rx))
+    }
+
     /// Snapshot for `/health` / diagnostics. Cheap: one mutex acquire.
     pub fn stats(&self) -> DialogStats {
         let map = self.pending.lock().unwrap();
@@ -227,6 +312,33 @@ mod tests {
         ack.blocking_recv().expect("first ack must arrive");
         // Second ack on the same id is a silent no-op.
         s.ack(&id);
+    }
+
+    #[test]
+    fn try_register_succeeds_when_empty() {
+        let s = DialogState::new();
+        let res = s.try_register();
+        assert!(res.is_ok());
+        assert_eq!(s.stats().orphan_count, 1);
+    }
+
+    #[test]
+    fn try_register_rejects_when_pending() {
+        let s = DialogState::new();
+        let (_id, _rx, _ack) = s.try_register().expect("first try_register");
+        let busy = s.try_register().expect_err("second try_register must be busy");
+        assert_eq!(busy.pending_count, 1);
+        // Registry still holds the original entry.
+        assert_eq!(s.stats().orphan_count, 1);
+    }
+
+    #[test]
+    fn try_register_succeeds_after_complete() {
+        let s = DialogState::new();
+        let (id, _rx, _ack) = s.try_register().expect("first");
+        s.complete(&id, serde_json::json!({"ok": true}));
+        let res = s.try_register();
+        assert!(res.is_ok());
     }
 
     #[test]
