@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.36] — 2026-05-04
+
+### Fixed
+
+- **Dialog submit no longer kills the GUI process.** A successful
+  form submit destroyed the dialog window via `close_window`, which
+  triggered the multi-window `CloseRequested` handler from 0.4.25.
+  That handler quit the app whenever no other window was visible —
+  and after a typical agent flow the setup window is closed, so the
+  dialog window *was* the last visible window. Result: the GUI died
+  ~20 ms after `got response` (trace 2026-05-04 16:11:42.197 "GUI is
+  gone, will relaunch"). The follow-up tool call then sat 8 s in
+  `wait_for_aiui` waiting for the auto-resurrect path to bring the
+  HTTP server back, and frequently timed out before that succeeded.
+  The dialog window is now *never* a quit trigger — it is a
+  per-call ephemeral surface, recreated on demand. The setup window
+  retains the original quit behaviour but additionally checks the
+  attached-MCP-children counter, so the GUI stays alive headless as
+  long as any MCP-stdio child is connected over the lifetime
+  socket.
+- **`aiui not reachable` tool-call response now diagnostic.** When
+  `wait_for_aiui` times out, the response previously said only "not
+  reachable on localhost:7777, open aiui from /Applications" —
+  unhelpful for the dominant real causes (multiple aiui calls in
+  one assistant turn, stale dialog window from a prior session,
+  parallel Claude session holding the dialog). The agent then
+  relayed that text verbatim and the user re-opened an aiui that
+  was already running. The new message lists the four realistic
+  causes in priority order, hints at retry-vs-tell-the-user for
+  each, and detects local-vs-remote-host context so the SSH-tunnel
+  branch only appears on remotes. Phrased as agent-facing guidance
+  with an explicit "do not relay this verbatim" instruction.
+
 ## [0.4.35] — 2026-05-04
 
 ### Fixed
