@@ -89,6 +89,20 @@ def _token() -> str:
     return TOKEN_PATH.read_text().strip()
 
 
+def _explain_exc(e: BaseException) -> str:
+    """Return a non-empty, human-readable description of an exception.
+
+    httpx wraps low-level transport errors (RemoteProtocolError after
+    the peer crashed mid-response, ReadError on stream close, …) where
+    ``str(e)`` is empty. Without this fallback those surfaced as
+    ``error: ""`` in tool responses — useless for diagnosis. The
+    exception class name is always present, so it gives the user
+    *something* concrete even when httpx provides no message.
+    """
+    msg = str(e).strip()
+    return msg if msg else type(e).__name__
+
+
 async def _preflight() -> None:
     """Quick sanity check before every render call: the service on :7777 must
     accept our bearer token. Guards against stale local aiui instances that
@@ -112,7 +126,37 @@ async def _preflight() -> None:
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} timed out on /health — likely a stale "
                 f"local aiui instance holding the port. Run `pkill -f '^aiui$'` on "
-                f"this host. ({e})"
+                f"this host. ({_explain_exc(e)})"
+            ) from e
+        except httpx.RemoteProtocolError as e:
+            # Connection reset / closed mid-response. The on-Mac mcp-stdio
+            # child's auto-resurrect normally brings aiui.app back on the
+            # next tool call, so a one-off reset is usually self-healing —
+            # we name the most common stuck-state causes (stale SSH tunnel
+            # squatting :7777, token mismatch from a parallel install)
+            # rather than telling the user to manually restart aiui.app.
+            # httpx leaves str(e) empty for this class of error — the
+            # `_explain_exc` fallback surfaces the class name so the user
+            # at least sees *something* concrete.
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} reset the connection. "
+                f"The Mac-side mcp-stdio normally auto-resurrects aiui.app on "
+                f"the next call — if this persists, a stale process may hold "
+                f"the port. Verify that Claude Desktop is open on the Mac and, "
+                f"on remotes, re-register the host in aiui.app settings to "
+                f"re-sync the token. "
+                f"({_explain_exc(e)})"
+            ) from e
+        except httpx.HTTPError as e:
+            # Catch-all for the rest of the httpx hierarchy (RequestError,
+            # WriteError, HTTPStatusError, …) so we never bubble up a bare
+            # exception with an empty message.
+            raise RuntimeError(
+                f"aiui companion request to {ENDPOINT} failed: {_explain_exc(e)}. "
+                f"Verify Claude Desktop is open on the Mac; auto-resurrect "
+                f"normally restores the GUI on the next call. If repeated, "
+                f"check the SSH reverse-tunnel and re-register this remote "
+                f"in aiui.app settings to re-sync the token."
             ) from e
 
         if r.status_code == 401:
@@ -576,7 +620,12 @@ async def aiui_health() -> dict[str, Any]:
             return {"ok": True, **data, "endpoint": ENDPOINT, "server": BUILD_INFO}
     except Exception as e:
         log.warning("health check failed: %s", e)
-        return {"ok": False, "error": str(e), "endpoint": ENDPOINT, "server": BUILD_INFO}
+        return {
+            "ok": False,
+            "error": _explain_exc(e),
+            "endpoint": ENDPOINT,
+            "server": BUILD_INFO,
+        }
 
 
 # Renamed from the FastMCP-decorator `version` prompt — tools use a
@@ -589,13 +638,23 @@ async def version_tool() -> dict[str, Any]:
     Cheap; does not hit the network. Works against both a local companion
     (on-Mac) and a remote one reached via SSH tunnel.
     """
-    async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
-        r = await client.get(
-            f"{ENDPOINT}/version",
-            headers={"Authorization": f"Bearer {_token()}"},
-        )
-        r.raise_for_status()
-        return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
+            r = await client.get(
+                f"{ENDPOINT}/version",
+                headers={"Authorization": f"Bearer {_token()}"},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        # Same defensive wrapping as aiui_health: a bare exception with an
+        # empty message would surface as "Error executing tool version:" in
+        # the client and leave the user with nothing to act on. Mirror the
+        # diagnosis aiui_health gives.
+        raise RuntimeError(
+            f"aiui /version failed at {ENDPOINT}: {_explain_exc(e)}. "
+            f"Run `aiui_health` for a full reachability diagnosis."
+        ) from e
 
 
 @mcp.tool(name="update")
@@ -613,13 +672,19 @@ async def update_tool() -> dict[str, Any]:
     """
     # Use the long render timeout because download + install of the updater
     # bundle can take several seconds on a slow network.
-    async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
-        r = await client.post(
-            f"{ENDPOINT}/update",
-            headers={"Authorization": f"Bearer {_token()}"},
-        )
-        r.raise_for_status()
-        return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+            r = await client.post(
+                f"{ENDPOINT}/update",
+                headers={"Authorization": f"Bearer {_token()}"},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        raise RuntimeError(
+            f"aiui /update failed at {ENDPOINT}: {_explain_exc(e)}. "
+            f"Run `aiui_health` first to check whether aiui.app is reachable."
+        ) from e
 
 
 def main() -> None:
