@@ -47,12 +47,50 @@ impl LifetimeStats {
 /// grace period once all clients are gone. Increments/decrements the shared
 /// `conns` counter on every connect/disconnect so `/health` can report the
 /// live child count without polling.
+///
+/// Multi-instance hardening (since 0.4.33): if the socket path already
+/// answers a connection, another aiui-app is alive and we are the
+/// duplicate — exit immediately rather than racing for ownership. The
+/// previous behaviour (`remove_file` then `bind`) silently tore the
+/// existing instance's listener out from under it on every dup-launch,
+/// which is how the 2026-05-04 dual-companion incident produced reset
+/// connections in the first place.
 pub async fn gui_serve(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) {
-    let _ = std::fs::remove_file(&sock);
+    if sock.exists() {
+        // Probe whether the existing socket is live (another aiui is
+        // listening) or a stale leftover from a crashed previous run.
+        // A live listener accepts the connection; a stale path returns
+        // ENOENT / ECONNREFUSED.
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(stream) => {
+                drop(stream);
+                trace(&format!(
+                    "lifetime: another aiui already serves {} — exiting (multi-instance)",
+                    sock.display()
+                ));
+                let app_for_exit = app.clone();
+                let _ = app
+                    .run_on_main_thread(move || app_for_exit.exit(1));
+                return;
+            }
+            Err(_) => {
+                // Stale; safe to remove and re-bind.
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
+    }
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
-            trace(&format!("lifetime: bind {} failed: {e}", sock.display()));
+            // Bind failed despite the existence check above — race
+            // condition, another instance grabbed it between our probe
+            // and our bind. Same conclusion: we're the duplicate, exit.
+            trace(&format!(
+                "lifetime: bind {} failed: {e} — exiting (multi-instance race)",
+                sock.display()
+            ));
+            let app_for_exit = app.clone();
+            let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
             return;
         }
     };

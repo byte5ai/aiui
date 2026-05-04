@@ -2,6 +2,48 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.33] — 2026-05-04
+
+### Fixed
+
+- **Multi-instance race that produced empty-message connection
+  resets is structurally tied off.** Trace from 2026-05-04 13:06
+  showed two aiui-app processes alive at the same time: one bound
+  the lifetime socket + HTTP port :7777, the other competed for
+  every `ssh -NTR` and fell into shared-forward mode talking to
+  itself. Tool calls landed on whichever happened to answer first;
+  on every transition the in-flight one reset its connection
+  (`RemoteProtocolError("")`). The 0.4.31 fix made that error
+  diagnosable; this fix makes it not happen.
+
+  Three structural changes, none of them quick-wins:
+
+  1. **`/probe` carries identity now.** Response includes our pid
+     and `AIUI_GIT_SHA` alongside `aiui: true`. The
+     tunnel-manager's strict-match decision (new
+     `probe_response_is_self`) treats *any* response that doesn't
+     carry our own pid + sha as foreign — even if it's a valid
+     aiui that just happens to share our token. Foreign responses
+     no longer trigger the shared-forward poll mode that hijacked
+     tool calls onto the wrong instance.
+  2. **Lifetime socket is single-instance-strict.** When the GUI
+     starts up and the socket path already accepts connections
+     (= another aiui owns it), we exit cleanly with `app.exit(1)`
+     instead of `remove_file`'ing the live owner's listener out
+     from under it. Stale leftovers (post-crash sockets that don't
+     accept) are detected by a connect-probe and only then
+     removed. The probe + bind path also exits on bind-failure
+     (race-condition coverage). Mirrors the v0.4.25 hardening that
+     already exists for HTTP :7777.
+  3. **Tunnel-manager dedup confirmed.** `TunnelManager::ensure`
+     was already idempotent per host (HashMap key check); reviewed
+     and verified in this fix to confirm there's no second path
+     for spawning duplicate `ssh -NTR` tasks.
+
+  Six new unit tests cover `probe_response_is_self`: self-match,
+  pid-mismatch, sha-mismatch, legacy responses without pid/sha,
+  `aiui: false`, invalid JSON. All 58 lib tests green.
+
 ## [0.4.32] — 2026-05-04
 
 ### Added

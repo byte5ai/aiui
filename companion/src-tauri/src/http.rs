@@ -200,9 +200,14 @@ async fn ping() -> &'static str {
 /// Authenticated probe used by the tunnel-manager's shared-forward
 /// detection. Unlike /ping, this requires the bearer token, so it
 /// distinguishes "another aiui with our token is forwarding the port"
-/// from "some random process on :7777 is answering". Without this
-/// distinction a malicious squatter could mask a port-takeover by
-/// answering "pong" and aiui would keep showing connected-shared.
+/// from "some random process on :7777 is answering".
+///
+/// Since 0.4.33: response carries `pid` and `build_sha` so the calling
+/// tunnel-manager can verify *its own* aiui is on the other end vs. a
+/// concurrent second aiui-app instance with the same token (the case
+/// that produced the 2026-05-04 connection-reset incident — two
+/// companions, both with the user's token, indistinguishable from
+/// `aiui: true` alone).
 async fn probe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -217,6 +222,8 @@ async fn probe(
     Json(serde_json::json!({
         "aiui": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "build_sha": env!("AIUI_GIT_SHA"),
     }))
     .into_response()
 }

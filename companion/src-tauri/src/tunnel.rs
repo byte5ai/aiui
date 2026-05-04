@@ -121,15 +121,24 @@ impl TunnelManager {
 /// aren't ssh-ing per second.
 const SHARED_FORWARD_POLL_SECS: u64 = 30;
 
-/// Ask the remote whether localhost:`port` is already answering `/ping` from
-/// aiui. Returns Some(true) only when an *authenticated* probe to the
-/// remote-side port confirms a same-token aiui is responding (the typical
-/// stale-sshd-sess case where our reverse-forward keeps tunneling to *our*
-/// aiui through a zombie session). Returns Some(false) on a clean "port
-/// is empty" or "answering process isn't aiui or has wrong token".
-/// Returns None when ssh itself failed to connect at all (different
-/// failure mode than "port unreachable") so the retry loop can stay
-/// patient instead of flipping state on every blip.
+/// Ask the remote whether localhost:`port` is already answering `/probe`
+/// from *our own* aiui. Returns:
+///
+/// - `Some(true)` only when the responder is identifiably *us* — same
+///   pid + same compile-time `build_sha`. That's the only legitimate
+///   shared-forward case (stale-sshd-sess that's still tunneling back
+///   to our process).
+/// - `Some(false)` for any other outcome a tunnel-manager can act on
+///   immediately:
+///   * port empty / curl 4xx (no aiui at all)
+///   * a *different* aiui instance answered (different pid or sha) —
+///     this is the multi-instance race; we mustn't accept it as
+///     "shared", or the second companion's tool calls would silently
+///     route to the first
+///   * some other authed-but-unrelated service answered
+/// - `None` when ssh itself failed to connect at all — different
+///   failure mode than "port unreachable", so the retry loop stays
+///   patient instead of flipping state on every blip.
 ///
 /// Token source: `~/.config/aiui/token` on the *remote* host (scp'd
 /// there at remote-registration time). If the file is missing on the
@@ -140,7 +149,7 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
     // Read the token *on the remote* and auth-bind the curl in one shell
     // command so the token never appears in our local argv. -f makes curl
     // return non-zero on 4xx/5xx (so 401 = not-shared); -m 3 caps total
-    // time; --json-out marker makes the success body easy to recognize.
+    // time.
     let cmd = format!(
         "T=$(cat ~/.config/aiui/token 2>/dev/null) && \
          [ -n \"$T\" ] && \
@@ -160,11 +169,8 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
         .await;
     match out {
         Ok(o) if o.status.success() => {
-            // Body must be JSON containing `"aiui":true` — otherwise some
-            // other authed-but-unrelated service answered. (Defensive:
-            // /probe is ours, but be paranoid.)
             let body = String::from_utf8_lossy(&o.stdout);
-            Some(body.contains("\"aiui\":true") || body.contains("\"aiui\": true"))
+            Some(probe_response_is_self(&body))
         }
         Ok(o) => {
             // ssh ran, but the remote command failed (curl 401, port
@@ -179,6 +185,29 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
         }
         Err(_) => None,
     }
+}
+
+/// Pure decision: given the raw `/probe` response body, decide whether
+/// it came from *this* aiui instance (same pid + same build SHA). Any
+/// other valid aiui response (different pid, different sha, or an old
+/// version that doesn't ship pid/sha at all) is treated as foreign —
+/// the caller will not switch to shared-forward poll mode for it.
+///
+/// Pulled out as a pure function so it can be unit-tested without
+/// running ssh.
+fn probe_response_is_self(body: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if !parsed.get("aiui").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return false;
+    }
+    let body_pid = parsed.get("pid").and_then(|v| v.as_u64());
+    let body_sha = parsed.get("build_sha").and_then(|v| v.as_str());
+    let our_pid = std::process::id() as u64;
+    let our_sha = env!("AIUI_GIT_SHA");
+    matches!(body_pid, Some(p) if p == our_pid)
+        && matches!(body_sha, Some(s) if s == our_sha)
 }
 
 async fn run_tunnel(
@@ -346,5 +375,78 @@ async fn shared_forward_poll_loop(
                 return PollOutcome::Cancelled;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// We can't easily mock `std::process::id()` or `env!("AIUI_GIT_SHA")`,
+    /// so we read them through the same channel the function uses and
+    /// build the test body to match. Asymmetric cases (different pid /
+    /// sha) just plug in known-bogus values.
+    fn our_pid() -> u32 {
+        std::process::id()
+    }
+    fn our_sha() -> &'static str {
+        env!("AIUI_GIT_SHA")
+    }
+
+    #[test]
+    fn probe_self_match_returns_true() {
+        let body = format!(
+            r#"{{"aiui": true, "version": "0.4.x", "pid": {}, "build_sha": "{}"}}"#,
+            our_pid(),
+            our_sha()
+        );
+        assert!(probe_response_is_self(&body));
+    }
+
+    #[test]
+    fn probe_different_pid_returns_false() {
+        let bogus_pid = our_pid().wrapping_add(1);
+        let body = format!(
+            r#"{{"aiui": true, "pid": {}, "build_sha": "{}"}}"#,
+            bogus_pid,
+            our_sha()
+        );
+        assert!(!probe_response_is_self(&body));
+    }
+
+    #[test]
+    fn probe_different_sha_returns_false() {
+        let body = format!(
+            r#"{{"aiui": true, "pid": {}, "build_sha": "0000000000000000000000000000000000000000"}}"#,
+            our_pid()
+        );
+        assert!(!probe_response_is_self(&body));
+    }
+
+    #[test]
+    fn probe_legacy_response_without_pid_sha_returns_false() {
+        // Old aiui versions (≤ 0.4.32) ship the body without pid /
+        // build_sha. The strict matcher must treat those as foreign —
+        // we can't prove they're us, so we won't claim them as
+        // shared-forward owners. Otherwise a v0.4.32 zombie + v0.4.33
+        // primary would still race.
+        let body = r#"{"aiui": true, "version": "0.4.32"}"#;
+        assert!(!probe_response_is_self(body));
+    }
+
+    #[test]
+    fn probe_aiui_false_returns_false() {
+        let body = format!(
+            r#"{{"aiui": false, "pid": {}, "build_sha": "{}"}}"#,
+            our_pid(),
+            our_sha()
+        );
+        assert!(!probe_response_is_self(&body));
+    }
+
+    #[test]
+    fn probe_invalid_json_returns_false() {
+        assert!(!probe_response_is_self("not json"));
+        assert!(!probe_response_is_self(""));
     }
 }
