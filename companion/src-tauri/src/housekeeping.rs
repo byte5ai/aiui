@@ -1,9 +1,9 @@
 //! Kill stale `aiui --mcp-stdio` children left over from older app versions.
 //!
 //! Context: Claude Desktop spawns `aiui --mcp-stdio` once and keeps it alive
-//! for the whole Claude Desktop session. If the user drags a new `aiui.app`
-//! over the old one, those already-spawned children keep running — with the
-//! *old* binary. Their lifetime-socket logic may be pre-auto-resurrect (≤
+//! for the whole Claude Desktop session. If the user updates the aiui binary
+//! while a session is live, those already-spawned children keep running with
+//! the *old* code. Their lifetime-channel logic may be pre-auto-resurrect (≤
 //! v0.2.5) or otherwise incompatible, so the user ends up with a stale MCP
 //! server that refuses to reconnect to the new GUI.
 //!
@@ -11,115 +11,160 @@
 //!
 //!  1. **GUI-side sweep** (`kill_stale_mcp_stdio_children`): on every GUI
 //!     startup we scan for `aiui --mcp-stdio` processes whose executable
-//!     path differs from ours and SIGTERM them. This only catches the case
-//!     where the *path* changed — useless when the user dragged a new
-//!     `aiui.app` over the old one in place.
+//!     path differs from ours and signal them to terminate. This catches the
+//!     case where the *path* changed — useless when the user replaced the
+//!     binary in place.
 //!
-//!  2. **Subprocess-side self-check** (`disk_version_if_stale`): every
-//!     `--mcp-stdio` invocation reads `CFBundleShortVersionString` from
+//!  2. **Subprocess-side self-check** (`disk_version_if_stale`, macOS only):
+//!     every `--mcp-stdio` invocation reads `CFBundleShortVersionString` from
 //!     the on-disk `Info.plist` two directories up from `argv[0]` and
-//!     compares it with `CARGO_PKG_VERSION` baked in at compile time. If
-//!     they disagree, the in-memory binary is stale — the bundle on disk
-//!     was replaced after this process loaded — and we exit so Claude
-//!     Desktop respawns us against the fresh binary.
+//!     compares it with `CARGO_PKG_VERSION` baked in at compile time. If they
+//!     disagree, the in-memory binary is stale — the bundle on disk was
+//!     replaced after this process loaded — and we exit so Claude Desktop
+//!     respawns us against the fresh binary.
 //!
-//! Together those two layers catch the in-place-replace scenario that
-//! produced the 2026-04-30 form-tool-call crash: a Claude-Desktop-spawned
-//! mcp-stdio child kept the previous version in memory across an
-//! updater-driven replacement of `/Applications/aiui.app`.
+//!     On Windows there is no analog of `Info.plist`. The Windows path-based
+//!     sweep (mechanism 1) covers the NSIS-update case because NSIS replaces
+//!     files at the install path while old children continue running from a
+//!     temporary copy under their original PID — sysinfo's `exe()` reports
+//!     the original path, which differs from `current_exe()` for the freshly
+//!     spawned GUI.
 //!
-//! macOS-specific: we use `ps -axo pid=,command=` to enumerate processes
-//! (there is no /proc on macOS). The executable path is the first whitespace-
-//! delimited token of `command`.
+//! Cross-platform via `sysinfo`: both sweeps enumerate processes with the
+//! same API, no `ps`/`tasklist` shell-out, no /proc assumption.
 //!
 //! Safety: we never kill our own pid. If the current binary path can't be
-//! determined, we skip the sweep entirely.
+//! determined, we skip the path-based sweep entirely.
 //!
-//! Idempotent: called once per GUI startup. Running it on a clean system is
-//! a no-op.
+//! Idempotent: running on a clean system is a no-op.
 
 use crate::logging::trace;
+use sysinfo::{ProcessRefreshKind, RefreshKind, Signal, System};
+
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-/// A stale `aiui --mcp-stdio` process that should be terminated.
-#[derive(Debug, PartialEq, Eq)]
+/// A stale `aiui --mcp-stdio` process discovered during the sweep.
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct StaleChild {
     pid: u32,
     exe: String,
 }
 
-/// Parse `ps -axo pid=,command=` output and return the stale-child candidates
-/// — processes running `aiui --mcp-stdio` under any executable path other
-/// than `current_exe_path`, excluding `own_pid`.
-fn find_stale(ps_stdout: &str, current_exe_path: &str, own_pid: u32) -> Vec<StaleChild> {
-    let mut out = Vec::new();
-    for line in ps_stdout.lines() {
-        let line = line.trim_start();
-        let Some((pid_str, rest)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if pid == own_pid {
-            continue;
-        }
-        let rest = rest.trim_start();
-        if !rest.contains("--mcp-stdio") {
-            continue;
-        }
-        let exe = rest.split_whitespace().next().unwrap_or("");
-        // Narrow to our binary family — any path ending in /aiui that's
-        // running with --mcp-stdio. This skips random unrelated processes
-        // that happen to mention "--mcp-stdio" in their argv.
-        if !exe.ends_with("/aiui") && exe != "aiui" {
-            continue;
-        }
-        if exe == current_exe_path {
-            continue;
-        }
-        out.push(StaleChild {
-            pid,
-            exe: exe.to_string(),
-        });
-    }
-    out
+/// Lightweight snapshot of one process — what we need for both filters.
+#[derive(Debug, Clone)]
+struct ProcSnap {
+    pid: u32,
+    exe: String,
+    args: Vec<String>,
 }
 
-/// Scan for stale `aiui --mcp-stdio` processes and SIGTERM the ones whose
-/// executable path differs from `current_exe_path`. Returns the number of
-/// processes killed.
+/// Enumerate every running process via `sysinfo` and return a snapshot.
+/// Cross-platform: identical behaviour on macOS, Linux, and Windows.
+fn snapshot_processes() -> Vec<ProcSnap> {
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+    );
+    sys.processes()
+        .iter()
+        .map(|(pid, p)| {
+            let exe = p
+                .exe()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    p.cmd()
+                        .first()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
+            let args = p
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().to_string())
+                .collect();
+            ProcSnap {
+                pid: pid.as_u32(),
+                exe,
+                args,
+            }
+        })
+        .collect()
+}
+
+/// True iff `exe` looks like our aiui binary — last path component is
+/// `aiui` (Unix) or `aiui.exe` (Windows). The path-based filter is what
+/// keeps us from accidentally signalling a Python script that happens to
+/// have `--mcp-stdio` in its argv.
+fn is_aiui_binary(exe: &str) -> bool {
+    let leaf = exe
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(exe)
+        .to_ascii_lowercase();
+    leaf == "aiui" || leaf == "aiui.exe"
+}
+
+/// True iff `args` contains the `--mcp-stdio` flag anywhere.
+fn has_mcp_stdio_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mcp-stdio")
+}
+
+/// Filter: stale (different path) `aiui --mcp-stdio` children, excluding
+/// `own_pid`. Pure function over a snapshot, kept testable.
+fn find_stale(snap: &[ProcSnap], current_exe_path: &str, own_pid: u32) -> Vec<StaleChild> {
+    snap.iter()
+        .filter(|p| p.pid != own_pid)
+        .filter(|p| has_mcp_stdio_flag(&p.args))
+        .filter(|p| is_aiui_binary(&p.exe))
+        .filter(|p| p.exe != current_exe_path)
+        .map(|p| StaleChild {
+            pid: p.pid,
+            exe: p.exe.clone(),
+        })
+        .collect()
+}
+
+/// Filter: every `aiui --mcp-stdio` child regardless of executable path,
+/// excluding `own_pid`. Used for the uninstall flow.
+fn find_all_children(snap: &[ProcSnap], own_pid: u32) -> Vec<StaleChild> {
+    snap.iter()
+        .filter(|p| p.pid != own_pid)
+        .filter(|p| has_mcp_stdio_flag(&p.args))
+        .filter(|p| is_aiui_binary(&p.exe))
+        .map(|p| StaleChild {
+            pid: p.pid,
+            exe: p.exe.clone(),
+        })
+        .collect()
+}
+
+/// Cross-platform process termination via sysinfo. Sends SIGTERM on Unix
+/// and the equivalent terminate-by-handle on Windows.
+fn terminate_pid(pid: u32) {
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+    );
+    if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
+        let _ = p.kill_with(Signal::Term).unwrap_or_else(|| p.kill());
+    }
+}
+
+/// Scan for stale `aiui --mcp-stdio` processes and terminate the ones
+/// whose executable path differs from `current_exe_path`. Returns the
+/// number of processes killed.
 pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
     let own_pid = std::process::id();
-
-    let out = match Command::new("ps").args(["-axo", "pid=,command="]).output() {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            trace(&format!(
-                "housekeeping: ps exited {:?} ({} bytes stderr)",
-                o.status.code(),
-                o.stderr.len()
-            ));
-            return 0;
-        }
-        Err(e) => {
-            trace(&format!("housekeeping: ps failed to start: {e}"));
-            return 0;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stale = find_stale(&stdout, current_exe_path, own_pid);
+    let snap = snapshot_processes();
+    let stale = find_stale(&snap, current_exe_path, own_pid);
 
     for child in &stale {
         trace(&format!(
             "housekeeping: killing stale mcp-stdio child pid={} exe={}",
             child.pid, child.exe
         ));
-        // SIGTERM (15). Claude Desktop notices the broken pipe and respawns
-        // with the current config, which now points at our binary.
-        let _ = Command::new("kill").arg(child.pid.to_string()).output();
+        terminate_pid(child.pid);
     }
 
     if !stale.is_empty() {
@@ -131,9 +176,36 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
     stale.len()
 }
 
+/// Sibling of `kill_stale_mcp_stdio_children` that doesn't filter by
+/// executable path — every running `aiui --mcp-stdio` (other than our
+/// own pid) gets terminated. Bound to the uninstall flow (#72): without
+/// this, the auto-resurrect loop in `mcp_attach` would relaunch the GUI
+/// the moment we call `app.exit(0)`.
+pub fn kill_all_mcp_stdio_children() -> usize {
+    let own_pid = std::process::id();
+    let snap = snapshot_processes();
+    let children = find_all_children(&snap, own_pid);
+
+    for child in &children {
+        trace(&format!(
+            "housekeeping: killing mcp-stdio child pid={} exe={} (uninstall sweep)",
+            child.pid, child.exe
+        ));
+        terminate_pid(child.pid);
+    }
+
+    if !children.is_empty() {
+        trace(&format!(
+            "housekeeping: terminated {} mcp-stdio child(ren) for uninstall",
+            children.len()
+        ));
+    }
+    children.len()
+}
+
 /// Pure decision: given our compile-time version string and the version
-/// string read from the on-disk `Info.plist`, return `true` when this
-/// in-memory binary is stale (i.e. should exit so it can be respawned).
+/// string read from the on-disk bundle, return `true` when this in-memory
+/// binary is stale (i.e. should exit so it can be respawned).
 ///
 /// Empty / whitespace `disk` is treated as "unknown" → not stale: better
 /// to keep running than abort a working subprocess on a transient
@@ -143,16 +215,22 @@ pub(crate) fn is_disk_version_stale(own: &str, disk: &str) -> bool {
     !disk.is_empty() && disk != own
 }
 
-/// True iff the bundle on disk (one bundle level up from `argv[0]`)
-/// reports a `CFBundleShortVersionString` that differs from our own
-/// compile-time `CARGO_PKG_VERSION`. Returns the on-disk version when
-/// stale so the caller can log it; `None` when fresh, when running
-/// outside an `.app` bundle (dev build, `cargo run`), or when the
-/// lookup itself fails (no `Info.plist`, `plutil` missing, …).
+/// True iff the bundle on disk reports a version that differs from our
+/// own compile-time `CARGO_PKG_VERSION`. Returns the on-disk version when
+/// stale so the caller can log it; `None` when fresh, when running outside
+/// a packaged install (dev build, `cargo run`), or when the lookup itself
+/// fails.
 ///
-/// Self-detection at the subprocess side is what closes the gap that
-/// the path-based GUI sweep can't see: an in-place `.app` replacement
-/// leaves the running child with stale code at the unchanged path.
+/// Self-detection at the subprocess side is what closes the gap that the
+/// path-based GUI sweep can't see: an in-place bundle replacement leaves
+/// the running child with stale code at the unchanged path.
+///
+/// Implemented for macOS (reads `CFBundleShortVersionString` from
+/// `Info.plist`); on Windows there is no in-bundle version stamp accessible
+/// without pulling a Win32 resource-parsing crate, so we return `None` and
+/// rely on the path-based GUI sweep to catch updates after the user
+/// restarts Claude Desktop.
+#[cfg(target_os = "macos")]
 pub fn disk_version_if_stale() -> Option<String> {
     let own = env!("CARGO_PKG_VERSION");
     let exe = std::env::current_exe().ok()?;
@@ -177,117 +255,48 @@ pub fn disk_version_if_stale() -> Option<String> {
     }
 }
 
-/// Find every `aiui --mcp-stdio` process regardless of executable path,
-/// excluding `own_pid`. Used for the uninstall flow where we want to take
-/// down ALL children — keeping any of them alive would re-launch the GUI
-/// via `mcp_attach`'s auto-resurrect path the moment we exit, defeating
-/// the whole point of "uninstall + drag .app to trash".
-fn find_all_children(ps_stdout: &str, own_pid: u32) -> Vec<StaleChild> {
-    let mut out = Vec::new();
-    for line in ps_stdout.lines() {
-        let line = line.trim_start();
-        let Some((pid_str, rest)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if pid == own_pid {
-            continue;
-        }
-        let rest = rest.trim_start();
-        if !rest.contains("--mcp-stdio") {
-            continue;
-        }
-        let exe = rest.split_whitespace().next().unwrap_or("");
-        if !exe.ends_with("/aiui") && exe != "aiui" {
-            continue;
-        }
-        out.push(StaleChild {
-            pid,
-            exe: exe.to_string(),
-        });
-    }
-    out
-}
-
-/// Sibling of `kill_stale_mcp_stdio_children` that doesn't filter by
-/// executable path — every running `aiui --mcp-stdio` (other than our
-/// own pid) gets SIGTERM'd. Bound to the uninstall flow (#72): without
-/// this, the auto-resurrect loop in `mcp_attach` would relaunch the GUI
-/// the moment we call `app.exit(0)`.
-pub fn kill_all_mcp_stdio_children() -> usize {
-    let own_pid = std::process::id();
-
-    let out = match Command::new("ps").args(["-axo", "pid=,command="]).output() {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            trace(&format!(
-                "housekeeping: ps exited {:?} ({} bytes stderr)",
-                o.status.code(),
-                o.stderr.len()
-            ));
-            return 0;
-        }
-        Err(e) => {
-            trace(&format!("housekeeping: ps failed to start: {e}"));
-            return 0;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let children = find_all_children(&stdout, own_pid);
-
-    for child in &children {
-        trace(&format!(
-            "housekeeping: killing mcp-stdio child pid={} exe={} (uninstall sweep)",
-            child.pid, child.exe
-        ));
-        let _ = Command::new("kill").arg(child.pid.to_string()).output();
-    }
-
-    if !children.is_empty() {
-        trace(&format!(
-            "housekeeping: terminated {} mcp-stdio child(ren) for uninstall",
-            children.len()
-        ));
-    }
-    children.len()
+#[cfg(not(target_os = "macos"))]
+pub fn disk_version_if_stale() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    const CURRENT: &str = r"C:\Program Files\aiui\aiui.exe";
+    #[cfg(not(windows))]
     const CURRENT: &str = "/Applications/aiui.app/Contents/MacOS/aiui";
 
-    #[test]
-    fn skips_empty_and_garbage_lines() {
-        assert!(find_stale("", CURRENT, 1).is_empty());
-        assert!(find_stale("  \n\t\n", CURRENT, 1).is_empty());
-        assert!(find_stale("not a pid line", CURRENT, 1).is_empty());
+    fn snap(pid: u32, exe: &str, args: &[&str]) -> ProcSnap {
+        ProcSnap {
+            pid,
+            exe: exe.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
     fn skips_unrelated_processes() {
-        let ps = "\
-          12345 /usr/bin/python3 some_script.py --mcp-stdio\n\
-          23456 /opt/homebrew/bin/uv tool uvx aiui-mcp\n\
-          34567 /bin/zsh -c echo hello\n\
-        ";
-        assert!(find_stale(ps, CURRENT, 1).is_empty());
+        let s = vec![
+            snap(12345, "/usr/bin/python3", &["python3", "some_script.py", "--mcp-stdio"]),
+            snap(23456, "/opt/homebrew/bin/uv", &["uv", "tool", "uvx", "aiui-mcp"]),
+            snap(34567, "/bin/zsh", &["zsh", "-c", "echo hello"]),
+        ];
+        assert!(find_stale(&s, CURRENT, 1).is_empty());
     }
 
     #[test]
     fn skips_current_binary() {
-        let ps = format!("99999 {CURRENT} --mcp-stdio\n");
-        assert!(find_stale(&ps, CURRENT, 1).is_empty());
+        let s = vec![snap(99999, CURRENT, &[CURRENT, "--mcp-stdio"])];
+        assert!(find_stale(&s, CURRENT, 1).is_empty());
     }
 
     #[test]
     fn skips_own_pid_even_if_path_differs() {
-        let ps = "12345 /old/path/aiui --mcp-stdio\n";
-        assert!(find_stale(ps, CURRENT, 12345).is_empty());
+        let s = vec![snap(12345, "/old/path/aiui", &["/old/path/aiui", "--mcp-stdio"])];
+        assert!(find_stale(&s, CURRENT, 12345).is_empty());
     }
 
     #[test]
@@ -307,8 +316,8 @@ mod tests {
 
     #[test]
     fn disk_version_check_treats_empty_disk_as_unknown_not_stale() {
-        // If `plutil` returns nothing — bundle missing, dev build,
-        // permissions issue — we'd rather keep running than abort.
+        // If the on-disk lookup returns nothing — bundle missing, dev
+        // build, permissions issue — we'd rather keep running than abort.
         // The GUI-side sweep is the safety net for that path.
         assert!(!is_disk_version_stale("0.4.26", ""));
         assert!(!is_disk_version_stale("0.4.26", "   "));
@@ -317,11 +326,11 @@ mod tests {
 
     #[test]
     fn finds_stale_child_with_different_path() {
-        let ps = "\
-          12345 /old/path/aiui --mcp-stdio\n\
-          23456 /Applications/aiui.app/Contents/MacOS/aiui --mcp-stdio\n\
-        ";
-        let stale = find_stale(ps, CURRENT, 1);
+        let s = vec![
+            snap(12345, "/old/path/aiui", &["/old/path/aiui", "--mcp-stdio"]),
+            snap(23456, CURRENT, &[CURRENT, "--mcp-stdio"]),
+        ];
+        let stale = find_stale(&s, CURRENT, 1);
         assert_eq!(
             stale,
             vec![StaleChild {
@@ -333,12 +342,12 @@ mod tests {
 
     #[test]
     fn finds_multiple_stale_children() {
-        let ps = "\
-          100 /a/aiui --mcp-stdio\n\
-          200 /b/aiui --mcp-stdio --extra\n\
-          300 /Applications/aiui.app/Contents/MacOS/aiui --mcp-stdio\n\
-        ";
-        let stale = find_stale(ps, CURRENT, 1);
+        let s = vec![
+            snap(100, "/a/aiui", &["/a/aiui", "--mcp-stdio"]),
+            snap(200, "/b/aiui", &["/b/aiui", "--mcp-stdio", "--extra"]),
+            snap(300, CURRENT, &[CURRENT, "--mcp-stdio"]),
+        ];
+        let stale = find_stale(&s, CURRENT, 1);
         assert_eq!(stale.len(), 2);
         assert_eq!(stale[0].pid, 100);
         assert_eq!(stale[1].pid, 200);
@@ -348,16 +357,20 @@ mod tests {
     fn ignores_aiui_gui_processes_without_mcp_stdio_flag() {
         // The GUI process itself runs the same binary but without
         // `--mcp-stdio`. Must not be killed.
-        let ps = format!("42 {CURRENT}\n43 /old/path/aiui\n");
-        assert!(find_stale(&ps, CURRENT, 1).is_empty());
+        let s = vec![
+            snap(42, CURRENT, &[CURRENT]),
+            snap(43, "/old/path/aiui", &["/old/path/aiui"]),
+        ];
+        assert!(find_stale(&s, CURRENT, 1).is_empty());
     }
 
     #[test]
-    fn tolerates_leading_whitespace_from_ps() {
-        // ps pads pid column with leading spaces.
-        let ps = "    12345 /old/path/aiui --mcp-stdio\n";
-        let stale = find_stale(ps, CURRENT, 1);
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].pid, 12345);
+    fn windows_exe_extension_is_recognized() {
+        // On Windows, `is_aiui_binary` must accept `aiui.exe` regardless of
+        // case. Verify here cross-platform — the leaf check is OS-agnostic.
+        assert!(is_aiui_binary(r"C:\Program Files\aiui\aiui.exe"));
+        assert!(is_aiui_binary(r"C:\Program Files\aiui\AIUI.EXE"));
+        assert!(is_aiui_binary("/Applications/aiui.app/Contents/MacOS/aiui"));
+        assert!(!is_aiui_binary("/usr/bin/python3"));
     }
 }

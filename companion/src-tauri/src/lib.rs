@@ -276,9 +276,25 @@ fn open_url(url: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("open {url}: {e}"))?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        let _ = url; // silence unused on non-macos until ports land
+        // `cmd /C start "" <url>` is the canonical way to open a URL with
+        // the user's default browser on Windows. The empty `""` argument
+        // is the window-title placeholder — without it `start` interprets
+        // a quoted URL as the title and refuses to launch.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("start {url}: {e}"))?;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        // Linux / BSD fallback for completeness — aiui is not officially
+        // shipped there, but the build should compile and behave sanely.
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("xdg-open {url}: {e}"))?;
     }
     Ok(())
 }
@@ -524,6 +540,24 @@ async fn remove_remote(
     Ok(results)
 }
 
+/// Uninstall hint shown after the cleanup sweep — tells the user how to
+/// remove the app bundle itself, which aiui can't do for itself
+/// (a running process can't delete its own binary on either OS).
+fn uninstall_app_removal_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen."
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Deinstalliere aiui über \"Apps & Features\" in den Windows-Einstellungen, um auch die App zu entfernen."
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        "Entferne das aiui-Binary manuell, um auch die App zu entfernen."
+    }
+}
+
 #[tauri::command]
 async fn uninstall_all(
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
@@ -549,10 +583,7 @@ async fn uninstall_all(
             "Lokale Dateien entfernt: {}",
             cfg.config_dir.display()
         ),
-        details: Some(
-            "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen."
-                .into(),
-        ),
+        details: Some(uninstall_app_removal_hint().into()),
     });
     Ok(results)
 }
