@@ -1,10 +1,11 @@
 """Regression tests for the empty-error-string bug shipped before 0.4.31.
 
 Symptom in the field: `aiui_health` returned `{"ok": false, "error": ""}` when
-aiui.app on the Mac crashed mid-response (or when a stale SSH reverse-tunnel
-held :7777 with no live process behind it). The same bug surfaced on the
-`version` and `update` tools as a bare `Error executing tool …:` with no
-diagnostic detail.
+the Mac side reset the HTTP connection mid-response — typically a stale SSH
+reverse-tunnel still bound to :7777 with nothing alive behind it, or the
+on-Mac mcp-stdio caught between auto-resurrect cycles. The same bug surfaced
+on the `version` and `update` tools as a bare `Error executing tool …:` with
+no diagnostic detail.
 
 Root cause: httpx raises `RemoteProtocolError("")` for "connection reset by
 peer" — `str(e)` is empty, and the server passed that straight through. The

@@ -129,16 +129,22 @@ async def _preflight() -> None:
                 f"this host. ({_explain_exc(e)})"
             ) from e
         except httpx.RemoteProtocolError as e:
-            # Connection reset / closed mid-response. Typically: aiui.app on
-            # the Mac crashed or shut down while we were talking to it, or a
-            # zombie SSH reverse-tunnel is still bound to :7777 with nothing
-            # alive on the Mac end. httpx leaves str(e) empty for this class
-            # of error — _explain_exc surfaces the class name as fallback.
+            # Connection reset / closed mid-response. The on-Mac mcp-stdio
+            # child's auto-resurrect normally brings aiui.app back on the
+            # next tool call, so a one-off reset is usually self-healing —
+            # we name the most common stuck-state causes (stale SSH tunnel
+            # squatting :7777, token mismatch from a parallel install)
+            # rather than telling the user to manually restart aiui.app.
+            # httpx leaves str(e) empty for this class of error — the
+            # `_explain_exc` fallback surfaces the class name so the user
+            # at least sees *something* concrete.
             raise RuntimeError(
-                f"aiui companion at {ENDPOINT} reset the connection — "
-                f"aiui.app on the Mac likely crashed or shut down, or a stale "
-                f"SSH tunnel is bound to :7777 with no live process behind it. "
-                f"Restart aiui.app on the Mac, then retry. "
+                f"aiui companion at {ENDPOINT} reset the connection. "
+                f"The Mac-side mcp-stdio normally auto-resurrects aiui.app on "
+                f"the next call — if this persists, a stale process may hold "
+                f"the port. Verify that Claude Desktop is open on the Mac and, "
+                f"on remotes, re-register the host in aiui.app settings to "
+                f"re-sync the token. "
                 f"({_explain_exc(e)})"
             ) from e
         except httpx.HTTPError as e:
@@ -147,8 +153,10 @@ async def _preflight() -> None:
             # exception with an empty message.
             raise RuntimeError(
                 f"aiui companion request to {ENDPOINT} failed: {_explain_exc(e)}. "
-                f"Check that aiui.app is running on the Mac and the SSH "
-                f"reverse-tunnel is active."
+                f"Verify Claude Desktop is open on the Mac; auto-resurrect "
+                f"normally restores the GUI on the next call. If repeated, "
+                f"check the SSH reverse-tunnel and re-register this remote "
+                f"in aiui.app settings to re-sync the token."
             ) from e
 
         if r.status_code == 401:
