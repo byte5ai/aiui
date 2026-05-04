@@ -157,6 +157,61 @@ to give context, not to ask anything. Result-handling unchanged.
   images use `image` with a real source.
 - Embedding HTML in node labels — Mermaid's `securityLevel: strict`
   rejects it (which we want). Keep labels plain text.
+- UI-layout mockups (dashboard tiles, hardware panels, screen
+  layouts) — Mermaid is graph-DSL, not layout-DSL. Use `wireframe`
+  for that, see below.
+
+## UI-layout mockups: `wireframe`
+
+When you'd otherwise reach for ASCII boxes-and-pipes to mock a UI
+layout — dashboard tiles, hardware-UI panels, a login-screen sketch,
+a hand-drawn-feel app surface — **stop**. Use the `wireframe` field
+in a `form` instead. `mermaid` covers diagrams (graphs, flows, state);
+`wireframe` covers fixed-position panel grids.
+
+Spec:
+`{kind: "wireframe", panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}`.
+
+`panels` is the only required field. Each panel has:
+
+- `title` — uppercase header, optional
+- `content` — multi-line monospace body, escape `\n` for line-breaks
+- `col_span` / `row_span` — default 1
+- `tone` — `"default"` (neutral), `"muted"` (de-emphasised),
+  `"highlight"` (accent border + tinted background)
+
+aiui renders real CSS-Grid panels with proper borders, monospace
+content, and theme-matched colours — the layout actually looks like
+the layout, instead of approximating it with `+`s and `|`s.
+
+```
+{
+  "kind": "wireframe",
+  "label": "U-Boot-Funkbude",
+  "columns": 3,
+  "panels": [
+    {"title": "EMPFANG", "col_span": 2, "content": "14:32:07 [SCHWACH] …\n14:32:11 [STARK]   WX MIDWAY"},
+    {"title": "STATUS",  "col_span": 1, "content": "Tiefe: 18 m\nKurs:  270°\nSpeed: 8 kn"},
+    {"title": "SIGNAL",  "col_span": 1, "content": "Atmo:    █▒▒\nWetter:  ▓▒▒", "tone": "muted"},
+    {"title": "AKTION",  "col_span": 2, "content": "[T]auchen [A]uftauchen [K]urs", "tone": "highlight"}
+  ]
+}
+```
+
+Read-only — sits between input fields to give layout context, like
+`markdown` / `image` / `mermaid`. Result-handling unchanged.
+
+**Anti-patterns:**
+
+- ASCII boxes-and-pipes for *anything* layout-shaped — that's the
+  slop this field replaces.
+- Using `wireframe` for graphs / flows / sequences — those are
+  `mermaid`-shaped, the panels here have no edges.
+- Putting deeply nested layouts inside one panel's `content` — the
+  field is for the *outer* layout. If you need nested boxes, split
+  into more panels with `col_span` / `row_span`.
+- Free-form HTML / markdown inside `content` — content is plain
+  text, rendered monospace; everything else is intentionally ignored.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 
