@@ -173,7 +173,27 @@ fn looks_like_local_path(s: &str) -> bool {
     if s.starts_with("data:") || s.starts_with("http://") || s.starts_with("https://") {
         return false;
     }
-    s.starts_with('/') || s.starts_with('~')
+    if s.starts_with('/') || s.starts_with('~') {
+        return true;
+    }
+    // Windows drive-letter absolute paths: `C:\foo`, `D:/bar`, including
+    // long-path prefixes `\\?\C:\…` and UNC `\\server\share\…`. Strict
+    // enough to avoid catching strings like `data:image/...` which never
+    // reach here anyway because of the early `data:` exit above.
+    if cfg!(windows) {
+        let bytes = s.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            return true;
+        }
+        if s.starts_with(r"\\") {
+            return true;
+        }
+    }
+    false
 }
 
 fn expand_tilde(s: &str) -> Option<PathBuf> {

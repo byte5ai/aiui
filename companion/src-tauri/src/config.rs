@@ -11,12 +11,29 @@ pub struct AppConfig {
     pub http_port: u16,
 }
 
+/// Returns the OS-appropriate aiui config directory.
+///
+/// - macOS / Linux: `~/.config/aiui` (XDG-style — kept on macOS deliberately
+///   so existing v0.4.x installs keep their token without migration).
+/// - Windows: `%APPDATA%\aiui` (Roaming) — resolved via `dirs::config_dir()`.
+pub fn config_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = dirs::config_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no %APPDATA%"))?;
+        Ok(base.join("aiui"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = dirs::home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home dir"))?;
+        Ok(home.join(".config").join("aiui"))
+    }
+}
+
 impl AppConfig {
     pub fn load_or_init() -> io::Result<Self> {
-        let config_dir = dirs::home_dir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home dir"))?
-            .join(".config")
-            .join("aiui");
+        let config_dir = config_dir()?;
         fs::create_dir_all(&config_dir)?;
 
         let token_path = config_dir.join("token");
