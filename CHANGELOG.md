@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.31] — 2026-05-04
+
+### Fixed
+
+- **`aiui_health`, `version`, `update` no longer return empty error strings.**
+  When aiui.app on the Mac crashed mid-response or a stale SSH reverse-tunnel
+  held :7777 with no live process behind it, `httpx` raised
+  `RemoteProtocolError("")` — `str(e)` is empty for that class, so the tool
+  responses came back as `{"ok": false, "error": ""}` (and `version` /
+  `update` surfaced as bare `Error executing tool …:`). Useless in exactly
+  the moment the user needed the diagnostic. Fix is two-part:
+  - New `_explain_exc` helper falls back to the exception class name when
+    `str(e)` is empty or whitespace-only — guarantees the user always sees
+    *something* concrete.
+  - `_preflight` (render-path), `version`, and `update` get explicit `except`
+    branches for `httpx.RemoteProtocolError` (with restart-aiui guidance) and
+    a catch-all `httpx.HTTPError` (so stranger transport errors no longer
+    bubble up as bare exceptions). 8 regression tests in
+    `tests/test_health_error_handling.py` lock the contract in.
+
 ## [0.4.30] — 2026-05-03
 
 ### Fixed
