@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.34] — 2026-05-04
+
+### Added
+
+- **Per-remote resync button in Settings.** Each registered remote
+  now has a `⟳` icon button next to "Entfernen". Clicking it
+  triggers the same `patch_claude_code_config_remote` +
+  `kill_remote_mcp_stdio` sequence that runs in the background at
+  every aiui-app startup — but on demand, with the StepResult log
+  inline. Lets the user retry a sync that failed silently in the
+  background (e.g. the 2026-05-04 `dev@devhost: sweep failed` case)
+  without having to close + reopen aiui-app. Sweep failures appear
+  in the activity log immediately.
+
+### Fixed
+
+- **Dialog window now opens to the front.** When aiui runs in
+  Accessory mode (LSUIElement-style daemon, no Dock icon) macOS
+  doesn't bring its windows above other apps even with
+  `set_focus()`. An agent rendered a dialog and the user didn't see
+  it because Claude Desktop was covering it (reported 2026-05-04).
+  `ensure_dialog_window` now temporarily promotes the app to
+  Regular activation policy and marks the window
+  `always_on_top: true` for the first 800 ms — long enough to win
+  against any focused app, short enough that the user can Cmd+Tab
+  away naturally afterwards. `close_window` demotes back to
+  Accessory once the dialog finishes so we don't grow a permanent
+  Dock icon.
+- **Form footer no longer covers the last form field.** The
+  sticky footer's opaque background overlapped scroll-end content
+  because the container's `padding-bottom` didn't reserve the
+  footer's height. Bumped from 16 px to 75 px (footer ≈ 61 px +
+  buffer) with matching `margin-bottom: -75px` on the footer so it
+  still sits flush with the window edge. Visible in tester's
+  wireframe-test screenshot 2026-05-04.
+
+### Known issues
+
+- **Cold-start race on the second dialog after `close_window`** —
+  the first ask after a `confirm` returned `ReadError` (connection
+  reset mid-render); the immediate retry succeeded. Window-Ready
+  handshake from 0.4.30 doesn't fully cover the rebuild path. Not
+  patched in 0.4.34 because the trace doesn't yet show whether the
+  reset originates in the WebView rebuild, the SSH-tunnel layer,
+  or a remaining multi-instance edge — symptom-fix without root
+  diagnosis would risk masking it instead of fixing it. Tracked
+  for 0.4.35 once we have a reproduction with detailed render-path
+  trace.
+
 ## [0.4.33] — 2026-05-04
 
 ### Fixed

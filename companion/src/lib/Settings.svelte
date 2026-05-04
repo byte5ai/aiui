@@ -93,6 +93,17 @@
     }
   }
 
+  async function resyncRemote(host: string) {
+    busy = true;
+    try {
+      const results = await invoke<StepResult[]>("resync_remote", { hostAlias: host });
+      pushLog(results);
+      await refresh();
+    } finally {
+      busy = false;
+    }
+  }
+
   async function doUninstall() {
     busy = true;
     try {
@@ -381,6 +392,13 @@
                 <code>{h}</code>
                 <div class="tunnel-status {tunnel.tone}">{tunnel.text}</div>
               </div>
+              <button
+                class="icon-button"
+                onclick={() => resyncRemote(h)}
+                disabled={busy}
+                title={$_("settings.remotes.resync.tooltip")}
+                aria-label={$_("settings.remotes.resync.tooltip")}
+              >⟳</button>
               <button onclick={() => removeRemote(h)} disabled={busy}
                 >{$_("settings.remotes.remove")}</button
               >

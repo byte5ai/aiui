@@ -73,6 +73,15 @@ button {
   box-shadow: var(--shadow-sm);
   transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
 }
+/* Compact icon button for inline actions (resync per remote, etc.).
+   Same chrome as a normal button but square + smaller, font-size up
+   so the glyph reads at a glance. v0.4.34 resync feature. */
+button.icon-button {
+  padding: 4px 8px;
+  min-width: 28px;
+  font-size: 14px;
+  line-height: 1;
+}
 button:hover:not(:disabled) {
   background: linear-gradient(180deg,
     color-mix(in srgb, var(--surface-raised) 95%, var(--accent)),
@@ -168,8 +177,16 @@ label {
   /* Native title bar handles the top-of-window real estate now (see
      v0.4.30 drag fix). Content can sit close to the title-bar
      boundary; 14 px gives visual breathing room without wasting
-     vertical space. */
-  padding: 14px 20px 16px 20px;
+     vertical space.
+
+     Bottom padding is sized to the sticky-footer's combined height
+     (12 padding-top + ~32 button + 16 padding-bottom + 1 border ≈
+     61 px) plus a 14 px buffer so the last form field doesn't get
+     covered by the footer's opaque background when the content
+     scrolls to its end. The footer below uses a matching negative
+     margin-bottom to break out of this padding and sit flush with
+     the window edge. v0.4.34 footer-overlap fix. */
+  padding: 14px 20px 75px 20px;
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
@@ -216,12 +233,15 @@ label {
   border-top: 1px solid var(--border);
   /* Pull-out below the container's bottom padding so the border sits
      flush with the window edge while the buttons keep their breathing
-     room above. */
+     room above. v0.4.34: bumped from -16 to -75 to match the
+     container's increased padding-bottom (footer-height reservation).
+     Without this match, the last form field would still get covered
+     by the sticky footer's opaque background at scroll-end. */
   margin-left: -20px;
   margin-right: -20px;
   padding-left: 20px;
   padding-right: 20px;
-  margin-bottom: -16px;
+  margin-bottom: -75px;
   padding-bottom: 16px;
 }
 

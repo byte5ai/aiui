@@ -45,6 +45,7 @@
     "remotes.add.button": "Einrichten",
     "remotes.add.hint": "Trägt Reverse-Tunnel in ~/.ssh/config ein, kopiert den Auth-Token per scp zum Host und startet den Tunnel sofort.",
     "remotes.remove": "Entfernen",
+    "remotes.resync.tooltip": "Pin neu setzen + alte aiui-mcp-Subprozesse killen (auf Remote)",
     "log.title": "Zuletzt",
     "tunnel.connected": "verbunden",
     "tunnel.connected_shared": "verbunden (geteilter Forward)",
