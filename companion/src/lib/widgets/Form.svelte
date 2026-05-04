@@ -688,6 +688,11 @@
     {/each}
   </div>
 
+  <!-- Spacer reserves footer height inside the scroll flow so the
+       last form field never gets overlapped by the sticky footer at
+       scroll-end. Belongs to this component, not to .container —
+       Settings has its own footer-vs-content geometry. v0.4.35. -->
+  <div class="form-footer-spacer" aria-hidden="true"></div>
   <div class="footer">
     {#each actions as a}
       <button

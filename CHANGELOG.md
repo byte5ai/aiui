@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.35] — 2026-05-04
+
+### Fixed
+
+- **Settings window's "Add remote" input no longer hides behind the
+  footer.** The 0.4.34 footer-overlap fix bumped `.container`'s
+  `padding-bottom` to 75 px globally, plus matching negative
+  `margin-bottom` on `.footer`. That was correct for Form.svelte
+  (which has many fields and benefits from the reservation), but
+  broke Settings.svelte: the "Neuen Remote hinzufügen" input
+  section sits right above the footer there and got pushed under
+  it. Reverted both globals to the original values (16 / -16 px)
+  and moved the height-reservation **into** Form.svelte as a local
+  `.form-footer-spacer` div placed immediately before the footer.
+  Settings stays untouched, Form keeps its scroll-end clearance.
+- **Resync-button tooltip in plain language.** The 0.4.34 string
+  ("Pin neu setzen + alte aiui-mcp-Subprozesse killen") was
+  implementation jargon. Now it's user-facing wording: "aiui-
+  Verbindung zu diesem Host erneuern" / "Refresh aiui connection
+  on this host". The button still does the same patch + kill
+  sequence; the user just doesn't have to know that.
+
 ## [0.4.34] — 2026-05-04
 
 ### Added

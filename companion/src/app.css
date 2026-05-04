@@ -179,14 +179,14 @@ label {
      boundary; 14 px gives visual breathing room without wasting
      vertical space.
 
-     Bottom padding is sized to the sticky-footer's combined height
-     (12 padding-top + ~32 button + 16 padding-bottom + 1 border ≈
-     61 px) plus a 14 px buffer so the last form field doesn't get
-     covered by the footer's opaque background when the content
-     scrolls to its end. The footer below uses a matching negative
-     margin-bottom to break out of this padding and sit flush with
-     the window edge. v0.4.34 footer-overlap fix. */
-  padding: 14px 20px 75px 20px;
+     Bottom padding kept at 16 px (matching the original layout). A
+     reservation for the sticky footer's height has to be local to
+     the component that uses it — Form.svelte adds a footer-spacer
+     before its `<div class="footer">`. The 0.4.34 attempt to bake
+     the reservation into `.container` here broke Settings.svelte's
+     "add remote" section by pushing it under the same footer's
+     overlap zone. v0.4.35 reverts that back. */
+  padding: 14px 20px 16px 20px;
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
@@ -233,16 +233,27 @@ label {
   border-top: 1px solid var(--border);
   /* Pull-out below the container's bottom padding so the border sits
      flush with the window edge while the buttons keep their breathing
-     room above. v0.4.34: bumped from -16 to -75 to match the
-     container's increased padding-bottom (footer-height reservation).
-     Without this match, the last form field would still get covered
-     by the sticky footer's opaque background at scroll-end. */
+     room above. (v0.4.35 reverted from -75 back to -16 — see the
+     container comment above.) */
   margin-left: -20px;
   margin-right: -20px;
   padding-left: 20px;
   padding-right: 20px;
-  margin-bottom: -75px;
+  margin-bottom: -16px;
   padding-bottom: 16px;
+}
+
+/* Form-local reservation for the sticky footer's height. Sits as
+   a sibling immediately before `<div class="footer">` in
+   Form.svelte. When the content overflows the container, this
+   spacer means scroll-end is ~70 px below the last real field, so
+   the footer's opaque background no longer overlaps it. When the
+   content fits, the spacer is invisible (no background, no
+   border) and `margin-top: auto` on the footer still pushes it
+   against the window edge. v0.4.35 form-overlap fix. */
+.form-footer-spacer {
+  height: 70px;
+  flex-shrink: 0;
 }
 
 code {
