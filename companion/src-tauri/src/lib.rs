@@ -1061,34 +1061,45 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Multi-window lifecycle (v0.4.25):
+            // Multi-window lifecycle (v0.4.25, revised v0.4.36):
             //
             // The setup window and the dialog window are independent.
             // Closing one shouldn't kill the other — and definitely
-            // shouldn't kill an in-flight dialog the agent is still
-            // waiting on.
+            // shouldn't kill the GUI process while the lifetime
+            // socket still has attached MCP-stdio children depending
+            // on it.
             //
-            //  • Red X on setup window: setup goes away. If a dialog is
-            //    visible *or* something is pending, the app stays alive.
-            //    Otherwise the app quits, and `mcp_attach`'s
+            //  • Red X on setup window: setup goes away. If no other
+            //    window is visible AND no MCP-stdio children are
+            //    attached, the app quits and `mcp_attach`'s
             //    auto-resurrect path brings it back on the next tool
-            //    call. Same UX promise as before, just without the
-            //    cross-window damage.
+            //    call. As long as a child is attached, we stay alive
+            //    headless — the lifetime grace timer (60s after the
+            //    last child detaches) is the only legitimate
+            //    "nobody needs aiui anymore" signal.
             //  • Red X on dialog window: the dialog is treated as
-            //    cancelled (the frontend's CloseRequested-listener fires
-            //    `dialog_cancel` first; this branch runs after).
-            //    Otherwise identical to setup-window close.
+            //    cancelled (the frontend's CloseRequested-listener
+            //    fires `dialog_cancel` first; this branch runs after).
+            //    NEVER quits the app, regardless of any-visible state.
+            //    The dialog window is per-call ephemeral — destroyed
+            //    after every submit/cancel by `close_window`. Quitting
+            //    the GUI here would tear down the HTTP server while
+            //    the agent's tool call is still parsing the response,
+            //    producing the 8s `wait_for_aiui` timeouts the user
+            //    saw on 2026-05-04 (trace 16:11:42.197 "GUI is gone"
+            //    20 ms after a successful form submit).
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let app = window.app_handle();
                 let closed_label = window.label().to_string();
-                // Tauri lets the close proceed unless we set
-                // api.prevent_close(); we want the close to happen.
-                // Schedule the quit-check on the next tick so it runs
-                // *after* this window is actually destroyed.
+                if closed_label == DIALOG_WINDOW_LABEL {
+                    log::debug!(
+                        "[aiui] dialog window closed — staying alive for further tool calls"
+                    );
+                    return;
+                }
+                // Setup window: quit only if nothing else needs us.
                 let app_for_check = app.clone();
                 let _ = app.run_on_main_thread(move || {
-                    // Filter out the just-closed window — at this point
-                    // it may still appear in the registry briefly.
                     let any_visible = app_for_check
                         .webview_windows()
                         .iter()
@@ -1096,14 +1107,18 @@ pub fn run() {
                             label.as_str() != closed_label
                                 && w.is_visible().unwrap_or(false)
                         });
-                    if !any_visible {
+                    let attached = app_for_check
+                        .try_state::<Arc<lifetime::LifetimeStats>>()
+                        .map(|s| s.child_count())
+                        .unwrap_or(0);
+                    if !any_visible && attached == 0 {
                         log::info!(
-                            "[aiui] last visible window ({closed_label}) closed — quitting; auto-resurrect will bring us back on next tool call"
+                            "[aiui] setup window closed and no MCP-stdio children attached — quitting; auto-resurrect will bring us back on next tool call"
                         );
                         app_for_check.exit(0);
                     } else {
                         log::debug!(
-                            "[aiui] {closed_label} closed, but other windows still visible — staying alive"
+                            "[aiui] setup window closed, staying alive (visible_others={any_visible}, attached_children={attached})"
                         );
                     }
                 });

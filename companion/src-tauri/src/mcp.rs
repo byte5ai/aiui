@@ -381,19 +381,50 @@ async fn wait_for_aiui(http: &reqwest::Client, cfg: &AppConfig) -> bool {
     }
 }
 
-/// Tool-call response signaling that the local aiui companion isn't
-/// reachable. Phrased as user-facing guidance rather than a raw error
-/// because Claude tends to relay this verbatim to the user.
+/// Tool-call response signaling that the local aiui companion didn't
+/// answer `/ping` within `COLDSTART_WAIT`. Differentiates the realistic
+/// causes so the calling agent can choose between "retry once" and
+/// "tell the user something useful". v0.4.36 rewrite: the previous
+/// generic "not reachable on localhost:7777" was relayed verbatim by
+/// Claude even when the actual cause was contention (parallel session,
+/// stale dialog window, multiple aiui calls in one assistant turn) —
+/// none of which the user can fix by re-opening aiui.
 fn aiui_unreachable_result() -> Value {
+    let local = crate::lifetime::is_interactive_session();
+    let context_line = if local {
+        "You are running on the user's local Mac (no SSH session detected)."
+    } else {
+        "You are running on a remote dev host. aiui reaches the user's Mac \
+         via an SSH-reverse-tunnel on port 7777."
+    };
+    let text = format!(
+        "aiui companion did not answer /ping on localhost:7777 within 8 seconds.\n\
+         \n\
+         {context_line}\n\
+         \n\
+         Likely causes (in order of frequency):\n\
+         1. **Multiple aiui calls in one assistant turn.** The previous call \
+            held the dialog window; the second one raced ahead before the \
+            companion freed the slot. Retry the failing call once after a \
+            short wait — usually succeeds.\n\
+         2. **Stale dialog window from an earlier session.** A previous \
+            agent's dialog timed out or was orphaned and is still pinning \
+            the companion. Tell the user: \"please close any leftover aiui \
+            dialog windows on your Mac and try again.\"\n\
+         3. **A parallel Claude session is using aiui right now.** Two \
+            agents on the same Mac share one companion; only one dialog at \
+            a time. Either retry shortly or tell the user the other session \
+            is currently holding the dialog.\n\
+         4. **aiui is genuinely not running** (cold-start path). If you are \
+            on the user's Mac, ask them to open aiui from /Applications. If \
+            on a remote host, the SSH-reverse-tunnel may be down — point \
+            them to aiui Settings → Connections.\n\
+         \n\
+         Do not relay this entire message to the user verbatim — pick the \
+         likely cause and phrase it plainly."
+    );
     json!({
-        "content": [{
-            "type": "text",
-            "text": "aiui companion is not reachable on localhost:7777. \
-                     If you're on the local machine: open aiui from /Applications. \
-                     If you're on a remote dev host: the SSH-reverse-tunnel to your \
-                     Mac is down — check that aiui is running there and the tunnel \
-                     in aiui Settings shows 'connected'."
-        }],
+        "content": [{ "type": "text", "text": text }],
         "isError": true
     })
 }
