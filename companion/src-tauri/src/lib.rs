@@ -91,11 +91,24 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     // its custom close button (none today, but the contract should be
     // symmetric).
     let label = window.label().to_string();
+    let app = window.app_handle().clone();
     let _ = window.close();
-    // If that was the last visible window and nothing else is pending,
-    // the OS-level CloseRequested handler will fire next and decide
-    // whether the app should quit.
     log::debug!("[aiui] close_window: closed {label}");
+
+    // If that was the dialog window and no setup window is open,
+    // demote the app back to Accessory mode so we don't permanently
+    // grow a Dock icon. `ensure_dialog_window` promotes us to Regular
+    // for the dialog's lifetime; this is the matching demote.
+    #[cfg(target_os = "macos")]
+    if label == DIALOG_WINDOW_LABEL {
+        let setup_open = app
+            .get_webview_window(SETUP_WINDOW_LABEL)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        if !setup_open {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+    }
     Ok(())
 }
 
@@ -453,6 +466,41 @@ async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
     Ok(results)
 }
 
+/// On-demand resync trigger for a single registered remote — wraps
+/// the same patch-pin + kill-stale-mcp-stdio sequence that runs in
+/// the background at every aiui-app startup. Surfaced as a per-remote
+/// button in Settings so the user can re-invoke it without restarting
+/// aiui (and see the StepResult log inline if a sweep fails).
+///
+/// Why this exists: 0.4.29's auto-resync on GUI-start is silent — if
+/// the SSH-side `pkill` fails (remote temporarily unreachable) the
+/// stale subprocess keeps running with the previous version. Without
+/// a manual trigger, the user would have to close + reopen aiui-app
+/// to retry. v0.4.34 adds the on-demand path.
+#[tauri::command]
+async fn resync_remote(
+    host_alias: String,
+) -> Result<Vec<setup::StepResult>, String> {
+    let our_version = env!("CARGO_PKG_VERSION");
+    // Re-pin in `~/.claude.json` on the remote (idempotent — if
+    // already pinned, no rewrite, returns AlreadyCurrent).
+    let (pin_step, patch) = setup::patch_claude_code_config_remote(
+        &host_alias,
+        None,
+        our_version,
+    );
+    let mut results = vec![pin_step];
+    // Sweep stale aiui-mcp children only when the pin actually
+    // changed (or unconditionally? — yes, unconditionally on
+    // user-triggered resync, because the user wouldn't click resync
+    // unless they suspect drift). On unconditional sweep: kills any
+    // running aiui-mcp regardless of pin state, which is what the
+    // user wants from a "force fresh" button.
+    let _ = patch;  // not used here, but kept for tracing
+    results.push(setup::kill_remote_mcp_stdio(&host_alias));
+    Ok(results)
+}
+
 #[tauri::command]
 async fn remove_remote(
     host_alias: String,
@@ -581,10 +629,35 @@ pub(crate) fn build_setup_window(
 pub(crate) fn ensure_dialog_window(
     app: &tauri::AppHandle,
 ) -> tauri::Result<tauri::WebviewWindow> {
+    // Promote the app from Accessory to Regular for the duration of the
+    // dialog. In Accessory mode (LSUIElement-style daemon, no Dock icon)
+    // macOS won't bring our windows to the front above other apps even
+    // with `set_focus()` — the agent renders a dialog and the user
+    // doesn't see it because Claude Desktop covers it. Promoting to
+    // Regular for the dialog window restores normal front/focus
+    // behaviour; we drop back to Accessory in `close_window` once the
+    // dialog finishes so we don't permanently grow a Dock icon.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
     if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
         let _ = win.show();
         let _ = win.set_focus();
         let _ = win.unminimize();
+        // Briefly mark the window always-on-top to win against any
+        // app that's grabbed focus in the meantime, then lift the
+        // flag so the user can naturally Cmd+Tab away later. 800 ms
+        // is enough for the activation to settle without leaving a
+        // sticky front-most window.
+        let _ = win.set_always_on_top(true);
+        let app_for_lift = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
+                let _ = w.set_always_on_top(false);
+            }
+        });
         return Ok(win);
     }
     // Window is being built fresh — its frontend listeners aren't up
@@ -618,7 +691,23 @@ pub(crate) fn ensure_dialog_window(
     .decorations(true)
     .disable_drag_drop_handler()
     .visible(true)
+    .always_on_top(true)
     .build()
+    .map(|win| {
+        // Fresh dialog windows also get the same lift-after-800 ms
+        // treatment as the reused-window branch above. The
+        // always_on_top flag from the builder ensures the window
+        // appears above everything; we drop it shortly after so
+        // Cmd+Tab works normally afterwards.
+        let app_for_lift = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
+                let _ = w.set_always_on_top(false);
+            }
+        });
+        win
+    })
 }
 
 /// True when no aiui window is currently visible to the user. Used by
@@ -773,6 +862,7 @@ pub fn run() {
             status,
             add_remote,
             remove_remote,
+            resync_remote,
             reinstall_skill,
             repair_skill,
             restart_claude_desktop,
