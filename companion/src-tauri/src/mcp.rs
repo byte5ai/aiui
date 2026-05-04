@@ -450,55 +450,61 @@ async fn tools_call(
     }
 
     let outcome = match name.as_str() {
-        "confirm" => render_dialog(
-            json!({
-                "kind": "confirm",
-                "title": args.get("title"),
-                "message": args.get("message"),
-                "header": args.get("header"),
-                "destructive": args.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false),
-                "confirmLabel": args.get("confirm_label"),
-                "cancelLabel": args.get("cancel_label"),
-                "image": args.get("image")
-            }),
-            cfg,
-            http,
-        )
-        .await
-        .map(format_confirm_result),
+        "confirm" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "confirm",
+                    "title": args.get("title"),
+                    "message": args.get("message"),
+                    "header": args.get("header"),
+                    "destructive": args.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "confirmLabel": args.get("confirm_label"),
+                    "cancelLabel": args.get("cancel_label"),
+                    "image": args.get("image")
+                }),
+                cfg,
+                http,
+            )
+            .await,
+            format_confirm_result,
+        ),
 
-        "ask" => render_dialog(
-            json!({
-                "kind": "ask",
-                "question": args.get("question"),
-                "header": args.get("header"),
-                "options": args.get("options"),
-                "multiSelect": args.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false),
-                "allowOther": args.get("allow_other").and_then(|v| v.as_bool()).unwrap_or(false)
-            }),
-            cfg,
-            http,
-        )
-        .await
-        .map(format_dialog_result),
+        "ask" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "ask",
+                    "question": args.get("question"),
+                    "header": args.get("header"),
+                    "options": args.get("options"),
+                    "multiSelect": args.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "allowOther": args.get("allow_other").and_then(|v| v.as_bool()).unwrap_or(false)
+                }),
+                cfg,
+                http,
+            )
+            .await,
+            format_dialog_result,
+        ),
 
-        "form" => render_dialog(
-            json!({
-                "kind": "form",
-                "title": args.get("title"),
-                "description": args.get("description"),
-                "header": args.get("header"),
-                "fields": args.get("fields"),
-                "tabs": args.get("tabs"),
-                "actions": args.get("actions"),
-                "submitLabel": args.get("submit_label"),
-                "cancelLabel": args.get("cancel_label")
-            }),
-            cfg,
-            http,
-        )
-        .await
-        .map(format_dialog_result),
+        "form" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "form",
+                    "title": args.get("title"),
+                    "description": args.get("description"),
+                    "header": args.get("header"),
+                    "fields": args.get("fields"),
+                    "tabs": args.get("tabs"),
+                    "actions": args.get("actions"),
+                    "submitLabel": args.get("submit_label"),
+                    "cancelLabel": args.get("cancel_label")
+                }),
+                cfg,
+                http,
+            )
+            .await,
+            format_dialog_result,
+        ),
 
         "aiui_health" => get_json(http, cfg, "/health").await.map(value_to_tool_text),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
@@ -535,12 +541,30 @@ fn base_url(cfg: &AppConfig) -> String {
     format!("http://127.0.0.1:{}", cfg.http_port)
 }
 
+/// Per-call dialog rendering can fail in two structurally different
+/// ways. v0.4.36 splits them so the tool dispatcher can convert
+/// `Busy` into a structured tool result (with retry-vs-tell-user
+/// guidance) instead of bubbling it up as a generic transport error
+/// the way "render http 409" used to.
+enum RenderError {
+    /// The companion answered 409 — another dialog is already in
+    /// flight. Carries the diagnostic counts the HTTP layer reported.
+    Busy {
+        pending_count: u64,
+        oldest_age_secs: u64,
+    },
+    /// Transport, parse, status-other-than-409, or token failures.
+    /// Surfaced as a generic "aiui tool error" to the agent, since
+    /// these are conditions the user actually has to act on.
+    Transport(String),
+}
+
 async fn render_dialog(
     spec: Value,
     cfg: &AppConfig,
     http: &reqwest::Client,
-) -> Result<Value, String> {
-    let token = load_token(cfg)?;
+) -> Result<Value, RenderError> {
+    let token = load_token(cfg).map_err(RenderError::Transport)?;
     let url = format!("{}/render", base_url(cfg));
     // Resolve any absolute / `~/`-rooted file paths in `src` /
     // `thumbnail` to `data:` URLs *here* — at the bridge — because
@@ -559,13 +583,80 @@ async fn render_dialog(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("POST /render: {e}"))?;
+        .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        // Body shape from http::render: { error, pending_count, oldest_age_secs }.
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        return Err(RenderError::Busy {
+            pending_count: body
+                .get("pending_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1),
+            oldest_age_secs: body
+                .get("oldest_age_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        });
+    }
     if !resp.status().is_success() {
-        return Err(format!("render http {}", resp.status()));
+        return Err(RenderError::Transport(format!(
+            "render http {}",
+            resp.status()
+        )));
     }
     resp.json::<Value>()
         .await
-        .map_err(|e| format!("parse /render: {e}"))
+        .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))
+}
+
+/// Tool-call response signaling that the companion is alive but
+/// already serving another dialog (multi-call-per-turn, second Claude
+/// session, stale window). Phrased as agent-facing guidance, parallel
+/// to `aiui_unreachable_result`.
+fn aiui_busy_result(pending_count: u64, oldest_age_secs: u64) -> Value {
+    let text = format!(
+        "aiui companion is busy serving another dialog right now \
+         (pending={pending_count}, oldest_age={oldest_age_secs}s).\n\
+         \n\
+         The companion intentionally serves only one dialog at a time. \
+         The other dialog is one of:\n\
+         1. **Your previous aiui call in this same assistant turn.** Tools \
+            in one turn run sequentially and the prior dialog hasn't been \
+            answered yet. Wait until the user answers, then issue the next \
+            call. Do not retry rapidly.\n\
+         2. **A stale dialog window from an earlier session** that the \
+            user never answered. Tell the user: \"please answer or close \
+            the leftover aiui dialog on your Mac, then I'll retry.\" The \
+            companion will sweep it automatically after 5 minutes.\n\
+         3. **A parallel Claude session is currently using aiui.** Either \
+            wait briefly and retry, or tell the user the other session \
+            holds the dialog right now.\n\
+         \n\
+         Do not relay this entire message to the user verbatim — pick the \
+         likely cause and phrase it plainly."
+    );
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true
+    })
+}
+
+/// Dispatch a `render_dialog` outcome into a tool-call result. `Busy`
+/// becomes a successful tool call with `isError: true` and diagnostic
+/// guidance; `Transport` becomes an `Err` that `tools_call` then
+/// renders as the generic "aiui tool error: …" path.
+fn dispatch_render(
+    res: Result<Value, RenderError>,
+    formatter: fn(Value) -> Value,
+) -> Result<Value, String> {
+    match res {
+        Ok(v) => Ok(formatter(v)),
+        Err(RenderError::Busy {
+            pending_count,
+            oldest_age_secs,
+        }) => Ok(aiui_busy_result(pending_count, oldest_age_secs)),
+        Err(RenderError::Transport(s)) => Err(s),
+    }
 }
 
 async fn get_json(
