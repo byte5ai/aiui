@@ -91,6 +91,9 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     // its custom close button (none today, but the contract should be
     // symmetric).
     let label = window.label().to_string();
+    // App handle only needed for the macOS dock-demote path below; bind
+    // it inside that cfg-block so Windows builds don't see it as unused.
+    #[cfg(target_os = "macos")]
     let app = window.app_handle().clone();
     let _ = window.close();
     log::debug!("[aiui] close_window: closed {label}");
@@ -1157,13 +1160,24 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
-        .run(|app, event| {
+        .run(|_app, _event| {
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
-            // → Settings-Fenster nach vorn holen.
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_settings_window(app);
-            }
-            // Cmd-Q and window-close both just let the app terminate;
+            // → Settings-Fenster nach vorn holen. `RunEvent::Reopen` is
+            // a Mac-only variant, so this whole branch is gated.
+            //
+            // Windows has no analogous "reopen" semantics — clicking the
+            // installed `.exe` while it's already running is handled by
+            // tauri-plugin-single-instance, which surfaces the existing
+            // window through its own callback (wired up at plugin init,
+            // not here).
+            //
+            // Cmd-Q / window-close both just let the app terminate;
             // auto-resurrect in mcp_attach brings aiui back when needed.
+            #[cfg(target_os = "macos")]
+            {
+                if let tauri::RunEvent::Reopen { .. } = _event {
+                    show_settings_window(_app);
+                }
+            }
         });
 }
