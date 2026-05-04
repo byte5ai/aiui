@@ -693,7 +693,7 @@ pub(crate) fn ensure_dialog_window(
     .visible(true)
     .always_on_top(true)
     .build()
-    .map(|win| {
+    .inspect(|_win| {
         // Fresh dialog windows also get the same lift-after-800 ms
         // treatment as the reused-window branch above. The
         // always_on_top flag from the builder ensures the window
@@ -706,7 +706,6 @@ pub(crate) fn ensure_dialog_window(
                 let _ = w.set_always_on_top(false);
             }
         });
-        win
     })
 }
 
