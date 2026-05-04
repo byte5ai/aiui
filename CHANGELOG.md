@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.32] — 2026-05-04
+
+### Added
+
+- **`wireframe` form-field for UI-layout mockups.** Sibling of
+  `mermaid` in the inline-context category — but where `mermaid`
+  covers graph-shaped diagrams (flowcharts, sequence/state, gantt),
+  `wireframe` covers fixed-position panel grids (dashboard tiles,
+  hardware-UI mockups, login-screen sketches). The agent ships a
+  declarative spec, aiui renders real CSS-Grid panels with proper
+  borders, monospace content, and theme-matched colours instead of
+  expecting the model to draw boxes-and-pipes in ASCII:
+
+  ```json
+  {
+    "kind": "wireframe",
+    "columns": 3,
+    "panels": [
+      {"title": "STATUS",  "col_span": 1, "content": "Tiefe: 18 m\nKurs: 270°"},
+      {"title": "EMPFANG", "col_span": 2, "content": "14:32 [STARK]…"},
+      {"title": "AKTION",  "col_span": 3, "content": "[T]auchen [A]uf", "tone": "highlight"}
+    ]
+  }
+  ```
+
+  Each panel: optional `title` (uppercase header), `content`
+  (multi-line monospace text), `col_span` / `row_span` (default 1),
+  `tone` ∈ `{"default", "muted", "highlight"}`. Top-level `columns`,
+  `gap`, `label`, `max_height`. Read-only, sits between input fields
+  like the other inline-context blocks. Tool-description in `mcp.rs`
+  and skill-doc (`docs/skill.md` + bundled `python/aiui_mcp/skill.md`)
+  call this out explicitly so the agent stops reaching for ASCII when
+  the user asks for a UI mockup.
+
+  *Why this and not `mermaid`*: mermaid's `block-beta` is for
+  architecture diagrams, not UI layouts; positioning is graph-driven,
+  not grid-driven. Forcing a UI mockup through it produces something
+  that doesn't look like a UI. The wireframe field stays small and
+  agent-friendly: a panel array on a CSS-Grid is enough for the 90 %
+  case (mockup discussions, layout reviews, hardware-UI sketches),
+  and v2 / Canvas-mode picks up where this stops (interactive,
+  multi-turn, persistent surfaces).
+
 ## [0.4.31] — 2026-05-04
 
 ### Fixed

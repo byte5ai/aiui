@@ -126,6 +126,48 @@ These don't ask anything — they sit between input fields to give context
 - `static_text` — plain styled note with `tone: "info"|"warn"|"muted"`.
   Lighter weight than `markdown` when no formatting is needed.
 
+## Schematic diagrams: `mermaid`
+
+For graph-shaped visualisations — flowcharts, sequence diagrams, state
+machines, gantt, ER, class diagrams, mind-maps — use the `mermaid`
+field instead of ASCII boxes-and-arrows. Spec:
+`{kind: "mermaid", source: "<DSL>", label?, max_height?}`. The `source`
+is a Mermaid-DSL string; aiui pipes it through `mermaid.render()`,
+sanitises the SVG, and embeds inline. Read-only, sits between input
+fields like `markdown` / `image`.
+
+## UI-layout mockups: `wireframe`
+
+Orthogonal to `mermaid` — `mermaid` is for graphs, `wireframe` is for
+*layouts*. When you'd otherwise sketch a UI mockup with ASCII
+boxes-and-pipes (dashboard tiles, hardware-UI panels, login-screen
+sketch, app-surface layout), use `wireframe` instead. Real CSS-Grid
+panels, no monospace approximation.
+
+Spec:
+`{kind: "wireframe", panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}`.
+
+Each panel has optional `title` (uppercase header), `content`
+(multi-line monospace body, escape `\n` for line-breaks), `col_span` /
+`row_span` (default 1), and `tone` ∈ `{"default","muted","highlight"}`.
+
+```json
+{
+  "kind": "wireframe",
+  "label": "U-Boot-Funkbude",
+  "columns": 3,
+  "panels": [
+    {"title": "EMPFANG", "col_span": 2, "content": "14:32:07 [SCHWACH] …\n14:32:11 [STARK]   WX MIDWAY"},
+    {"title": "STATUS",  "col_span": 1, "content": "Tiefe: 18 m\nKurs:  270°"},
+    {"title": "AKTION",  "col_span": 3, "content": "[T]auchen [A]uftauchen [K]urs", "tone": "highlight"}
+  ]
+}
+```
+
+Read-only, sits between input fields. Anti-pattern: ASCII
+boxes-and-pipes for *anything* layout-shaped — that is exactly what
+this field replaces.
+
 ## Visual pickers: `image_grid`
 
 For "pick one (or more) of these N generated images" — logo variants,
