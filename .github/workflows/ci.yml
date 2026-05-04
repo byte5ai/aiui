@@ -15,8 +15,20 @@ concurrency:
 
 jobs:
   companion:
-    name: Tauri companion (Rust + Svelte)
-    runs-on: macos-14
+    name: Tauri companion (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macOS arm64
+            build_bundle: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x86_64
+            build_bundle: true
     steps:
       - uses: actions/checkout@v4
 
@@ -28,11 +40,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: companion/src-tauri -> target
+          key: ${{ matrix.target }}
 
       - name: Install frontend deps
         working-directory: companion
@@ -48,11 +61,38 @@ jobs:
 
       - name: Cargo check
         working-directory: companion/src-tauri
-        run: cargo check --release --target aarch64-apple-darwin
+        run: cargo check --release --target ${{ matrix.target }}
+
+      - name: Cargo test
+        working-directory: companion/src-tauri
+        run: cargo test --lib --release --target ${{ matrix.target }}
 
       - name: Cargo clippy
         working-directory: companion/src-tauri
-        run: cargo clippy --release --target aarch64-apple-darwin -- -D warnings
+        run: cargo clippy --release --target ${{ matrix.target }} -- -D warnings
+
+      # Windows-only: produce a real NSIS installer so we can hand the
+      # `.exe` to a tester or run it on a Windows VM. Mac CI stays
+      # bundle-less — releases are still cut manually via scripts/release.sh.
+      - name: Install Tauri CLI
+        if: matrix.build_bundle
+        run: npm install --global @tauri-apps/cli@^2
+
+      - name: Tauri build (NSIS)
+        if: matrix.build_bundle
+        working-directory: companion
+        run: tauri build --target ${{ matrix.target }} --bundles nsis
+
+      - name: Upload NSIS installer
+        if: matrix.build_bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiui-windows-x86_64-nsis
+          path: |
+            companion/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            companion/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.sig
+          if-no-files-found: error
+          retention-days: 14
 
   mcp:
     name: aiui-mcp (Python)
