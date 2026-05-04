@@ -16,11 +16,13 @@
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tauri-apps/cli": "^2.10.1",
     "@tsconfig/svelte": "^5.0.8",
-    "appdmg": "^0.6.6",
     "svelte": "^5.55.4",
     "svelte-check": "^4.4.6",
     "typescript": "^6.0.3",
     "vite": "^8.0.9"
+  },
+  "optionalDependencies": {
+    "appdmg": "^0.6.6"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
