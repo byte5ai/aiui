@@ -210,6 +210,13 @@ pub fn kill_all_mcp_stdio_children() -> usize {
 /// Empty / whitespace `disk` is treated as "unknown" → not stale: better
 /// to keep running than abort a working subprocess on a transient
 /// `plutil` glitch.
+///
+/// On Windows the helper is unused at runtime — `disk_version_if_stale`
+/// short-circuits to `None` because there is no `Info.plist` to read —
+/// but the unit tests still validate the pure decision logic on every
+/// platform, so we keep the function compiled and silence dead-code on
+/// non-macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn is_disk_version_stale(own: &str, disk: &str) -> bool {
     let disk = disk.trim();
     !disk.is_empty() && disk != own

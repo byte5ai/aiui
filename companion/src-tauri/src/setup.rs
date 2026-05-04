@@ -26,8 +26,8 @@ fn home() -> PathBuf {
 fn claude_desktop_config_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        let base = dirs::config_dir().unwrap_or_else(|| home());
-        return base.join("Claude").join("claude_desktop_config.json");
+        let base = dirs::config_dir().unwrap_or_else(home);
+        base.join("Claude").join("claude_desktop_config.json")
     }
     #[cfg(not(target_os = "windows"))]
     {
