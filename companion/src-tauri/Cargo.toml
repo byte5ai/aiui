@@ -21,6 +21,12 @@ tauri-build = { version = "2.5.6", features = [] }
 chrono = "0.4"
 
 [dependencies]
+# `macos-private-api` is the feature that enables `set_activation_policy`
+# (LSUIElement Accessory ↔ Regular toggle). It must stay listed here
+# unconditionally because Tauri's build-script cross-checks it against
+# `app.macOSPrivateApi: true` in tauri.conf.json. On non-macOS targets
+# the feature compiles as a no-op, so leaving it always-on costs nothing
+# on Windows and keeps the build-script happy.
 tauri = { version = "2.10.3", features = ["macos-private-api"] }
 tauri-plugin-log = "2"
 tauri-plugin-single-instance = "2"
@@ -51,3 +57,7 @@ socket2 = "0.5"
 # `data:` URLs so the WebView can render them under the strict img-src
 # CSP. See companion/src-tauri/src/imageresolve.rs.
 base64 = "0.22"
+# Cross-platform process enumeration. Replaces the macOS-only
+# `ps -axo pid=,command=` shell-out in housekeeping.rs so the
+# stale-mcp-stdio-child sweep also works on Windows (no /proc, no `ps`).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }

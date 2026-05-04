@@ -51,7 +51,31 @@ log = logging.getLogger("aiui")
 log.info("---- %s started pid=%d ----", BUILD_INFO, os.getpid())
 
 
-TOKEN_PATH = Path(os.environ.get("AIUI_TOKEN_PATH", "~/.config/aiui/token")).expanduser()
+def _default_token_path() -> str:
+    """Per-OS default location of the companion's pairing token.
+
+    The companion (Tauri side) writes the token to its OS-correct config
+    directory; this server reads from the matching path so the two sides
+    agree without needing AIUI_TOKEN_PATH to be set.
+
+    - Linux / macOS: `~/.config/aiui/token` — XDG-style. macOS keeps the
+      same path as Linux so existing v0.4.x installs don't have to migrate.
+    - Windows: `%APPDATA%\\aiui\\token` — matches Tauri's `dirs::config_dir()`.
+
+    In practice the Python side runs on the Linux remote almost always —
+    the Windows branch only kicks in if someone runs `aiui-mcp` directly
+    on a Windows host (rare, but no longer broken).
+    """
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return str(Path(appdata) / "aiui" / "token")
+        # Fallback if APPDATA is somehow unset — unusual on Windows.
+        return str(Path.home() / "AppData" / "Roaming" / "aiui" / "token")
+    return "~/.config/aiui/token"
+
+
+TOKEN_PATH = Path(os.environ.get("AIUI_TOKEN_PATH", _default_token_path())).expanduser()
 ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
 TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
 HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))

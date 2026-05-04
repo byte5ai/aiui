@@ -17,6 +17,28 @@ fn home() -> PathBuf {
     dirs::home_dir().expect("home dir")
 }
 
+/// Path to Claude Desktop's user config file. Differs per OS:
+///
+/// - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+/// - Windows: `%APPDATA%\Claude\claude_desktop_config.json` —
+///   `dirs::config_dir()` resolves Roaming AppData on Windows.
+/// - Linux: same XDG-style layout as macOS for completeness.
+fn claude_desktop_config_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = dirs::config_dir().unwrap_or_else(home);
+        base.join("Claude").join("claude_desktop_config.json")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        home()
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }
+}
+
 fn backup(path: &PathBuf) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -31,11 +53,7 @@ fn backup(path: &PathBuf) -> std::io::Result<()> {
 }
 
 pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
-    let path = home()
-        .join("Library")
-        .join("Application Support")
-        .join("Claude")
-        .join("claude_desktop_config.json");
+    let path = claude_desktop_config_path();
 
     let existing: Value = if path.exists() {
         match fs::read_to_string(&path) {
@@ -259,18 +277,35 @@ pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
 }
 
 pub fn app_binary_path() -> String {
-    // when bundled, the executable sits at aiui.app/Contents/MacOS/aiui
+    // when bundled, the executable sits at aiui.app/Contents/MacOS/aiui on
+    // macOS and at the NSIS install dir on Windows. `current_exe` is the
+    // truth source on both — the per-OS string is only a last-ditch
+    // fallback for environments where `current_exe` errors out (rare).
     std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "/Applications/aiui.app/Contents/MacOS/aiui".to_string())
+        .unwrap_or_else(|_| default_app_binary_path().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn default_app_binary_path() -> &'static str {
+    "/Applications/aiui.app/Contents/MacOS/aiui"
+}
+
+#[cfg(target_os = "windows")]
+fn default_app_binary_path() -> &'static str {
+    // Default per-user NSIS install location. If the user picked a custom
+    // path during install, `current_exe` returns the truth and this
+    // fallback never fires.
+    r"C:\Users\Public\aiui\aiui.exe"
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn default_app_binary_path() -> &'static str {
+    "/usr/local/bin/aiui"
 }
 
 pub fn is_claude_config_current(app_binary_path: &str) -> bool {
-    let path = home()
-        .join("Library")
-        .join("Application Support")
-        .join("Claude")
-        .join("claude_desktop_config.json");
+    let path = claude_desktop_config_path();
     let Ok(s) = fs::read_to_string(&path) else {
         return false;
     };
@@ -309,20 +344,49 @@ pub fn is_claude_code_config_current(app_binary_path: &str) -> bool {
 }
 
 /// Best-effort check whether the Claude Desktop application is currently
-/// running on this Mac. Used to switch the "Restart Claude Desktop" button
-/// label between Start / Restart so we don't ask the user to "restart"
+/// running. Used to switch the "Restart Claude Desktop" button label
+/// between Start / Restart so we don't ask the user to "restart"
 /// something that isn't running.
 ///
-/// Pure read-only — uses `pgrep -f` against the typical install path. If
-/// `pgrep` is missing or errors, we assume "not running" rather than
-/// blocking the UI.
+/// Pure read-only. Per-OS process probe:
+///
+/// - macOS: `pgrep -f /Applications/Claude.app/` matches against the full
+///   command line, which catches helper processes too (still a true positive).
+/// - Windows: `tasklist /FI "IMAGENAME eq Claude.exe" /NH` lists running
+///   processes by image name; non-empty stdout means at least one match.
+///
+/// If the probe errors out we assume "not running" rather than blocking
+/// the UI.
 pub fn is_claude_desktop_running() -> bool {
-    let out = std::process::Command::new("pgrep")
-        .args(["-f", "/Applications/Claude.app/"])
-        .output();
-    match out {
-        Ok(o) => o.status.success() && !o.stdout.is_empty(),
-        Err(_) => false,
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "/Applications/Claude.app/"])
+            .output();
+        match out {
+            Ok(o) => o.status.success() && !o.stdout.is_empty(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Claude.exe", "/NH"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                // tasklist prints "INFO: No tasks are running …" on a
+                // miss instead of empty stdout, so look for the actual
+                // image name (case-insensitive).
+                let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                s.contains("claude.exe")
+            }
+            _ => false,
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        false
     }
 }
 

@@ -1,0 +1,173 @@
+# Windows release pipeline for aiui — companion side only.
+#
+# Why a separate workflow: macOS releases still run through
+# `scripts/release.sh` locally (Apple-signing keys + notarytool live in
+# the maintainer's keychain, not in CI). Windows has no such anchor —
+# CI is the only practical place to produce a signed NSIS installer.
+#
+# This workflow is **manually triggered** (`workflow_dispatch`) against
+# a tag the maintainer already created with `scripts/release.sh`. That
+# script publishes the macOS GitHub release plus the initial
+# `latest.json`; this workflow then attaches the Windows installer +
+# updater bundle to the same release and rewrites `latest.json` to add
+# the `windows-x86_64` platform entry.
+#
+# One-time setup (see also: scripts/release.sh header):
+#
+#   1. Repo → Settings → Secrets and variables → Actions:
+#        - TAURI_SIGNING_PRIVATE_KEY        (literal content of the
+#                                            minisign private key — not
+#                                            a path)
+#        - TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#                                           (empty string if the key has
+#                                            no password)
+#
+#   2. The release for `vX.Y.Z` must already exist on GitHub (created
+#      by `scripts/release.sh X.Y.Z` from the maintainer's machine).
+#
+# Usage:
+#
+#   GitHub UI → Actions → "release-windows" → Run workflow → enter tag
+#   `v0.5.0` → Run.
+#
+# What the run produces:
+#
+#   - aiui_<version>_x64-setup.exe                attached to release
+#   - aiui_<version>_x64-setup.nsis.zip           attached to release
+#   - aiui_<version>_x64-setup.nsis.zip.sig       attached to release
+#   - latest.json patched in-place with the new windows-x86_64 entry
+#
+# Code signing for the `.exe` itself (Authenticode / SmartScreen) is
+# explicitly NOT done here — the v1 plan calls for unsigned shipping
+# with SmartScreen-Nag accepted (see plan-doc Phase 4). Adding an EV
+# cert later is a separate concern that touches the `tauri build`
+# invocation only; the rest of this workflow stays unchanged.
+
+name: release-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.5.0). Must already exist on GitHub."
+        required: true
+        type: string
+
+permissions:
+  contents: write   # needed for `gh release upload` + the latest.json edit
+
+concurrency:
+  group: release-windows-${{ inputs.tag }}
+  cancel-in-progress: false   # never cancel a release midway
+
+jobs:
+  build-and-attach:
+    name: Build signed Windows installer + attach to release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: companion/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion/src-tauri -> target
+          key: x86_64-pc-windows-msvc-release
+
+      - name: Install frontend deps
+        working-directory: companion
+        run: npm ci
+
+      - name: Vite build
+        working-directory: companion
+        run: npm run build
+
+      - name: Install Tauri CLI
+        run: npm install --global @tauri-apps/cli@^2
+
+      # Use the production tauri.conf.json — `createUpdaterArtifacts:
+      # true` is correct here, the secrets are present, the produced
+      # `.nsis.zip` + `.sig` go into the release alongside the `.exe`.
+      - name: Tauri build (NSIS + updater bundle)
+        working-directory: companion
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Locate produced bundle files
+        id: bundle
+        shell: pwsh
+        working-directory: companion/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+        run: |
+          $exe = Get-ChildItem -Filter *.exe | Select-Object -First 1
+          $zip = Get-ChildItem -Filter *.nsis.zip | Select-Object -First 1
+          $sig = Get-ChildItem -Filter *.nsis.zip.sig | Select-Object -First 1
+          if (-not $exe) { throw "no .exe produced" }
+          if (-not $zip) { throw "no .nsis.zip produced — check TAURI_SIGNING_PRIVATE_KEY" }
+          if (-not $sig) { throw "no .sig produced — check TAURI_SIGNING_PRIVATE_KEY" }
+          "exe=$($exe.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip=$($zip.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sig=$($sig.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$($exe.BaseName -replace '^aiui_' -replace '_x64-setup$','')" `
+                                     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Attach installer + updater bundle to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" `
+            "${{ steps.bundle.outputs.exe }}" `
+            "${{ steps.bundle.outputs.zip }}" `
+            "${{ steps.bundle.outputs.sig }}" `
+            --repo "${{ github.repository }}" `
+            --clobber
+
+      # Patch the existing latest.json to add the windows-x86_64 entry,
+      # then upload it back to the release (overwriting the macOS-only
+      # version that scripts/release.sh produced earlier).
+      - name: Update latest.json with windows-x86_64 entry
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.bundle.outputs.version }}
+          SIG_PATH: ${{ steps.bundle.outputs.sig }}
+        run: |
+          # Pull the current latest.json from the release.
+          gh release download "$env:TAG" --repo "$env:REPO" --pattern "latest.json" --output latest.json --clobber
+
+          $sig = Get-Content -Raw -Path "$env:SIG_PATH"
+          $url = "https://github.com/$env:REPO/releases/download/$env:TAG/aiui_${env:VERSION}_x64-setup.nsis.zip"
+
+          $json = Get-Content -Raw -Path latest.json | ConvertFrom-Json
+          if (-not $json.platforms) { $json | Add-Member -NotePropertyName platforms -NotePropertyValue (New-Object PSObject) }
+          $json.platforms | Add-Member -Force -NotePropertyName "windows-x86_64" -NotePropertyValue ([PSCustomObject]@{
+            signature = $sig
+            url       = $url
+          })
+          $json | ConvertTo-Json -Depth 10 | Set-Content -Path latest.json -NoNewline
+
+          gh release upload "$env:TAG" latest.json --repo "$env:REPO" --clobber
+
+      - name: Verification summary
+        run: |
+          echo "Windows release for ${{ inputs.tag }} attached." >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "Artifacts:" >> $env:GITHUB_STEP_SUMMARY
+          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.exe" >> $env:GITHUB_STEP_SUMMARY
+          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.nsis.zip" >> $env:GITHUB_STEP_SUMMARY
+          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.nsis.zip.sig" >> $env:GITHUB_STEP_SUMMARY
+          echo "- latest.json (patched with windows-x86_64)" >> $env:GITHUB_STEP_SUMMARY
