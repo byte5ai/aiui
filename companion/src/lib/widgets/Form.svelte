@@ -4,6 +4,7 @@
   import DOMPurify from "dompurify";
   import TreeNode from "./TreeNode.svelte";
   import MermaidView from "./MermaidView.svelte";
+  import WireframeView from "./WireframeView.svelte";
 
   type SelectOption = { label: string; value: string; description?: string };
 
@@ -52,6 +53,20 @@
     | { kind: "markdown"; text: string }
     | { kind: "image"; src: string; label?: string; alt?: string; max_height?: number }
     | { kind: "mermaid"; source: string; label?: string; max_height?: number }
+    | {
+        kind: "wireframe";
+        panels: Array<{
+          title?: string;
+          content?: string;
+          col_span?: number;
+          row_span?: number;
+          tone?: "default" | "muted" | "highlight";
+        }>;
+        columns?: number;
+        gap?: number;
+        label?: string;
+        max_height?: number;
+      }
     | {
         kind: "image_grid";
         name: string;
@@ -166,6 +181,7 @@
       case "markdown":
       case "image":
       case "mermaid":
+      case "wireframe":
         return undefined;
       case "checkbox":
         return f.default ?? false;
@@ -204,7 +220,8 @@
         f.kind !== "static_text" &&
         f.kind !== "markdown" &&
         f.kind !== "image" &&
-        f.kind !== "mermaid"
+        f.kind !== "mermaid" &&
+        f.kind !== "wireframe"
     );
   }
 
@@ -315,7 +332,8 @@
       f.kind === "static_text" ||
       f.kind === "markdown" ||
       f.kind === "image" ||
-      f.kind === "mermaid"
+      f.kind === "mermaid" ||
+      f.kind === "wireframe"
     )
       return true;
     if (f.kind === "checkbox" || f.kind === "slider") return true;
@@ -454,6 +472,14 @@
         </figure>
       {:else if f.kind === "mermaid"}
         <MermaidView source={f.source} label={f.label} max_height={f.max_height} />
+      {:else if f.kind === "wireframe"}
+        <WireframeView
+          panels={f.panels}
+          columns={f.columns}
+          gap={f.gap}
+          label={f.label}
+          max_height={f.max_height}
+        />
       {:else if f.kind === "tree"}
         {@const treeValue = values[f.name] as { selected: string[]; expanded: Set<string> }}
         <div>
