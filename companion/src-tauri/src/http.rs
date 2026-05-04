@@ -474,7 +474,34 @@ async fn render(
     // See companion/src-tauri/src/imageresolve.rs for failure modes.
     crate::imageresolve::resolve_image_srcs(&mut req.spec).await;
 
-    let (id, result_rx, ack_rx) = state.dialog.register();
+    // v0.4.36: try_register rejects when a dialog is already in flight
+    // instead of evicting the existing one. Two parallel callers — multi-
+    // call-per-turn, two Claude sessions, or a stale window from a prior
+    // timeout — would otherwise overlay each other in the single dialog
+    // window, with the older request's `oneshot` resolving as `evicted`
+    // exactly while the user was still looking at it. The 409 response
+    // gives the second caller a structured "busy" answer so the agent
+    // can choose to retry or tell the user the dialog is held by
+    // something else. Setup-window-driven UI calls don't go through
+    // /render at all, so this only governs agent dialog traffic.
+    let (id, result_rx, ack_rx) = match state.dialog.try_register() {
+        Ok(triple) => triple,
+        Err(busy) => {
+            trace(&format!(
+                "render: rejected — companion busy (pending={}, oldest_age={}s)",
+                busy.pending_count, busy.oldest_age_secs
+            ));
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "busy",
+                    "pending_count": busy.pending_count,
+                    "oldest_age_secs": busy.oldest_age_secs,
+                })),
+            )
+                .into_response();
+        }
+    };
     trace(&format!("render: registered id={}", id));
     let dr = DialogRequest {
         id: id.clone(),

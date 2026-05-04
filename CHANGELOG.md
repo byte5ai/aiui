@@ -6,6 +6,20 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Concurrent renders now reject with a 409 instead of evicting the
+  in-flight dialog.** `DialogState::register` ran a sweep + hard-cap
+  eviction before inserting, so a second `/render` call while a user
+  was still answering the first dialog would push the first entry's
+  oneshot to "evicted" *while the user was still looking at it* — and
+  the new dialog overlaid the same single window. That manifested as
+  a confused user, an evict-cancelled prior call, and a second
+  unexplained dialog. The new `try_register` rejects with a `BusyInfo`
+  carrying `pending_count` + `oldest_age_secs`; `/render` returns
+  `409 Conflict` with that body; `mcp.rs` translates the 409 into a
+  structured tool-call result that lists the three realistic causes
+  (multi-call-per-turn, stale window, parallel session) with
+  retry-vs-tell-user guidance for each. The companion now serves at
+  most one dialog at a time, structurally.
 - **Dialog submit no longer kills the GUI process.** A successful
   form submit destroyed the dialog window via `close_window`, which
   triggered the multi-window `CloseRequested` handler from 0.4.25.
