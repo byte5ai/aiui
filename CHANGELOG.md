@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.37] — 2026-05-05
+
+### Fixed
+
+- **Orphan ssh-NTR tunnels no longer block fresh aiui starts.** When an
+  earlier aiui exited via `app.exit()` or `process::exit()` (multi-
+  instance race, lifetime-grace timeout, HTTP-bind failure, uninstall),
+  Rust Drop was skipped and `tokio::process::Child::kill_on_drop` never
+  fired — `tunnel.rs`'s `ssh -NTR 7777:localhost:7777 ...` children
+  re-parented to launchd (ppid=1) and survived. With `ServerAlive`
+  keeping their SSH session healthy, they held the remote-side port
+  indefinitely. Every fresh aiui then failed `-NTR` with
+  `ExitOnForwardFailure` and fell back into "shared forward" mode
+  forever, even though *its* parent was the only legitimate tunnel
+  owner. Two new mechanisms close this:
+  - **Pre-exit cleanup.** Every `app.exit()` / `process::exit()` in
+    the GUI now calls `housekeeping::pre_exit_cleanup` first, which
+    finds and signals our own ssh-NTR children before the process
+    departs. Trace logs each exit with a reason string so the killer
+    path is identifiable in `aiui-trace.log` next time something
+    goes wrong.
+  - **Startup orphan sweep.** GUI startup signals every ssh-NTR-on-
+    `cfg.http_port` process whose ppid is 1 — orphans inherited from
+    a previously-crashed aiui. Filter is tight (exact arg shape, no
+    heuristic `pkill -f`) so unrelated SSH sessions are never
+    touched.
+- **Trace at every exit path.** `quit_app/uninstall`,
+  `setup-close-no-children`, `http-bind-error`, `multi-instance-live`,
+  `multi-instance-bind-race`, `multi-instance-pipe-busy`,
+  `multi-instance-pipe-race`, `pipe-rotate-failed`, and
+  `grace-expired` are now individually labeled in the trace. The
+  v0.4.36 respawn-loop investigation was crippled by the absence of
+  exit-path attribution; this is the foundation for diagnosing the
+  next one.
+
 ## [0.4.36] — 2026-05-04
 
 ### Fixed
