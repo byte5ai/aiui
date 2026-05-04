@@ -317,6 +317,11 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     // ourselves. Otherwise an already-running mcp_attach loop on a child
     // can race the GUI exit and re-launch us.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let port = app
+        .try_state::<Arc<config::AppConfig>>()
+        .map(|c| c.http_port)
+        .unwrap_or(7777);
+    housekeeping::pre_exit_cleanup(port, "quit_app/uninstall");
     app.exit(0);
     Ok(())
 }
@@ -987,16 +992,36 @@ pub fn run() {
                     // Hop to main thread to call exit cleanly.
                     let app_for_exit = app_handle_for_exit.clone();
                     let _ = app_handle_for_exit.run_on_main_thread(move || {
+                        housekeeping::pre_exit_cleanup(
+                            port_for_error,
+                            "http-bind-error",
+                        );
                         app_for_exit.exit(1);
                     });
                 }
             });
 
+            // Startup orphan sweep: any `ssh -NTR <port>:localhost:<port>`
+            // process that's been re-parented to launchd (ppid=1) is a
+            // tunnel from a previously-crashed aiui that exited via
+            // `app.exit()` / `process::exit()` and skipped Drop. Left
+            // alive, it holds the remote-side port and forces the new
+            // GUI into shared-forward mode forever — the v0.4.36 loop
+            // root cause. Sweep before binding our own tunnels. v0.4.37.
+            {
+                let port = cfg.http_port;
+                let killed = housekeeping::kill_aiui_ssh_ntr(port, true);
+                logging::trace(&format!(
+                    "[aiui] startup: swept {killed} orphan ssh-NTR tunnel(s) on :{port}"
+                ));
+            }
+
             // Lifetime socket — couples GUI lifetime to MCP-stdio children.
             // Counter is shared with `/health` via `LifetimeStats`.
+            let lifetime_port = cfg.http_port;
             rt.spawn(async move {
                 let sock = lifetime::socket_path(&cfg_lt.config_dir);
-                lifetime::gui_serve(sock, app_handle_lt, lifetime_lt.conns.clone()).await;
+                lifetime::gui_serve(sock, app_handle_lt, lifetime_lt.conns.clone(), lifetime_port).await;
             });
 
             // Auto-start reverse tunnels for every registered remote.
@@ -1149,6 +1174,11 @@ pub fn run() {
                         log::info!(
                             "[aiui] setup window closed and no MCP-stdio children attached — quitting; auto-resurrect will bring us back on next tool call"
                         );
+                        let port = app_for_check
+                            .try_state::<Arc<config::AppConfig>>()
+                            .map(|c| c.http_port)
+                            .unwrap_or(7777);
+                        housekeeping::pre_exit_cleanup(port, "setup-close-no-children");
                         app_for_check.exit(0);
                     } else {
                         log::debug!(

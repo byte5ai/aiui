@@ -85,19 +85,19 @@ impl LifetimeStats {
 /// previous behaviour silently tore the existing instance's listener
 /// out from under it on every dup-launch, which is how the 2026-05-04
 /// dual-companion incident produced reset connections in the first place.
-pub async fn gui_serve(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) {
+pub async fn gui_serve(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, http_port: u16) {
     #[cfg(unix)]
     {
-        gui_serve_unix(sock, app, conns).await;
+        gui_serve_unix(sock, app, conns, http_port).await;
     }
     #[cfg(windows)]
     {
-        gui_serve_windows(sock, app, conns).await;
+        gui_serve_windows(sock, app, conns, http_port).await;
     }
 }
 
 #[cfg(unix)]
-async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) {
+async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, http_port: u16) {
     if sock.exists() {
         // Probe whether the existing socket is live (another aiui is
         // listening) or a stale leftover from a crashed previous run.
@@ -111,7 +111,10 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) 
                     sock.display()
                 ));
                 let app_for_exit = app.clone();
-                let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+                let _ = app.run_on_main_thread(move || {
+                    crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-live");
+                    app_for_exit.exit(1)
+                });
                 return;
             }
             Err(_) => {
@@ -131,13 +134,16 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) 
                 sock.display()
             ));
             let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+            let _ = app.run_on_main_thread(move || {
+                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-bind-race");
+                app_for_exit.exit(1)
+            });
             return;
         }
     };
     trace(&format!("lifetime: listening on {}", sock.display()));
 
-    let wake = make_shutdown_watcher(conns.clone(), app.clone());
+    let wake = make_shutdown_watcher(conns.clone(), app.clone(), http_port);
 
     loop {
         match listener.accept().await {
@@ -169,7 +175,7 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) 
 }
 
 #[cfg(windows)]
-async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>) {
+async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, http_port: u16) {
     let pipe_name = sock.to_string_lossy().to_string();
 
     // Multi-instance probe: try to *connect* as a client. If it succeeds
@@ -183,7 +189,10 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
                 "lifetime: another aiui already serves {pipe_name} — exiting (multi-instance)"
             ));
             let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+            let _ = app.run_on_main_thread(move || {
+                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-live");
+                app_for_exit.exit(1)
+            });
             return;
         }
         Err(e) if e.raw_os_error() == Some(231) => {
@@ -191,7 +200,10 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
                 "lifetime: pipe {pipe_name} busy — another aiui is up, exiting"
             ));
             let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+            let _ = app.run_on_main_thread(move || {
+                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-pipe-busy");
+                app_for_exit.exit(1)
+            });
             return;
         }
         Err(_) => {
@@ -209,13 +221,16 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
                 "lifetime: create_pipe {pipe_name} failed: {e} — exiting (multi-instance race)"
             ));
             let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+            let _ = app.run_on_main_thread(move || {
+                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-pipe-race");
+                app_for_exit.exit(1)
+            });
             return;
         }
     };
     trace(&format!("lifetime: listening on {pipe_name}"));
 
-    let wake = make_shutdown_watcher(conns.clone(), app.clone());
+    let wake = make_shutdown_watcher(conns.clone(), app.clone(), http_port);
 
     loop {
         if let Err(e) = next_server.connect().await {
@@ -231,7 +246,10 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
             Err(e) => {
                 trace(&format!("lifetime: pipe rotate failed: {e} — exiting"));
                 let app_for_exit = app.clone();
-                let _ = app.run_on_main_thread(move || app_for_exit.exit(1));
+                let _ = app.run_on_main_thread(move || {
+                    crate::housekeeping::pre_exit_cleanup(http_port, "pipe-rotate-failed");
+                    app_for_exit.exit(1)
+                });
                 return;
             }
         };
@@ -262,7 +280,7 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
 /// `Notify` that connect/disconnect handlers signal — armed once when
 /// the last client leaves, and cancellable by a fresh connect within
 /// the grace period.
-fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle) -> Arc<Notify> {
+fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16) -> Arc<Notify> {
     let wake = Arc::new(Notify::new());
     let conns_w = conns.clone();
     let wake_w = wake.clone();
@@ -283,6 +301,7 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle) -> Arc<Notify>
                         // Cmd-Q and window-close are deliberately blocked
                         // there, so the only legitimate shutdown path is
                         // this one.
+                        crate::housekeeping::pre_exit_cleanup(http_port, "grace-expired");
                         let _ = app;
                         std::process::exit(0);
                     }
