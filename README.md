@@ -7,7 +7,7 @@
 
 # aiui
 
-**Claude Code can ask, confirm, and collect input — as real native macOS dialogs.**
+**Claude Desktop App can ask, confirm, and collect input — as real native macOS dialogs.**
 
 [![Download aiui.app](https://img.shields.io/badge/Download%20for%20Mac-aiui.app-4f46e5?style=for-the-badge&logo=apple)](https://github.com/byte5ai/aiui/releases/latest)
 [![MIT License](https://img.shields.io/badge/MIT-Open%20Source-171717?style=for-the-badge)](https://github.com/byte5ai/aiui/blob/main/LICENSE)
@@ -20,7 +20,7 @@
 
 ## The chat is sometimes the wrong place
 
-When Claude Code has a question that's really a pick between options, you
+When Claude Desktop App has a question that's really a pick between options, you
 have to type the answer in prose. When it wants your go-ahead before
 touching production, you get a blue Yes/No box — and nothing more
 tailored. Need to hand it a secret for a moment? It lands in the
@@ -28,7 +28,7 @@ transcript.
 
 There's a better way.
 
-**aiui** lets Claude Code open real, native dialogs on your Mac:
+**aiui** lets Claude Desktop App open real, native dialogs on your Mac:
 
 - **"Which of these three deploy strategies?"** A window with three
   cards, each with context. One click. Done.
@@ -47,12 +47,12 @@ conversations, no throwaway web dashboards cluttering your system — just
 a familiar macOS window that does what it looks like.
 
 <p align="center">
-  <img src="assets/aiui-shot1.jpg" alt="Claude Code session with an aiui dialog on the Mac desktop" width="720">
+  <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
 </p>
 
 ## Works locally and remotely
 
-Running Claude Code directly on your Mac? aiui plugs in.
+Running Claude Desktop App directly on your Mac? aiui plugs in.
 
 Running it over SSH on a remote machine (dev box, project VM)? aiui
 automatically sets up a tunnel so the remote agent can pop dialogs right
@@ -68,22 +68,22 @@ No Terminal. No Homebrew. No Python. No `uv`.
 2. Drag into `Applications`.
 3. Launch it once from Finder.
 
-That's it. aiui registers itself with Claude Desktop and Claude Code
+That's it. aiui registers itself with Claude Desktop App
 automatically. The MCP server ships inside the app bundle as native
 code, so you don't need a Python toolchain on your Mac.
 
 From now on aiui runs silently in the background — only while Claude
-Desktop is open. No dock icon, no menu-bar clutter, no lingering
-daemons. aiui tools are available in **every** Claude Code session
+Desktop App is open. No dock icon, no menu-bar clutter, no lingering
+daemons. aiui tools are available in **every** Claude Desktop App session
 immediately; no per-project config needed.
 
 Updates install themselves in the background. If you want to force a
-check, use `/aiui:update` in Claude Code, or open aiui's settings
+check, use `/aiui:update` in Claude Desktop App, or open aiui's settings
 window.
 
 ## Quickstart
 
-Open any Claude Code session and try one of these — just write it as a
+Open any Claude Desktop App session and try one of these — just write it as a
 normal message:
 
 > *"Ask me with aiui which of three deploy strategies we want today."*
@@ -116,7 +116,7 @@ content leaves your system. A local auth token lives in `~/.config/aiui/`
 (mode 0600) and is only scp'd to hosts you explicitly register in
 settings.
 
-## Slash commands in Claude Code
+## Slash commands in Claude Desktop App
 
 | Command | What it does |
 |---|---|
