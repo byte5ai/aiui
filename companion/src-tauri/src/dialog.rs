@@ -80,9 +80,9 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
     const BASE_H: f64 = 480.0;
     const MAX_W: f64 = 1100.0;
     const MAX_H: f64 = 900.0;
-    /// Approx. vertical pixels eaten by header chip + title + description
-    /// + footer-with-buttons. Fields below this threshold fit in the
-    /// base height with no extra room needed.
+    // Approx. vertical pixels eaten by header chip + title + description
+    // + footer-with-buttons. Fields below this threshold fit in the
+    // base height with no extra room needed.
     const CHROME_H: f64 = 220.0;
 
     let mut width = BASE_W;
