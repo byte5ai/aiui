@@ -662,11 +662,19 @@ pub(crate) fn build_setup_window(
 /// window so the user gets a consistent aiui chrome regardless of
 /// which view they're seeing — the *content* is what differs.
 ///
-/// Reused across renders: if a dialog window already exists, we just
-/// surface it. The frontend handles the actual content swap when the
+/// Reused across renders: if a dialog window already exists, we surface
+/// it and resize it to the new spec's estimated size — small confirm
+/// after a wide form shouldn't keep the wide form's geometry, and
+/// vice versa. Frontend handles the actual content swap when the
 /// `dialog:show` event arrives.
+///
+/// `size` is the per-spec inner-size estimate from
+/// `dialog::estimate_dialog_size`. The window is resizable, so the user
+/// can drag past these defaults — we just pick a sensible starting
+/// geometry given what the agent asked us to render.
 pub(crate) fn ensure_dialog_window(
     app: &tauri::AppHandle,
+    size: (f64, f64),
 ) -> tauri::Result<tauri::WebviewWindow> {
     // Promote the app from Accessory to Regular for the duration of the
     // dialog. In Accessory mode (LSUIElement-style daemon, no Dock icon)
@@ -681,6 +689,10 @@ pub(crate) fn ensure_dialog_window(
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
     if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
+        // Resize to fit the new spec before surfacing. Without this,
+        // a confirm rendered after a long form would keep the form's
+        // tall geometry (and vice versa).
+        let _ = win.set_size(tauri::LogicalSize::new(size.0, size.1));
         let _ = win.show();
         let _ = win.set_focus();
         let _ = win.unminimize();
@@ -711,10 +723,14 @@ pub(crate) fn ensure_dialog_window(
         WebviewUrl::App("index.html".into()),
     )
     .title("aiui")
-    .inner_size(520.0, 480.0)
-    .min_inner_size(520.0, 380.0)
-    .max_inner_size(520.0, 640.0)
-    .resizable(false)
+    // Initial size from `estimate_dialog_size` — we widen for
+    // wireframe/mermaid/table and grow vertically for long forms,
+    // clamped to (1100, 900). Resizable so the user always has the
+    // last word; min size keeps the dialog usable but prevents
+    // accidental sub-icon collapse. v0.4.40.
+    .inner_size(size.0, size.1)
+    .min_inner_size(360.0, 320.0)
+    .resizable(true)
     .center()
     // Native, fully-visible title bar so macOS handles window-drag
     // for us. Tauri's `data-tauri-drag-region` HTML attribute and
