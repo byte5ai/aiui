@@ -47,6 +47,10 @@ conversations, no throwaway web dashboards cluttering your system — just
 a familiar macOS window that does what it looks like.
 
 <p align="center">
+  <img src="assets/aiui%20Demo%200.4.40.gif" alt="aiui demo: Claude Code opens a native dialog, user clicks, agent continues" width="720">
+</p>
+
+<p align="center">
   <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
 </p>
 
