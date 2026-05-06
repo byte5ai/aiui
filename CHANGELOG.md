@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.39] — 2026-05-06
+
+### Fixed
+
+- **Silent update-check no longer steals focus mid-dialog.**
+  `checkForUpdates({ silent: true })` is fired automatically by
+  `App.svelte` after every successful render (the `update:check`
+  event from Rust), on window focus, and on mount. When a new
+  version *was* actually available, the function silently called
+  `invoke("surface_for_dialog")` and `ask("Update verfügbar?")`
+  anyway — surfacing the Settings window in Regular activation
+  policy and stealing focus from whatever dialog the agent had
+  on screen. Reproduced 2026-05-06 right after 0.4.38 shipped:
+  user opened an agent dialog, the post-render auto-check picked
+  up 0.4.38, the install prompt opened on top of the active
+  dialog, the user's interaction broke. The silent path now
+  truly silent — error toasts, "you're on latest" messages, and
+  the install prompt are all gated behind `!silent`. Available
+  updates surface only on the next manual "Nach Updates suchen"
+  click or on the next GUI restart (Tauri-Updater pulls
+  automatically). Console logs the deferred update for
+  diagnostics.
+
 ## [0.4.38] — 2026-05-06
 
 ### Fixed
