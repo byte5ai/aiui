@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.40] — 2026-05-06
+
+### Added
+
+- **Per-spec dialog window sizing.** `dialog::estimate_dialog_size`
+  scans the rendered spec and picks an inner-size in (520..=1100,
+  480..=900) before the window surfaces. Wide widgets (`wireframe` ≥ 3
+  cols, `mermaid`, `table` ≥ 4 cols, `image_grid` ≥ 4 cols) widen the
+  window; long forms grow vertically; tabs add a tab-bar header
+  height. Confirm/ask specs keep the 520×480 base. Reused windows
+  resize to fit the new spec on each render — a confirm after a long
+  form no longer keeps the form's tall geometry. Pure function with
+  unit tests.
+- **Resizable dialog window.** `resizable(true)`,
+  `min_inner_size(360, 320)`, `max_inner_size` removed. The user has
+  the last word; the per-spec estimate is just a sensible starting
+  point.
+- **MCP `notifications/progress` for blocking tool calls.** While
+  `confirm`/`ask`/`form` waits on the user, the companion sends a
+  progress notification every 10 s with the client-supplied
+  `progressToken`. Keeps Claude Desktop and Claude Code from
+  concluding "tool hung" mid-dialog (default client timeouts are
+  60–120 s). Routed through a new mpsc-based stdout writer in
+  `mcp::run_stdio` so notifications interleave cleanly with the
+  eventual tool response. No-op if the client doesn't pass a
+  `progressToken`. v0.4.40.
+- **Tool descriptions explicitly state blocking semantics.** The
+  `confirm`/`ask`/`form` descriptions now end with a note that the
+  tool blocks until user submit/cancel, that responses can take
+  minutes, and that progress notifications fire every ~10 s. Stops
+  the agent from typing "Companion scheint zu hängen" when the
+  user is just thinking.
+
 ## [0.4.39] — 2026-05-06
 
 ### Fixed
