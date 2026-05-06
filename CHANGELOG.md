@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.38] — 2026-05-06
+
+### Fixed
+
+- **Mermaid flowchart node labels are visible again.** Mermaid 11
+  renders flowchart node labels inside `<foreignObject>` SVG elements
+  (HTML-in-SVG, for proper word-wrapping). The DOMPurify pass in
+  `MermaidView.svelte` was stripping `<foreignObject>` outright as a
+  belt-and-braces measure on top of `securityLevel: 'strict'` — the
+  result was correctly-shaped, correctly-coloured boxes with **no
+  text**. Reproduced 2026-05-06 with a Bundesrepublik-Verfassungsorgane
+  flowchart. The forbid-list now keeps only `<script>` (event-handler
+  attributes are still caught by `FORBID_ATTR` and the svg/svgFilters
+  profile), and Mermaid's native HTML labels render through.
+
 ## [0.4.37] — 2026-05-05
 
 ### Fixed
