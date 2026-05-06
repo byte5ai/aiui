@@ -551,7 +551,10 @@ async fn render(
     // Surface the window from the main thread. If the window is being
     // built fresh (first render of this session, or after the user
     // closed it), `ensure_dialog_window` reset the ready flag.
-    surface_main_window(&state.app, &id);
+    // Window-size estimate is per-spec — wide widgets widen, long
+    // forms grow vertically. v0.4.40.
+    let size = crate::dialog::estimate_dialog_size(&dr.spec);
+    surface_main_window(&state.app, &id, size);
 
     // Window-ready handshake: wait until the frontend signals that
     // its `dialog:show` listener is registered. Without this gate
@@ -749,15 +752,19 @@ async fn wait_for_dialog_ready(app: &AppHandle, phase: &str) {
 }
 
 /// Surface the dialog window for the incoming render. If the window
-/// already exists, show + focus + unminimize; otherwise build it.
+/// already exists, show + focus + unminimize + resize to fit this
+/// spec; otherwise build it at the spec-derived inner size.
 /// All Tauri window operations have to run on the main thread, so we
 /// hop there via `run_on_main_thread`.
-fn surface_main_window(app: &AppHandle, id: &str) {
+fn surface_main_window(app: &AppHandle, id: &str, size: (f64, f64)) {
     let app_for_show = app.clone();
     let id_for_log = id.to_string();
     let rc = app.clone().run_on_main_thread(move || {
-        trace(&format!("render: main-thread callback id={}", id_for_log));
-        match crate::ensure_dialog_window(&app_for_show) {
+        trace(&format!(
+            "render: main-thread callback id={} size=({:.0},{:.0})",
+            id_for_log, size.0, size.1
+        ));
+        match crate::ensure_dialog_window(&app_for_show, size) {
             Ok(_win) => {
                 trace("render: main-thread dialog window ready (show/build)");
             }

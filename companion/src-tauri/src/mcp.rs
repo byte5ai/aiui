@@ -19,6 +19,14 @@ use crate::logging::trace;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+
+/// How often the companion fires `notifications/progress` while a
+/// `confirm`/`ask`/`form` tool call waits on the user. Picked to land
+/// well below MCP-client default timeouts (Claude Desktop ≈ 60 s,
+/// Claude Code ≈ 120 s) so the notification clearly signals "still
+/// alive" before any client-side give-up. v0.4.40.
+const PROGRESS_NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 const SKILL_MD: &str = include_str!("../../../docs/skill.md");
 
@@ -111,14 +119,37 @@ const STDIN_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 *
 /// Top-level entry: read JSON-RPC messages from stdin, dispatch to handlers,
 /// write responses to stdout. Runs until stdin closes or the idle deadline
 /// expires.
+///
+/// Outgoing traffic flows through an mpsc channel rather than directly
+/// onto stdout, so that a long-running tool call (waiting on the user
+/// in `confirm`/`ask`/`form`) can interleave `notifications/progress`
+/// onto the wire from a side-task without racing for the stdout lock.
+/// v0.4.40.
 pub async fn run_stdio(cfg: Arc<AppConfig>) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .expect("reqwest client");
+
+    // Single writer task drains the channel onto stdout. Capacity 128
+    // is comfortable for one-response-at-a-time + ~6 progress
+    // notifications per minute per active tool call.
+    let (tx, mut rx) = mpsc::channel::<Value>(128);
+    let writer_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(msg) = rx.recv().await {
+            if stdout
+                .write_all(format!("{msg}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
 
     trace("mcp-stdio: run_stdio entered");
 
@@ -139,11 +170,11 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
                 }
                 Ok(None) => {
                     trace("mcp-stdio: stdin closed, exiting");
-                    return;
+                    break;
                 }
                 Err(e) => {
                     trace(&format!("mcp-stdio: stdin error: {e}, exiting"));
-                    return;
+                    break;
                 }
             },
             _ = tokio::time::sleep(STDIN_IDLE_LIMIT) => {
@@ -157,7 +188,7 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
                         "mcp-stdio: no input for {:?}, parent likely gone, exiting",
                         elapsed
                     ));
-                    return;
+                    break;
                 }
                 trace(&format!(
                     "mcp-stdio: idle-timer fired but only {:?} elapsed (likely post-suspend); rearming",
@@ -180,19 +211,39 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
             continue;
         };
 
-        let response = match dispatch(method, params, &cfg, &http).await {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(err) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": err.code, "message": err.message }
-            }),
-        };
-        let _ = stdout
-            .write_all(format!("{response}\n").as_bytes())
-            .await;
-        let _ = stdout.flush().await;
+        // Each request gets its own dispatch task so progress
+        // notifications can be sent in parallel via the writer
+        // channel. Tasks share `cfg` and `http` (both `Clone`-able);
+        // the channel is the sync point.
+        let cfg_for_task = cfg.clone();
+        let http_for_task = http.clone();
+        let tx_for_task = tx.clone();
+        let method_owned = method.to_string();
+        tokio::spawn(async move {
+            let response = match dispatch(
+                &method_owned,
+                params,
+                &cfg_for_task,
+                &http_for_task,
+                &tx_for_task,
+            )
+            .await
+            {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err(err) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": err.code, "message": err.message }
+                }),
+            };
+            let _ = tx_for_task.send(response).await;
+        });
     }
+
+    // Close the channel so the writer task drains and exits. Without
+    // this, exit waits forever on the still-open sender.
+    drop(tx);
+    let _ = writer_task.await;
 }
 
 struct RpcError {
@@ -205,6 +256,7 @@ async fn dispatch(
     params: Value,
     cfg: &Arc<AppConfig>,
     http: &reqwest::Client,
+    tx: &mpsc::Sender<Value>,
 ) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
@@ -227,7 +279,7 @@ async fn dispatch(
             "instructions": INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({ "tools": tools_list() })),
-        "tools/call" => tools_call(params, cfg, http).await,
+        "tools/call" => tools_call(params, cfg, http, tx).await,
         "prompts/list" => Ok(json!({ "prompts": prompts_list() })),
         "prompts/get" => prompts_get(params),
         _ => Err(RpcError {
@@ -243,7 +295,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "confirm",
-            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. For visual sign-off (\"is this image OK?\", \"keep this generated diagram?\") pass `image: {src, alt?, max_height?}` — `src` accepts data: URLs, http(s) URLs, or absolute / `~/`-rooted local paths (resolved on YOUR host). Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat.",
+            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. For visual sign-off (\"is this image OK?\", \"keep this generated diagram?\") pass `image: {src, alt?, max_height?}` — `src` accepts data: URLs, http(s) URLs, or absolute / `~/`-rooted local paths (resolved on YOUR host). Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat. **This tool blocks until the user clicks a button. Response can take minutes — do not assume aiui is broken on slow response, the user is just thinking. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -269,7 +321,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "ask",
-            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. For visual choice (\"which of these images?\") pass `thumbnail: <src>` per option — same resolution rules as anywhere else in aiui (data:, http(s)://, or absolute local path). Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`.",
+            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. For visual choice (\"which of these images?\") pass `thumbnail: <src>` per option — same resolution rules as anywhere else in aiui (data:, http(s)://, or absolute local path). Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`. **This tool blocks until the user picks an option or cancels. Response can take minutes — do not assume aiui is broken on slow response. Progress notifications fire every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -296,7 +348,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, mermaid, wireframe, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog.",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, mermaid, wireframe, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -433,6 +485,7 @@ async fn tools_call(
     params: Value,
     cfg: &Arc<AppConfig>,
     http: &reqwest::Client,
+    tx: &mpsc::Sender<Value>,
 ) -> Result<Value, RpcError> {
     let name = params
         .get("name")
@@ -441,11 +494,49 @@ async fn tools_call(
         .to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // MCP progress notifications. The client opts in by passing a token
+    // in `params._meta.progressToken` (string or integer). While the
+    // tool blocks on the user, we send a `notifications/progress`
+    // every PROGRESS_NOTIFY_INTERVAL with the same token so the
+    // client knows we're alive — keeps Claude Desktop and Claude
+    // Code from concluding "tool hung" mid-dialog. v0.4.40.
+    let progress_token = params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .cloned();
+    let progress_handle = if let Some(token) = progress_token {
+        let tx_clone = tx.clone();
+        Some(tokio::spawn(async move {
+            let mut elapsed_secs: u64 = 0;
+            loop {
+                tokio::time::sleep(PROGRESS_NOTIFY_INTERVAL).await;
+                elapsed_secs += PROGRESS_NOTIFY_INTERVAL.as_secs();
+                let notif = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": token,
+                        "progress": elapsed_secs,
+                        "message": format!("aiui still waiting on user ({elapsed_secs}s)"),
+                    }
+                });
+                if tx_clone.send(notif).await.is_err() {
+                    break;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Cold-start gate: every tool we expose hits the local HTTP server.
     // Wait for it to become reachable instead of returning a connection-
     // refused error the moment we get one — that masks the auto-resurrect
     // path's startup window cleanly.
     if !wait_for_aiui(http, cfg).await {
+        if let Some(h) = progress_handle {
+            h.abort();
+        }
         return Ok(aiui_unreachable_result());
     }
 
@@ -513,12 +604,19 @@ async fn tools_call(
             .map(value_to_tool_text),
 
         _ => {
+            if let Some(h) = progress_handle {
+                h.abort();
+            }
             return Ok(json!({
                 "content": [{"type": "text", "text": format!("unknown tool: {name}")}],
                 "isError": true
             }));
         }
     };
+
+    if let Some(h) = progress_handle {
+        h.abort();
+    }
 
     match outcome {
         Ok(v) => Ok(v),
