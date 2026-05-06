@@ -6,11 +6,22 @@
   //
   // Pipeline:
   //   1. mermaid.render() turns the source DSL into an SVG string
-  //   2. DOMPurify sanitises the SVG (script/foreignObject/event-attrs out)
+  //   2. DOMPurify sanitises the SVG (script + event-attrs out)
   //   3. {@html} drops it into the DOM
   //
   // mermaid.initialize({ securityLevel: 'strict' }) blocks HTML-in-labels
   // upstream; the DOMPurify pass is the second line of defence.
+  //
+  // v0.4.38: `<foreignObject>` is allowed through now. Mermaid 11 renders
+  // flowchart node labels inside `<foreignObject>` elements (HTML inside
+  // SVG, for proper word-wrapping). `securityLevel: 'strict'` blocks the
+  // HTML *inside* those elements being interpreted as markup, but does
+  // not stop Mermaid from emitting the elements themselves — and our
+  // previous belt-and-braces strip was deleting them outright, leaving
+  // labelless boxes (the 0.4.37 Verfassungsorgane test). DOMPurify's
+  // svg/svgFilters profile + the FORBID_ATTR list still keep scripts and
+  // event handlers out, so dropping `foreignObject` from FORBID_TAGS is
+  // safe.
 
   import { onMount } from "svelte";
   import mermaid from "mermaid";
@@ -51,10 +62,10 @@
       .then(({ svg: rendered }) => {
         svg = DOMPurify.sanitize(rendered, {
           USE_PROFILES: { svg: true, svgFilters: true },
-          // Belt-and-braces removals; mermaid + securityLevel:strict
-          // shouldn't emit these, but if a future mermaid release ever
-          // does, we drop them rather than execute.
-          FORBID_TAGS: ["script", "foreignObject"],
+          // Mermaid 11 emits node labels inside `<foreignObject>`, so
+          // it stays in the allow-list. `<script>` is the only tag we
+          // forbid outright; event-handler attrs are caught by FORBID_ATTR.
+          FORBID_TAGS: ["script"],
           FORBID_ATTR: ["onclick", "onload", "onerror", "onmouseover"],
         });
         error = null;
