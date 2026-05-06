@@ -2,7 +2,7 @@
 
 MCP server for [**aiui**](https://github.com/byte5ai/aiui) — lets Claude
 Code sessions render native macOS dialogs on the user's Mac. Works for
-local and remote Claude Code setups.
+local and remote Claude Desktop App setups.
 
 ## Install
 
