@@ -179,6 +179,23 @@ struct StatusReport {
     /// requests — that's how v0.4.8 ended up showing a permanent red
     /// banner on a perfectly healthy server. Issue #77.
     http_alive: bool,
+    /// Lower-case OS identifier — `"macos"`, `"windows"`, `"linux"`, or
+    /// `"other"`. Lets the Svelte side render OS-specific copy (e.g. the
+    /// uninstall instructions: drag to Trash vs. Apps & Features) without
+    /// pulling in `@tauri-apps/plugin-os`. Set once at compile time.
+    os: &'static str,
+}
+
+const fn current_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
 }
 
 #[tauri::command]
@@ -203,6 +220,7 @@ async fn status(
         welcome_pending: is_first_run(&cfg),
         http_error: http_err.lock().ok().and_then(|s| s.clone()),
         http_alive,
+        os: current_os(),
     })
 }
 
