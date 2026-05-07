@@ -23,8 +23,7 @@
 When Claude Desktop App has a question that's really a pick between options, you
 have to type the answer in prose. When it wants your go-ahead before
 touching production, you get a blue Yes/No box — and nothing more
-tailored. Need to hand it a secret for a moment? It lands in the
-transcript.
+tailored.
 
 There's a better way.
 
@@ -48,10 +47,6 @@ a familiar macOS window that does what it looks like.
 
 <p align="center">
   <img src="assets/aiui%20Demo%200.4.40.gif" alt="aiui demo: Claude Code opens a native dialog, user clicks, agent continues" width="720">
-</p>
-
-<p align="center">
-  <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
 </p>
 
 ## Works locally and remotely
@@ -113,6 +108,10 @@ back in chat — without it, the agent might forget aiui exists.
 | Ad-hoc local web UIs for one-off tasks | No longer needed |
 | Remote hosts where the agent has no way to ask you | Dialogs tunnel back to your Mac automatically |
 
+<p align="center">
+  <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
+</p>
+
 ## Privacy
 
 aiui runs purely locally on your Mac. No telemetry, no usage data, no
@@ -151,10 +150,10 @@ The underlying WebKit view loads only while a dialog is on screen.
 Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
 if you need it.
 
-**Does it work on Linux or Windows?** No. aiui renders native macOS
-dialogs; porting would require a different companion per OS. If you want
-this, please [open an issue](https://github.com/byte5ai/aiui/issues/new)
-and vote.
+**Does it work on Linux or Windows?** Linux: no. Windows: in progress —
+the Rust core and CI build already target Windows; interactive E2E testing
+and a first release are still outstanding. Follow
+[#118](https://github.com/byte5ai/aiui/pull/118) for status.
 
 **Can I use aiui without Claude Desktop?** The companion is
 auto-spawned by Claude Desktop via its MCP registration, so in the
