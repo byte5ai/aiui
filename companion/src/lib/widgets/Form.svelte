@@ -432,7 +432,8 @@
   }
 </script>
 
-<div class="stack">
+<main class="window-shell">
+  <div class="window-scroll">
   {#if spec.header}<span class="chip">{spec.header}</span>{/if}
   <div>
     <p class="title">{spec.title}</p>
@@ -688,12 +689,14 @@
     {/each}
   </div>
 
-  <!-- Spacer reserves footer height inside the scroll flow so the
-       last form field never gets overlapped by the sticky footer at
-       scroll-end. Belongs to this component, not to .container —
-       Settings has its own footer-vs-content geometry. v0.4.35. -->
-  <div class="form-footer-spacer" aria-hidden="true"></div>
-  <div class="footer">
+  </div><!-- /.window-scroll -->
+
+  <!-- Footer is now a real flex sibling of .window-scroll, not a sticky
+       overlay. The form-footer-spacer hack from v0.4.35 (a fixed-height
+       transparent block reserving sticky-footer overlap room) is gone:
+       the footer can no longer overlap content because content lives in
+       a separately-scrolling region above it. -->
+  <footer class="window-footer">
     {#each actions as a}
       <button
         class:primary={a.primary}
@@ -705,8 +708,8 @@
         {a.label}
       </button>
     {/each}
-  </div>
-</div>
+  </footer>
+</main>
 
 <style>
   .static-text {

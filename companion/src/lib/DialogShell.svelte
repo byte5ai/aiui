@@ -77,36 +77,44 @@
   }
 </script>
 
-<!-- App.svelte provides the outer container with Apple-HIG title-bar
-     padding and the drag region. We render straight into it. -->
+<!-- DialogShell is a thin host: it owns the per-window event listeners,
+     the keyboard handler and the lifetime of the current dialog spec.
+     The actual chrome (header / scroll / footer) is provided by the
+     widget components themselves so they can put whatever sections they
+     need into the scroll region and own their own button row. The shell
+     just makes sure the WebView fills its window. -->
 {#if current}
-    <!-- {#key current.id} forces a fresh widget instance for every new
-      dialog, even when two consecutive renders are the same kind (e.g.
-      two `confirm`s). Without it, Svelte recycles the component and
-      stale field/checkbox/radio state from the previous dialog can bleed
-      into the current one — silently sending wrong answers back to the
-      caller. Issue #H-1 in v0.4.10 review. -->
-    {#key current.id}
-      {#if current.spec.kind === "ask"}
-        <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-      {:else if current.spec.kind === "form"}
-        <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-      {:else if current.spec.kind === "confirm"}
-        <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-      {:else}
-        <div class="stack">
+  <!-- {#key current.id} forces a fresh widget instance for every new
+    dialog, even when two consecutive renders are the same kind (e.g.
+    two `confirm`s). Without it, Svelte recycles the component and
+    stale field/checkbox/radio state from the previous dialog can bleed
+    into the current one — silently sending wrong answers back to the
+    caller. Issue #H-1 in v0.4.10 review. -->
+  {#key current.id}
+    {#if current.spec.kind === "ask"}
+      <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "form"}
+      <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "confirm"}
+      <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else}
+      <main class="window-shell">
+        <div class="window-scroll">
           <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
           <pre>{JSON.stringify(current.spec, null, 2)}</pre>
-          <div class="footer">
-            <button onclick={handleCancel}>{$_("dialog.close")}</button>
-          </div>
         </div>
-      {/if}
-    {/key}
+        <footer class="window-footer">
+          <button onclick={handleCancel}>{$_("dialog.close")}</button>
+        </footer>
+      </main>
+    {/if}
+  {/key}
 {:else}
   <!-- Brief idle state — only visible during the few hundred ms
        between window-show and the dialog:show event arriving. -->
-  <div class="idle"></div>
+  <main class="window-shell">
+    <div class="idle"></div>
+  </main>
 {/if}
 
 <style>

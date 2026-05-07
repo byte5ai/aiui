@@ -173,87 +173,93 @@ label {
   letter-spacing: 0.06em;
 }
 
-.container {
-  /* Native title bar handles the top-of-window real estate now (see
-     v0.4.30 drag fix). Content can sit close to the title-bar
-     boundary; 14 px gives visual breathing room without wasting
-     vertical space.
-
-     Bottom padding kept at 16 px (matching the original layout). A
-     reservation for the sticky footer's height has to be local to
-     the component that uses it — Form.svelte adds a footer-spacer
-     before its `<div class="footer">`. The 0.4.34 attempt to bake
-     the reservation into `.container` here broke Settings.svelte's
-     "add remote" section by pushing it under the same footer's
-     overlap zone. v0.4.35 reverts that back. */
-  padding: 14px 20px 16px 20px;
+/* ---------- Window shell ----------
+ *
+ * Every aiui window (Settings + every dialog widget — Ask, Form, Confirm)
+ * uses the same three-zone vertical layout:
+ *
+ *   .window-shell        outer flex column, fills the WebView (height:100%)
+ *   ├─ .window-header    static, never scrolls (optional)
+ *   ├─ .window-scroll    flex:1, owns the scrollbar
+ *   └─ .window-footer    static, never scrolls (optional)
+ *
+ * The footer is a real sibling of the scroll region rather than a
+ * `position: sticky` overlay: content can never end up hidden behind
+ * it, the per-component `form-footer-spacer` workaround that v0.4.34/35
+ * introduced is gone, and Mac vs. Windows render the same — no more
+ * scroll-vs-stacking-context divergence.
+ *
+ * Header and footer are optional. A widget that needs neither (e.g. a
+ * minimal idle state) can mount only `.window-scroll` directly inside
+ * `.window-shell`; the flex-1 rule still gives it the full height.
+ *
+ * History: replaced `.container` (scrollable, with its sticky `.footer`
+ * child) plus `.form-footer-spacer`. See git log for the chain of fixes
+ * that went into the old model — issues #77, #78, #114, #115, #116,
+ * v0.4.34/35.
+ */
+.window-shell {
+  display: flex;
+  flex-direction: column;
   height: 100%;
+  overflow: hidden;
+}
+
+.window-header {
+  flex: 0 0 auto;
+  /* Native title bar handles the top-of-window real estate (see
+     v0.4.30 drag fix); 14 px gives breathing room from the title-bar
+     boundary without wasting vertical space. */
+  padding: 14px 20px 0 20px;
+}
+
+.window-scroll {
+  flex: 1 1 auto;
+  min-height: 0;          /* required so flex children can actually shrink and scroll */
   overflow-y: auto;
   overflow-x: hidden;
+  padding: 16px 20px;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  /* keep the scrollbar visible instead of the auto-hiding overlay default,
-     so the user can tell at a glance that there's more below */
+  /* Keep the scrollbar visible instead of the auto-hiding overlay default,
+     so the user can tell at a glance that there's more below. */
   scrollbar-gutter: stable;
 }
-.container::-webkit-scrollbar {
+/* When a header is present we don't want a doubled top gap. */
+.window-header + .window-scroll {
+  padding-top: 16px;
+}
+/* When the shell starts directly with a scroll region (no header), keep
+   the same 14 px standoff from the title bar that .window-header would
+   have provided. */
+.window-shell > .window-scroll:first-child {
+  padding-top: 14px;
+}
+.window-scroll::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
-.container::-webkit-scrollbar-thumb {
+.window-scroll::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--fg) 18%, transparent);
   border-radius: 4px;
   border: 2px solid var(--bg);
 }
-.container::-webkit-scrollbar-thumb:hover {
+.window-scroll::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--fg) 28%, transparent);
 }
-.container::-webkit-scrollbar-track {
+.window-scroll::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.footer {
-  /* `margin-top: auto` keeps the footer pinned to the bottom of the
-     visible viewport when content fits. `position: sticky; bottom: 0`
-     keeps it pinned there even when the content above scrolls. Without
-     this, the welcome banner pushes the footer (with Uninstall etc.)
-     below the fold — and macOS settings windows aren't typically
-     scrollable, so users miss the buttons entirely. Issue #78. */
-  margin-top: auto;
-  position: sticky;
-  bottom: 0;
+.window-footer {
+  flex: 0 0 auto;
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding-top: 12px;
-  /* Opaque background so scrolled content doesn't show through. Use the
-     same color as `.container`'s parent background to blend in. */
+  padding: 12px 20px 16px 20px;
   background: var(--bg);
   border-top: 1px solid var(--border);
-  /* Pull-out below the container's bottom padding so the border sits
-     flush with the window edge while the buttons keep their breathing
-     room above. (v0.4.35 reverted from -75 back to -16 — see the
-     container comment above.) */
-  margin-left: -20px;
-  margin-right: -20px;
-  padding-left: 20px;
-  padding-right: 20px;
-  margin-bottom: -16px;
-  padding-bottom: 16px;
-}
-
-/* Form-local reservation for the sticky footer's height. Sits as
-   a sibling immediately before `<div class="footer">` in
-   Form.svelte. When the content overflows the container, this
-   spacer means scroll-end is ~70 px below the last real field, so
-   the footer's opaque background no longer overlaps it. When the
-   content fits, the spacer is invisible (no background, no
-   border) and `margin-top: auto` on the footer still pushes it
-   against the window edge. v0.4.35 form-overlap fix. */
-.form-footer-spacer {
-  height: 70px;
-  flex-shrink: 0;
 }
 
 code {
@@ -318,12 +324,14 @@ pre {
   background: var(--surface);
 }
 
-/* subtle entrance animation for dialog content */
+/* Subtle entrance animation for dialog content. Targets the scroll
+   region so the staggered fade applies to whatever sections each
+   widget renders. */
 @keyframes aiui-enter {
   from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-main.container > * { animation: aiui-enter 0.18s ease-out both; }
-main.container > *:nth-child(2) { animation-delay: 0.03s; }
-main.container > *:nth-child(3) { animation-delay: 0.06s; }
-main.container > *:nth-child(4) { animation-delay: 0.09s; }
+.window-scroll > * { animation: aiui-enter 0.18s ease-out both; }
+.window-scroll > *:nth-child(2) { animation-delay: 0.03s; }
+.window-scroll > *:nth-child(3) { animation-delay: 0.06s; }
+.window-scroll > *:nth-child(4) { animation-delay: 0.09s; }

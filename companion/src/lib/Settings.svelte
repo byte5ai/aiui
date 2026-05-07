@@ -216,8 +216,8 @@
 </script>
 
 {#if status}
-  <div class="stack">
-    <header class="app-header">
+  <main class="window-shell">
+    <header class="window-header app-header">
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
@@ -254,6 +254,7 @@
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </header>
 
+    <div class="window-scroll">
     <!-- Show the banner only when the live Rust-side TCP self-probe says
       the HTTP server isn't accepting connections. `status.http_error` is
       the explanatory text from the original bind-failure if any — but
@@ -461,7 +462,9 @@
       </section>
     {/if}
 
-    <div class="footer">
+    </div><!-- /.window-scroll -->
+
+    <footer class="window-footer">
       {#if confirmUninstall}
         <span class="subtitle" style="margin-right: auto; align-self: center;">
           {$_("settings.uninstall.confirm")}
@@ -483,8 +486,8 @@
           >{$_("settings.uninstall.button")}</button
         >
       {/if}
-    </div>
-  </div>
+    </footer>
+  </main>
 {/if}
 
 {#if uninstallDone}
