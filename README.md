@@ -150,10 +150,10 @@ The underlying WebKit view loads only while a dialog is on screen.
 Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
 if you need it.
 
-**Does it work on Linux or Windows?** No. aiui renders native macOS
-dialogs; porting would require a different companion per OS. If you want
-this, please [open an issue](https://github.com/byte5ai/aiui/issues/new)
-and vote.
+**Does it work on Linux or Windows?** Linux: no. Windows: in progress —
+the Rust core and CI build already target Windows; interactive E2E testing
+and a first release are still outstanding. Follow
+[#118](https://github.com/byte5ai/aiui/pull/118) for status.
 
 **Can I use aiui without Claude Desktop?** The companion is
 auto-spawned by Claude Desktop via its MCP registration, so in the
