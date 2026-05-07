@@ -209,7 +209,17 @@ label {
   flex: 0 0 auto;
   /* Native title bar handles the top-of-window real estate (see
      v0.4.30 drag fix); 14 px gives breathing room from the title-bar
-     boundary without wasting vertical space. */
+     boundary without wasting vertical space.
+     ---
+     Padding ownership: the *shell* (`.window-header`, `.window-scroll`,
+     `.window-footer`) owns horizontal padding so the three regions stay
+     visually flush at the window edge. Components that need their own
+     padding (e.g. for a flex layout, a border, or extra breathing room)
+     should put a wrapper element *inside* `.window-header` with their
+     own classes, instead of stacking another class on the same element
+     and overriding `padding`. The latter pattern (e.g. `<header class=
+     "window-header app-header">` where `.app-header` re-defined
+     `padding`) was the bug Codex flagged in PR #129. */
   padding: 14px 20px 0 20px;
 }
 
