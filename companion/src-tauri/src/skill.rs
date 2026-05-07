@@ -4,6 +4,7 @@
 //! picks up automatically at session start.
 
 use crate::logging::trace;
+use crate::proc_ext::no_window;
 use crate::setup::StepResult;
 use std::fs;
 use std::path::PathBuf;
@@ -82,15 +83,16 @@ pub fn install_to_remote(host_alias: &str) -> StepResult {
         };
     }
 
-    let mkdir = Command::new("ssh")
-        .args([
+    let mkdir = no_window(
+        Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
             "--",
             host_alias,
             "mkdir -p ~/.claude/skills/aiui",
-        ])
-        .output();
+        ]),
+    )
+    .output();
     if let Ok(o) = &mkdir {
         if !o.status.success() {
             let _ = fs::remove_file(&stage);
@@ -103,7 +105,7 @@ pub fn install_to_remote(host_alias: &str) -> StepResult {
     }
 
     let dest = format!("{host_alias}:.claude/skills/aiui/SKILL.md");
-    let out = Command::new("scp").arg(&stage).arg(&dest).output();
+    let out = no_window(Command::new("scp").arg(&stage).arg(&dest)).output();
     let _ = fs::remove_file(&stage);
     match out {
         Err(e) => StepResult {
@@ -145,15 +147,16 @@ pub fn remove_from_remote(host_alias: &str) -> StepResult {
             details: None,
         };
     }
-    let out = Command::new("ssh")
-        .args([
+    let out = no_window(
+        Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
             "--",
             host_alias,
             "rm -f ~/.claude/skills/aiui/SKILL.md; rmdir ~/.claude/skills/aiui 2>/dev/null; true",
-        ])
-        .output();
+        ]),
+    )
+    .output();
     match out {
         Err(e) => StepResult {
             ok: false,

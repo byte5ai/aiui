@@ -14,6 +14,7 @@
 //! session died) we drop back into the normal `ssh -NTR` retry loop.
 
 use crate::logging::trace;
+use crate::proc_ext::no_window_tokio;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -155,18 +156,17 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
          [ -n \"$T\" ] && \
          curl -sS -f -m 3 -H \"Authorization: Bearer $T\" {url} 2>/dev/null"
     );
-    let out = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "--",
-            host,
-            &cmd,
-        ])
-        .output()
-        .await;
+    let out = no_window_tokio(Command::new("ssh").args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "--",
+        host,
+        &cmd,
+    ]))
+    .output()
+    .await;
     match out {
         Ok(o) if o.status.success() => {
             let body = String::from_utf8_lossy(&o.stdout);
@@ -225,29 +225,31 @@ async fn run_tunnel(
         ));
         *status.lock().await = TunnelStatus::Connecting;
 
-        let mut child = match Command::new("ssh")
-            .args([
-                "-N",
-                "-T",
-                "-R",
-                &format!("{port}:localhost:{port}"),
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "--",
-                &host,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+        let mut child = match no_window_tokio(
+            Command::new("ssh")
+                .args([
+                    "-N",
+                    "-T",
+                    "-R",
+                    &format!("{port}:localhost:{port}"),
+                    "-o",
+                    "ServerAliveInterval=30",
+                    "-o",
+                    "ServerAliveCountMax=3",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "--",
+                    &host,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true),
+        )
+        .spawn()
         {
             Ok(c) => c,
             Err(e) => {

@@ -8,6 +8,7 @@ mod imageresolve;
 mod lifetime;
 mod logging;
 mod mcp;
+mod proc_ext;
 mod setup;
 mod skill;
 mod tunnel;
@@ -285,10 +286,16 @@ fn open_url(url: String) -> Result<(), String> {
         // the user's default browser on Windows. The empty `""` argument
         // is the window-title placeholder — without it `start` interprets
         // a quoted URL as the title and refuses to launch.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
-            .map_err(|e| format!("start {url}: {e}"))?;
+        //
+        // We still set CREATE_NO_WINDOW on the `cmd` host: `start` itself
+        // launches the browser detached and returns immediately, so the
+        // wrapping cmd shouldn't keep a console open even for the split
+        // second the GUI default would expose.
+        crate::proc_ext::no_window(
+            std::process::Command::new("cmd").args(["/C", "start", "", &url]),
+        )
+        .spawn()
+        .map_err(|e| format!("start {url}: {e}"))?;
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -330,41 +337,125 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 /// and picks up the freshly-patched aiui MCP server entry. This is the
 /// "after-Setup nudge" the user otherwise has to figure out themselves.
 ///
-/// Uses AppleScript for the quit (so Claude gets a chance to close cleanly,
-/// not SIGKILL) and `open -a` for the relaunch. If Claude Desktop isn't
-/// installed or isn't running, the quit step quietly no-ops and we just
-/// launch fresh.
+/// Per-OS implementation:
+///
+/// - macOS: AppleScript quit (graceful, lets Claude clean up) + `open -a`
+///   for the relaunch. Both no-op silently if Claude isn't installed/running.
+///
+/// - Windows: `taskkill /IM Claude.exe` (no /F, that would SIGKILL) +
+///   re-launch via the resolved install path. Claude Desktop on Windows
+///   ships either as a per-user NSIS install (default
+///   `%LOCALAPPDATA%\Programs\claude-desktop\Claude.exe`) or via the
+///   maintainer's MSIX in `%LOCALAPPDATA%\AnthropicClaude\Claude.exe`.
+///   We probe both; whichever exists wins. If neither does, surface a
+///   clear error instead of silently no-oping.
 #[tauri::command]
 async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
-    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
 
-    // Best-effort quit. Status of `osascript` is non-fatal — if Claude isn't
-    // running, AppleScript returns an error that we treat as a no-op.
-    let _ = Command::new("osascript")
-        .args(["-e", "tell application \"Claude\" to quit"])
+        // Best-effort quit. Status of `osascript` is non-fatal — if Claude
+        // isn't running, AppleScript returns an error that we treat as a
+        // no-op.
+        let _ = Command::new("osascript")
+            .args(["-e", "tell application \"Claude\" to quit"])
+            .output();
+
+        // Give Claude a moment to actually shut down before relaunching,
+        // so `open -a` doesn't race with a still-quitting instance.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let out = Command::new("open").args(["-a", "Claude"]).output();
+        match out {
+            Ok(o) if o.status.success() => Ok(setup::StepResult {
+                ok: true,
+                message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+                details: None,
+            }),
+            Ok(o) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte Claude Desktop nicht starten.".into(),
+                details: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            }),
+            Err(e) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte `open -a Claude` nicht ausführen.".into(),
+                details: Some(e.to_string()),
+            }),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use crate::proc_ext::no_window;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        // Best-effort graceful close (no `/F`). If Claude is already gone
+        // taskkill returns exit code 128 — we don't surface that.
+        let _ = no_window(
+            Command::new("taskkill").args(["/IM", "Claude.exe"]),
+        )
         .output();
 
-    // Give Claude a moment to actually shut down before relaunching, so
-    // `open -a` doesn't race with a still-quitting instance.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Give Claude a moment to actually exit before relaunching.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-    let out = Command::new("open").args(["-a", "Claude"]).output();
-    match out {
-        Ok(o) if o.status.success() => Ok(setup::StepResult {
-            ok: true,
-            message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+        // Resolve the executable. Prefer LOCALAPPDATA over hard-coded
+        // C:\Program Files because Claude Desktop on Windows is a per-user
+        // install in either the NSIS or the AnthropicClaude flavour.
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let candidates: Vec<PathBuf> = if local_app_data.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join("claude-desktop")
+                    .join("Claude.exe"),
+                PathBuf::from(&local_app_data)
+                    .join("AnthropicClaude")
+                    .join("Claude.exe"),
+            ]
+        };
+        let exe = candidates.iter().find(|p| p.exists());
+        let Some(exe) = exe else {
+            return Ok(setup::StepResult {
+                ok: false,
+                message: "Claude Desktop nicht gefunden.".into(),
+                details: Some(format!(
+                    "Gesucht in: {}. Bitte Claude Desktop manuell neu starten.",
+                    candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )),
+            });
+        };
+
+        // Spawn detached — we're the parent of a brand-new Claude process,
+        // but we don't want to keep its lifetime tied to ours.
+        match no_window(&mut Command::new(exe)).spawn() {
+            Ok(_) => Ok(setup::StepResult {
+                ok: true,
+                message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+                details: Some(format!("Gestartet: {}", exe.display())),
+            }),
+            Err(e) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte Claude Desktop nicht starten.".into(),
+                details: Some(format!("{}: {e}", exe.display())),
+            }),
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        Ok(setup::StepResult {
+            ok: false,
+            message: "Restart Claude Desktop wird auf dieser Plattform nicht unterstützt.".into(),
             details: None,
-        }),
-        Ok(o) => Ok(setup::StepResult {
-            ok: false,
-            message: "Konnte Claude Desktop nicht starten.".into(),
-            details: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        }),
-        Err(e) => Ok(setup::StepResult {
-            ok: false,
-            message: "Konnte `open -a Claude` nicht ausführen.".into(),
-            details: Some(e.to_string()),
-        }),
+        })
     }
 }
 

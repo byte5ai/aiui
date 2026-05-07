@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 use crate::fsutil::atomic_write;
+use crate::proc_ext::no_window;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -228,15 +229,16 @@ pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
     }
     // ensure remote dir. `--` keeps host_alias out of ssh option position
     // even if validation regresses one day.
-    let out1 = Command::new("ssh")
-        .args([
+    let out1 = no_window(
+        Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
             "--",
             host_alias,
             "mkdir -p ~/.config/aiui && chmod 700 ~/.config/aiui",
-        ])
-        .output();
+        ]),
+    )
+    .output();
     match out1 {
         Err(e) => {
             return StepResult {
@@ -256,7 +258,7 @@ pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
     }
 
     let dest = format!("{host_alias}:.config/aiui/token");
-    let out2 = Command::new("scp").arg(token_path).arg(&dest).output();
+    let out2 = no_window(Command::new("scp").arg(token_path).arg(&dest)).output();
     match out2 {
         Err(e) => StepResult {
             ok: false,
@@ -370,9 +372,14 @@ pub fn is_claude_desktop_running() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Claude.exe", "/NH"])
-            .output();
+        let out = no_window(
+            std::process::Command::new("tasklist").args([
+                "/FI",
+                "IMAGENAME eq Claude.exe",
+                "/NH",
+            ]),
+        )
+        .output();
         match out {
             Ok(o) if o.status.success() => {
                 // tasklist prints "INFO: No tasks are running …" on a
@@ -813,15 +820,16 @@ print("ok:patched")
 /// 1 = nothing matched. Both are success from our perspective; only
 /// the SSH layer or shell-not-found counts as a real failure.
 pub fn kill_remote_mcp_stdio(host_alias: &str) -> StepResult {
-    let out = std::process::Command::new("ssh")
-        .args([
+    let out = no_window(
+        std::process::Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
             "--",
             host_alias,
             "pkill -f 'aiui-mcp' 2>/dev/null; true",
-        ])
-        .output();
+        ]),
+    )
+    .output();
     match out {
         Err(e) => StepResult {
             ok: false,
@@ -948,24 +956,26 @@ echo "STAGE:OK"
     //                    `--` interpretation of the first script byte
     //   -T               disable TTY allocation; ssh would refuse PTY when
     //                    stdin is a pipe anyway, but this is explicit
-    let mut child = match Command::new("ssh")
-        .args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "--",
-            host_alias,
-            "/bin/bash",
-            "--login",
-            "-s",
-            "--",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut child = match no_window(
+        Command::new("ssh")
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "--",
+                host_alias,
+                "/bin/bash",
+                "--login",
+                "-s",
+                "--",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .spawn()
     {
         Ok(c) => c,
         Err(e) => {
@@ -1118,18 +1128,20 @@ fn run_remote_python(
         };
     }
 
-    let child = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "--",
-            host_alias,
-            "python3 -",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let child = no_window(
+        Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "--",
+                host_alias,
+                "python3 -",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .spawn();
 
     let mut child = match child {
         Ok(c) => c,
@@ -1220,15 +1232,16 @@ pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
             details: None,
         };
     }
-    let out = Command::new("ssh")
-        .args([
+    let out = no_window(
+        Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
             "--",
             host_alias,
             "rm -f ~/.config/aiui/token",
-        ])
-        .output();
+        ]),
+    )
+    .output();
     match out {
         Err(e) => StepResult {
             ok: false,
