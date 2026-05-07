@@ -50,10 +50,6 @@ a familiar macOS window that does what it looks like.
   <img src="assets/aiui%20Demo%200.4.40.gif" alt="aiui demo: Claude Code opens a native dialog, user clicks, agent continues" width="720">
 </p>
 
-<p align="center">
-  <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
-</p>
-
 ## Works locally and remotely
 
 Running Claude Desktop App directly on your Mac? aiui plugs in.
@@ -112,6 +108,10 @@ back in chat — without it, the agent might forget aiui exists.
 | Destructive actions with a vague "please confirm" | Red-styled yes/no, unambiguous |
 | Ad-hoc local web UIs for one-off tasks | No longer needed |
 | Remote hosts where the agent has no way to ask you | Dialogs tunnel back to your Mac automatically |
+
+<p align="center">
+  <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
+</p>
 
 ## Privacy
 
