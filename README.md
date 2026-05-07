@@ -23,8 +23,7 @@
 When Claude Desktop App has a question that's really a pick between options, you
 have to type the answer in prose. When it wants your go-ahead before
 touching production, you get a blue Yes/No box — and nothing more
-tailored. Need to hand it a secret for a moment? It lands in the
-transcript.
+tailored.
 
 There's a better way.
 
