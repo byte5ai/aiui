@@ -265,7 +265,9 @@
         {#if status.http_error}
           <p>{status.http_error}</p>
         {/if}
-        <p class="http-error-hint">{$_("settings.http_error.hint", { values: { port: status.http_port } })}</p>
+        <!-- OS-specific because the diagnostic command differs: `lsof` on
+          macOS, `Get-NetTCPConnection` on Windows, `ss` on Linux. -->
+        <p class="http-error-hint">{$_(`settings.http_error.hint.${status.os}`, { values: { port: status.http_port } })}</p>
       </section>
     {/if}
 
