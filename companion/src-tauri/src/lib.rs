@@ -284,46 +284,23 @@ fn repair_skill() -> Result<setup::StepResult, String> {
 /// "Problem melden"-button (and any other future external-link case)
 /// has to round-trip through Rust. Issue surfaced 2026-04-27 by tester
 /// clicking the button for the first time.
+///
+/// The dispatch goes through the `open` crate, which calls
+/// `ShellExecuteW` on Windows, `/usr/bin/open` on macOS, and `xdg-open`
+/// on Linux/BSD. None of those routes the URL through a shell, so
+/// metacharacters (`&`, `|`, `^`, …) inside the URL stay inert — closing
+/// the command-injection surface that the previous `cmd /C start "" …`
+/// path had on Windows (Codex review of PR #128).
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     // Sanity-check: only allow http(s) so a compromised renderer can't
-    // smuggle file:// or shell URIs through this command.
+    // smuggle file:// or shell URIs through this command. The downstream
+    // launcher would also refuse most of those, but we want a single
+    // explicit gate at the entry.
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("refusing non-http(s) URL: {url}"));
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| format!("open {url}: {e}"))?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmd /C start "" <url>` is the canonical way to open a URL with
-        // the user's default browser on Windows. The empty `""` argument
-        // is the window-title placeholder — without it `start` interprets
-        // a quoted URL as the title and refuses to launch.
-        //
-        // We still set CREATE_NO_WINDOW on the `cmd` host: `start` itself
-        // launches the browser detached and returns immediately, so the
-        // wrapping cmd shouldn't keep a console open even for the split
-        // second the GUI default would expose.
-        crate::proc_ext::no_window(
-            std::process::Command::new("cmd").args(["/C", "start", "", &url]),
-        )
-        .spawn()
-        .map_err(|e| format!("start {url}: {e}"))?;
-    }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        // Linux / BSD fallback for completeness — aiui is not officially
-        // shipped there, but the build should compile and behave sanely.
-        std::process::Command::new("xdg-open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| format!("xdg-open {url}: {e}"))?;
-    }
+    open::that(&url).map_err(|e| format!("open {url}: {e}"))?;
     Ok(())
 }
 
@@ -416,12 +393,48 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
         )
         .output();
 
+        // Capture the path of the running Claude.exe *before* we tell it
+        // to quit — that's the most reliable way to find the right binary
+        // (covers MSIX/Store installs, custom install dirs, renames),
+        // beating any LOCALAPPDATA-based guess. After taskkill the process
+        // is gone and `sysinfo` would no longer see it, so the lookup
+        // happens here.
+        //
+        // Codex review of PR #128: the previous logic just took the first
+        // existing candidate path, which silently picks the older binary
+        // when both NSIS and MSIX installs coexist (mid-upgrade), and
+        // misses Store-installed Claudes entirely.
+        let running_exe: Option<PathBuf> = {
+            use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+            let sys = System::new_with_specifics(
+                RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+            );
+            sys.processes()
+                .values()
+                .find(|p| {
+                    p.name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("Claude.exe")
+                })
+                .and_then(|p| p.exe().map(|e| e.to_path_buf()))
+        };
+
+        // Best-effort graceful close (no `/F`). Issued *after* we captured
+        // the path so we don't race with Windows tearing the process
+        // entry down. If Claude is already gone taskkill returns exit
+        // code 128 — we don't surface that.
+        let _ = no_window(
+            Command::new("taskkill").args(["/IM", "Claude.exe"]),
+        )
+        .output();
+
         // Give Claude a moment to actually exit before relaunching.
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-        // Resolve the executable. Prefer LOCALAPPDATA over hard-coded
-        // C:\Program Files because Claude Desktop on Windows is a per-user
-        // install in either the NSIS or the AnthropicClaude flavour.
+        // Hard-coded fallback paths covering the two known per-user
+        // installer flavours. Used only when no Claude.exe is currently
+        // running (cold-start case) — the live-process lookup above wins
+        // whenever it has a result.
         let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let candidates: Vec<PathBuf> = if local_app_data.is_empty() {
             Vec::new()
@@ -436,25 +449,33 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
                     .join("Claude.exe"),
             ]
         };
-        let exe = candidates.iter().find(|p| p.exists());
+
+        // Resolution order: live process path → first existing fallback.
+        let exe: Option<PathBuf> = running_exe
+            .clone()
+            .or_else(|| candidates.iter().find(|p| p.exists()).cloned());
+
         let Some(exe) = exe else {
+            // Surface every path we tried so the user can compare against
+            // their actual install location and report it back.
+            let mut tried: Vec<String> = candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            tried.insert(0, "(running Claude.exe — none found)".to_string());
             return Ok(setup::StepResult {
                 ok: false,
                 message: "Claude Desktop nicht gefunden.".into(),
                 details: Some(format!(
-                    "Gesucht in: {}. Bitte Claude Desktop manuell neu starten.",
-                    candidates
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    "Gesucht: {}. Bitte Claude Desktop manuell neu starten und den tatsächlichen Pfad melden, damit aiui ihn künftig findet.",
+                    tried.join(", "),
                 )),
             });
         };
 
         // Spawn detached — we're the parent of a brand-new Claude process,
         // but we don't want to keep its lifetime tied to ours.
-        match no_window(&mut Command::new(exe)).spawn() {
+        match no_window(&mut Command::new(&exe)).spawn() {
             Ok(_) => Ok(setup::StepResult {
                 ok: true,
                 message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),

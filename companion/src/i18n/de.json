@@ -8,7 +8,7 @@
   "settings": {
     "http_error.title": "aiui nimmt keine Requests entgegen",
     "http_error.hint.macos": "Ein anderer Prozess hält Port {port} auf diesem Rechner. Beende eine alte aiui-Instanz oder prüfe mit `lsof -nP -iTCP:{port}` welcher Prozess sitzt, dann aiui neu starten.",
-    "http_error.hint.windows": "Ein anderer Prozess hält Port {port} auf diesem Rechner. Beende eine alte aiui-Instanz oder prüfe in PowerShell mit `Get-NetTCPConnection -LocalPort {port}` welcher Prozess sitzt, dann aiui neu starten.",
+    "http_error.hint.windows": "Ein anderer Prozess hält Port {port} auf diesem Rechner. Beende eine alte aiui-Instanz oder prüfe in PowerShell mit `Get-Process -Id (Get-NetTCPConnection -LocalPort {port}).OwningProcess` welcher Prozess sitzt, dann aiui neu starten.",
     "http_error.hint.linux": "Ein anderer Prozess hält Port {port} auf diesem Rechner. Beende eine alte aiui-Instanz oder prüfe mit `ss -tnlp \"sport = :{port}\"` welcher Prozess sitzt, dann aiui neu starten.",
     "http_error.hint.other": "Ein anderer Prozess hält Port {port} auf diesem Rechner. Beende eine alte aiui-Instanz und starte aiui neu.",
     "welcome.title": "aiui — Setup",

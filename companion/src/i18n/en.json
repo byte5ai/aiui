@@ -8,7 +8,7 @@
   "settings": {
     "http_error.title": "aiui can't accept requests",
     "http_error.hint.macos": "Something else is holding port {port} on this computer. Quit any old aiui instance, or check `lsof -nP -iTCP:{port}` for the squatter, then relaunch aiui.",
-    "http_error.hint.windows": "Something else is holding port {port} on this computer. Quit any old aiui instance, or check `Get-NetTCPConnection -LocalPort {port}` in PowerShell for the squatter, then relaunch aiui.",
+    "http_error.hint.windows": "Something else is holding port {port} on this computer. Quit any old aiui instance, or run `Get-Process -Id (Get-NetTCPConnection -LocalPort {port}).OwningProcess` in PowerShell to see the squatter's name, then relaunch aiui.",
     "http_error.hint.linux": "Something else is holding port {port} on this computer. Quit any old aiui instance, or check `ss -tnlp \"sport = :{port}\"` for the squatter, then relaunch aiui.",
     "http_error.hint.other": "Something else is holding port {port} on this computer. Quit any old aiui instance and relaunch aiui.",
     "welcome.title": "aiui — setup",
