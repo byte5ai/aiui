@@ -8,6 +8,7 @@ mod imageresolve;
 mod lifetime;
 mod logging;
 mod mcp;
+mod proc_ext;
 mod setup;
 mod skill;
 mod tunnel;
@@ -178,6 +179,23 @@ struct StatusReport {
     /// requests — that's how v0.4.8 ended up showing a permanent red
     /// banner on a perfectly healthy server. Issue #77.
     http_alive: bool,
+    /// Lower-case OS identifier — `"macos"`, `"windows"`, `"linux"`, or
+    /// `"other"`. Lets the Svelte side render OS-specific copy (e.g. the
+    /// uninstall instructions: drag to Trash vs. Apps & Features) without
+    /// pulling in `@tauri-apps/plugin-os`. Set once at compile time.
+    os: &'static str,
+}
+
+const fn current_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
 }
 
 #[tauri::command]
@@ -202,6 +220,7 @@ async fn status(
         welcome_pending: is_first_run(&cfg),
         http_error: http_err.lock().ok().and_then(|s| s.clone()),
         http_alive,
+        os: current_os(),
     })
 }
 
@@ -265,40 +284,23 @@ fn repair_skill() -> Result<setup::StepResult, String> {
 /// "Problem melden"-button (and any other future external-link case)
 /// has to round-trip through Rust. Issue surfaced 2026-04-27 by tester
 /// clicking the button for the first time.
+///
+/// The dispatch goes through the `open` crate, which calls
+/// `ShellExecuteW` on Windows, `/usr/bin/open` on macOS, and `xdg-open`
+/// on Linux/BSD. None of those routes the URL through a shell, so
+/// metacharacters (`&`, `|`, `^`, …) inside the URL stay inert — closing
+/// the command-injection surface that the previous `cmd /C start "" …`
+/// path had on Windows (Codex review of PR #128).
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     // Sanity-check: only allow http(s) so a compromised renderer can't
-    // smuggle file:// or shell URIs through this command.
+    // smuggle file:// or shell URIs through this command. The downstream
+    // launcher would also refuse most of those, but we want a single
+    // explicit gate at the entry.
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("refusing non-http(s) URL: {url}"));
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| format!("open {url}: {e}"))?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmd /C start "" <url>` is the canonical way to open a URL with
-        // the user's default browser on Windows. The empty `""` argument
-        // is the window-title placeholder — without it `start` interprets
-        // a quoted URL as the title and refuses to launch.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
-            .map_err(|e| format!("start {url}: {e}"))?;
-    }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        // Linux / BSD fallback for completeness — aiui is not officially
-        // shipped there, but the build should compile and behave sanely.
-        std::process::Command::new("xdg-open")
-            .arg(&url)
-            .spawn()
-            .map_err(|e| format!("xdg-open {url}: {e}"))?;
-    }
+    open::that(&url).map_err(|e| format!("open {url}: {e}"))?;
     Ok(())
 }
 
@@ -330,41 +332,169 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 /// and picks up the freshly-patched aiui MCP server entry. This is the
 /// "after-Setup nudge" the user otherwise has to figure out themselves.
 ///
-/// Uses AppleScript for the quit (so Claude gets a chance to close cleanly,
-/// not SIGKILL) and `open -a` for the relaunch. If Claude Desktop isn't
-/// installed or isn't running, the quit step quietly no-ops and we just
-/// launch fresh.
+/// Per-OS implementation:
+///
+/// - macOS: AppleScript quit (graceful, lets Claude clean up) + `open -a`
+///   for the relaunch. Both no-op silently if Claude isn't installed/running.
+///
+/// - Windows: `taskkill /IM Claude.exe` (no /F, that would SIGKILL) +
+///   re-launch via the resolved install path. Claude Desktop on Windows
+///   ships either as a per-user NSIS install (default
+///   `%LOCALAPPDATA%\Programs\claude-desktop\Claude.exe`) or via the
+///   maintainer's MSIX in `%LOCALAPPDATA%\AnthropicClaude\Claude.exe`.
+///   We probe both; whichever exists wins. If neither does, surface a
+///   clear error instead of silently no-oping.
 #[tauri::command]
 async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
-    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
 
-    // Best-effort quit. Status of `osascript` is non-fatal — if Claude isn't
-    // running, AppleScript returns an error that we treat as a no-op.
-    let _ = Command::new("osascript")
-        .args(["-e", "tell application \"Claude\" to quit"])
+        // Best-effort quit. Status of `osascript` is non-fatal — if Claude
+        // isn't running, AppleScript returns an error that we treat as a
+        // no-op.
+        let _ = Command::new("osascript")
+            .args(["-e", "tell application \"Claude\" to quit"])
+            .output();
+
+        // Give Claude a moment to actually shut down before relaunching,
+        // so `open -a` doesn't race with a still-quitting instance.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let out = Command::new("open").args(["-a", "Claude"]).output();
+        match out {
+            Ok(o) if o.status.success() => Ok(setup::StepResult {
+                ok: true,
+                message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+                details: None,
+            }),
+            Ok(o) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte Claude Desktop nicht starten.".into(),
+                details: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            }),
+            Err(e) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte `open -a Claude` nicht ausführen.".into(),
+                details: Some(e.to_string()),
+            }),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use crate::proc_ext::no_window;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        // Best-effort graceful close (no `/F`). If Claude is already gone
+        // taskkill returns exit code 128 — we don't surface that.
+        let _ = no_window(
+            Command::new("taskkill").args(["/IM", "Claude.exe"]),
+        )
         .output();
 
-    // Give Claude a moment to actually shut down before relaunching, so
-    // `open -a` doesn't race with a still-quitting instance.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Capture the path of the running Claude.exe *before* we tell it
+        // to quit — that's the most reliable way to find the right binary
+        // (covers MSIX/Store installs, custom install dirs, renames),
+        // beating any LOCALAPPDATA-based guess. After taskkill the process
+        // is gone and `sysinfo` would no longer see it, so the lookup
+        // happens here.
+        //
+        // Codex review of PR #128: the previous logic just took the first
+        // existing candidate path, which silently picks the older binary
+        // when both NSIS and MSIX installs coexist (mid-upgrade), and
+        // misses Store-installed Claudes entirely.
+        let running_exe: Option<PathBuf> = {
+            use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+            let sys = System::new_with_specifics(
+                RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+            );
+            sys.processes()
+                .values()
+                .find(|p| {
+                    p.name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("Claude.exe")
+                })
+                .and_then(|p| p.exe().map(|e| e.to_path_buf()))
+        };
 
-    let out = Command::new("open").args(["-a", "Claude"]).output();
-    match out {
-        Ok(o) if o.status.success() => Ok(setup::StepResult {
-            ok: true,
-            message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+        // Best-effort graceful close (no `/F`). Issued *after* we captured
+        // the path so we don't race with Windows tearing the process
+        // entry down. If Claude is already gone taskkill returns exit
+        // code 128 — we don't surface that.
+        let _ = no_window(
+            Command::new("taskkill").args(["/IM", "Claude.exe"]),
+        )
+        .output();
+
+        // Give Claude a moment to actually exit before relaunching.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // Hard-coded fallback paths covering the two known per-user
+        // installer flavours. Used only when no Claude.exe is currently
+        // running (cold-start case) — the live-process lookup above wins
+        // whenever it has a result.
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let candidates: Vec<PathBuf> = if local_app_data.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join("claude-desktop")
+                    .join("Claude.exe"),
+                PathBuf::from(&local_app_data)
+                    .join("AnthropicClaude")
+                    .join("Claude.exe"),
+            ]
+        };
+
+        // Resolution order: live process path → first existing fallback.
+        let exe: Option<PathBuf> = running_exe
+            .clone()
+            .or_else(|| candidates.iter().find(|p| p.exists()).cloned());
+
+        let Some(exe) = exe else {
+            // Surface every path we tried so the user can compare against
+            // their actual install location and report it back.
+            let mut tried: Vec<String> = candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            tried.insert(0, "(running Claude.exe — none found)".to_string());
+            return Ok(setup::StepResult {
+                ok: false,
+                message: "Claude Desktop nicht gefunden.".into(),
+                details: Some(format!(
+                    "Gesucht: {}. Bitte Claude Desktop manuell neu starten und den tatsächlichen Pfad melden, damit aiui ihn künftig findet.",
+                    tried.join(", "),
+                )),
+            });
+        };
+
+        // Spawn detached — we're the parent of a brand-new Claude process,
+        // but we don't want to keep its lifetime tied to ours.
+        match no_window(&mut Command::new(&exe)).spawn() {
+            Ok(_) => Ok(setup::StepResult {
+                ok: true,
+                message: "Claude Desktop neu gestartet — neuer aiui-Eintrag wird beim Boot geladen.".into(),
+                details: Some(format!("Gestartet: {}", exe.display())),
+            }),
+            Err(e) => Ok(setup::StepResult {
+                ok: false,
+                message: "Konnte Claude Desktop nicht starten.".into(),
+                details: Some(format!("{}: {e}", exe.display())),
+            }),
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        Ok(setup::StepResult {
+            ok: false,
+            message: "Restart Claude Desktop wird auf dieser Plattform nicht unterstützt.".into(),
             details: None,
-        }),
-        Ok(o) => Ok(setup::StepResult {
-            ok: false,
-            message: "Konnte Claude Desktop nicht starten.".into(),
-            details: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        }),
-        Err(e) => Ok(setup::StepResult {
-            ok: false,
-            message: "Konnte `open -a Claude` nicht ausführen.".into(),
-            details: Some(e.to_string()),
-        }),
+        })
     }
 }
 

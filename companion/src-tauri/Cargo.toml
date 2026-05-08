@@ -57,6 +57,13 @@ socket2 = "0.5"
 # `data:` URLs so the WebView can render them under the strict img-src
 # CSP. See companion/src-tauri/src/imageresolve.rs.
 base64 = "0.22"
+# Cross-platform default-browser launcher used by `open_url`. On Windows
+# it calls `ShellExecuteW` directly — no `cmd.exe`, so URLs containing
+# shell metacharacters (`&`, `|`, `^`, …) cannot be reinterpreted as a
+# command line. Required after Codex flagged the previous
+# `cmd /C start "" <url>` path as a renderer-reachable command-injection
+# surface (PR #128 review).
+open = "5"
 # Cross-platform process enumeration. Replaces the macOS-only
 # `ps -axo pid=,command=` shell-out in housekeeping.rs so the
 # stale-mcp-stdio-child sweep also works on Windows (no /proc, no `ps`).
