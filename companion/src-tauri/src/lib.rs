@@ -762,7 +762,7 @@ pub(crate) fn build_setup_window(
     WebviewWindowBuilder::new(
         app,
         SETUP_WINDOW_LABEL,
-        WebviewUrl::App("index.html".into()),
+        WebviewUrl::App("setup.html".into()),
     )
     .title("aiui")
     .inner_size(520.0, 480.0)
@@ -850,7 +850,7 @@ pub(crate) fn ensure_dialog_window(
     WebviewWindowBuilder::new(
         app,
         DIALOG_WINDOW_LABEL,
-        WebviewUrl::App("index.html".into()),
+        WebviewUrl::App("dialog.html".into()),
     )
     .title("aiui")
     // Initial size from `estimate_dialog_size` — we widen for
