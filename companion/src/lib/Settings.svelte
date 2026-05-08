@@ -216,8 +216,16 @@
 </script>
 
 {#if status}
-  <div class="stack">
-    <header class="app-header">
+  <main class="window-shell">
+    <!-- Outer `<header>` owns the shell padding (alignment with
+      .window-scroll / .window-footer); the inner `.app-header` owns
+      its component-internal flex layout and bottom border. Codex review
+      of PR #129: keeping both classes on the same element let
+      `.app-header`'s `padding: 4px 0 12px 0` overwrite the shell's
+      horizontal padding, so the header drifted left of the scroll
+      content. -->
+    <header class="window-header">
+    <div class="app-header">
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
@@ -252,8 +260,10 @@
         <div class="header-tagline">{$_("app.status.background")}</div>
       </div>
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
+    </div><!-- /.app-header -->
     </header>
 
+    <div class="window-scroll">
     <!-- Show the banner only when the live Rust-side TCP self-probe says
       the HTTP server isn't accepting connections. `status.http_error` is
       the explanatory text from the original bind-failure if any — but
@@ -461,7 +471,9 @@
       </section>
     {/if}
 
-    <div class="footer">
+    </div><!-- /.window-scroll -->
+
+    <footer class="window-footer">
       {#if confirmUninstall}
         <span class="subtitle" style="margin-right: auto; align-self: center;">
           {$_("settings.uninstall.confirm")}
@@ -483,8 +495,8 @@
           >{$_("settings.uninstall.button")}</button
         >
       {/if}
-    </div>
-  </div>
+    </footer>
+  </main>
 {/if}
 
 {#if uninstallDone}
@@ -514,9 +526,11 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    /* Native title bar (v0.4.30) supplies its own height; container
-       already pads 14 px on top. A small inner padding here lets the
-       header content breathe without pressing against the title bar. */
+    /* Vertical-only padding: the outer `<header class="window-header">`
+       owns the horizontal padding so this header stays flush with
+       `.window-scroll` and `.window-footer`. Vertical numbers tuned to
+       leave space for the title-bar boundary above and the bottom
+       border of the section below. Codex review of PR #129. */
     padding: 4px 0 12px 0;
     border-bottom: 1px solid var(--border);
   }

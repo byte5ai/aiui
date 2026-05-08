@@ -27,25 +27,27 @@
   }
 </script>
 
-<div class="stack">
-  {#if spec.header}<span class="chip">{spec.header}</span>{/if}
-  {#if spec.image}
-    <figure class="confirm-image" style={spec.image.max_height ? `max-height: ${spec.image.max_height}px` : ""}>
-      <img src={spec.image.src} alt={spec.image.alt ?? spec.title} />
-    </figure>
-  {/if}
-  <div>
-    <p class="title">{spec.title}</p>
-    {#if spec.message}<p class="subtitle">{spec.message}</p>{/if}
+<main class="window-shell">
+  <div class="window-scroll">
+    {#if spec.header}<span class="chip">{spec.header}</span>{/if}
+    {#if spec.image}
+      <figure class="confirm-image" style={spec.image.max_height ? `max-height: ${spec.image.max_height}px` : ""}>
+        <img src={spec.image.src} alt={spec.image.alt ?? spec.title} />
+      </figure>
+    {/if}
+    <div>
+      <p class="title">{spec.title}</p>
+      {#if spec.message}<p class="subtitle">{spec.message}</p>{/if}
+    </div>
   </div>
 
-  <div class="footer">
+  <footer class="window-footer">
     <button onclick={deny}>{spec.cancelLabel ?? $_("dialog.confirm.no")}</button>
     <button class={spec.destructive ? "danger" : "primary"} onclick={confirm}
       >{spec.confirmLabel ?? $_("dialog.confirm.yes")}</button
     >
-  </div>
-</div>
+  </footer>
+</main>
 
 <style>
   .confirm-image {

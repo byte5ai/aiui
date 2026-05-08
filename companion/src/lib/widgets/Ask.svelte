@@ -49,7 +49,8 @@
   let canSubmit = $derived(selected.size > 0 || (otherActive && other.trim().length > 0));
 </script>
 
-<div class="stack">
+<main class="window-shell">
+  <div class="window-scroll">
   {#if spec.header}<span class="chip">{spec.header}</span>{/if}
   <p class="title">{spec.question}</p>
 
@@ -95,8 +96,10 @@
     {/if}
   </div>
 
-  <div class="footer">
+  </div><!-- /.window-scroll -->
+
+  <footer class="window-footer">
     <button onclick={oncancel}>{$_("dialog.cancel")}</button>
     <button class="primary" disabled={!canSubmit} onclick={submit}>{$_("dialog.submit")}</button>
-  </div>
-</div>
+  </footer>
+</main>
