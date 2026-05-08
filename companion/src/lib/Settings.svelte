@@ -26,6 +26,9 @@
     welcome_pending: boolean;
     http_error: string | null;
     http_alive: boolean;
+    /** Lower-case OS identifier from the backend. Used to pick the right
+     * variant of OS-specific UI copy (e.g. uninstall instructions). */
+    os: "macos" | "windows" | "linux" | "other";
   };
   let status = $state<Status | null>(null);
   let newHost = $state("");
@@ -262,7 +265,9 @@
         {#if status.http_error}
           <p>{status.http_error}</p>
         {/if}
-        <p class="http-error-hint">{$_("settings.http_error.hint", { values: { port: status.http_port } })}</p>
+        <!-- OS-specific because the diagnostic command differs: `lsof` on
+          macOS, `Get-NetTCPConnection` on Windows, `ss` on Linux. -->
+        <p class="http-error-hint">{$_(`settings.http_error.hint.${status.os}`, { values: { port: status.http_port } })}</p>
       </section>
     {/if}
 
@@ -491,7 +496,10 @@
   <div class="modal-backdrop" role="presentation" onclick={() => (uninstallDone = false)}>
     <div class="modal" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
       <h2>{$_("settings.uninstall.done.title")}</h2>
-      <p>{$_("settings.uninstall.done.body")}</p>
+      <!-- The uninstall-removal hint is OS-specific: drag to Trash on macOS,
+        Apps & Features on Windows, etc. The backend reports `status.os` so
+        we don't need a separate platform-detection plugin. -->
+      <p>{$_(`settings.uninstall.done.body.${status?.os ?? "other"}`)}</p>
       <div class="modal-foot">
         <button class="primary danger" onclick={quitApp}>
           {$_("settings.uninstall.done.quit")}
