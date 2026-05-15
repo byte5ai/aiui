@@ -675,10 +675,20 @@ async fn render_dialog(
     let mut spec = spec;
     crate::imageresolve::resolve_local_paths(&mut spec);
     let body = json!({ "spec": spec });
+    // POST /render is long-poll: the GUI holds the response open
+    // until the user clicks submit/cancel or the companion-side
+    // `DIALOG_TTL` sweep fires (currently 2 h). Override the shared
+    // reqwest client's 300-s default per-call so the user has the
+    // full TTL to fill out the form. We add 60 s slack on top so a
+    // backend-side TTL cancel still reaches us cleanly before our
+    // own timeout. v0.4.41.
     let resp = http
         .post(&url)
         .bearer_auth(&token)
         .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            crate::dialog::DIALOG_TTL.as_secs() + 60,
+        ))
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
