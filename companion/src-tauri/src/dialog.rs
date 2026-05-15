@@ -9,6 +9,11 @@ use uuid::Uuid;
 pub struct DialogRequest {
     pub id: String,
     pub spec: serde_json::Value,
+    /// Companion-side TTL for this dialog, in seconds. Frontend reads
+    /// this to schedule warning banners (T-15 min, T-2 min) and an
+    /// auto-cancel slightly before the backend sweeps. Single source
+    /// of truth for "how long the user has" is here in Rust. v0.4.41.
+    pub ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,8 +34,13 @@ pub struct DialogResult {
 }
 
 /// How long an unresolved dialog may sit in the registry before opportunistic
-/// sweep cancels it. Bound for `cargo`-controlled tweaking later.
-pub const DIALOG_TTL: Duration = Duration::from_secs(5 * 60);
+/// sweep cancels it. Two hours — long enough to cover any realistic form
+/// the user could fill out without artificial pressure, short enough to
+/// auto-recover from a genuinely stuck WebView. v0.4.41 raised from 5 min
+/// after the 2026-05-06 Weekly-Planner feedback where complex forms hit
+/// the prior limit mid-fill. Frontend gets the value (via
+/// `DialogRequest.ttl_secs`) and surfaces it as countdown warnings.
+pub const DIALOG_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Hard cap on concurrently registered dialogs. When exceeded, the oldest
 /// entry is evicted so the map cannot grow without bound even under bursty

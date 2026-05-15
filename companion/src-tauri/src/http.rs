@@ -506,6 +506,10 @@ async fn render(
     let dr = DialogRequest {
         id: id.clone(),
         spec: req.spec,
+        // Sent so the frontend can schedule warning banners + auto-cancel
+        // a fraction before the backend sweep fires. Single source of
+        // truth lives in `DIALOG_TTL`. v0.4.41.
+        ttl_secs: DIALOG_TTL.as_secs(),
     };
 
     // ── Idle-restart check (#41) ────────────────────────────────────────

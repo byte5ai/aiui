@@ -81,6 +81,11 @@
     "confirm.yes": "Yes",
     "confirm.no": "No",
     "unknown_kind": "Unknown widget kind: {kind}",
-    "close": "Close"
+    "close": "Close",
+    "ttl": {
+      "yellow": "About {countdown} min left to submit — after that your input will be discarded automatically.",
+      "red": "Less than {countdown} until auto-cancel. Please submit or cancel now.",
+      "dismiss_aria": "Dismiss notice"
+    }
   }
 }
