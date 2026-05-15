@@ -2,6 +2,48 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.41] — 2026-05-06
+
+### Changed
+
+- **`DIALOG_TTL` raised from 5 min to 2 h.** A 5-min limit silently
+  killed any agent dialog the user took longer than that to fill in;
+  worst case the form returned `{cancelled: true, reason:
+  "ttl_expired"}` to the agent and the user's input was discarded
+  with no warning. 2 h covers any realistic form-filling session
+  without artificial pressure and is short enough to auto-recover
+  from a genuinely stuck WebView. Reported 2026-05-06 on the Weekly
+  Planner form.
+- **mcp-stdio `/render` HTTP client now per-call long-poll.** The
+  shared reqwest client keeps its 300-s default for /health,
+  /version, /update, etc., but POST /render gets an explicit
+  `.timeout(DIALOG_TTL + 60 s)` override so it doesn't trip the
+  300-s default during a long form. Without the override, every
+  reqwest timeout would race the backend TTL sweep and randomly
+  return a transport error instead of a clean cancellation.
+
+### Added
+
+- **Backend → frontend TTL handoff.** `DialogRequest` now carries
+  `ttl_secs`. Single source of truth for the deadline lives in
+  `DIALOG_TTL`; the frontend just reads what the backend declared.
+- **Countdown warning banners in the dialog window.** Two-stage:
+  - **T-15 min**: yellow, dismissible, *"Noch ca. {countdown} Min
+    zum Abschicken — danach werden die Eingaben automatisch
+    verworfen."*
+  - **T-2 min**: red, non-dismissible, *"Weniger als {countdown}
+    bis zum automatischen Abbruch. Bitte jetzt abschicken oder
+    abbrechen."*
+  - **T-5 s**: frontend auto-cancels via the existing `handleCancel`
+    code path, so the user's session ends with a clean close instead
+    of the backend's TTL sweep racing a last-second submit.
+- **Timers are per-dialog with full reset on every new
+  `dialog:show`.** A second dialog after the first submitted starts
+  with fresh banners + countdown; callbacks scheduled by the
+  previous dialog see a mismatched id and no-op, eliminating
+  stale-timer races. Cleanup also runs on submit, cancel, and
+  component-destroy.
+
 ## [0.4.40] — 2026-05-06
 
 ### Added

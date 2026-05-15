@@ -81,6 +81,11 @@
     "confirm.yes": "Ja",
     "confirm.no": "Nein",
     "unknown_kind": "Unbekannter Widget-Typ: {kind}",
-    "close": "Schließen"
+    "close": "Schließen",
+    "ttl": {
+      "yellow": "Noch ca. {countdown} Min zum Abschicken — danach werden die Eingaben automatisch verworfen.",
+      "red": "Weniger als {countdown} bis zum automatischen Abbruch. Bitte jetzt abschicken oder abbrechen.",
+      "dismiss_aria": "Hinweis ausblenden"
+    }
   }
 }
