@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.42] — 2026-05-16
+
+### Fixed
+
+- **Sibling `aiui --mcp-stdio` cleanup at child startup.** Claude
+  Desktop has been observed (2026-05-16) to occasionally spawn a fresh
+  `aiui --mcp-stdio` child without killing the previous one. Both
+  children attached to the lifetime socket, both registered their
+  prompt list, and Claude Desktop's slash-command routing then
+  couldn't decide which child owned `prompts/get` — `/aiui:health`,
+  `/aiui:version` etc. failed with "kein erkannter Befehl" even
+  though the prompts were correctly listed in the autocomplete.
+  Existing housekeeping covered stale-by-binary-path
+  (`kill_stale_mcp_stdio_children`) and stale-by-version
+  (`disk_version_if_stale`), but not stale-by-duplicate-spawn —
+  same path, same version, just two of them. New
+  `kill_sibling_mcp_stdio_with_same_grandparent` runs once at every
+  mcp-stdio startup: enumerates running `aiui --mcp-stdio`
+  processes, picks the ones whose **grandparent** PID matches ours
+  (= same Claude Desktop / Claude Code instance, via the
+  `disclaimer`/wrapper-process intermediate), and were started
+  **before** us, and sends them SIGTERM along with their wrapper.
+  Strict newer-kills-older rule prevents two simultaneously-started
+  duplicates from tearing each other down. No-op when grandparent
+  can't be resolved (terminal-launched mcp-stdio, orphans). Never
+  touches the grandparent itself (= Claude Desktop / Claude Code).
+  Cross-platform via the existing `sysinfo` snapshot path used by
+  the other housekeeping sweeps. Eight unit tests cover same-/
+  different-grandparent, newer-skip, unknown-noop, own-pid-skip,
+  and chain-break edge cases.
+
 ## [0.4.41] — 2026-05-06
 
 ### Changed
