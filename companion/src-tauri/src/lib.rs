@@ -940,6 +940,21 @@ pub fn run_mcp_stdio_only() {
         std::process::exit(0);
     }
 
+    // Multi-instance protection (v0.4.42): kill any older
+    // `aiui --mcp-stdio` siblings spawned by the same MCP client. Claude
+    // Desktop has been observed (2026-05-16) to occasionally spawn a
+    // fresh child without killing the previous one — when both attach
+    // to the lifetime socket and both register their prompt list,
+    // Claude Desktop's slash-command routing can't decide which child
+    // owns `prompts/get` and the slash-command fails with "kein
+    // erkannter Befehl". The newer child (us) wins; the older one
+    // gets SIGTERM, along with its disclaimer wrapper, so Claude
+    // Desktop can't immediately respawn the same race. Safe no-op if
+    // we can't resolve our own grandparent (terminal-launched
+    // mcp-stdio, orphaned process). Existing single-child setups are
+    // untouched: nothing to kill, function returns 0.
+    let _ = housekeeping::kill_sibling_mcp_stdio_with_same_grandparent();
+
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     logging::trace(&format!(
         "mcp-stdio: entering run loop, token_path={}",
