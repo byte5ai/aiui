@@ -116,6 +116,26 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Frontend silent-update gate (v0.4.43): returns `true` iff installing
+/// + relaunching right now would NOT disrupt anything the user is
+/// currently looking at. The silent updater path in `updater.ts` calls
+/// this before `downloadAndInstall` so a post-render auto-check can
+/// install a pending update **only** while the dialog window is idle.
+/// Without this, the v0.4.39 silent-mode-too-silent regression kept
+/// updates from ever shipping automatically — the v0.4.43 design is
+/// "install transparently when safe, never interrupt a live form".
+///
+/// Criterion: the dialog registry is empty (no pending render-call
+/// waiting on user input). We deliberately don't gate on Settings
+/// being open — the user is in Settings *intentionally*; an install
+/// + relaunch there is fine.
+#[tauri::command]
+async fn is_update_safe_to_install(
+    dialog_state: tauri::State<'_, Arc<dialog::DialogState>>,
+) -> Result<bool, String> {
+    Ok(dialog_state.stats().orphan_count == 0)
+}
+
 /// Called from the frontend right before showing a modal update dialog.
 /// An Accessory-mode app (LSUIElement) doesn't own a Dock entry, and macOS
 /// won't reliably bring its dialogs to the foreground — we temporarily
@@ -966,6 +986,35 @@ pub fn run_mcp_stdio_only() {
         let sock = lifetime::socket_path(&cfg.config_dir);
         // Keep the lifetime socket alive in parallel with stdio.
         tokio::spawn(lifetime::mcp_attach(sock));
+        // Periodic stale-binary self-check (v0.4.43, Codex review P1a):
+        // every 30 s we re-run disk_version_if_stale. If the on-disk
+        // bundle has been replaced (in-app update, manual DMG drop)
+        // since we started, we exit so Claude Desktop respawns us
+        // against the fresh binary. Without this, a child spawned
+        // before the update keeps running its old in-RAM code
+        // indefinitely — the exact failure mode that the 2026-05-23
+        // 0.4.40-children-survive-update cascade was driven by.
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Some(disk_version) = housekeeping::disk_version_if_stale() {
+                    eprintln!(
+                        "[aiui] mcp-stdio: periodic self-check: in-memory v{} \
+                         != on-disk v{}; exiting so Claude Desktop respawns \
+                         the fresh build.",
+                        env!("CARGO_PKG_VERSION"),
+                        disk_version
+                    );
+                    logging::trace(&format!(
+                        "mcp-stdio: periodic self-check fired — disk v{} \
+                         differs from in-memory v{}; exiting (clean)",
+                        disk_version,
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                    std::process::exit(0);
+                }
+            }
+        });
         mcp::run_stdio(cfg).await;
     });
 }
@@ -973,6 +1022,55 @@ pub fn run_mcp_stdio_only() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
+
+    // Process-lifetime advisory lock (v0.4.43). Held from the very
+    // first line of run() until the process dies. Two GUIs spawned in
+    // the same millisecond used to race for the lifetime-socket bind
+    // and the HTTP-port bind (Phase 1+2 of the 2026-05-23 cascade:
+    // 10 GUI restarts in 52 s, then `multi-instance-bind-race` +
+    // `http-bind-error` exits). With the lock, only the first
+    // arrival makes it past this check; subsequent invocations exit
+    // immediately and leave the running GUI untouched.
+    //
+    // Drop is bound to process death via `mem::forget` further down —
+    // we don't want it released while the GUI is still alive on a
+    // panic-unwind path.
+    let lock_path = cfg.config_dir.join("gui.lock");
+    let gui_lock = match housekeeping::ProcessLock::try_acquire(&lock_path) {
+        Ok(g) => g,
+        Err(e) => {
+            // Another aiui-GUI is alive and holds the lock. Exit
+            // immediately, traced so the post-mortem in /tmp/aiui-trace.log
+            // explains the silent disappearance.
+            logging::trace(&format!(
+                "[aiui] exit (gui-lock-busy): another aiui-GUI holds {} ({e}); \
+                 exiting without binding socket/http",
+                lock_path.display()
+            ));
+            // No pre_exit_cleanup here: we never opened tunnels nor
+            // mounted the HTTP server, so there's nothing to sweep.
+            std::process::exit(0);
+        }
+    };
+    logging::trace(&format!(
+        "[aiui] gui-lock acquired: {}",
+        gui_lock.path().display()
+    ));
+
+    // Pre-GUI sweep (v0.4.43, Codex review P2a): now that we hold the
+    // exclusive GUI lock, kill any aiui-mcp-stdio children that started
+    // *before* this GUI. They're necessarily from a previous GUI
+    // generation and may carry stale in-RAM code (the 2026-05-23
+    // 0.4.40-children-survive-update scenario). New GUI = new truth.
+    // Race-safe because only the lock-winner reaches this line.
+    let pre_gui_killed = housekeeping::kill_mcp_stdio_started_before_self();
+    if pre_gui_killed > 0 {
+        logging::trace(&format!(
+            "[aiui] startup: killed {pre_gui_killed} pre-GUI mcp-stdio child(ren); \
+             Claude Desktop will respawn them against the current binary"
+        ));
+    }
+
     let dialog_state = Arc::new(dialog::DialogState::new());
     let ui_acks = Arc::new(ack::AckRegistry::new());
     let lifetime_stats = Arc::new(lifetime::LifetimeStats::new());
@@ -1058,6 +1156,7 @@ pub fn run() {
             dialog_window_ready,
             close_window,
             surface_for_dialog,
+            is_update_safe_to_install,
             status,
             add_remote,
             remove_remote,
@@ -1351,7 +1450,28 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
-        .run(|_app, _event| {
+        .run(|app, event| {
+            // ExitRequested catch (v0.4.43, Codex review P0c). Cmd-Q,
+            // ⌘W on the last visible window, OS shutdown, and the
+            // Tauri-Updater's `.restart()` all funnel through this
+            // event. Before v0.4.43 we let the event fall through to
+            // Tauri's default handler, which terminated the process
+            // *without* running our `pre_exit_cleanup` — leaving the
+            // ssh-NTR tunnel children to launchd as orphans. That was
+            // the untraced exit path that the 2026-05-23 Phase-1 cascade
+            // (10 GUI restarts, no exit-reason in trace) ran on. We now
+            // sweep tunnels first, then let Tauri proceed.
+            //
+            // Note: we *don't* call api.prevent_exit() — the cleanup is
+            // fire-and-forget pre-shutdown, not a veto.
+            if let tauri::RunEvent::ExitRequested { .. } = &event {
+                let port = app
+                    .try_state::<Arc<config::AppConfig>>()
+                    .map(|cfg| cfg.http_port)
+                    .unwrap_or(7777);
+                housekeeping::pre_exit_cleanup(port, "tauri-exit-requested");
+            }
+
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
             // → Settings-Fenster nach vorn holen. `RunEvent::Reopen` is
             // a Mac-only variant, so this whole branch is gated.
@@ -1361,14 +1481,16 @@ pub fn run() {
             // tauri-plugin-single-instance, which surfaces the existing
             // window through its own callback (wired up at plugin init,
             // not here).
-            //
-            // Cmd-Q / window-close both just let the app terminate;
-            // auto-resurrect in mcp_attach brings aiui back when needed.
             #[cfg(target_os = "macos")]
             {
-                if let tauri::RunEvent::Reopen { .. } = _event {
-                    show_settings_window(_app);
+                if let tauri::RunEvent::Reopen { .. } = event {
+                    show_settings_window(app);
                 }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = event;
+                let _ = app;
             }
         });
 }

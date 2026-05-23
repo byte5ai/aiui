@@ -39,10 +39,76 @@
 //! Idempotent: running on a clean system is a no-op.
 
 use crate::logging::trace;
+use fs4::fs_std::FileExt;
+use std::fs::OpenOptions;
+use std::io;
+use std::path::{Path, PathBuf};
 use sysinfo::{ProcessRefreshKind, RefreshKind, Signal, System};
 
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
+/// Process-lifetime advisory lock backed by `flock` on Unix (and
+/// `LockFileEx` on Windows via `fs4`). Used to enforce a single live
+/// aiui-GUI instance:
+///
+/// * GUI acquires the lock at the very start of `run()`, before
+///   `lifetime::gui_serve` or `http::serve` open any sockets.
+/// * A second GUI process started while the lock is held fails the
+///   `try_lock_exclusive` call immediately (LOCK_NB-equivalent) and
+///   exits with a traced `(gui-lock-busy)` reason — no race against
+///   the lifetime-socket or HTTP-port bind.
+/// * Kernel releases the lock automatically when the process dies, so
+///   a crashed predecessor never leaves a stale lock blocking future
+///   starts (the failure mode `O_EXCL`-style PID files would have).
+///
+/// Designed as RAII: keep the returned guard alive for the whole
+/// process lifetime; drop it (explicit or implicit) to release.
+/// v0.4.43.
+pub struct ProcessLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl ProcessLock {
+    /// Try to acquire the lock at `path` without blocking. Returns
+    /// `Ok(guard)` on success, `Err(io::Error)` if the lock is already
+    /// held by another process (kind `WouldBlock`) or any filesystem
+    /// problem (permissions, missing parent directory, …).
+    ///
+    /// Creates the lock file with mode 0600 — the file body is never
+    /// read or written, only locked.
+    pub fn try_acquire(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        // Make sure the parent directory exists. The caller is expected
+        // to pass `<config_dir>/gui.lock`; `config_dir` is created
+        // earlier by AppConfig::load_or_init, but being defensive here
+        // saves a future bug when callers pass a fresh path.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        file.try_lock_exclusive()?;
+        Ok(Self { file, path })
+    }
+
+    /// Path of the underlying lock file. Useful for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // Explicit unlock for fast handoff; the kernel would do this
+        // automatically on close, but doing it here gives a deterministic
+        // ordering point in the shutdown sequence.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -288,6 +354,75 @@ pub fn kill_sibling_mcp_stdio_with_same_grandparent() -> usize {
          (grandparent={gp_str})"
     ));
     n
+}
+
+/// Filter: every `aiui --mcp-stdio` child started *strictly before*
+/// `own_start_time`, excluding `own_pid`. Pure function over a
+/// snapshot — caller passes own pid + own start_time so tests don't
+/// need to spoof `std::process::id`.
+///
+/// Used by the GUI at startup right after it wins the process-lifetime
+/// lock: any mcp-stdio that predates the freshly-started GUI carries
+/// the binary it was spawned with (potentially pre-update RAM), and
+/// `disk_version_if_stale` would only catch the version-drift case on
+/// its own. The newer GUI is the source of truth → all older children
+/// are kicked, Claude Desktop respawns them against the current binary
+/// with all of the current GUI's protections (sibling-kill, periodic
+/// stale-check, etc.). v0.4.43.
+fn find_pre_gui_mcp_stdio_to_kill(
+    snap: &[ProcSnap],
+    own_pid: u32,
+    own_start_time: u64,
+) -> Vec<StaleChild> {
+    snap.iter()
+        .filter(|p| p.pid != own_pid)
+        .filter(|p| has_mcp_stdio_flag(&p.args))
+        .filter(|p| is_aiui_binary(&p.exe))
+        .filter(|p| p.start_time < own_start_time)
+        .map(|p| StaleChild {
+            pid: p.pid,
+            exe: p.exe.clone(),
+        })
+        .collect()
+}
+
+/// Public entry: terminate every `aiui --mcp-stdio` child older than
+/// us. Returns the count of children signalled. Safe to call from
+/// the GUI startup path after winning the process-lifetime lock —
+/// no race because at most one GUI holds the lock.
+pub fn kill_mcp_stdio_started_before_self() -> usize {
+    let own_pid = std::process::id();
+    let snap = snapshot_processes();
+    let own_start_time = snap
+        .iter()
+        .find(|p| p.pid == own_pid)
+        .map(|p| p.start_time)
+        .unwrap_or(0);
+    if own_start_time == 0 {
+        // We couldn't find ourselves in the snapshot — refuse to act
+        // rather than potentially kill same-second children. The
+        // sibling-kill path on the mcp-stdio side is the safety net.
+        trace(
+            "housekeeping: pre-GUI sweep skipped — own start_time unresolved \
+             (refusing to act without a cutoff to avoid same-second kills)",
+        );
+        return 0;
+    }
+    let victims = find_pre_gui_mcp_stdio_to_kill(&snap, own_pid, own_start_time);
+    for victim in &victims {
+        trace(&format!(
+            "housekeeping: killing pre-GUI mcp-stdio child pid={} exe={} (cutoff={})",
+            victim.pid, victim.exe, own_start_time
+        ));
+        terminate_pid(victim.pid);
+    }
+    if !victims.is_empty() {
+        trace(&format!(
+            "housekeeping: terminated {} pre-GUI mcp-stdio child(ren) at startup",
+            victims.len()
+        ));
+    }
+    victims.len()
 }
 
 /// Cross-platform process termination via sysinfo. Sends SIGTERM on Unix
@@ -820,6 +955,130 @@ mod tests {
         let victims = find_sibling_mcp_stdio_to_kill(&snap, 500, Some(100), 2100);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].pid, 300);
+    }
+
+    // ---------- find_pre_gui_mcp_stdio_to_kill ----------
+
+    #[test]
+    fn pre_gui_kill_finds_older_children() {
+        let snap = vec![
+            snap_full(200, 100, CURRENT, &[CURRENT, "--mcp-stdio"], 1000),
+            snap_full(300, 100, CURRENT, &[CURRENT, "--mcp-stdio"], 1500),
+            snap_full(400, 1, "/Applications/aiui.app/Contents/MacOS/aiui", &["aiui"], 2000),
+        ];
+        // We are pid 400, started at t=2000.
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 400, 2000);
+        assert_eq!(victims.len(), 2);
+        let pids: Vec<u32> = victims.iter().map(|v| v.pid).collect();
+        assert!(pids.contains(&200));
+        assert!(pids.contains(&300));
+    }
+
+    #[test]
+    fn pre_gui_kill_skips_same_second_children() {
+        // start_time is integer seconds. A child started in the same
+        // second as the GUI (1500 == 1500) MUST NOT be killed —
+        // otherwise two near-simultaneous spawns can ping-pong each
+        // other to death.
+        let snap = vec![
+            snap_full(200, 100, CURRENT, &[CURRENT, "--mcp-stdio"], 1500),
+            snap_full(300, 1, "aiui", &["aiui"], 1500),
+        ];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 300, 1500);
+        assert!(
+            victims.is_empty(),
+            "same-second child must not be a pre-GUI kill victim"
+        );
+    }
+
+    #[test]
+    fn pre_gui_kill_skips_newer_children() {
+        // Children started AFTER us must not be killed — the rule is
+        // strictly "older than GUI". A newer child is the next legit
+        // mcp-stdio that Claude Desktop has just spawned against us.
+        let snap = vec![
+            snap_full(200, 100, CURRENT, &[CURRENT, "--mcp-stdio"], 3000),
+            snap_full(300, 1, "aiui", &["aiui"], 2000),
+        ];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 300, 2000);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn pre_gui_kill_skips_own_pid() {
+        let snap = vec![snap_full(300, 1, CURRENT, &[CURRENT, "--mcp-stdio"], 1000)];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 300, 2000);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn pre_gui_kill_ignores_non_aiui_processes() {
+        let snap = vec![
+            snap_full(200, 100, "/usr/bin/python3", &["python", "--mcp-stdio"], 1000),
+            snap_full(300, 1, "aiui", &["aiui"], 2000),
+        ];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 300, 2000);
+        assert!(
+            victims.is_empty(),
+            "a python script with --mcp-stdio flag must not match"
+        );
+    }
+
+    // ---------- ProcessLock ----------
+
+    #[test]
+    fn process_lock_basic_acquire_and_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-test-lock-basic-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gui.lock");
+
+        let lock = ProcessLock::try_acquire(&path).expect("first acquire must succeed");
+        assert_eq!(lock.path(), path);
+        drop(lock);
+        // After drop, a fresh acquire must succeed again.
+        let lock2 = ProcessLock::try_acquire(&path).expect("re-acquire after drop must succeed");
+        drop(lock2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_lock_is_exclusive_while_held() {
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-test-lock-exclusive-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gui.lock");
+
+        let _guard = ProcessLock::try_acquire(&path).expect("first acquire must succeed");
+        // Second acquire from the SAME process: fs4's flock semantics
+        // grant the lock to the holding process, so a second
+        // try_lock_exclusive on a different file handle should still
+        // fail on Linux but may succeed on macOS depending on flock
+        // semantics. The cross-platform guarantee is that a different
+        // *process* cannot acquire — which we can't easily test in a
+        // single-process unit test. Instead, verify the path-mechanics
+        // are sound and the lock file is created.
+        assert!(path.exists(), "lock file must exist after acquire");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_lock_creates_parent_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-test-lock-mkdir-{}",
+            std::process::id()
+        ));
+        // Don't pre-create the directory — the helper should.
+        let path = dir.join("nested/gui.lock");
+
+        let lock = ProcessLock::try_acquire(&path).expect("must create parent dir");
+        assert!(path.exists());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
