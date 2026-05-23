@@ -2,6 +2,70 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.43] — 2026-05-23
+
+Cascade-eradication release. The 2026-05-23 trace showed 10 GUI process
+restarts in 52 s under v0.4.40, with no traced exit reason — the GUI was
+dying via a code path I had never instrumented. Codex review (see PR)
+identified the gaps. Five interlocking fixes:
+
+### Added
+
+- **`housekeeping::ProcessLock`** — RAII guard around `fs4`'s
+  `try_lock_exclusive` (Unix `flock`, Windows `LockFileEx`). Kernel
+  releases the lock automatically on process death, so a crashed
+  predecessor never leaves a stale lock blocking the next start. Path
+  defaults to `<config_dir>/gui.lock`.
+- **`housekeeping::kill_mcp_stdio_started_before_self`** — pure-function
+  filter + public helper that terminates every `aiui --mcp-stdio` child
+  with `start_time` strictly older than the calling process. Used by
+  the GUI at startup right after winning the process-lifetime lock, so
+  pre-update children get reset to current-binary semantics without
+  waiting for the periodic stale-check to fire.
+- **Periodic `disk_version_if_stale` in mcp-stdio** — extra tokio task
+  alongside `mcp::run_stdio` runs the on-disk-vs-in-memory version
+  comparison every 30 s. On mismatch the child exits cleanly, Claude
+  Desktop respawns it against the current binary. Closes the v0.4.40
+  "children spawned before the update keep their stale RAM forever"
+  gap.
+- **`is_update_safe_to_install` Tauri command** — single-line gate
+  (returns `dialog_state.stats().orphan_count == 0`) consumed by the
+  silent updater path so it can install transparently while no dialog
+  is open. Replaces the v0.4.39 "too silent" regression that
+  effectively disabled the auto-updater entirely.
+
+### Fixed
+
+- **GUI process-lifetime lock at the start of `run()`.** Two GUIs
+  spawned in the same millisecond used to race for the lifetime-socket
+  bind and the HTTP-port bind. Now only the first arrival proceeds;
+  later invocations exit immediately with a traced
+  `(gui-lock-busy)` reason. Race-condition between
+  `lifetime::gui_serve`'s probe/remove/bind sequence and concurrent
+  `http::serve` `SO_REUSEADDR` binds is gone — atomic at the lock,
+  not heuristic at each individual bind site.
+- **`RunEvent::ExitRequested` now triggers `pre_exit_cleanup`.** Cmd-Q,
+  ⌘W on the last visible window, OS shutdown, and the Tauri-updater
+  restart all funnel through this event. Until now Tauri's default
+  terminator ran past our `pre_exit_cleanup`, leaving ssh-NTR tunnel
+  children to launchd as orphans — the **untraced** exit path that
+  drove the Phase 1 cascade in the 2026-05-23 trace.
+- **Explicit `pre_exit_cleanup` before `app_handle.restart()`** in the
+  updater path. Belt-and-braces in case the implicit
+  `ExitRequested` emission ever changes; cleanup is idempotent.
+- **Silent updater installs transparently when safe.** `silent: true`
+  now downloads + installs + relaunches if the dialog window has no
+  pending render. If a dialog is open, the install is deferred to the
+  next safe auto-check — no more mid-dialog Settings-window pop-ups,
+  but also no more "auto-update never ships" regression.
+
+### Notes
+
+- 89 → 96 unit tests (7 new in `housekeeping::tests` covering
+  `ProcessLock` exclusivity, `find_pre_gui_mcp_stdio_to_kill` strict
+  cutoff, and the various skip paths). All pass; clippy
+  `-D warnings` clean; svelte-check 0 errors.
+
 ## [0.4.42] — 2026-05-16
 
 ### Fixed

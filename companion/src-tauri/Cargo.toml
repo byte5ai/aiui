@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.4.42"
+version = "0.4.43"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""
@@ -68,3 +68,10 @@ open = "5"
 # `ps -axo pid=,command=` shell-out in housekeeping.rs so the
 # stale-mcp-stdio-child sweep also works on Windows (no /proc, no `ps`).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Cross-platform advisory file lock (`flock`-equivalent). Used by the
+# process-lifetime lock in housekeeping::ProcessLock to enforce a
+# single live GUI instance — the kernel drops the lock automatically
+# when our process dies, so we never leak stale lock files. v0.4.43,
+# after Codex review (PR #131 follow-up) flagged the probe/remove/bind
+# race in lifetime::gui_serve.
+fs4 = { version = "0.12", features = ["sync"] }

@@ -432,9 +432,19 @@ async fn update(
     // Install succeeded. Schedule the relaunch AFTER we've returned this
     // response so the agent receives the version delta. 500ms is plenty for
     // Axum to flush + close the TCP write side before exit.
+    //
+    // v0.4.43: explicit pre_exit_cleanup before `.restart()`. The
+    // Tauri-internal restart path *does* emit RunEvent::ExitRequested
+    // (which our `run`-callback catches), so this is belt-and-braces
+    // — but a duplicate cleanup is cheap (idempotent sweep) and
+    // guarantees the ssh-NTR children die before the new process tries
+    // to claim their port. Without this, a previous bug had the
+    // restart's tunnels racing the new GUI's startup-sweep.
     let app_handle = state.app.clone();
+    let http_port = state.cfg.http_port;
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        crate::housekeeping::pre_exit_cleanup(http_port, "updater-restart");
         trace("update: restarting into new binary");
         app_handle.restart();
     });
