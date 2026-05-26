@@ -70,6 +70,8 @@
     "uninstall.done.body.other": "Konfiguration ist weg. Klick rechts auf den roten Beenden-Button und entferne aiui anschließend über deinen Paketmanager — eine laufende App kann sich nicht selbst entfernen.",
     "uninstall.done.quit": "aiui beenden",
     "updates.check": "Nach Updates suchen",
+    "pending_update.text": "aiui {version} ist verfügbar.",
+    "pending_update.install": "Installieren",
     "report.button": "Problem melden",
     "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt."
   },

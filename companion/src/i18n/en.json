@@ -70,6 +70,8 @@
     "uninstall.done.body.other": "Configuration is gone. Click the red Quit button on the right, then remove aiui via your package manager — a running app can't remove itself.",
     "uninstall.done.quit": "Quit aiui",
     "updates.check": "Check for updates",
+    "pending_update.text": "aiui {version} is available.",
+    "pending_update.install": "Install",
     "report.button": "Report issue",
     "report.hint": "Opens a new GitHub issue with version and build pre-filled."
   },
