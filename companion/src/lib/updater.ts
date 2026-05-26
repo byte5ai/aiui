@@ -49,35 +49,26 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
 
   // Update available.
   if (opts.silent) {
-    // Check whether installing right now would interrupt a live
-    // dialog. The Rust side returns false iff `DialogState` has any
-    // pending render — in that case we defer until the next
-    // auto-check cycle (post-render, window-focus, or mount fires
-    // again later). Otherwise we install transparently, no prompt.
-    let safe = false;
+    // v0.4.44: notification-first instead of transparent-install. We
+    // record the available version in the Rust-side `PendingUpdate`
+    // state; Settings.svelte reads that on mount and renders a
+    // non-modal banner ("Update auf v{version} verfügbar —
+    // Installieren"). Rust also broadcasts an `update:available`
+    // event so a live Settings window updates its banner immediately.
+    // No `downloadAndInstall` here — the user opts in by clicking
+    // the banner (which calls back into this function with
+    // `silent: false`), so a long form mid-fill is never interrupted
+    // by a sudden restart. The 0.4.43 silent-install path is gone:
+    // it solved the mid-dialog UI problem but left the user
+    // completely unaware that an update happened, which the user
+    // flagged on 2026-05-26.
     try {
-      safe = await invoke<boolean>("is_update_safe_to_install");
-    } catch (e) {
-      console.debug(`[aiui] silent updater safety check failed: ${e}`);
-      return;
-    }
-    if (!safe) {
+      await invoke("set_pending_update", { version: update.version });
       console.debug(
-        `[aiui] update ${update.version} available — deferred, dialog pending`,
+        `[aiui] update ${update.version} available — pending banner set, no install yet`,
       );
-      return;
-    }
-    console.debug(
-      `[aiui] silent install of ${update.version} (dialog idle); relaunching afterwards`,
-    );
-    try {
-      await update.downloadAndInstall();
-      await relaunch();
     } catch (e) {
-      // Install failure during silent path: don't surface UI (would
-      // pop a banner mid-session), just log. Manual "Nach Updates
-      // suchen" click can retry with full error reporting.
-      console.debug(`[aiui] silent install failed: ${e}`);
+      console.debug(`[aiui] failed to record pending update: ${e}`);
     }
     return;
   }
@@ -94,5 +85,13 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   if (!wantInstall) return;
 
   await update.downloadAndInstall();
+  // Clear the pending-update banner before relaunch — once the new
+  // binary is on disk the banner would be stale (version === current
+  // after relaunch, no longer a pending update).
+  try {
+    await invoke("clear_pending_update");
+  } catch (e) {
+    console.debug(`[aiui] clear_pending_update failed (continuing): ${e}`);
+  }
   await relaunch();
 }

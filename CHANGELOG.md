@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.44] — 2026-05-26
+
+Two fixes that close the loop on yesterday's structural changes.
+
+### Fixed
+
+- **`RunEvent::ExitRequested` now vetoes when the GUI is still
+  needed.** v0.4.43 traced the event and ran `pre_exit_cleanup`, but
+  did not actually stop Tauri's default terminator. Result: the GUI
+  still died ~18 ms after every dialog submit on macOS — Tauri's
+  default behaviour for "last visible window closed" reached
+  `ExitRequested` *after* my `on_window_event` returned, and the
+  process exited regardless. v0.4.44 calls `api.prevent_exit()`
+  whenever `LifetimeStats.child_count > 0` **or** the dialog registry
+  has a pending render. The lifetime-grace timer (60 s after the last
+  child detaches) remains the only legitimate "everyone's gone,
+  really exit" trigger in normal operation. Explicit exits (`app.exit`
+  with a code, lifetime-grace-expired) still run cleanup and proceed.
+
+### Added
+
+- **Pending-update banner in Settings (notification-first auto-update).**
+  Replaces the v0.4.43 transparent-silent-install with a model the
+  user actually notices. The periodic auto-check (now 6 h cadence,
+  raised from 30 min) writes the available version into a new
+  Rust-side `PendingUpdate` state and broadcasts an
+  `update:available` event. Settings.svelte renders a non-modal
+  yellow banner at the top of the window: *"aiui v0.4.X ist
+  verfügbar — [Installieren]"*. The Install button routes through the
+  manual `checkForUpdates({ silent: false })` path so the user always
+  sees the native confirmation modal before anything restarts. Banner
+  clears automatically once the on-disk version catches up. No more
+  mid-dialog interruptions, no more silent installs the user never
+  knows about — both regressions from v0.4.39 / v0.4.43 closed.
+
+### Notes
+
+- New Tauri commands: `set_pending_update`, `clear_pending_update`,
+  both consumed by `updater.ts`.
+- `StatusReport` gains a `pending_update: Option<String>` field so a
+  Settings window that opens *after* the auto-check fires still
+  picks up the banner via its 2 s status poll.
+- 89 unit tests still pass; clippy `-D warnings` clean; svelte-check
+  0 errors. Veto logic deliberately not unit-tested as a pure
+  function — extracting it from the `RunEvent` closure was more
+  invasive than the test value justified.
+
 ## [0.4.43] — 2026-05-23
 
 Cascade-eradication release. The 2026-05-23 trace showed 10 GUI process

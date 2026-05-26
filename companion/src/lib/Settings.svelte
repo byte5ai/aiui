@@ -29,6 +29,12 @@
     /** Lower-case OS identifier from the backend. Used to pick the right
      * variant of OS-specific UI copy (e.g. uninstall instructions). */
     os: "macos" | "windows" | "linux" | "other";
+    /** When the periodic auto-check found a newer release (set by
+     * `set_pending_update` in updater.ts silent path). Settings shows a
+     * non-modal banner with this version + an "Installieren" button.
+     * Cleared once the user installs (clear_pending_update) or once
+     * the on-disk version catches up. v0.4.44. */
+    pending_update: string | null;
   };
   let status = $state<Status | null>(null);
   let newHost = $state("");
@@ -206,9 +212,31 @@
     }
   }
 
+  /** Triggered by the "Installieren" button on the pending-update
+   * banner. Routes through the manual `checkForUpdates` path so the
+   * user sees the native modal confirmation ("install v0.4.X?") and
+   * we don't bypass the explicit-consent step. v0.4.44. */
+  async function installPendingUpdate() {
+    if (busy) return;
+    busy = true;
+    try {
+      await checkForUpdates({ silent: false });
+    } finally {
+      busy = false;
+    }
+  }
+
   onMount(() => {
     refresh();
     timer = window.setInterval(refresh, 2000);
+    // Listen for the cross-window `update:available` broadcast from
+    // Rust so the banner refreshes immediately when the silent
+    // updater detects a new version, not only on the 2 s status poll.
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      void listen<string | null>("update:available", (e) => {
+        if (status) status = { ...status, pending_update: e.payload ?? null };
+      });
+    });
   });
   onDestroy(() => {
     if (timer) window.clearInterval(timer);
@@ -262,6 +290,26 @@
       <div class="build-info" title={status.build_info}>{status.build_info.split(" ")[1]}</div>
     </div><!-- /.app-header -->
     </header>
+
+    <!-- Pending-update banner (v0.4.44). Non-modal, dismiss-free: it
+         sits above the scroll region until the user clicks Install or
+         the on-disk version catches up (Rust clears the flag after
+         relaunch). No timer-driven popups, no mid-dialog disruption —
+         the user opens Settings and the banner is just there. -->
+    {#if status.pending_update}
+      <div class="update-banner" role="status" aria-live="polite">
+        <span class="update-banner-text">
+          {$_("settings.pending_update.text", { values: { version: status.pending_update } })}
+        </span>
+        <button
+          class="update-banner-button"
+          onclick={installPendingUpdate}
+          disabled={busy}
+        >
+          {$_("settings.pending_update.install")}
+        </button>
+      </div>
+    {/if}
 
     <div class="window-scroll">
     <!-- Show the banner only when the live Rust-side TCP self-probe says
@@ -522,6 +570,46 @@
 {/if}
 
 <style>
+  /* Pending-update banner (v0.4.44). Lives between .window-header and
+     .window-scroll as a flex sibling so it inherits the shell's
+     horizontal padding. Yellow accent for "informational, action
+     available" without screaming. */
+  .update-banner {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 8px 20px 0 20px;
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning, #f3c623) 60%, var(--border));
+    background: color-mix(in srgb, var(--warning, #f3c623) 18%, var(--bg, #fff));
+    color: color-mix(in srgb, var(--warning, #f3c623) 70%, var(--fg, #000));
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.4;
+  }
+  .update-banner-text {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .update-banner-button {
+    flex: 0 0 auto;
+    background: var(--warning, #f3c623);
+    color: var(--bg, #fff);
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .update-banner-button:hover {
+    filter: brightness(0.95);
+  }
+  .update-banner-button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
   .app-header {
     display: flex;
     align-items: center;
