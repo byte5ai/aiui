@@ -14,7 +14,7 @@ mod skill;
 mod tunnel;
 
 use std::sync::Arc;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Tauri window labels. Setup and dialog live in *separate* windows so:
 ///  • the agent's dialog never visually overlaps the user's settings,
@@ -160,6 +160,48 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Pending-update state (v0.4.44). Holds the version string Tauri's
+/// updater plugin reported as the newest available release, set by
+/// the silent auto-check path; consumed by the Settings banner. Newtype
+/// so Tauri's `State<T>` can distinguish it from other
+/// `Arc<Mutex<Option<String>>>`-typed state (notably `http_error`).
+#[derive(Default)]
+pub struct PendingUpdate(pub std::sync::Mutex<Option<String>>);
+
+#[tauri::command]
+async fn set_pending_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<PendingUpdate>>,
+    version: String,
+) -> Result<(), String> {
+    let trimmed = version.trim();
+    let new_value = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    if let Ok(mut slot) = state.0.lock() {
+        *slot = new_value.clone();
+    }
+    // Notify every window — both setup and dialog can re-read status
+    // and refresh their banner accordingly. The dialog window will
+    // typically ignore it, the setup window's banner reacts.
+    let _ = app.emit("update:available", &new_value);
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_pending_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<PendingUpdate>>,
+) -> Result<(), String> {
+    if let Ok(mut slot) = state.0.lock() {
+        *slot = None;
+    }
+    let _ = app.emit("update:available", &None::<String>);
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct StatusReport {
     app_binary_path: String,
@@ -204,6 +246,11 @@ struct StatusReport {
     /// uninstall instructions: drag to Trash vs. Apps & Features) without
     /// pulling in `@tauri-apps/plugin-os`. Set once at compile time.
     os: &'static str,
+    /// `Some(version)` when the periodic auto-update check has found a
+    /// newer release that hasn't been installed yet. Drives the
+    /// non-modal banner in Settings ("Update auf v0.4.X verfügbar —
+    /// Installieren"). v0.4.44.
+    pending_update: Option<String>,
 }
 
 const fn current_os() -> &'static str {
@@ -223,6 +270,7 @@ async fn status(
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
+    pending_update: tauri::State<'_, Arc<PendingUpdate>>,
 ) -> Result<StatusReport, String> {
     let bin = setup::app_binary_path();
     let http_alive = probe_http_self(&cfg).await;
@@ -241,6 +289,7 @@ async fn status(
         http_error: http_err.lock().ok().and_then(|s| s.clone()),
         http_alive,
         os: current_os(),
+        pending_update: pending_update.0.lock().ok().and_then(|s| s.clone()),
     })
 }
 
@@ -1083,6 +1132,20 @@ pub fn run() {
     let http_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
 
+    // Pending-update state (v0.4.44). Set by the silent updater path
+    // in `updater.ts` whenever the periodic auto-check finds a newer
+    // release; read by Settings.svelte to render a non-modal banner
+    // ("Update auf v0.4.X verfügbar — Installieren"). Replaces the
+    // 0.4.43 transparent-silent-install with a notification-first
+    // model: user sees the banner the next time they open Settings,
+    // clicks Install to surface the modal confirmation. No more
+    // mid-dialog interruptions, no more silent installs the user
+    // never knows about.
+    //
+    // Wrapped in a newtype so Tauri's `State<T>` resolution can tell
+    // it apart from `http_error` (same underlying type).
+    let pending_update = Arc::new(PendingUpdate::default());
+
     // Window-ready handshake: the dialog window's frontend signals
     // here (via the `dialog_window_ready` Tauri command) once its
     // listeners are wired up. The render path *waits* on this watch
@@ -1147,6 +1210,7 @@ pub fn run() {
         .manage(lifetime_stats.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
+        .manage(pending_update.clone())
         .manage(dialog_ready_tx.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
@@ -1157,6 +1221,8 @@ pub fn run() {
             close_window,
             surface_for_dialog,
             is_update_safe_to_install,
+            set_pending_update,
+            clear_pending_update,
             status,
             add_remote,
             remove_remote,
@@ -1451,25 +1517,63 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error building tauri application")
         .run(|app, event| {
-            // ExitRequested catch (v0.4.43, Codex review P0c). Cmd-Q,
-            // ⌘W on the last visible window, OS shutdown, and the
-            // Tauri-Updater's `.restart()` all funnel through this
-            // event. Before v0.4.43 we let the event fall through to
-            // Tauri's default handler, which terminated the process
-            // *without* running our `pre_exit_cleanup` — leaving the
-            // ssh-NTR tunnel children to launchd as orphans. That was
-            // the untraced exit path that the 2026-05-23 Phase-1 cascade
-            // (10 GUI restarts, no exit-reason in trace) ran on. We now
-            // sweep tunnels first, then let Tauri proceed.
+            // ExitRequested handler (v0.4.43 introduced cleanup; v0.4.44
+            // adds the veto for the "headless mode" case). Tauri fires
+            // ExitRequested on Cmd-Q, on ⌘W of the last visible
+            // window, on OS shutdown, and on `.restart()`. The
+            // last-window-close case is the dangerous one: as soon as
+            // the agent's dialog window closes after a submit, Tauri
+            // wants to terminate the process — but that's wrong while
+            // the GUI is meant to live headless serving the lifetime
+            // socket. v0.4.42 lost the GUI ~18 ms after every Dialog
+            // submit through this path (trace 2026-05-26 17:00:28.181
+            // → 17:00:28.199); the dialog-window-close branch of
+            // on_window_event already returned without exit, but
+            // Tauri's default ExitRequested handler ran *after* it
+            // and killed the process anyway.
             //
-            // Note: we *don't* call api.prevent_exit() — the cleanup is
-            // fire-and-forget pre-shutdown, not a veto.
-            if let tauri::RunEvent::ExitRequested { .. } = &event {
+            // Resolution rule:
+            //   • Anyone still depending on us — an attached
+            //     mcp-stdio child or a pending dialog — ⇒ veto the
+            //     exit via `api.prevent_exit()`. The lifetime-grace
+            //     timer (60 s after the last child detaches) remains
+            //     the *only* legitimate "everyone's gone, really
+            //     exit" signal in normal operation.
+            //   • Nobody attached and no pending dialog ⇒ honour the
+            //     exit, but run pre_exit_cleanup first so any ssh-NTR
+            //     tunnel children get SIGTERM instead of becoming
+            //     launchd orphans.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                let attached = app
+                    .try_state::<Arc<lifetime::LifetimeStats>>()
+                    .map(|s| s.child_count())
+                    .unwrap_or(0);
+                let pending_dialogs = app
+                    .try_state::<Arc<dialog::DialogState>>()
+                    .map(|s| s.stats().orphan_count)
+                    .unwrap_or(0);
+
+                if code.is_none() && (attached > 0 || pending_dialogs > 0) {
+                    // Tauri-initiated quit (no explicit exit code).
+                    // Someone still needs us — keep the process alive.
+                    logging::trace(&format!(
+                        "[aiui] veto tauri-exit-requested: attached_children={attached}, \
+                         pending_dialogs={pending_dialogs}"
+                    ));
+                    api.prevent_exit();
+                    return;
+                }
+
                 let port = app
                     .try_state::<Arc<config::AppConfig>>()
                     .map(|cfg| cfg.http_port)
                     .unwrap_or(7777);
-                housekeeping::pre_exit_cleanup(port, "tauri-exit-requested");
+                let reason = if code.is_some() {
+                    "tauri-exit-requested-explicit"
+                } else {
+                    "tauri-exit-requested-no-attached"
+                };
+                housekeeping::pre_exit_cleanup(port, reason);
             }
 
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.

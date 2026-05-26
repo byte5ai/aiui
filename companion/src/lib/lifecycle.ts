@@ -10,15 +10,19 @@
 //   • on window focus (covers wake-from-sleep and "user came back to the
 //     Mac" without needing an OS-level event hook).
 //
-// A 30-minute cooldown debounces bursts so a chatty session doesn't
-// hammer the GitHub release endpoint. Both windows share the cooldown
-// shape independently — the duplicate hits are still well below GitHub's
-// rate limit.
+// v0.4.44 raised the cooldown from 30 min to 6 h. The check itself is
+// cheap, but with the new notification-first model (silent path sets a
+// pending-update flag instead of installing) we don't need bursty
+// re-checks — once the flag is set, the banner stays until the user
+// installs or the version on disk catches up. Six hours is the
+// "approximate daily" rhythm the user asked for on 2026-05-26: a
+// chatty session won't hammer the GitHub release endpoint, but a
+// long-running GUI still picks up new releases the same day.
 
 import { listen } from "@tauri-apps/api/event";
 import { checkForUpdates } from "./updater";
 
-const UPDATE_COOLDOWN_MS = 30 * 60 * 1000;
+const UPDATE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 let lastUpdateCheck = 0;
 
 function maybeCheckForUpdates(reason: string) {
