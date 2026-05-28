@@ -1,6 +1,7 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { _ } from "svelte-i18n";
   import { onMount } from "svelte";
   import Ask from "./widgets/Ask.svelte";
@@ -159,6 +160,28 @@
 
     window.addEventListener("keydown", onKey);
 
+    // Window-close → cancel (v0.4.45, Bug #1). When the user closes the
+    // dialog window with the native red X (or Cmd-W), Tauri fires
+    // CloseRequested. Without handling it here, the Rust side's
+    // on_window_event returned without emitting `dialog_cancel`, so the
+    // pending `/render` call hung until DIALOG_TTL (2 h since 0.4.41) —
+    // the agent never learned the user dismissed the dialog. We now
+    // treat an X-close exactly like clicking Cancel: emit `dialog_cancel`
+    // for the in-flight dialog, then let the window close. The recursive
+    // `close_window` invoke inside handleCancel re-fires CloseRequested,
+    // but by then `current` is null so the guard below is a no-op and
+    // the close proceeds.
+    const win = getCurrentWebviewWindow();
+    const closeReqPromise = win.onCloseRequested(async (event) => {
+      if (current) {
+        // Stop the immediate destroy so the cancel reaches the backend
+        // before the window (and its WebView) goes away.
+        event.preventDefault();
+        await handleCancel();
+      }
+      // else: no live dialog — let Tauri close the window normally.
+    });
+
     // Window-ready handshake (v0.4.30): tell the Rust render path
     // that our `dialog:show` listener is installed and we can safely
     // receive events. Without this, the backend would emit before
@@ -175,6 +198,7 @@
       clearTtlTimers();
       (await dialogPromise)();
       (await pingPromise)();
+      (await closeReqPromise)();
       window.removeEventListener("keydown", onKey);
     };
   });
@@ -188,8 +212,19 @@
     clearTtlTimers();
     const id = current.id;
     current = null;
-    await invoke("dialog_submit", { id, result });
-    await invoke("close_window");
+    // v0.4.45 (Bug #3): never swallow the invoke result silently. If
+    // dialog_submit fails the agent would otherwise hang forever with
+    // no signal — at least surface it to the console for diagnosis.
+    try {
+      await invoke("dialog_submit", { id, result });
+    } catch (e) {
+      console.error(`[aiui] dialog_submit failed for ${id}: ${e}`);
+    }
+    try {
+      await invoke("close_window");
+    } catch (e) {
+      console.error(`[aiui] close_window failed: ${e}`);
+    }
   }
 
   async function handleCancel() {
@@ -197,12 +232,18 @@
     if (current) {
       const id = current.id;
       current = null;
-      await invoke("dialog_cancel", { id });
+      try {
+        await invoke("dialog_cancel", { id });
+      } catch (e) {
+        console.error(`[aiui] dialog_cancel failed for ${id}: ${e}`);
+      }
+    }
+    // Always close the window — whether we just cancelled a live dialog
+    // or the user closed an already-empty dialog window.
+    try {
       await invoke("close_window");
-    } else {
-      // No dialog yet — the user closed an empty dialog window. Just
-      // close it.
-      await invoke("close_window");
+    } catch (e) {
+      console.error(`[aiui] close_window failed: ${e}`);
     }
   }
 </script>

@@ -682,19 +682,25 @@ async fn render(
         },
         Err(_) => {
             // TTL expired without user response. Cancel the registry
-            // entry (also frees its slot) and return a structured timeout.
+            // entry (frees its slot) and fall through to the normal
+            // 200-OK response below with cancelled:true + reason.
+            //
+            // v0.4.45 (Bug #5): previously this returned HTTP 408, which
+            // mcp.rs's render_dialog treated as a non-success status →
+            // generic "aiui tool error: render http 408" — a different
+            // shape than a user-driven cancel (200 {cancelled:true}).
+            // The agent then saw a transport error instead of a clean
+            // "user didn't respond" cancellation. Now both the
+            // user-cancel and the TTL-expiry paths produce the exact
+            // same tool-result shape; only `reason` differs.
             trace(&format!("render: TTL expired id={}", id));
             state.dialog.cancel(&id);
-            return (
-                StatusCode::REQUEST_TIMEOUT,
-                Json(serde_json::json!({
-                    "id": id,
-                    "cancelled": true,
-                    "error": "timeout",
-                    "detail": format!("no user response within {:?}", DIALOG_TTL),
-                })),
-            )
-                .into_response();
+            crate::dialog::DialogResult {
+                id: id.clone(),
+                cancelled: true,
+                result: serde_json::Value::Null,
+                reason: Some("ttl_expired".into()),
+            }
         }
     };
     trace(&format!(

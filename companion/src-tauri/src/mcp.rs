@@ -107,18 +107,21 @@ is missing or empty, say \"no remotes registered yet — open Settings to \
 add one\".
 ";
 
-/// How long mcp-stdio waits for *any* incoming line before assuming the
-/// parent process has gone silent and exiting. This is an event-driven
-/// deadline that resets on activity — equivalent to "no input for 6 h ⇒
-/// exit", with zero idle cost. Catches the failure mode where Claude
-/// Desktop forgets to close our stdin pipe but also never sends another
-/// request, which is how stale mcp-stdio children accumulated in the
-/// 2026-04-25 incident.
-const STDIN_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-
 /// Top-level entry: read JSON-RPC messages from stdin, dispatch to handlers,
-/// write responses to stdout. Runs until stdin closes or the idle deadline
-/// expires.
+/// write responses to stdout. Runs until stdin closes (parent gone).
+///
+/// v0.4.45 removed the `STDIN_IDLE_LIMIT` self-exit (was 6 h). It was a
+/// workaround for the 2026-04-25 stale-mcp-stdio-accumulation incident,
+/// but it assumed "no input for 6 h ⇒ parent gone" — which is false for
+/// the common case "user simply didn't run an agent overnight". The
+/// timer fired every night, the child self-exited, the lifetime grace
+/// timer then tore down the GUI 60 s later, and Claude Desktop (which
+/// does not auto-respawn a disconnected MCP server) showed "Server
+/// disconnected" until the user restarted it. The genuine "parent
+/// gone" case is caught cleanly by stdin-EOF below; the stale-child
+/// accumulation the timer was meant to prevent is now covered three
+/// other ways (sibling-kill, periodic disk_version_if_stale, pre-GUI
+/// kill). So: no timer, just block on stdin.
 ///
 /// Outgoing traffic flows through an mpsc channel rather than directly
 /// onto stdout, so that a long-running tool call (waiting on the user
@@ -153,48 +156,19 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
 
     trace("mcp-stdio: run_stdio entered");
 
-    // Track the wall-clock instant of the last incoming line so we can
-    // double-check the idle deadline after a sleep. `tokio::time::sleep`
-    // is monotonic-clock based and *should* compose correctly across
-    // suspend/resume on macOS, but we've seen reports of timer-drift
-    // edge cases — verifying with `Instant::now()` on wake is cheap
-    // insurance against premature exit. Issue #H-4 in v0.4.10 review.
-    let mut last_activity = std::time::Instant::now();
-
     loop {
-        let line = tokio::select! {
-            res = reader.next_line() => match res {
-                Ok(Some(l)) => {
-                    last_activity = std::time::Instant::now();
-                    l
-                }
-                Ok(None) => {
-                    trace("mcp-stdio: stdin closed, exiting");
-                    break;
-                }
-                Err(e) => {
-                    trace(&format!("mcp-stdio: stdin error: {e}, exiting"));
-                    break;
-                }
-            },
-            _ = tokio::time::sleep(STDIN_IDLE_LIMIT) => {
-                // Double-check actual elapsed time before exiting. If the
-                // host suspended for a long stretch, the sleep can fire
-                // earlier than expected after wake; bail out only if the
-                // wall-clock confirms we've actually been idle.
-                let elapsed = last_activity.elapsed();
-                if elapsed >= STDIN_IDLE_LIMIT {
-                    trace(&format!(
-                        "mcp-stdio: no input for {:?}, parent likely gone, exiting",
-                        elapsed
-                    ));
-                    break;
-                }
-                trace(&format!(
-                    "mcp-stdio: idle-timer fired but only {:?} elapsed (likely post-suspend); rearming",
-                    elapsed
-                ));
-                continue;
+        // Block on stdin. EOF (`Ok(None)`) means the parent closed the
+        // pipe — that's the one true "parent gone" signal. No idle
+        // timer: an idle-but-alive parent must keep us alive (v0.4.45).
+        let line = match reader.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                trace("mcp-stdio: stdin closed, exiting");
+                break;
+            }
+            Err(e) => {
+                trace(&format!("mcp-stdio: stdin error: {e}, exiting"));
+                break;
             }
         };
 
@@ -395,13 +369,18 @@ fn tools_list() -> Value {
 
 /// How long mcp-stdio waits for the aiui HTTP endpoint to become reachable
 /// before giving up on a tool call. The dominant case this catches: the
-/// user closed the GUI via the window's red X (which exits the app),
-/// then immediately triggered a render call — `mcp_attach`'s
-/// auto-resurrect (see `lifetime.rs`) IS firing in parallel and brings
-/// the GUI back, but Claude's tool call would otherwise race ahead and
-/// hit a not-yet-bound port. Eight seconds covers a realistic cold-start
-/// (Tauri init + WebView load + HTTP bind) on a normal Mac.
-const COLDSTART_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+/// GUI is mid-cold-start (auto-resurrect after the user closed it, or a
+/// fresh `open --auto` from `mcp_attach`) and Claude's tool call would
+/// otherwise race ahead and hit a not-yet-bound port.
+///
+/// v0.4.45 (Bug #4): raised 8 s → 30 s. A full cold start (Tauri init +
+/// WebView load + HTTP bind + lifetime-socket + tunnels) can exceed 8 s
+/// on a busy Mac, and the 2026-05-26 incident showed a tool call dying
+/// at the 8 s mark while the GUI was still coming up. 30 s comfortably
+/// covers a worst-case cold start and is still well under any sane
+/// MCP-client tool timeout, so a genuinely-down aiui still fails fast
+/// enough to surface the diagnostic message.
+const COLDSTART_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Poll `/ping` until the HTTP server answers, or `COLDSTART_WAIT` elapses.
 /// `/ping` is unauthenticated and cheap, returning `pong` in plain text —
@@ -450,7 +429,7 @@ fn aiui_unreachable_result() -> Value {
          via an SSH-reverse-tunnel on port 7777."
     };
     let text = format!(
-        "aiui companion did not answer /ping on localhost:7777 within 8 seconds.\n\
+        "aiui companion did not answer /ping on localhost:7777 within {} seconds.\n\
          \n\
          {context_line}\n\
          \n\
@@ -473,7 +452,8 @@ fn aiui_unreachable_result() -> Value {
             them to aiui Settings → Connections.\n\
          \n\
          Do not relay this entire message to the user verbatim — pick the \
-         likely cause and phrase it plainly."
+         likely cause and phrase it plainly.",
+        COLDSTART_WAIT.as_secs()
     );
     json!({
         "content": [{ "type": "text", "text": text }],

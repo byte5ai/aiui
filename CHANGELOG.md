@@ -2,6 +2,93 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.45] — 2026-05-28
+
+Stability release. A chain of vivid real-world incidents over the last
+days (aiui dying overnight, the next morning's tool call hanging, a
+cancel button the agent never heard) traced back to a small set of
+root causes. Fixed together; Codex consulted on the two architectural
+calls (headless updater + idle-exit removal).
+
+### Fixed
+
+- **aiui no longer dies overnight (Bug #6).** `STDIN_IDLE_LIMIT` (the
+  6 h "no stdin input ⇒ parent likely gone ⇒ self-exit" timer in
+  `mcp.rs`) is **removed**. Its assumption was false for the common
+  case "the user simply didn't run an agent for 6 h" — every night
+  the mcp-stdio self-exited, the lifetime grace timer then tore down
+  the GUI 60 s later, and Claude Desktop (which does not auto-respawn
+  a disconnected MCP server) sat at "Server disconnected" until the
+  user restarted it. Confirmed firing multiple times per week. The
+  genuine "parent gone" signal is stdin-EOF, which is handled cleanly;
+  the stale-child accumulation the timer once guarded against is now
+  covered three other ways (sibling-kill, periodic
+  `disk_version_if_stale`, pre-GUI kill).
+- **Auto-update now works headless (Bug #7).** The update check used
+  to live only in the frontend (`lifecycle.ts`), so it ran only while
+  a window was open — but aiui is headless almost all the time, so
+  auto-updates effectively never fired and users stayed weeks behind
+  (the reason the 0.4.42→0.4.44 hops never installed themselves). A
+  new Rust-side task in `run()` polls `app.updater().check()` every
+  6 h regardless of window state, records any newer release in the
+  `PendingUpdate` state, and broadcasts `update:available`. The
+  Settings banner (0.4.44) then offers a one-click install. No
+  auto-install, no restart under a live dialog.
+- **X-closing a dialog now cancels it (Bug #1).** Closing the dialog
+  window with the native red X (or ⌘W) fired `WindowEvent::CloseRequested`,
+  but the Rust handler returned without emitting `dialog_cancel` — so
+  the pending `/render` hung until `DIALOG_TTL` (2 h since 0.4.41) and
+  the agent never learned the user dismissed it. A new
+  `onCloseRequested` listener in `DialogShell.svelte` emits
+  `dialog_cancel` for the in-flight dialog before the window is
+  destroyed, exactly like the Cancel button.
+- **`/render` TTL-expiry returns a clean cancellation (Bug #5).**
+  Previously it returned HTTP 408, which `mcp.rs` surfaced as a
+  generic "render http 408" transport error — a different shape than
+  a user-driven cancel. Now both paths return the same
+  `{cancelled: true}` tool-result shape; only `reason` differs
+  (`ttl_expired`).
+- **Cancel/submit no longer swallow invoke errors silently (Bug #3).**
+  `handleCancel`/`handleSubmit` in `DialogShell.svelte` wrap the
+  `dialog_cancel`/`dialog_submit`/`close_window` invokes in try/catch
+  with console logging, so a failed round-trip is at least
+  diagnosable instead of a silent hang.
+- **`COLDSTART_WAIT` raised 8 s → 30 s (Bug #4).** A full GUI cold
+  start (Tauri init + WebView + HTTP bind + tunnels) can exceed 8 s on
+  a busy Mac; the 2026-05-26 incident showed a tool call dying at the
+  8 s mark while the GUI was still coming up. 30 s covers a worst-case
+  cold start, still well under any sane client tool-timeout.
+- **HTTP bind failure → degraded mode instead of exit-loop (Issue #55).**
+  With the process-lifetime lock (0.4.43), a bind failure on :7777 now
+  means a *foreign* process holds the port, not a second aiui. Exiting
+  in that case released the gui-lock → mcp_attach respawned → bind
+  failed again → respawn loop. aiui now stays alive in a degraded
+  state: records the error, surfaces the Settings window with the
+  explanatory banner (lsof hint included), keeps the lifetime socket
+  up. No loop, no silent failure.
+
+### Verified / closed
+
+- **Issue #56** (/health ready at exact dialog hard-cap) — already
+  fixed by the 0.4.36 single-occupancy refactor (`orphan_count <
+  DIALOG_HARD_CAP`, strict). Verified, closeable.
+- **Issue #121** (form reappears / restart not recognized, v0.4.37) —
+  the Setup-Window respawn-loop, fixed by 0.4.43 ProcessLock + 0.4.44
+  ExitRequested veto + this release's idle-exit removal. Verify on the
+  reporter's setup, then close.
+- **Issue #120** (footer buttons not aligned, content behind, v0.4.37)
+  — fixed by the 3-zone shell-layout refactor (PR #129). Verify, close.
+
+### Known / out of scope
+
+- **MCP-client tool-timeout (Bug #2)** — when the client (Claude
+  Desktop / Cowork) sends no `progressToken`, our keep-alive
+  notifications can't fire, and the client gives up after ~4 min if
+  the user takes that long on a form. aiui-side this is now far less
+  likely to bite (aiui no longer dies, cold start is more tolerant),
+  but the residual is client-side and warrants an Anthropic bug
+  report, not an aiui change.
+
 ## [0.4.44] — 2026-05-26
 
 Two fixes that close the loop on yesterday's structural changes.
