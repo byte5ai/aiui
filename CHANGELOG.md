@@ -66,6 +66,14 @@ calls (headless updater + idle-exit removal).
   state: records the error, surfaces the Settings window with the
   explanatory banner (lsof hint included), keeps the lifetime socket
   up. No loop, no silent failure.
+- **`kill_remote_mcp_stdio` now validates its host alias (Issue #52
+  follow-up).** It was the one ssh call site that relied on the `--`
+  end-of-options marker alone, without the `is_valid_host_alias`
+  boundary check every sibling helper carries. The alias comes from
+  `remotes.json` (already validated at `add_remote` time), so this is
+  defense-in-depth rather than a live hole — but it restores the
+  "every remote helper validates at its boundary" invariant the rest
+  of the hardening pass established.
 
 ### Verified / closed
 
