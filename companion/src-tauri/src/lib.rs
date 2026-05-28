@@ -1296,7 +1296,7 @@ pub fn run() {
             // reads this on its first tick.
             let http_error_for_serve = http_error.clone();
             let port_for_error = cfg.http_port;
-            let app_handle_for_exit = app_handle_http.clone();
+            let app_handle_for_degraded = app_handle_http.clone();
             rt.spawn(async move {
                 if let Err(e) = http::serve(
                     cfg_http,
@@ -1307,22 +1307,37 @@ pub fn run() {
                 )
                 .await
                 {
+                    // v0.4.45 (Issue #55): degraded mode instead of exit(1).
+                    // Before the process-lifetime lock (0.4.43), an
+                    // EADDRINUSE here meant "another aiui owns the port"
+                    // and exiting was correct. Now the lock guarantees
+                    // we're the only aiui — so a bind failure means a
+                    // *foreign* process holds :7777. Exiting in that case
+                    // released the gui-lock, mcp_attach respawned us, we
+                    // failed to bind again → respawn loop. Instead we
+                    // stay alive in a degraded state: record the error,
+                    // surface the Settings window so the user sees *why*
+                    // dialogs aren't landing, and leave the lifetime
+                    // socket up. No respawn loop, no silent failure.
                     log::error!(
-                        "[aiui] http server error on :{port_for_error}: {e} — exiting (other instance owns the port)"
+                        "[aiui] http server error on :{port_for_error}: {e} — entering degraded mode (foreign process owns the port)"
                     );
+                    logging::trace(&format!(
+                        "[aiui] http-bind-error on :{port_for_error}: {e} — degraded mode, surfacing settings banner"
+                    ));
                     if let Ok(mut slot) = http_error_for_serve.lock() {
                         *slot = Some(format!(
-                            "Konnte localhost:{port_for_error} nicht öffnen — Port wahrscheinlich belegt. {e}"
+                            "Konnte localhost:{port_for_error} nicht öffnen — \
+                             Port von einem anderen Prozess belegt. Schließe den \
+                             Prozess (lsof -i :{port_for_error}) und starte aiui neu. {e}"
                         ));
                     }
-                    // Hop to main thread to call exit cleanly.
-                    let app_for_exit = app_handle_for_exit.clone();
-                    let _ = app_handle_for_exit.run_on_main_thread(move || {
-                        housekeeping::pre_exit_cleanup(
-                            port_for_error,
-                            "http-bind-error",
-                        );
-                        app_for_exit.exit(1);
+                    // Surface the Settings window so the http_error banner
+                    // becomes visible. Done on the main thread (Tauri
+                    // window ops are main-thread-only).
+                    let app_for_banner = app_handle_for_degraded.clone();
+                    let _ = app_handle_for_degraded.run_on_main_thread(move || {
+                        show_settings_window(&app_for_banner);
                     });
                 }
             });
@@ -1418,6 +1433,56 @@ pub fn run() {
                             ));
                         }
                     });
+                }
+            });
+
+            // Headless update-check (v0.4.45, Bug #7). The frontend
+            // update-check in lifecycle.ts only ran while a window was
+            // open — but aiui spends almost all its time headless
+            // (Accessory mode, no window), so auto-updates effectively
+            // never fired and users stayed weeks behind. This Rust-side
+            // task runs regardless of window state: every 6 h it asks
+            // the updater for the latest release and, if one is newer,
+            // records it in the shared `PendingUpdate` state and
+            // broadcasts `update:available`. It deliberately does NOT
+            // install — the Settings banner offers a one-click install
+            // so we never restart under a live dialog. `app.updater()`
+            // is window-independent (it's a Manager extension making
+            // plain HTTPS calls), confirmed safe headless.
+            let app_handle_update = app_handle.clone();
+            let pending_update_task = pending_update.clone();
+            rt.spawn(async move {
+                use tauri_plugin_updater::UpdaterExt;
+                const CHECK_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(6 * 60 * 60);
+                // Small initial delay so the check doesn't compete with
+                // the startup burst (tunnels, remote-pin, skill write).
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                loop {
+                    match app_handle_update.updater() {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                let v = update.version.trim().to_string();
+                                logging::trace(&format!(
+                                    "update-check: {v} available (headless, deferred to banner)"
+                                ));
+                                if let Ok(mut slot) = pending_update_task.0.lock() {
+                                    *slot = Some(v.clone());
+                                }
+                                let _ = app_handle_update.emit("update:available", Some(v));
+                            }
+                            Ok(None) => {
+                                logging::trace("update-check: already on latest");
+                            }
+                            Err(e) => {
+                                logging::trace(&format!("update-check: check failed: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            logging::trace(&format!("update-check: updater unavailable: {e}"));
+                        }
+                    }
+                    tokio::time::sleep(CHECK_INTERVAL).await;
                 }
             });
 
