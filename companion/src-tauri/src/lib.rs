@@ -150,6 +150,13 @@ pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle) {
 /// it. Cheap (one mutex read + a window lookup); called on app
 /// re-activation, exactly when a user would otherwise notice a leftover
 /// empty frame.
+///
+/// Currently wired only to macOS `RunEvent::Reopen`; other platforms
+/// have no trigger yet (Windows surfaces the existing window via the
+/// single-instance plugin), so allow it to be unused there instead of
+/// `#[cfg]`-gating the whole fn — keeps it ready for a future Windows
+/// hook without tripping CI's `-D warnings` dead-code check.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
     let pending = app
         .try_state::<Arc<dialog::DialogState>>()
