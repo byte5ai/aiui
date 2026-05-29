@@ -218,48 +218,42 @@ fn find_all_children(snap: &[ProcSnap], own_pid: u32) -> Vec<StaleChild> {
         .collect()
 }
 
-/// Resolve the grandparent (= parent's parent) PID of `pid` in the
-/// snapshot. Returns `None` if the chain breaks at any step — caller
-/// treats that as "unknown lineage, do not act".
-fn grandparent_pid(snap: &[ProcSnap], pid: u32) -> Option<u32> {
-    let me = snap.iter().find(|p| p.pid == pid)?;
-    let ppid = me.ppid?;
-    let parent = snap.iter().find(|p| p.pid == ppid)?;
-    parent.ppid
+/// A process is *orphaned* when its parent is gone — reparented to
+/// launchd/init (`ppid == 1`), parent unknown (`None`), or the ppid no
+/// longer exists in the snapshot. Only orphaned `aiui --mcp-stdio`
+/// children are safe to reap: their MCP client (the Claude.app / Cowork
+/// helper wrapper that spawned them) has died, so they are genuinely
+/// abandoned. A child whose parent is still alive belongs to a *live*
+/// session — and must be spared.
+fn is_orphaned_child(snap: &[ProcSnap], p: &ProcSnap) -> bool {
+    match p.ppid {
+        None => true,
+        Some(1) => true,
+        Some(pp) => !snap.iter().any(|q| q.pid == pp),
+    }
 }
 
-/// Filter: other `aiui --mcp-stdio` children spawned by the same MCP
-/// client (= same grandparent in the process tree, typically the Claude
-/// Desktop or Claude Code App process) and started *before* us. Pure
-/// function over a snapshot — the `(own_pid, own_grandparent, own_start)`
-/// triple comes from the caller so tests don't need to spoof
-/// `std::process::id()`.
+/// Filter: every *orphaned* `aiui --mcp-stdio` child (parent process
+/// gone), excluding `own_pid`. Pure function over a snapshot so tests
+/// don't need to spoof `std::process::id()`.
 ///
-/// "Same grandparent" was picked over "same parent" because every
-/// mcp-stdio on macOS sits one level below a Claude.app helper wrapper
-/// (`disclaimer`); each spawn gets its own wrapper, so PPIDs differ,
-/// but the wrappers themselves are all children of the same Claude.app
-/// process.
-///
-/// "Started before us" enforces a strict newer-kills-older rule. Two
-/// mcp-stdios spawned at the same instant from the same parent would
-/// otherwise see each other as "older" and tear each other down.
-/// v0.4.42.
-fn find_sibling_mcp_stdio_to_kill(
-    snap: &[ProcSnap],
-    own_pid: u32,
-    own_grandparent: Option<u32>,
-    own_start_time: u64,
-) -> Vec<StaleChild> {
-    let Some(own_gp) = own_grandparent else {
-        return Vec::new();
-    };
+/// v0.4.46 (Bug A): replaces the previous "newer-kills-older with the
+/// same grandparent" rule. That rule used the Claude.app process as the
+/// discriminator — but in Cowork every concurrently-open session's
+/// mcp-stdio sits under the *one* Claude.app grandparent, so starting a
+/// new session tore down the still-live aiui connection of every other
+/// session (the 2026-05-28 "Server disconnected on first MCP call"
+/// reports). Orphan-status is the correct discriminator: a leaked child
+/// has lost its parent wrapper; a live parallel session has not. The
+/// genuine duplicate-child case the old rule guarded against is already
+/// covered by stdin-EOF (a client that drops a child closes its stdin,
+/// and `run_stdio` exits on EOF).
+fn find_orphaned_mcp_stdio_to_kill(snap: &[ProcSnap], own_pid: u32) -> Vec<StaleChild> {
     snap.iter()
         .filter(|p| p.pid != own_pid)
         .filter(|p| has_mcp_stdio_flag(&p.args))
         .filter(|p| is_aiui_binary(&p.exe))
-        .filter(|p| p.start_time < own_start_time)
-        .filter(|p| grandparent_pid(snap, p.pid) == Some(own_gp))
+        .filter(|p| is_orphaned_child(snap, p))
         .map(|p| StaleChild {
             pid: p.pid,
             exe: p.exe.clone(),
@@ -267,92 +261,48 @@ fn find_sibling_mcp_stdio_to_kill(
         .collect()
 }
 
-/// Kill any older `aiui --mcp-stdio` children spawned by the *same* MCP
-/// client as us. Called once at mcp-stdio startup, after the
-/// `disk_version_if_stale` self-check. Returns the number of siblings
-/// terminated.
+/// Reap every *orphaned* `aiui --mcp-stdio` child — one whose parent
+/// (the Claude.app / Cowork helper wrapper) has died, leaving it
+/// reparented to launchd. Called once at mcp-stdio startup. Returns the
+/// number of children terminated.
 ///
-/// Why this exists: Claude Desktop has been observed (2026-05-16) to
-/// occasionally spawn a fresh `aiui --mcp-stdio` child while leaving
-/// the previous one running. Both children attach to the lifetime
-/// socket, both register their prompt list, and Claude Desktop's
-/// internal slash-command routing then can't decide which child owns
-/// `prompts/get` — the slash-command fails with "kein erkannter
-/// Befehl" even though the prompt list itself was loaded correctly.
-/// The aiui-side fix is the strict newer-kills-older policy here: the
-/// fresh child wins, the stale one gets SIGTERM, Claude Desktop is
-/// left with exactly one mcp-stdio per app instance.
+/// Why this exists / why it changed (v0.4.46, Bug A): the previous
+/// implementation killed any older mcp-stdio sharing our *grandparent*
+/// (the Claude.app process). That was meant to clear a Claude-Desktop
+/// duplicate-child glitch (one session, two children, slash-command
+/// routing confused — "kein erkannter Befehl"). But it mis-fired badly
+/// under Cowork: every concurrently-open Cowork session's mcp-stdio
+/// sits under the same single Claude.app grandparent, so starting a new
+/// session reaped the still-live aiui connection of every *other*
+/// session (the 2026-05-28 "Server disconnected on first MCP call"
+/// reports). "Same grandparent" can't tell a leaked duplicate from a
+/// live parallel session — both share the app.
 ///
-/// We also terminate the immediate parent (the
-/// `Claude.app/Contents/Helpers/disclaimer` wrapper on macOS) of the
-/// older sibling so it doesn't immediately respawn a replacement and
-/// trigger the race again. The grandparent — the Claude.app process
-/// itself — is never touched.
-///
-/// Safety: if our own lineage can't be fully resolved (e.g. we're
-/// running standalone from a terminal, no MCP-client grandparent), the
-/// function is a no-op. We never broadly sweep all aiui-mcp-stdio
-/// children — `kill_all_mcp_stdio_children` is the uninstall-only path
-/// for that.
-pub fn kill_sibling_mcp_stdio_with_same_grandparent() -> usize {
+/// Orphan-status can: a leaked child has lost its parent wrapper; a live
+/// session's child has not. So we now reap only orphans. The original
+/// duplicate-child case is already covered by stdin-EOF — when a client
+/// drops a child it closes the child's stdin, and `run_stdio` exits on
+/// EOF. We never broadly sweep all aiui-mcp-stdio children;
+/// `kill_all_mcp_stdio_children` is the uninstall-only path for that.
+pub fn kill_orphaned_mcp_stdio_children() -> usize {
     let own_pid = std::process::id();
     let snap = snapshot_processes();
-    let own_grandparent = grandparent_pid(&snap, own_pid);
-    let own_start_time = snap
-        .iter()
-        .find(|p| p.pid == own_pid)
-        .map(|p| p.start_time)
-        .unwrap_or(0);
+    let victims = find_orphaned_mcp_stdio_to_kill(&snap, own_pid);
 
-    let siblings = find_sibling_mcp_stdio_to_kill(
-        &snap,
-        own_pid,
-        own_grandparent,
-        own_start_time,
-    );
-
-    if siblings.is_empty() {
-        return 0;
-    }
-
-    let gp_str = own_grandparent
-        .map(|gp| gp.to_string())
-        .unwrap_or_else(|| "<unknown>".into());
-
-    for sibling in &siblings {
-        // Find the sibling's immediate parent (typically the disclaimer
-        // wrapper on macOS) so we can SIGTERM it as well — without
-        // that, Claude Desktop's spawn-supervisor would re-run a fresh
-        // child against the just-killed pid and we'd be back to two.
-        let sibling_ppid = snap
-            .iter()
-            .find(|p| p.pid == sibling.pid)
-            .and_then(|p| p.ppid);
-
+    for victim in &victims {
         trace(&format!(
-            "housekeeping: killing older sibling mcp-stdio pid={} exe={} \
-             (same grandparent={} as own pid={})",
-            sibling.pid, sibling.exe, gp_str, own_pid
+            "housekeeping: reaping orphaned mcp-stdio pid={} exe={} \
+             (parent gone — abandoned leak)",
+            victim.pid, victim.exe
         ));
-        terminate_pid(sibling.pid);
-
-        // Belt-and-braces guard: never SIGTERM the grandparent itself —
-        // that would be the Claude Desktop / Claude Code app and would
-        // take our own current MCP session down with it.
-        if let Some(wrapper_pid) = sibling_ppid {
-            if Some(wrapper_pid) != own_grandparent && wrapper_pid != own_pid {
-                trace(&format!(
-                    "housekeeping: also terminating sibling wrapper pid={wrapper_pid}"
-                ));
-                terminate_pid(wrapper_pid);
-            }
-        }
+        terminate_pid(victim.pid);
     }
-    let n = siblings.len();
-    trace(&format!(
-        "housekeeping: terminated {n} older sibling mcp-stdio child(ren) on startup \
-         (grandparent={gp_str})"
-    ));
+    let n = victims.len();
+    if n > 0 {
+        trace(&format!(
+            "housekeeping: reaped {n} orphaned mcp-stdio child(ren) on startup"
+        ));
+    }
     n
 }
 
@@ -844,117 +794,87 @@ mod tests {
         assert_eq!(all.len(), 2);
     }
 
-    // ---------- find_sibling_mcp_stdio_to_kill ----------
-
-    /// Build the canonical Claude-Desktop process tree:
-    ///   100 (Claude.app)
-    ///   ├─ 200 (disclaimer wrapper)
-    ///   │    └─ 300 (aiui --mcp-stdio, older, start=1100)
-    ///   └─ 400 (disclaimer wrapper)
-    ///        └─ 500 (aiui --mcp-stdio, newer, start=2100)
-    fn canonical_claude_desktop_tree() -> Vec<ProcSnap> {
-        vec![
-            snap_full(100, 1, "/Applications/Claude.app/Contents/MacOS/Claude", &["Claude"], 800),
-            snap_full(200, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 1099),
-            snap_full(300, 200, CURRENT, &[CURRENT, "--mcp-stdio"], 1100),
-            snap_full(400, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 2099),
-            snap_full(500, 400, CURRENT, &[CURRENT, "--mcp-stdio"], 2100),
-        ]
-    }
+    // ---------- find_orphaned_mcp_stdio_to_kill (Bug A, v0.4.46) ----------
 
     #[test]
-    fn grandparent_resolves_through_disclaimer_wrapper() {
-        let snap = canonical_claude_desktop_tree();
-        assert_eq!(grandparent_pid(&snap, 500), Some(100));
-        assert_eq!(grandparent_pid(&snap, 300), Some(100));
-    }
-
-    #[test]
-    fn grandparent_is_none_when_chain_breaks() {
-        // Orphan with ppid=1 but no entry for pid=1 in the snapshot.
-        let snap = vec![snap_full(500, 1, CURRENT, &[CURRENT, "--mcp-stdio"], 2100)];
-        assert_eq!(grandparent_pid(&snap, 500), None);
-    }
-
-    #[test]
-    fn sibling_kill_finds_older_same_grandparent() {
-        let snap = canonical_claude_desktop_tree();
-        // We are pid 500 (the newer mcp-stdio), grandparent 100, start 2100.
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 500, Some(100), 2100);
+    fn orphan_reaped_when_reparented_to_launchd() {
+        // Parent died → child reparented to launchd (ppid==1).
+        let snap = vec![
+            snap_full(1, 0, "/sbin/launchd", &["launchd"], 1),
+            snap_full(300, 1, CURRENT, &[CURRENT, "--mcp-stdio"], 1100),
+        ];
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 999);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].pid, 300);
     }
 
     #[test]
-    fn sibling_kill_skips_newer_siblings() {
-        let snap = canonical_claude_desktop_tree();
-        // We are pid 300 (the older mcp-stdio). The newer one (500) must
-        // NOT show up — otherwise two simultaneously-started duplicates
-        // would tear each other down.
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 300, Some(100), 1100);
-        assert!(victims.is_empty(), "older must not target newer siblings");
+    fn orphan_reaped_when_parent_absent_from_snapshot() {
+        // Parent pid 250 is gone (not in the snapshot) → orphan.
+        let snap = vec![snap_full(300, 250, CURRENT, &[CURRENT, "--mcp-stdio"], 1100)];
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 999);
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].pid, 300);
     }
 
     #[test]
-    fn sibling_kill_ignores_other_mcp_client() {
-        // Two completely different MCP clients on the same Mac:
-        //   100 (Claude Desktop) → 200 (disclaimer) → 300 (aiui --mcp-stdio, older)
-        //   150 (Claude Code CLI) → 250 (bash)       → 350 (aiui --mcp-stdio, newer — us)
+    fn live_child_with_alive_parent_is_spared() {
+        // Wrapper 200 is alive → child 300 belongs to a live session.
         let snap = vec![
             snap_full(100, 1, "/Applications/Claude.app/Contents/MacOS/Claude", &["Claude"], 800),
             snap_full(200, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 1099),
             snap_full(300, 200, CURRENT, &[CURRENT, "--mcp-stdio"], 1100),
-            snap_full(150, 1, "/opt/homebrew/bin/claude", &["claude"], 1500),
-            snap_full(250, 150, "/bin/bash", &["bash", "-c", "..."], 1599),
-            snap_full(350, 250, CURRENT, &[CURRENT, "--mcp-stdio"], 1600),
         ];
-        // We are pid 350; grandparent is 150. Sibling 300's grandparent is
-        // 100 — different MCP client, must not be killed.
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 350, Some(150), 1600);
-        assert!(
-            victims.is_empty(),
-            "must not kill mcp-stdio of a different MCP client (different grandparent)"
-        );
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 999);
+        assert!(victims.is_empty(), "live child with alive parent must be spared");
     }
 
     #[test]
-    fn sibling_kill_noop_when_own_grandparent_unknown() {
-        let snap = canonical_claude_desktop_tree();
-        // Caller couldn't resolve our grandparent — must be a no-op
-        // regardless of what siblings exist, so we don't broadly sweep.
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 500, None, 2100);
+    fn concurrent_cowork_sessions_all_spared() {
+        // THE Bug A regression test. Two concurrent Cowork sessions, each
+        // with its own live disclaimer wrapper, both under the one live
+        // Claude.app grandparent (100). The old "same grandparent" rule
+        // reaped one when the other started — orphan-status spares both.
+        let snap = vec![
+            snap_full(100, 1, "/Applications/Claude.app/Contents/MacOS/Claude", &["Claude"], 800),
+            snap_full(200, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 1099),
+            snap_full(300, 200, CURRENT, &[CURRENT, "--mcp-stdio"], 1100), // session A
+            snap_full(400, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 2099),
+            snap_full(500, 400, CURRENT, &[CURRENT, "--mcp-stdio"], 2100), // session B (us)
+        ];
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 500);
+        assert!(victims.is_empty(), "live parallel Cowork sessions must all be spared");
+    }
+
+    #[test]
+    fn own_pid_never_reaped_even_if_orphaned() {
+        let snap = vec![snap_full(300, 1, CURRENT, &[CURRENT, "--mcp-stdio"], 1100)];
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 300);
+        assert!(victims.is_empty(), "own pid must never be reaped");
+    }
+
+    #[test]
+    fn non_aiui_orphan_and_non_mcp_aiui_ignored() {
+        let snap = vec![
+            // orphaned, but not aiui
+            snap_full(300, 1, "/usr/bin/python", &["python", "foo.py"], 1100),
+            // orphaned aiui, but GUI mode (no --mcp-stdio flag)
+            snap_full(310, 1, CURRENT, &[CURRENT, "--auto"], 1100),
+        ];
+        let victims = find_orphaned_mcp_stdio_to_kill(&snap, 999);
         assert!(victims.is_empty());
     }
 
     #[test]
-    fn sibling_kill_skips_own_pid_even_if_older() {
-        let snap = canonical_claude_desktop_tree();
-        // Caller passes our own pid as `own_pid` — we must never
-        // include ourselves even if start_time math says we're older
-        // than some hypothetical caller frame.
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 500, Some(100), 9999);
-        assert_eq!(victims.iter().filter(|v| v.pid == 500).count(), 0);
-    }
-
-    #[test]
-    fn sibling_kill_skips_unrelated_aiui_mcp_in_tree() {
-        // Two old aiui-mcp-stdio children, but only one is in our
-        // grandparent lineage. The other should not be touched.
-        let snap = vec![
-            snap_full(100, 1, "Claude", &["Claude"], 800),
-            snap_full(200, 100, "disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 1099),
-            snap_full(300, 200, CURRENT, &[CURRENT, "--mcp-stdio"], 1100),
-            // unrelated tree:
-            snap_full(700, 1, "OtherApp", &["OtherApp"], 800),
-            snap_full(750, 700, "wrapper", &["wrapper", CURRENT, "--mcp-stdio"], 1099),
-            snap_full(770, 750, CURRENT, &[CURRENT, "--mcp-stdio"], 1100),
-            // us:
-            snap_full(400, 100, "disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 2099),
-            snap_full(500, 400, CURRENT, &[CURRENT, "--mcp-stdio"], 2100),
-        ];
-        let victims = find_sibling_mcp_stdio_to_kill(&snap, 500, Some(100), 2100);
-        assert_eq!(victims.len(), 1);
-        assert_eq!(victims[0].pid, 300);
+    fn is_orphaned_child_handles_none_ppid() {
+        let p = ProcSnap {
+            pid: 300,
+            ppid: None,
+            exe: CURRENT.to_string(),
+            args: vec![],
+            start_time: 1,
+        };
+        assert!(is_orphaned_child(&[], &p));
     }
 
     // ---------- find_pre_gui_mcp_stdio_to_kill ----------

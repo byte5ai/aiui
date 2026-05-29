@@ -458,6 +458,57 @@ async fn update(
     }))
 }
 
+/// Field `kind`s the dialog frontend knows how to render. A spec
+/// carrying anything else would fall through to the "unknown_kind"
+/// placeholder in the WebView — exactly the kind of broken/empty
+/// surface we now refuse to show. Keep in sync with DialogShell /
+/// Form.svelte. (v0.4.46, Bug B+.)
+const KNOWN_FIELD_KINDS: &[&str] = &[
+    "text", "password", "secret", "number", "select", "checkbox", "slider",
+    "date", "datetime", "date_range", "color", "static_text", "markdown",
+    "image", "mermaid", "wireframe", "image_grid", "list", "table", "tree",
+];
+
+/// Validate a dialog spec *before* any window is created (v0.4.46,
+/// Bug B+). On failure returns `(detail, hint)` describing precisely
+/// what's wrong; the caller turns that into a structured `invalid_spec`
+/// response so the agent can fix the spec and retry — and the user never
+/// sees a broken or empty fallback window. Deliberately conservative:
+/// only rejects what the frontend genuinely cannot render (bad
+/// top-level kind, unknown field kind), never well-formed-but-unusual
+/// specs.
+fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
+    let kind = spec.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(kind, "ask" | "form" | "confirm") {
+        return Err((
+            format!("top-level 'kind' must be one of ask|form|confirm, got '{kind}'"),
+            "Use confirm for yes/no, ask for one-of-N, form for ≥2 inputs.".into(),
+        ));
+    }
+    let mut fields: Vec<&serde_json::Value> = Vec::new();
+    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
+        for t in tabs {
+            if let Some(fs) = t.get("fields").and_then(|v| v.as_array()) {
+                fields.extend(fs.iter());
+            }
+        }
+    }
+    if let Some(fs) = spec.get("fields").and_then(|v| v.as_array()) {
+        fields.extend(fs.iter());
+    }
+    for f in fields {
+        let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if !KNOWN_FIELD_KINDS.contains(&fk) {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+            return Err((
+                format!("form field '{name}' has unknown kind '{fk}'"),
+                format!("Allowed field kinds: {}.", KNOWN_FIELD_KINDS.join(", ")),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn render(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -483,6 +534,25 @@ async fn render(
     // agent's plain URL would silently render as a broken image.
     // See companion/src-tauri/src/imageresolve.rs for failure modes.
     crate::imageresolve::resolve_image_srcs(&mut req.spec).await;
+
+    // Spec validation (v0.4.46, Bug B+): reject anything the frontend
+    // can't render *before* creating a window, and tell the agent
+    // exactly what to fix. Without this, a bad `kind` opened a window
+    // showing the "unknown_kind" placeholder — a confusing surface the
+    // user had to dismiss. Now the agent gets `invalid_spec` + detail
+    // and can correct the call; nothing is shown to the user.
+    if let Err((detail, hint)) = validate_spec(&req.spec) {
+        trace(&format!("render: rejected — invalid_spec: {detail}"));
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "invalid_spec",
+                "detail": detail,
+                "hint": hint,
+            })),
+        )
+            .into_response();
+    }
 
     // v0.4.36: try_register rejects when a dialog is already in flight
     // instead of evicting the existing one. Two parallel callers — multi-
@@ -708,6 +778,21 @@ async fn render(
         result.id, result.cancelled
     ));
 
+    // Authoritative teardown (v0.4.46, Bug B): the render has reached a
+    // terminal outcome — user submit/cancel, native X-close, TTL expiry,
+    // or channel-drop. Destroy the dialog window now, from Rust, on the
+    // main thread. This is the single point that guarantees a dialog
+    // window never outlives its dialog: it covers the TTL/channel-drop
+    // paths the frontend's own close never reaches (the empty-window
+    // stranding of 2026-05-29), and is a harmless no-op on the
+    // submit/cancel paths where the window is already gone.
+    {
+        let app_for_destroy = state.app.clone();
+        let _ = state
+            .app
+            .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy));
+    }
+
     // Lifecycle-driven update check (#42): fire once after every
     // successful render. Frontend gates with a 30-min cooldown so this is
     // never noisier than the old 6h timer in active use, and zero load
@@ -814,4 +899,61 @@ fn reload_main_webview(app: &AppHandle) {
             trace("render: reload requested but main window is MISSING");
         }
     });
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::validate_spec;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_confirm() {
+        assert!(validate_spec(&json!({"kind":"confirm","title":"ok?"})).is_ok());
+    }
+
+    #[test]
+    fn accepts_form_with_known_fields() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"text","name":"a"},
+            {"kind":"secret","name":"tok"},
+            {"kind":"slider","name":"n"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_form_with_tabs() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"T","fields":[{"kind":"checkbox","name":"c"}]}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_kind() {
+        let err = validate_spec(&json!({"kind":"wizard"})).unwrap_err();
+        assert!(err.0.contains("wizard"));
+        assert!(err.0.contains("ask|form|confirm"));
+    }
+
+    #[test]
+    fn rejects_missing_top_level_kind() {
+        assert!(validate_spec(&json!({"title":"x"})).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_field_kind_with_name() {
+        let spec = json!({"kind":"form","fields":[{"kind":"hologram","name":"h"}]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("'h'"), "detail names the field: {}", err.0);
+        assert!(err.0.contains("hologram"));
+    }
+
+    #[test]
+    fn rejects_unknown_field_kind_in_tab() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"T","fields":[{"kind":"warp","name":"w"}]}
+        ]});
+        assert!(validate_spec(&spec).is_err());
+    }
 }

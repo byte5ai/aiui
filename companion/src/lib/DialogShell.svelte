@@ -1,7 +1,6 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
-  import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { _ } from "svelte-i18n";
   import { onMount } from "svelte";
   import Ask from "./widgets/Ask.svelte";
@@ -160,27 +159,15 @@
 
     window.addEventListener("keydown", onKey);
 
-    // Window-close → cancel (v0.4.45, Bug #1). When the user closes the
-    // dialog window with the native red X (or Cmd-W), Tauri fires
-    // CloseRequested. Without handling it here, the Rust side's
-    // on_window_event returned without emitting `dialog_cancel`, so the
-    // pending `/render` call hung until DIALOG_TTL (2 h since 0.4.41) —
-    // the agent never learned the user dismissed the dialog. We now
-    // treat an X-close exactly like clicking Cancel: emit `dialog_cancel`
-    // for the in-flight dialog, then let the window close. The recursive
-    // `close_window` invoke inside handleCancel re-fires CloseRequested,
-    // but by then `current` is null so the guard below is a no-op and
-    // the close proceeds.
-    const win = getCurrentWebviewWindow();
-    const closeReqPromise = win.onCloseRequested(async (event) => {
-      if (current) {
-        // Stop the immediate destroy so the cancel reaches the backend
-        // before the window (and its WebView) goes away.
-        event.preventDefault();
-        await handleCancel();
-      }
-      // else: no live dialog — let Tauri close the window normally.
-    });
+    // Window-close (native red X / ⌘W) is owned by Rust as of v0.4.46
+    // (on_window_event): it cancels any in-flight dialog and lets the
+    // window close, and the `/render` handler destroys the window on
+    // every terminal outcome. We deliberately no longer register a
+    // frontend `onCloseRequested` here. The 0.4.45 version called
+    // `event.preventDefault()` and then, if its cancel/close path failed
+    // (empty/stale dialog state), left the window stranded — visible,
+    // empty, and unclosable (Bug B, the 2026-05-29 overnight report).
+    // Letting Rust own teardown removes that fragile round-trip.
 
     // Window-ready handshake (v0.4.30): tell the Rust render path
     // that our `dialog:show` listener is installed and we can safely
@@ -198,7 +185,6 @@
       clearTtlTimers();
       (await dialogPromise)();
       (await pingPromise)();
-      (await closeReqPromise)();
       window.removeEventListener("keydown", onKey);
     };
   });
