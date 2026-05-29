@@ -686,6 +686,25 @@ async fn render_dialog(
                 .unwrap_or(0),
         });
     }
+    if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        // Invalid spec — http::render rejected it *before* showing any
+        // window (v0.4.46, Bug B+). Body shape: { error, detail, hint }.
+        // Surface detail+hint as the tool error so the agent understands
+        // exactly what's malformed and can fix the spec and retry — no
+        // confusing fallback window, no terse status code.
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        let detail = body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("invalid dialog spec");
+        let hint = body.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+        let msg = if hint.is_empty() {
+            format!("aiui rejected the dialog spec (invalid_spec): {detail}")
+        } else {
+            format!("aiui rejected the dialog spec (invalid_spec): {detail} — {hint}")
+        };
+        return Err(RenderError::Transport(msg));
+    }
     if !resp.status().is_success() {
         return Err(RenderError::Transport(format!(
             "render http {}",

@@ -326,6 +326,27 @@ impl DialogState {
         }
     }
 
+    /// Cancel every pending dialog with `reason`, resolving each waiting
+    /// `/render` as cancelled. Returns how many were cancelled. Used by
+    /// the dialog-window X-close handler and the orphan-window sweep
+    /// (v0.4.46, Bug B+) so that tearing the window down *always*
+    /// produces a terminal answer for any in-flight render — never a
+    /// silent hang behind an empty window.
+    pub fn cancel_all(&self, reason: &str) -> usize {
+        let mut map = self.pending.lock().unwrap();
+        let drained: Vec<(String, PendingEntry)> = map.drain().collect();
+        let n = drained.len();
+        for (id, entry) in drained {
+            let _ = entry.result_tx.send(DialogResult {
+                id,
+                cancelled: true,
+                result: serde_json::Value::Null,
+                reason: Some(reason.to_string()),
+            });
+        }
+        n
+    }
+
     /// Like `register` but rejects with `BusyInfo` if a dialog is already
     /// in flight after the TTL sweep. Used by `/render` so that two
     /// parallel callers (multiple aiui calls in one assistant turn,
@@ -443,6 +464,24 @@ mod tests {
         let r = rx.blocking_recv().unwrap();
         assert!(r.cancelled);
         assert_eq!(s.stats().orphan_count, 0);
+    }
+
+    #[test]
+    fn cancel_all_resolves_every_pending() {
+        let s = DialogState::new();
+        let (_id, rx, _ack) = s.register();
+        let n = s.cancel_all("window_closed");
+        assert_eq!(n, 1);
+        let r = rx.blocking_recv().unwrap();
+        assert!(r.cancelled);
+        assert_eq!(r.reason.as_deref(), Some("window_closed"));
+        assert_eq!(s.stats().orphan_count, 0);
+    }
+
+    #[test]
+    fn cancel_all_on_empty_is_zero() {
+        let s = DialogState::new();
+        assert_eq!(s.cancel_all("window_closed"), 0);
     }
 
     #[test]
