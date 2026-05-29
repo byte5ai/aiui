@@ -116,6 +116,51 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Authoritatively tear down the dialog window from the Rust side
+/// (v0.4.46, Bug B). Uses `destroy()` (immediate) rather than `close()`
+/// so it bypasses the `CloseRequested` → frontend round-trip that could
+/// strand an empty window when the WebView's handler failed to complete
+/// the close. This is the single teardown point for the dialog window:
+/// the `/render` handler calls it once a render reaches *any* terminal
+/// outcome (submit, cancel, X-close, TTL, channel-drop), so the window
+/// can never outlive the dialog it was showing. Idempotent — a no-op
+/// when the window is already gone.
+pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
+        let _ = win.destroy();
+    }
+    // Matching demote for `ensure_dialog_window`'s Regular-mode promote:
+    // drop back to Accessory once the dialog is gone, unless the setup
+    // window is still up.
+    #[cfg(target_os = "macos")]
+    {
+        let setup_open = app
+            .get_webview_window(SETUP_WINDOW_LABEL)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        if !setup_open {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+    }
+}
+
+/// Belt-and-suspenders invariant (v0.4.46, Bug B+): a dialog window may
+/// only exist while a dialog is pending in the registry. If a window is
+/// found with an empty registry, it's a stranded empty window — destroy
+/// it. Cheap (one mutex read + a window lookup); called on app
+/// re-activation, exactly when a user would otherwise notice a leftover
+/// empty frame.
+pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
+    let pending = app
+        .try_state::<Arc<dialog::DialogState>>()
+        .map(|s| s.stats().orphan_count)
+        .unwrap_or(0);
+    if pending == 0 && app.get_webview_window(DIALOG_WINDOW_LABEL).is_some() {
+        log::debug!("[aiui] sweep: destroying orphan dialog window (no pending dialog)");
+        destroy_dialog_window(app);
+    }
+}
+
 /// Frontend silent-update gate (v0.4.43): returns `true` iff installing
 /// + relaunching right now would NOT disrupt anything the user is
 /// currently looking at. The silent updater path in `updater.ts` calls
@@ -1009,20 +1054,18 @@ pub fn run_mcp_stdio_only() {
         std::process::exit(0);
     }
 
-    // Multi-instance protection (v0.4.42): kill any older
-    // `aiui --mcp-stdio` siblings spawned by the same MCP client. Claude
-    // Desktop has been observed (2026-05-16) to occasionally spawn a
-    // fresh child without killing the previous one — when both attach
-    // to the lifetime socket and both register their prompt list,
-    // Claude Desktop's slash-command routing can't decide which child
-    // owns `prompts/get` and the slash-command fails with "kein
-    // erkannter Befehl". The newer child (us) wins; the older one
-    // gets SIGTERM, along with its disclaimer wrapper, so Claude
-    // Desktop can't immediately respawn the same race. Safe no-op if
-    // we can't resolve our own grandparent (terminal-launched
-    // mcp-stdio, orphaned process). Existing single-child setups are
-    // untouched: nothing to kill, function returns 0.
-    let _ = housekeeping::kill_sibling_mcp_stdio_with_same_grandparent();
+    // Leak cleanup (v0.4.42, rescoped v0.4.46 / Bug A): reap any
+    // *orphaned* `aiui --mcp-stdio` children — ones whose MCP-client
+    // parent (Claude.app / Cowork wrapper) has died, leaving them
+    // reparented to launchd. The earlier version reaped any older
+    // mcp-stdio sharing our Claude.app *grandparent*; that tore down
+    // live *parallel Cowork sessions* (they all share the one Claude.app
+    // grandparent) — the "Server disconnected on first MCP call" reports.
+    // Orphan-status is the right discriminator: a leak has lost its
+    // parent, a live session has not. The duplicate-child glitch the old
+    // rule targeted is already handled by stdin-EOF. Safe no-op when no
+    // orphans exist; never touches live siblings.
+    let _ = housekeeping::kill_orphaned_mcp_stdio_children();
 
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     logging::trace(&format!(
@@ -1542,6 +1585,24 @@ pub fn run() {
                 let app = window.app_handle();
                 let closed_label = window.label().to_string();
                 if closed_label == DIALOG_WINDOW_LABEL {
+                    // User closed the dialog window with the native X (or
+                    // ⌘W). Resolve any in-flight `/render` as cancelled
+                    // right here in Rust — we no longer depend on a
+                    // frontend CloseRequested handler, which in 0.4.45
+                    // could `preventDefault()` and then fail to complete
+                    // the close, stranding an empty, unclosable window
+                    // (Bug B, the 2026-05-29 overnight report). We do NOT
+                    // prevent the close: the window is allowed to go away.
+                    // The awaiting `/render` will run its end-of-handler
+                    // `destroy_dialog_window` (a no-op by then).
+                    if let Some(ds) = app.try_state::<Arc<dialog::DialogState>>() {
+                        let n = ds.cancel_all("window_closed");
+                        if n > 0 {
+                            log::debug!(
+                                "[aiui] dialog window X-closed — cancelled {n} pending dialog(s)"
+                            );
+                        }
+                    }
                     log::debug!(
                         "[aiui] dialog window closed — staying alive for further tool calls"
                     );
@@ -1653,6 +1714,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 if let tauri::RunEvent::Reopen { .. } = event {
+                    // Self-heal: if a stranded empty dialog window is
+                    // still up with no pending dialog, sweep it before
+                    // surfacing settings — this is exactly when the user
+                    // would otherwise be greeted by a leftover empty
+                    // frame (v0.4.46, Bug B+).
+                    sweep_orphan_dialog_window(app);
                     show_settings_window(app);
                 }
             }

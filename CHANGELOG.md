@@ -2,6 +2,62 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.46] — 2026-05-29
+
+Dialog-lifecycle hardening. Two field-reported regressions from the
+lifecycle work of the last days, both root-caused from a Cowork session's
+logs + trace, plus a defensive pass so a malformed or stranded dialog can
+never leave the user staring at a dead window.
+
+### Fixed
+
+- **Starting a new Cowork session no longer disconnects aiui in the
+  other sessions (Bug A).** `kill_sibling_mcp_stdio_with_same_grandparent`
+  (0.4.42) reaped any older `aiui --mcp-stdio` sharing our Claude.app
+  *grandparent*. That was meant to clear a Claude-Desktop duplicate-child
+  glitch — but in Cowork every concurrently-open session's mcp-stdio sits
+  under the *one* Claude.app grandparent, so opening a new session
+  SIGTERM'd the still-live aiui child of every other session (the
+  2026-05-28 "MCP aiui: Server disconnected" toast on the first MCP call
+  of a fresh session; confirmed in the trace: `killing older sibling
+  pid=30384 (same grandparent=26243)`). Replaced with
+  `kill_orphaned_mcp_stdio_children`, which reaps only *orphaned* children
+  — ones whose parent wrapper has died (reparented to launchd). A live
+  parallel session's child has a live parent and is now spared. The
+  original duplicate-child case is already covered by stdin-EOF.
+- **The dialog window can no longer be left empty and unclosable (Bug B).**
+  The 0.4.45 X-close fix routed dialog teardown through a frontend
+  `onCloseRequested` handler that called `preventDefault()` and then ran
+  the cancel/close itself. If that path failed (empty/stale dialog
+  state), the close was prevented but never completed — the window sat
+  empty and the red X did nothing (the 2026-05-29 overnight report: a
+  blank "aiui" window, 9 ignored X-clicks in the GUI log). Teardown is
+  now **authoritative in Rust**: the `/render` handler destroys the
+  dialog window (`window.destroy()`, bypassing the CloseRequested →
+  frontend round-trip) on *every* terminal outcome — submit, cancel,
+  native X, TTL, or channel-drop — and the window-event handler cancels
+  any in-flight render directly when the user hits X. The fragile
+  frontend `onCloseRequested` is gone.
+
+### Hardened (Bug B+, defensive render flow)
+
+- **Invalid specs are rejected before a window opens.** `/render` now
+  validates the spec (top-level `kind ∈ {ask,form,confirm}`, known field
+  kinds) up front; a bad spec returns `invalid_spec` with a `detail` +
+  `hint` the agent can act on, instead of opening a window that renders
+  an "unknown_kind" placeholder. mcp-stdio surfaces that as a clear tool
+  error so the agent fixes the call and retries.
+- **A dialog window may only exist while a dialog is pending.** A
+  belt-and-suspenders `sweep_orphan_dialog_window` runs on app
+  re-activation (`Reopen`): if a dialog window is found with an empty
+  registry, it's destroyed — so a stranded empty frame self-heals even
+  if some future teardown path is missed.
+- **Every `/render` still resolves to exactly one terminal outcome** —
+  user response, `invalid_spec`, `ui_unreachable`, `busy`, or
+  `ttl_expired` — never a silent hang behind an empty window. (The
+  ack-contract watchdog and TTL paths from earlier releases are retained;
+  this release adds the window-teardown guarantee around them.)
+
 ## [0.4.45] — 2026-05-28
 
 Stability release. A chain of vivid real-world incidents over the last
