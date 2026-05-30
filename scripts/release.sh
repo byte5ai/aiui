@@ -50,8 +50,13 @@ fi
 : "${BUILD_KEYCHAIN:?not set}"
 : "${BUILD_KEYCHAIN_PASS_FILE:?not set}"
 : "${TAURI_SIGNING_PRIVATE_KEY_PATH:?not set}"
-: "${UV_PUBLISH_TOKEN:?not set — needed for publishing aiui-mcp to PyPI. Put it in .env.release or export before running. See script header for details.}"
-export UV_PUBLISH_TOKEN
+# AIUI_SKIP_PYPI=1 → validate-first / pre-release flow: build + sign + notarize
+# + GitHub release WITHOUT publishing aiui-mcp to PyPI (PyPI versions are
+# permanent; defer until the build is validated). The token is then not needed.
+if [[ "${AIUI_SKIP_PYPI:-}" != "1" ]]; then
+  : "${UV_PUBLISH_TOKEN:?not set — needed for publishing aiui-mcp to PyPI. Put it in .env.release or export before running. See script header for details. (Or set AIUI_SKIP_PYPI=1 to skip PyPI for a pre-release.)}"
+  export UV_PUBLISH_TOKEN
+fi
 # Tauri bundler reads TAURI_SIGNING_PRIVATE_KEY (literal key content) during
 # `tauri build`, not the _PATH variant. Load the file content here.
 export TAURI_SIGNING_PRIVATE_KEY="$(cat "${TAURI_SIGNING_PRIVATE_KEY_PATH}")"
@@ -230,6 +235,12 @@ update themselves in place via the in-app updater.
 See the [full diff](https://github.com/byte5ai/aiui/commits/${TAG}).
 NOTES_EOF
 
+# AIUI_RELEASE_PRERELEASE=1 → mark as a GitHub pre-release. GitHub's
+# `/releases/latest/` (what the in-app updater reads) skips pre-releases, so
+# this does NOT auto-update any client — for validate-first delivery. Promote
+# later with `gh release edit ${TAG} --prerelease=false` (then PyPI-publish).
+GH_PRERELEASE_FLAG=""
+[[ "${AIUI_RELEASE_PRERELEASE:-}" == "1" ]] && GH_PRERELEASE_FLAG="--prerelease"
 gh release create "${TAG}" \
   "${DIRECT_DMG}" \
   "${DIRECT_ZIP}" \
@@ -237,15 +248,20 @@ gh release create "${TAG}" \
   "${LATEST_JSON}" \
   --repo byte5ai/aiui \
   --title "aiui ${TAG}" \
-  --notes-file "${NOTES_FILE}"
+  --notes-file "${NOTES_FILE}" \
+  ${GH_PRERELEASE_FLAG}
 
-echo "✓ Released ${TAG} on GitHub"
+echo "✓ Released ${TAG} on GitHub${GH_PRERELEASE_FLAG:+ (pre-release)}"
 
 # PyPI publish AFTER the GitHub release succeeds. If this step fails the
 # Tauri side is already shipped and the manual recovery is `cd python &&
 # uv publish dist/*` once the credential issue is fixed. The pre-flight
 # token check at the top of this script is what stops us from getting
 # here without a token.
-echo "→ Publishing aiui-mcp ${VERSION} to PyPI"
-(cd python && uv publish)
-echo "✓ Published aiui-mcp ${VERSION} to PyPI"
+if [[ "${AIUI_SKIP_PYPI:-}" == "1" ]]; then
+  echo "→ Skipping PyPI publish (AIUI_SKIP_PYPI=1) — run \`cd python && uv publish\` (or promote) when validated"
+else
+  echo "→ Publishing aiui-mcp ${VERSION} to PyPI"
+  (cd python && uv publish)
+  echo "✓ Published aiui-mcp ${VERSION} to PyPI"
+fi
