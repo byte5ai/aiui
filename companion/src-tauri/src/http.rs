@@ -177,7 +177,7 @@ pub async fn serve(
     let router = Router::new()
         .route("/health", get(health))
         .route("/render", post(render))
-        .route("/render/{id}", get(render_poll))
+        .route("/render/:id", get(render_poll))
         .route("/version", get(version))
         .route("/update", post(update))
         .route("/ping", get(ping))
