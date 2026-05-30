@@ -432,6 +432,12 @@ fn open_url(url: String) -> Result<(), String> {
 /// running. Issue #72.
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    // Case (b): explicit uninstall. Latch the exit authority *first* so the
+    // `ExitRequested` default-deny gate honours the `app.exit(0)` below instead
+    // of vetoing it (Invariant I1).
+    if let Some(auth) = app.try_state::<Arc<lifetime::ExitAuthority>>() {
+        auth.authorize();
+    }
     let killed = housekeeping::kill_all_mcp_stdio_children();
     logging::trace(&format!(
         "quit_app: killed {killed} mcp-stdio child(ren) before exit"
@@ -446,6 +452,21 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
         .unwrap_or(7777);
     housekeeping::pre_exit_cleanup(port, "quit_app/uninstall");
     app.exit(0);
+    Ok(())
+}
+
+/// Latch the exit authority for case (c): an update-restart driven from the
+/// frontend updater. `updater.ts` calls this immediately before
+/// `@tauri-apps/plugin-process`'s `relaunch()`, which (like `app.restart()`)
+/// fires `RunEvent::ExitRequested`. Without the latch the default-deny gate
+/// would veto the relaunch and the update would never apply (Invariant I1).
+/// The HTTP `/update` path latches the same authority directly in Rust.
+#[tauri::command]
+async fn authorize_exit_for_update(
+    exit_authority: tauri::State<'_, Arc<lifetime::ExitAuthority>>,
+) -> Result<(), String> {
+    exit_authority.authorize();
+    logging::trace("authorize_exit_for_update: exit authority latched for update-restart");
     Ok(())
 }
 
@@ -1173,6 +1194,12 @@ pub fn run() {
     let dialog_state = Arc::new(dialog::DialogState::new());
     let ui_acks = Arc::new(ack::AckRegistry::new());
     let lifetime_stats = Arc::new(lifetime::LifetimeStats::new());
+    // Single exit authority (Invariant I1). Latched only by the two legitimate
+    // non-Wirt-death exits — uninstall (`quit_app`) and update-restart (HTTP
+    // `/update` + the frontend updater) — and read by the `ExitRequested`
+    // default-deny gate so those, and only those, Tauri-initiated terminations
+    // are honoured while Claude Desktop is alive.
+    let exit_authority = Arc::new(lifetime::ExitAuthority::new());
     let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
     // Shared cell that records a fatal HTTP-server bind/serve failure (e.g.
     // port 7777 held by another process). Read by the `status` command and
@@ -1258,6 +1285,7 @@ pub fn run() {
         .manage(dialog_state.clone())
         .manage(ui_acks.clone())
         .manage(lifetime_stats.clone())
+        .manage(exit_authority.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
         .manage(pending_update.clone())
@@ -1282,6 +1310,7 @@ pub fn run() {
             restart_claude_desktop,
             uninstall_all,
             quit_app,
+            authorize_exit_for_update,
             dismiss_welcome,
             open_url
         ])
@@ -1561,34 +1590,28 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Multi-window lifecycle (v0.4.25, revised v0.4.36):
+            // Multi-window lifecycle (v0.4.25, revised v0.4.36, Invariant I2):
             //
-            // The setup window and the dialog window are independent.
-            // Closing one shouldn't kill the other — and definitely
-            // shouldn't kill the GUI process while the lifetime
-            // socket still has attached MCP-stdio children depending
-            // on it.
+            // The setup window and the dialog window are independent, and
+            // closing a window is never a process exit — the host lives with
+            // its Wirt (Claude Desktop), not with any window.
             //
-            //  • Red X on setup window: setup goes away. If no other
-            //    window is visible AND no MCP-stdio children are
-            //    attached, the app quits and `mcp_attach`'s
-            //    auto-resurrect path brings it back on the next tool
-            //    call. As long as a child is attached, we stay alive
-            //    headless — the lifetime grace timer (60s after the
-            //    last child detaches) is the only legitimate
-            //    "nobody needs aiui anymore" signal.
-            //  • Red X on dialog window: the dialog is treated as
-            //    cancelled (the frontend's CloseRequested-listener
-            //    fires `dialog_cancel` first; this branch runs after).
-            //    NEVER quits the app, regardless of any-visible state.
-            //    The dialog window is per-call ephemeral — destroyed
-            //    after every submit/cancel by `close_window`. Quitting
-            //    the GUI here would tear down the HTTP server while
-            //    the agent's tool call is still parsing the response,
-            //    producing the 8s `wait_for_aiui` timeouts the user
-            //    saw on 2026-05-04 (trace 16:11:42.197 "GUI is gone"
-            //    20 ms after a successful form submit).
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            //  • Red X on setup window: hide it + demote to Accessory (no Dock
+            //    icon). The host stays alive headless; it is brought back to a
+            //    visible Settings window via Dock-click / `open` (the Reopen
+            //    handler) or the single-instance plugin. No exit here — the
+            //    process only ends when the watcher sees the Wirt gone or an
+            //    uninstall/update latches the exit authority.
+            //  • Red X on dialog window: the dialog is treated as cancelled
+            //    (the frontend's CloseRequested-listener fires `dialog_cancel`
+            //    first; this branch runs after). NEVER quits the app. The
+            //    dialog window is per-call ephemeral — destroyed after every
+            //    submit/cancel by `close_window`. Quitting the GUI here would
+            //    tear down the HTTP server while the agent's tool call is still
+            //    parsing the response, producing the 8s `wait_for_aiui`
+            //    timeouts the user saw on 2026-05-04 (trace 16:11:42.197 "GUI
+            //    is gone" 20 ms after a successful form submit).
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let closed_label = window.label().to_string();
                 if closed_label == DIALOG_WINDOW_LABEL {
@@ -1615,83 +1638,67 @@ pub fn run() {
                     );
                     return;
                 }
-                // Setup window: quit only if nothing else needs us.
-                let app_for_check = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    let any_visible = app_for_check
-                        .webview_windows()
-                        .iter()
-                        .any(|(label, w)| {
-                            label.as_str() != closed_label
-                                && w.is_visible().unwrap_or(false)
-                        });
-                    let attached = app_for_check
-                        .try_state::<Arc<lifetime::LifetimeStats>>()
-                        .map(|s| s.child_count())
-                        .unwrap_or(0);
-                    if !any_visible && attached == 0 {
-                        log::info!(
-                            "[aiui] setup window closed and no MCP-stdio children attached — quitting; auto-resurrect will bring us back on next tool call"
-                        );
-                        let port = app_for_check
-                            .try_state::<Arc<config::AppConfig>>()
-                            .map(|c| c.http_port)
-                            .unwrap_or(7777);
-                        housekeeping::pre_exit_cleanup(port, "setup-close-no-children");
-                        app_for_check.exit(0);
-                    } else {
-                        log::debug!(
-                            "[aiui] setup window closed, staying alive (visible_others={any_visible}, attached_children={attached})"
-                        );
-                    }
-                });
+                // Setup window: Invariant I2 — window close is NOT process
+                // exit. Hide the window and demote back to Accessory (no Dock
+                // icon) so aiui keeps living headless with its host (Claude
+                // Desktop), serving the lifetime socket + HTTP for local and
+                // remote dialogs. The process only ends when its Wirt quits
+                // (the watcher) or on an explicit uninstall/update — never
+                // because a user dismissed a window. The old
+                // `setup-close-no-children → app.exit(0)` path (which decided
+                // "nobody needs us" from the child count + window visibility,
+                // both proxies) is removed.
+                api.prevent_close();
+                let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+                log::debug!(
+                    "[aiui] setup window close → hidden + demoted to Accessory (host stays alive; I2)"
+                );
             }
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
         .run(|app, event| {
-            // ExitRequested handler (v0.4.43 introduced cleanup; v0.4.44
-            // adds the veto for the "headless mode" case). Tauri fires
-            // ExitRequested on Cmd-Q, on ⌘W of the last visible
+            // ExitRequested gate — single exit authority (Invariant I1). Tauri
+            // fires ExitRequested on ⌘Q, on ⌘W / close of the last visible
             // window, on OS shutdown, and on `.restart()`. The
-            // last-window-close case is the dangerous one: as soon as
-            // the agent's dialog window closes after a submit, Tauri
-            // wants to terminate the process — but that's wrong while
-            // the GUI is meant to live headless serving the lifetime
-            // socket. v0.4.42 lost the GUI ~18 ms after every Dialog
-            // submit through this path (trace 2026-05-26 17:00:28.181
-            // → 17:00:28.199); the dialog-window-close branch of
-            // on_window_event already returned without exit, but
-            // Tauri's default ExitRequested handler ran *after* it
-            // and killed the process anyway.
+            // last-window-close case is the dangerous one: as soon as the
+            // agent's dialog window closes after a submit, Tauri wants to
+            // terminate the process — but the host is meant to live headless
+            // serving the lifetime socket + HTTP. v0.4.42 lost the GUI ~18 ms
+            // after every dialog submit through exactly this path (trace
+            // 2026-05-26 17:00:28.181 → 17:00:28.199).
             //
-            // Resolution rule:
-            //   • Anyone still depending on us — an attached
-            //     mcp-stdio child or a pending dialog — ⇒ veto the
-            //     exit via `api.prevent_exit()`. The lifetime-grace
-            //     timer (60 s after the last child detaches) remains
-            //     the *only* legitimate "everyone's gone, really
-            //     exit" signal in normal operation.
-            //   • Nobody attached and no pending dialog ⇒ honour the
-            //     exit, but run pre_exit_cleanup first so any ssh-NTR
-            //     tunnel children get SIGTERM instead of becoming
-            //     launchd orphans.
-            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
-                let attached = app
-                    .try_state::<Arc<lifetime::LifetimeStats>>()
-                    .map(|s| s.child_count())
-                    .unwrap_or(0);
-                let pending_dialogs = app
-                    .try_state::<Arc<dialog::DialogState>>()
-                    .map(|s| s.stats().orphan_count)
-                    .unwrap_or(0);
-
-                if code.is_none() && (attached > 0 || pending_dialogs > 0) {
-                    // Tauri-initiated quit (no explicit exit code).
-                    // Someone still needs us — keep the process alive.
+            // The decision no longer reads child count or window visibility —
+            // both were proxies that the 0.4.43–0.4.45 patches kept getting
+            // wrong. It is `host_should_exit(explicit, cd_running)`: honour the
+            // exit only when an uninstall/update latched `ExitAuthority`, or
+            // the Wirt (Claude Desktop) is already gone; otherwise default-deny
+            // via `api.prevent_exit()`. The watcher owns the CD-gone exit in
+            // normal operation; this gate is the backstop for every other
+            // Tauri-initiated termination.
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                // Default-deny (Invariant I1). The only legitimate planned
+                // exits are: (b) uninstall / (c) update-restart — both latch
+                // `ExitAuthority` before asking Tauri to terminate — or (a) the
+                // Wirt (Claude Desktop) is already gone. Every other
+                // Tauri-initiated exit (last-window-close, ⌘Q, OS quit-all) is
+                // vetoed. This is what stops the headless host dying ~18 ms
+                // after a dialog submit (v0.4.42) and on overnight churn
+                // (v0.4.45): the child count and window visibility no longer
+                // enter the decision at all.
+                let explicit = app
+                    .try_state::<Arc<lifetime::ExitAuthority>>()
+                    .map(|a| a.is_authorized())
+                    .unwrap_or(false);
+                let cd_running = setup::is_claude_desktop_running();
+                if !lifetime::host_should_exit(explicit, cd_running) {
                     logging::trace(&format!(
-                        "[aiui] veto tauri-exit-requested: attached_children={attached}, \
-                         pending_dialogs={pending_dialogs}"
+                        "[aiui] veto ExitRequested (default-deny): explicit={explicit}, \
+                         claude_desktop_running={cd_running}"
                     ));
                     api.prevent_exit();
                     return;
@@ -1701,11 +1708,12 @@ pub fn run() {
                     .try_state::<Arc<config::AppConfig>>()
                     .map(|cfg| cfg.http_port)
                     .unwrap_or(7777);
-                let reason = if code.is_some() {
-                    "tauri-exit-requested-explicit"
+                let reason = if explicit {
+                    "exit-authorized-uninstall-or-update"
                 } else {
-                    "tauri-exit-requested-no-attached"
+                    "exit-claude-desktop-gone"
                 };
+                logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
                 housekeeping::pre_exit_cleanup(port, reason);
             }
 

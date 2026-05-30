@@ -93,5 +93,10 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
   } catch (e) {
     console.debug(`[aiui] clear_pending_update failed (continuing): ${e}`);
   }
+  // Invariant I1: the host's ExitRequested gate default-denies every
+  // Tauri-initiated exit. `relaunch()` fires ExitRequested, so we must latch
+  // the exit authority first (case (c), update-restart) or the relaunch would
+  // be vetoed and the freshly-installed update would never take effect.
+  await invoke("authorize_exit_for_update");
   await relaunch();
 }

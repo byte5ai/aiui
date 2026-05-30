@@ -444,6 +444,14 @@ async fn update(
     let http_port = state.cfg.http_port;
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // Case (c): latch the single exit authority so the `ExitRequested`
+        // default-deny gate honours the restart-initiated exit instead of
+        // vetoing it (Invariant I1). `app.restart()` fires ExitRequested.
+        if let Some(auth) =
+            app_handle.try_state::<std::sync::Arc<crate::lifetime::ExitAuthority>>()
+        {
+            auth.authorize();
+        }
         crate::housekeeping::pre_exit_cleanup(http_port, "updater-restart");
         trace("update: restarting into new binary");
         app_handle.restart();
