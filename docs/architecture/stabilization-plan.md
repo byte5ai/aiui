@@ -1,9 +1,12 @@
 # aiui Stabilization Plan (locked spec — guards against drift)
 
-Status: Steps 1–3 implemented + Step 4 multi-window (Refs #137, v0.5.0). The
-only remaining piece is Step 4's **tunnel** rework (aiui-dedicated cleanup) —
-Mac-side, deferred (see the Step 4 note). Per-step implementation records are
-inline under each step.
+Status: Steps 1–4 implemented (Refs #137, v0.5.0). Step 4's tunnel was settled
+empirically (2026-05-30): aiui-dedicated is correct and already in place — no
+refactor needed; piggyback is impossible (Claude Desktop provides no reverse
+forward). Per-step implementation records are inline under each step. The only
+non-code residual is the remote-path integration harness (cross-cutting, below)
+and a UX nicety (auto-discovering Code-tab remotes — needs Claude-Desktop
+support).
 Origin: root-cause analysis 2026-05-29 (Opus 4.8 code analysis + independent
 Codex diagnosis, convergent; external validation of the three pivotal facts).
 
@@ -172,30 +175,55 @@ Files: `http.rs`, `dialog.rs`, `mcp.rs`, `python/.../server.py`.
 >   progress tick, cold-start tolerance). Not yet exercised end-to-end against a
 >   live remote — integration harness is still the open cross-cutting item.
 
-## Step 4 — Tunnel mechanism + multi-window (one open decision)
+## Step 4 — Tunnel mechanism + multi-window (both resolved)
 
 Files: `tunnel.rs`, `setup.rs`, `lib.rs`, `dialog.rs`, `http.rs`, frontend.
 
-### Tunnel — DECISION PENDING, settled empirically (not by taste)
+### Tunnel — DECISION SETTLED EMPIRICALLY (2026-05-30): aiui-dedicated, no change
 
-Deciding facts to establish first:
+The original deciding facts:
 1. Does the SSH connection Claude Desktop opens to the remote carry a
-   `RemoteForward 7777` from `~/.ssh/config`? (Very likely the reason the code
-   migrated away from piggyback.)
+   `RemoteForward 7777` from `~/.ssh/config`?
 2. Is concurrent multi-session **on the same remote host** a requirement?
 
-- **If (1) yes and (2) no → Piggyback** (original design): aiui patches
-  `RemoteForward` into the host's `~/.ssh/config` block; **delete the dedicated
-  `ssh -NTR` TunnelManager + orphan-sweeps + shared-forward detection** (big
-  complexity removal). Inherits the user's working auth (agent-fwd / ProxyJump /
-  MFA).
-- **If (1) no or (2) yes → aiui-dedicated** (clean up current code): keep the
-  Mac-owned `ssh` but fix lifecycle/ownership; requires a non-interactive
-  BatchMode key Mac→remote.
-- Either way: **exactly one Mac-side owner.** Today's bug is running both in
-  parallel (one remote port, ExitOnForwardFailure collision → stale port →
-  ReadError). End-to-end tunnel health = probe `/probe` *through* the tunnel,
-  not "ssh process alive 2 s".
+> **Measured on the Mac (client side), 2026-05-30 — corrects an earlier wrong
+> inference.** A read-only probe of a live Claude-Desktop Code-tab session
+> found:
+> - **Fact (1) = NO.** Claude Desktop spawns `/usr/bin/ssh` *without* `-R` on
+>   its command line, *without* a custom `-F` config, and `ssh -G <host>`
+>   resolves **no `remoteforward`** for any host — there is no `RemoteForward`
+>   in `~/.ssh/config`. CD does **not** provide a reverse forward.
+> - **Fact (2) = YES** (user, 2026-05-30).
+> - aiui **already** runs the dedicated path: two live
+>   `ssh -N -T -R 7777:localhost:7777 … <host>` processes, parented by
+>   `aiui.app … --auto`, one per registered remote. They work
+>   (`ExitOnForwardFailure=yes` would have killed them on a bind clash).
+>
+> Both facts point to **aiui-dedicated**, which is also **what is already
+> implemented**. **Piggyback is impossible**, not merely unchosen: there is no
+> CD-provided forward to ride. (An earlier note here claimed CD provided the
+> forward and proposed deleting the TunnelManager — that was based on reading
+> the *remote's* aiui config, which is irrelevant: the **Mac** owns the
+> tunnels. Deleting the TunnelManager would have broken all remote dialogs.)
+
+- **aiui-dedicated** is correct and **needs no refactor.** The existing tunnel
+  is already adequately hardened: `ExitOnForwardFailure=yes` (clean bind /
+  collision handling), `ServerAliveInterval=30` + `ServerAliveCountMax=3`
+  (dead-connection detection ≤90 s → ssh exits → reconnect), shared-forward
+  detection (a second aiui / external owner of `:7777`), and the startup
+  orphan-sweep. It needs a non-interactive auth path Mac→remote — satisfied for
+  typical Code-tab users, who reach the remote via the *same* system `ssh` +
+  agent that CD itself uses (measured: `forwardagent no`, `controlmaster
+  false`, no ProxyJump → `BatchMode` succeeds).
+- The spec's *"health = probe `/probe` through the tunnel, not 'ssh alive
+  2 s'"* was written before crediting `ExitOnForwardFailure` + `ServerAlive`,
+  which already make "process alive" a sound health proxy; the original
+  ReadError driver (Mac HTTP not serving) is closed by **Step 1**. Adding a
+  periodic SSH `/probe` loop would be real overhead for marginal gain — a
+  quick-win deliberately **not** taken.
+- The "running both in parallel" collision the plan feared was a hypothesis;
+  the measurement shows only aiui's own `-NTR` and no competing manual
+  `RemoteForward` (aiui strips those on `add_remote` anyway).
 
 ### Multi-window (I8)
 
@@ -215,14 +243,16 @@ Deciding facts to establish first:
   - Window chrome (title bar / header chip) shows `session` + `session_origin`.
   - Fallback when the agent passes nothing: `session_origin` + short id.
 
-> **Multi-window implemented (2026-05-30, PR #137); tunnel deferred.**
-> User decision (2026-05-30): parallel sessions per remote ARE required →
-> tunnel branch is **aiui-dedicated** (clean up the existing `ssh -NTR`, one
-> Mac-side owner). That cleanup is Mac-side lifecycle work and was **not** done
-> in this PR — it can't be settled or validated from the remote where the work
-> happened (no remote registered here; the deciding `~/.ssh/config` fact lives
-> on the Mac). It remains the open piece of Step 4, best done alongside the
-> integration harness below.
+> **Multi-window implemented (2026-05-30, PR #137); tunnel settled, no change
+> needed** (see the empirical measurement above). The tunnel is already the
+> correct aiui-dedicated mechanism and adequately hardened; piggyback is
+> impossible (CD provides no forward). Step 4 is therefore complete bar the
+> optional verified-`/probe` health polish, which was assessed and declined as
+> marginal. The genuinely open, separate item is UX: aiui still requires the
+> user to register each remote manually in its settings (with a working
+> non-interactive ssh alias), independent of the Code-tab connection —
+> auto-discovering CD's connected remotes would need Claude-Desktop support and
+> is out of scope here.
 >
 > Multi-window itself is done, via a **pull model** rather than multiplying the
 > old emit/ack/ready handshake per window:
