@@ -14,6 +14,18 @@ pub struct DialogRequest {
     /// auto-cancel slightly before the backend sweeps. Single source
     /// of truth for "how long the user has" is here in Rust. v0.4.41.
     pub ttl_secs: u64,
+    /// Human-legible session label the caller passed (project name, task,
+    /// etc.) so the user can tell which session a dialog belongs to when
+    /// several are open at once (Invariant I8). `None` if the caller passed
+    /// nothing — the window then falls back to `session_origin` + short id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Origin host of the caller, auto-injected by the remote Python bridge
+    /// (its `hostname`) since the Mac can't distinguish remotes sharing
+    /// `:7777`. `None`/absent for local callers. Shown in the window chrome
+    /// alongside `session` (I8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,10 +62,12 @@ pub const DIALOG_HARD_CAP: usize = 16;
 struct PendingEntry {
     /// Resolves the `/render` waiter once the user submits or cancels.
     result_tx: oneshot::Sender<DialogResult>,
-    /// Resolves the per-render ack waiter the first time the frontend
-    /// confirms it received `dialog:show`. Wrapped in `Option` so we can
-    /// take it out exactly once.
-    ack_tx: Option<oneshot::Sender<()>>,
+    /// The full request payload (spec, ttl, session chrome). Stored so the
+    /// per-id dialog window can *pull* it on mount via `get_dialog_spec`
+    /// (Step 4 multi-window) instead of the backend emitting + waiting for an
+    /// ack — the pull model removes the event-ordering race the old
+    /// `dialog:show` + `dialog_window_ready` handshake existed to paper over.
+    request: DialogRequest,
     created_at: Instant,
 }
 
@@ -199,16 +213,6 @@ fn collect_visible_fields(spec: &serde_json::Value) -> Vec<&serde_json::Value> {
     out
 }
 
-/// Returned by `try_register` when a dialog is already in flight.
-/// Surfaced via /render as a 409 so the calling agent can distinguish
-/// "companion not reachable" from "companion is busy with someone
-/// else's dialog right now". v0.4.36.
-#[derive(Debug, Clone, Copy)]
-pub struct BusyInfo {
-    pub pending_count: usize,
-    pub oldest_age_secs: u64,
-}
-
 impl DialogState {
     pub fn new() -> Self {
         Self {
@@ -216,30 +220,21 @@ impl DialogState {
         }
     }
 
-    /// Registers a new dialog and returns `(id, result_rx, ack_rx)`. The
-    /// caller is responsible for surfacing the window + emitting the
-    /// `dialog:show` event.
-    ///
-    /// Performs an opportunistic sweep before insert: TTL-expired entries
-    /// are cancelled and removed, and if the hard cap would be exceeded
-    /// the oldest entry is evicted. No background reaper is needed.
-    ///
-    /// As of v0.4.36 the production /render path uses `try_register`
-    /// instead, which rejects rather than evicts when a dialog is
-    /// already in flight. `register` is retained as the
-    /// hard-cap-defense fallback for tests and any future call site
-    /// that legitimately wants eviction semantics.
-    #[allow(dead_code)]
-    pub fn register(
+    /// Register a new dialog and return `(id, result_rx)`. Multi-window
+    /// (Step 4, Invariant I8): N dialogs may be in flight at once — this never
+    /// rejects (the old single-occupancy 409 is gone). It sweeps TTL-expired
+    /// entries and, only if the hard cap would be exceeded, evicts the single
+    /// oldest. The caller (`/render`) builds a per-id window; the window pulls
+    /// the stored `DialogRequest` via [`Self::get_request`] on mount.
+    pub fn register_dialog(
         &self,
-    ) -> (
-        String,
-        oneshot::Receiver<DialogResult>,
-        oneshot::Receiver<()>,
-    ) {
+        spec: serde_json::Value,
+        session: Option<String>,
+        session_origin: Option<String>,
+        ttl_secs: u64,
+    ) -> (String, oneshot::Receiver<DialogResult>) {
         let id = Uuid::new_v4().to_string();
         let (result_tx, result_rx) = oneshot::channel();
-        let (ack_tx, ack_rx) = oneshot::channel();
 
         let mut map = self.pending.lock().unwrap();
 
@@ -279,27 +274,31 @@ impl DialogState {
             }
         }
 
+        let request = DialogRequest {
+            id: id.clone(),
+            spec,
+            ttl_secs,
+            session,
+            session_origin,
+        };
         map.insert(
             id.clone(),
             PendingEntry {
                 result_tx,
-                ack_tx: Some(ack_tx),
+                request,
                 created_at: now,
             },
         );
 
-        (id, result_rx, ack_rx)
+        (id, result_rx)
     }
 
-    /// Marks the dialog with `id` as having been received by the frontend.
-    /// Idempotent: the second call is a silent no-op (oneshot already sent).
-    pub fn ack(&self, id: &str) {
-        let mut map = self.pending.lock().unwrap();
-        if let Some(entry) = map.get_mut(id) {
-            if let Some(tx) = entry.ack_tx.take() {
-                let _ = tx.send(());
-            }
-        }
+    /// Return a clone of the stored request for `id`, for the per-id dialog
+    /// window to pull on mount (Step 4 pull model). `None` if the dialog is
+    /// gone (already resolved, evicted, or never existed) — the window then
+    /// closes itself.
+    pub fn get_request(&self, id: &str) -> Option<DialogRequest> {
+        self.pending.lock().unwrap().get(id).map(|e| e.request.clone())
     }
 
     pub fn complete(&self, id: &str, result: serde_json::Value) {
@@ -326,94 +325,11 @@ impl DialogState {
         }
     }
 
-    /// Cancel every pending dialog with `reason`, resolving each waiting
-    /// `/render` as cancelled. Returns how many were cancelled. Used by
-    /// the dialog-window X-close handler and the orphan-window sweep
-    /// (v0.4.46, Bug B+) so that tearing the window down *always*
-    /// produces a terminal answer for any in-flight render — never a
-    /// silent hang behind an empty window.
-    pub fn cancel_all(&self, reason: &str) -> usize {
-        let mut map = self.pending.lock().unwrap();
-        let drained: Vec<(String, PendingEntry)> = map.drain().collect();
-        let n = drained.len();
-        for (id, entry) in drained {
-            let _ = entry.result_tx.send(DialogResult {
-                id,
-                cancelled: true,
-                result: serde_json::Value::Null,
-                reason: Some(reason.to_string()),
-            });
-        }
-        n
-    }
-
-    /// Like `register` but rejects with `BusyInfo` if a dialog is already
-    /// in flight after the TTL sweep. Used by `/render` so that two
-    /// parallel callers (multiple aiui calls in one assistant turn,
-    /// two Claude sessions hitting the same companion, a stale window
-    /// from a previous timeout) can't silently overlay each other —
-    /// the second caller gets a clear conflict response instead of
-    /// having its predecessor's dialog evicted underfoot. v0.4.36.
-    ///
-    /// `register` is kept for tests and for any future call site that
-    /// genuinely wants the eviction-based behaviour, but the
-    /// production /render path uses `try_register` exclusively.
-    pub fn try_register(
-        &self,
-    ) -> Result<
-        (
-            String,
-            oneshot::Receiver<DialogResult>,
-            oneshot::Receiver<()>,
-        ),
-        BusyInfo,
-    > {
-        let mut map = self.pending.lock().unwrap();
-
-        // Sweep TTL-expired entries first — those don't count as
-        // "in flight" any more. Same logic as `register`.
-        let now = Instant::now();
-        let expired: Vec<String> = map
-            .iter()
-            .filter(|(_, e)| now.duration_since(e.created_at) > DIALOG_TTL)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for stale_id in expired {
-            if let Some(entry) = map.remove(&stale_id) {
-                let _ = entry.result_tx.send(DialogResult {
-                    id: stale_id,
-                    cancelled: true,
-                    result: serde_json::Value::Null,
-                    reason: Some("ttl_expired".into()),
-                });
-            }
-        }
-
-        if !map.is_empty() {
-            let oldest_age_secs = map
-                .values()
-                .map(|e| now.duration_since(e.created_at).as_secs())
-                .max()
-                .unwrap_or(0);
-            return Err(BusyInfo {
-                pending_count: map.len(),
-                oldest_age_secs,
-            });
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let (result_tx, result_rx) = oneshot::channel();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        map.insert(
-            id.clone(),
-            PendingEntry {
-                result_tx,
-                ack_tx: Some(ack_tx),
-                created_at: now,
-            },
-        );
-        Ok((id, result_rx, ack_rx))
-    }
+    // (Step 4 removed `cancel_all`: multi-window cancels per-id — the
+    // X-close handler cancels the closed window's own dialog by its label-id,
+    // and `sweep_orphan_dialog_window` reaps each orphan window individually.
+    // A blunt "cancel everything" would wrongly tear down other sessions'
+    // live dialogs.)
 
     /// Snapshot for `/health` / diagnostics. Cheap: one mutex acquire.
     pub fn stats(&self) -> DialogStats {
@@ -438,10 +354,14 @@ impl DialogState {
 mod tests {
     use super::*;
 
+    fn reg(s: &DialogState) -> (String, oneshot::Receiver<DialogResult>) {
+        s.register_dialog(serde_json::json!({"kind": "confirm", "title": "?"}), None, None, 0)
+    }
+
     #[test]
     fn register_inserts_entry() {
         let s = DialogState::new();
-        let (id, _rx, _ack) = s.register();
+        let (id, _rx) = reg(&s);
         assert!(!id.is_empty());
         assert_eq!(s.stats().orphan_count, 1);
     }
@@ -449,7 +369,7 @@ mod tests {
     #[test]
     fn complete_resolves_and_removes() {
         let s = DialogState::new();
-        let (id, rx, _ack) = s.register();
+        let (id, rx) = reg(&s);
         s.complete(&id, serde_json::json!({"ok": true}));
         let r = rx.blocking_recv().unwrap();
         assert!(!r.cancelled);
@@ -459,7 +379,7 @@ mod tests {
     #[test]
     fn cancel_resolves_and_removes() {
         let s = DialogState::new();
-        let (id, rx, _ack) = s.register();
+        let (id, rx) = reg(&s);
         s.cancel(&id);
         let r = rx.blocking_recv().unwrap();
         assert!(r.cancelled);
@@ -467,31 +387,32 @@ mod tests {
     }
 
     #[test]
-    fn cancel_all_resolves_every_pending() {
+    fn multiple_dialogs_register_concurrently_no_409() {
+        // Step 4 / I8: single-occupancy is gone — N dialogs coexist.
         let s = DialogState::new();
-        let (_id, rx, _ack) = s.register();
-        let n = s.cancel_all("window_closed");
-        assert_eq!(n, 1);
-        let r = rx.blocking_recv().unwrap();
-        assert!(r.cancelled);
-        assert_eq!(r.reason.as_deref(), Some("window_closed"));
-        assert_eq!(s.stats().orphan_count, 0);
+        let (_a, _ra) = reg(&s);
+        let (_b, _rb) = reg(&s);
+        let (_c, _rc) = reg(&s);
+        assert_eq!(s.stats().orphan_count, 3);
     }
 
     #[test]
-    fn cancel_all_on_empty_is_zero() {
+    fn get_request_returns_stored_payload_then_none_after_resolve() {
         let s = DialogState::new();
-        assert_eq!(s.cancel_all("window_closed"), 0);
-    }
-
-    #[test]
-    fn ack_fires_once() {
-        let s = DialogState::new();
-        let (id, _rx, ack) = s.register();
-        s.ack(&id);
-        ack.blocking_recv().expect("first ack must arrive");
-        // Second ack on the same id is a silent no-op.
-        s.ack(&id);
+        let (id, _rx) = s.register_dialog(
+            serde_json::json!({"kind": "confirm"}),
+            Some("my-project".into()),
+            Some("macmini".into()),
+            42,
+        );
+        let req = s.get_request(&id).expect("request stored for pull");
+        assert_eq!(req.id, id);
+        assert_eq!(req.ttl_secs, 42);
+        assert_eq!(req.session.as_deref(), Some("my-project"));
+        assert_eq!(req.session_origin.as_deref(), Some("macmini"));
+        // Once resolved, the pull returns None so the window closes itself.
+        s.complete(&id, serde_json::json!({}));
+        assert!(s.get_request(&id).is_none());
     }
 
     #[test]
@@ -580,48 +501,23 @@ mod tests {
     }
 
     #[test]
-    fn try_register_succeeds_when_empty() {
-        let s = DialogState::new();
-        let res = s.try_register();
-        assert!(res.is_ok());
-        assert_eq!(s.stats().orphan_count, 1);
-    }
-
-    #[test]
-    fn try_register_rejects_when_pending() {
-        let s = DialogState::new();
-        let (_id, _rx, _ack) = s.try_register().expect("first try_register");
-        let busy = s.try_register().expect_err("second try_register must be busy");
-        assert_eq!(busy.pending_count, 1);
-        // Registry still holds the original entry.
-        assert_eq!(s.stats().orphan_count, 1);
-    }
-
-    #[test]
-    fn try_register_succeeds_after_complete() {
-        let s = DialogState::new();
-        let (id, _rx, _ack) = s.try_register().expect("first");
-        s.complete(&id, serde_json::json!({"ok": true}));
-        let res = s.try_register();
-        assert!(res.is_ok());
-    }
-
-    #[test]
     fn hard_cap_evicts_oldest() {
         let s = DialogState::new();
         let mut rxs = Vec::new();
         for _ in 0..DIALOG_HARD_CAP {
-            let (_id, rx, _ack) = s.register();
+            let (_id, rx) = reg(&s);
             rxs.push(rx);
         }
         assert_eq!(s.stats().orphan_count, DIALOG_HARD_CAP);
 
-        // One more — should evict the oldest.
-        let (_id, _rx, _ack) = s.register();
+        // One more — should evict the oldest (the cap bounds the map; the
+        // 409 single-occupancy that used to reject earlier is gone).
+        let (_id, _rx) = reg(&s);
         assert_eq!(s.stats().orphan_count, DIALOG_HARD_CAP);
 
         // The first registered receiver should now resolve as cancelled.
         let first = rxs.remove(0).blocking_recv().unwrap();
         assert!(first.cancelled);
+        assert_eq!(first.reason.as_deref(), Some("evicted"));
     }
 }

@@ -45,16 +45,18 @@ fn dialog_cancel(
     Ok(())
 }
 
-/// Frontend confirms it received the matching `dialog:show` event. The
-/// `/render` handler waits up to 500 ms for this before assuming the WebView
-/// event loop is dead and triggering a recreate.
+/// Multi-window pull model (Step 4): the per-id dialog window fetches its own
+/// render payload on mount, keyed by its window label (= the dialog id). This
+/// replaces the old `dialog:show` emit + `dialog_window_ready` ack handshake —
+/// the frontend initiates, so there is no event-before-listener race to guard.
+/// Returns `None` if the dialog is already gone (resolved/evicted), and the
+/// window closes itself.
 #[tauri::command]
-fn dialog_received(
+fn get_dialog_spec(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
-) -> Result<(), String> {
-    state.ack(&id);
-    Ok(())
+) -> Result<Option<dialog::DialogRequest>, String> {
+    Ok(state.get_request(&id))
 }
 
 /// Frontend response to a `ui:ping` event from `/health`. Same shape as
@@ -68,19 +70,30 @@ fn ui_pong(
     Ok(())
 }
 
-/// Frontend signals that the dialog window is mounted and its
-/// `dialog:show` / `ui:ping` listeners are registered. The render
-/// path on the Rust side waits on this watch *before* emitting, so
-/// a freshly-built dialog window never receives a `dialog:show`
-/// event before the listener is up. Without this handshake we hit
-/// the 500 ms ack timeout, reload the WebView, and lose the user's
-/// dialog (the failure mode reported on 2026-05-03).
-#[tauri::command]
-fn dialog_window_ready(
-    tx: tauri::State<'_, Arc<tokio::sync::watch::Sender<bool>>>,
-) -> Result<(), String> {
-    let _ = tx.send(true);
-    Ok(())
+/// A dialog window's label IS its dialog id (Step 4 multi-window): any window
+/// that isn't the setup window is a dialog window. There is no longer a single
+/// reused `DIALOG_WINDOW_LABEL` window.
+fn is_dialog_window_label(label: &str) -> bool {
+    label != SETUP_WINDOW_LABEL
+}
+
+/// macOS: drop back to Accessory (no Dock icon) once no dialog window remains
+/// open *other than* `except` (the one currently being torn down — `destroy()`
+/// may not have removed it from the window list yet) and the setup window is
+/// hidden. Matches the Regular-mode promote in `build_dialog_window`.
+#[cfg(target_os = "macos")]
+fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
+    let setup_open = app
+        .get_webview_window(SETUP_WINDOW_LABEL)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let other_dialog_open = app
+        .webview_windows()
+        .keys()
+        .any(|l| is_dialog_window_label(l) && l != except);
+    if !other_dialog_open && !setup_open {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
 }
 
 #[tauri::command]
@@ -99,72 +112,61 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     let _ = window.close();
     log::debug!("[aiui] close_window: closed {label}");
 
-    // If that was the dialog window and no setup window is open,
-    // demote the app back to Accessory mode so we don't permanently
-    // grow a Dock icon. `ensure_dialog_window` promotes us to Regular
+    // If a dialog window just closed and nothing else needs the Dock icon,
+    // demote back to Accessory. `build_dialog_window` promoted us to Regular
     // for the dialog's lifetime; this is the matching demote.
     #[cfg(target_os = "macos")]
-    if label == DIALOG_WINDOW_LABEL {
-        let setup_open = app
-            .get_webview_window(SETUP_WINDOW_LABEL)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !setup_open {
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        }
+    if is_dialog_window_label(&label) {
+        demote_if_no_dialogs_except(&app, &label);
     }
     Ok(())
 }
 
-/// Authoritatively tear down the dialog window from the Rust side
-/// (v0.4.46, Bug B). Uses `destroy()` (immediate) rather than `close()`
-/// so it bypasses the `CloseRequested` → frontend round-trip that could
-/// strand an empty window when the WebView's handler failed to complete
-/// the close. This is the single teardown point for the dialog window:
-/// the `/render` handler calls it once a render reaches *any* terminal
-/// outcome (submit, cancel, X-close, TTL, channel-drop), so the window
-/// can never outlive the dialog it was showing. Idempotent — a no-op
-/// when the window is already gone.
-pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
+/// Authoritatively tear down the dialog window with label `id` from the Rust
+/// side (v0.4.46, Bug B; Step 4: now per-id). Uses `destroy()` (immediate)
+/// rather than `close()` so it bypasses the `CloseRequested` → frontend
+/// round-trip that could strand an empty window. The `/render` handler calls
+/// it once that render reaches *any* terminal outcome (submit, cancel,
+/// X-close, TTL, channel-drop), so a window can never outlive the dialog it
+/// was showing. Idempotent — a no-op when the window is already gone.
+pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle, id: &str) {
+    if let Some(win) = app.get_webview_window(id) {
         let _ = win.destroy();
     }
-    // Matching demote for `ensure_dialog_window`'s Regular-mode promote:
-    // drop back to Accessory once the dialog is gone, unless the setup
-    // window is still up.
+    // Matching demote for `build_dialog_window`'s Regular-mode promote: drop
+    // back to Accessory once the last dialog is gone (ignoring the one we just
+    // destroyed, which may still be in the window list) and setup is hidden.
     #[cfg(target_os = "macos")]
-    {
-        let setup_open = app
-            .get_webview_window(SETUP_WINDOW_LABEL)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !setup_open {
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        }
-    }
+    demote_if_no_dialogs_except(app, id);
 }
 
-/// Belt-and-suspenders invariant (v0.4.46, Bug B+): a dialog window may
-/// only exist while a dialog is pending in the registry. If a window is
-/// found with an empty registry, it's a stranded empty window — destroy
-/// it. Cheap (one mutex read + a window lookup); called on app
-/// re-activation, exactly when a user would otherwise notice a leftover
-/// empty frame.
+/// Belt-and-suspenders invariant (v0.4.46, Bug B+; Step 4: per-id): a dialog
+/// window may only exist while its dialog is pending in the registry. Any
+/// dialog-labelled window whose id is no longer registered is a stranded
+/// empty window — destroy it. Called on app re-activation, exactly when a
+/// user would otherwise notice a leftover empty frame.
 ///
-/// Currently wired only to macOS `RunEvent::Reopen`; other platforms
-/// have no trigger yet (Windows surfaces the existing window via the
-/// single-instance plugin), so allow it to be unused there instead of
-/// `#[cfg]`-gating the whole fn — keeps it ready for a future Windows
-/// hook without tripping CI's `-D warnings` dead-code check.
+/// Currently wired only to macOS `RunEvent::Reopen`; other platforms have no
+/// trigger yet (Windows surfaces the existing window via the single-instance
+/// plugin), so allow it to be unused there instead of `#[cfg]`-gating the
+/// whole fn — keeps it ready for a future Windows hook without tripping CI's
+/// `-D warnings` dead-code check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
-    let pending = app
-        .try_state::<Arc<dialog::DialogState>>()
-        .map(|s| s.stats().orphan_count)
-        .unwrap_or(0);
-    if pending == 0 && app.get_webview_window(DIALOG_WINDOW_LABEL).is_some() {
-        log::debug!("[aiui] sweep: destroying orphan dialog window (no pending dialog)");
-        destroy_dialog_window(app);
+    let Some(state) = app.try_state::<Arc<dialog::DialogState>>() else {
+        return;
+    };
+    // Collect dialog-window labels (ids) whose dialog is no longer registered.
+    let orphans: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|l| is_dialog_window_label(l))
+        .filter(|l| state.get_request(l).is_none())
+        .cloned()
+        .collect();
+    for id in orphans {
+        log::debug!("[aiui] sweep: destroying orphan dialog window id={id} (no pending dialog)");
+        destroy_dialog_window(app, &id);
     }
 }
 
@@ -201,10 +203,14 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     // The update dialog is surfaced from whichever window is alive when
     // the check fires — usually the setup window (frontend triggers it
     // from there). We just need *some* visible window to attach the OS
-    // dialog to.
-    let win = app
-        .get_webview_window(SETUP_WINDOW_LABEL)
-        .or_else(|| app.get_webview_window(DIALOG_WINDOW_LABEL));
+    // dialog to; fall back to any open dialog window (Step 4: dialog
+    // windows are labelled by id, so there's no single fixed label).
+    let win = app.get_webview_window(SETUP_WINDOW_LABEL).or_else(|| {
+        app.webview_windows()
+            .into_iter()
+            .find(|(label, _)| is_dialog_window_label(label))
+            .map(|(_, w)| w)
+    });
     if let Some(win) = win {
         let _ = win.show();
         let _ = win.set_focus();
@@ -933,96 +939,53 @@ pub(crate) fn build_setup_window(
 /// `dialog::estimate_dialog_size`. The window is resizable, so the user
 /// can drag past these defaults — we just pick a sensible starting
 /// geometry given what the agent asked us to render.
-pub(crate) fn ensure_dialog_window(
+/// Build a fresh dialog window labelled by the dialog `id` (Step 4
+/// multi-window: one window per render, never reused — N may be open at once).
+/// It loads `dialog.html`, which reads its own window label (= id) and *pulls*
+/// the render payload via `get_dialog_spec` on mount. Promotes the app to
+/// Regular so the window fronts above Claude Desktop (in Accessory mode macOS
+/// won't bring our windows forward even with `set_focus()`);
+/// `close_window` / `destroy_dialog_window` demote back to Accessory once the
+/// last dialog is gone.
+pub(crate) fn build_dialog_window(
     app: &tauri::AppHandle,
+    id: &str,
     size: (f64, f64),
 ) -> tauri::Result<tauri::WebviewWindow> {
-    // Promote the app from Accessory to Regular for the duration of the
-    // dialog. In Accessory mode (LSUIElement-style daemon, no Dock icon)
-    // macOS won't bring our windows to the front above other apps even
-    // with `set_focus()` — the agent renders a dialog and the user
-    // doesn't see it because Claude Desktop covers it. Promoting to
-    // Regular for the dialog window restores normal front/focus
-    // behaviour; we drop back to Accessory in `close_window` once the
-    // dialog finishes so we don't permanently grow a Dock icon.
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
-    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
-        // Resize to fit the new spec before surfacing. Without this,
-        // a confirm rendered after a long form would keep the form's
-        // tall geometry (and vice versa).
-        let _ = win.set_size(tauri::LogicalSize::new(size.0, size.1));
-        let _ = win.show();
-        let _ = win.set_focus();
-        let _ = win.unminimize();
-        // Briefly mark the window always-on-top to win against any
-        // app that's grabbed focus in the meantime, then lift the
-        // flag so the user can naturally Cmd+Tab away later. 800 ms
-        // is enough for the activation to settle without leaving a
-        // sticky front-most window.
-        let _ = win.set_always_on_top(true);
-        let app_for_lift = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
-                let _ = w.set_always_on_top(false);
-            }
-        });
-        return Ok(win);
-    }
-    // Window is being built fresh — its frontend listeners aren't up
-    // yet. Reset the ready flag so the render path waits for the
-    // `dialog_window_ready` signal before emitting `dialog:show`.
-    if let Some(tx) = app.try_state::<Arc<tokio::sync::watch::Sender<bool>>>() {
-        let _ = tx.inner().send(false);
-    }
-    WebviewWindowBuilder::new(
-        app,
-        DIALOG_WINDOW_LABEL,
-        WebviewUrl::App("dialog.html".into()),
-    )
-    .title("aiui")
-    // Initial size from `estimate_dialog_size` — we widen for
-    // wireframe/mermaid/table and grow vertically for long forms,
-    // clamped to (1100, 900). Resizable so the user always has the
-    // last word; min size keeps the dialog usable but prevents
-    // accidental sub-icon collapse. v0.4.40.
-    .inner_size(size.0, size.1)
-    .min_inner_size(360.0, 320.0)
-    .resizable(true)
-    .center()
-    // Native, fully-visible title bar so macOS handles window-drag
-    // for us. Tauri's `data-tauri-drag-region` HTML attribute and
-    // Chromium's `-webkit-app-region: drag` CSS are *both* unreliable
-    // on Tauri 2 + WKWebView (macOS 26): the first sometimes drops
-    // mousedown depending on z-order, the second is a Chromium-only
-    // CSS property that WKWebView doesn't honour at all. The only
-    // robust path is to let macOS run its own title-bar drag, which
-    // means a visible title bar (the previous "Overlay + hiddenTitle"
-    // setup hid the title-bar pixels but kept its drag behaviour
-    // half-broken). We accept the slightly-less-flush look in
-    // exchange for a window the user can actually move.
-    .decorations(true)
-    .disable_drag_drop_handler()
-    .visible(true)
-    .always_on_top(true)
-    .build()
-    .inspect(|_win| {
-        // Fresh dialog windows also get the same lift-after-800 ms
-        // treatment as the reused-window branch above. The
-        // always_on_top flag from the builder ensures the window
-        // appears above everything; we drop it shortly after so
-        // Cmd+Tab works normally afterwards.
-        let app_for_lift = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
-                let _ = w.set_always_on_top(false);
-            }
-        });
-    })
+    let id_for_lift = id.to_string();
+    WebviewWindowBuilder::new(app, id, WebviewUrl::App("dialog.html".into()))
+        .title("aiui")
+        // Initial size from `estimate_dialog_size` — we widen for
+        // wireframe/mermaid/table and grow vertically for long forms,
+        // clamped to (1100, 900). Resizable so the user always has the last
+        // word; min size keeps the dialog usable. v0.4.40.
+        .inner_size(size.0, size.1)
+        .min_inner_size(360.0, 320.0)
+        .resizable(true)
+        .center()
+        // Native, fully-visible title bar so macOS handles window-drag for us
+        // (Tauri's HTML drag-region and the `-webkit-app-region` CSS are both
+        // unreliable on Tauri 2 + WKWebView). v0.4.40.
+        .decorations(true)
+        .disable_drag_drop_handler()
+        .visible(true)
+        .always_on_top(true)
+        .build()
+        .inspect(|_win| {
+            // Briefly always-on-top to win the focus race, then lift it so
+            // Cmd+Tab works normally afterwards.
+            let app_for_lift = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if let Some(w) = app_for_lift.get_webview_window(&id_for_lift) {
+                    let _ = w.set_always_on_top(false);
+                }
+            });
+        })
 }
 
 /// True when no aiui window is currently visible to the user. Used by
@@ -1212,17 +1175,9 @@ pub fn run() {
     // it apart from `http_error` (same underlying type).
     let pending_update = Arc::new(PendingUpdate::default());
 
-    // Window-ready handshake: the dialog window's frontend signals
-    // here (via the `dialog_window_ready` Tauri command) once its
-    // listeners are wired up. The render path *waits* on this watch
-    // before emitting `dialog:show`, so a freshly-built dialog window
-    // never receives an event before its listener is registered. The
-    // 0.4.30 fix — without it, a 500 ms ack timeout could fire before
-    // the WebView even finished mounting Svelte (especially on the
-    // very first render of a session, when the window is built fresh
-    // and Vite has to load the bundle).
-    let (dialog_ready_tx, _dialog_ready_rx) = tokio::sync::watch::channel(false);
-    let dialog_ready_tx = Arc::new(dialog_ready_tx);
+    // (Step 4: the old `dialog_window_ready` watch handshake is gone — the
+    // per-id dialog window pulls its spec via `get_dialog_spec` on mount, so
+    // there's no emit to race and nothing to wait on.)
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1278,13 +1233,11 @@ pub fn run() {
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
         .manage(pending_update.clone())
-        .manage(dialog_ready_tx.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
-            dialog_received,
+            get_dialog_spec,
             ui_pong,
-            dialog_window_ready,
             close_window,
             surface_for_dialog,
             is_update_safe_to_install,
@@ -1606,27 +1559,22 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let closed_label = window.label().to_string();
-                if closed_label == DIALOG_WINDOW_LABEL {
-                    // User closed the dialog window with the native X (or
-                    // ⌘W). Resolve any in-flight `/render` as cancelled
-                    // right here in Rust — we no longer depend on a
-                    // frontend CloseRequested handler, which in 0.4.45
-                    // could `preventDefault()` and then fail to complete
-                    // the close, stranding an empty, unclosable window
-                    // (Bug B, the 2026-05-29 overnight report). We do NOT
-                    // prevent the close: the window is allowed to go away.
-                    // The awaiting `/render` will run its end-of-handler
-                    // `destroy_dialog_window` (a no-op by then).
+                if is_dialog_window_label(&closed_label) {
+                    // User closed THIS dialog window with the native X (or
+                    // ⌘W). Multi-window (Step 4): the window label is the
+                    // dialog id, so cancel exactly that dialog — never the
+                    // others that may be open for parallel sessions. Resolve
+                    // it as cancelled right here in Rust (we no longer depend
+                    // on a frontend CloseRequested handler, which in 0.4.45
+                    // could `preventDefault()` then fail to complete the
+                    // close, stranding an empty window — Bug B). We do NOT
+                    // prevent the close; the awaiting `/render` runs its
+                    // end-of-handler `destroy_dialog_window` (a no-op by then).
                     if let Some(ds) = app.try_state::<Arc<dialog::DialogState>>() {
-                        let n = ds.cancel_all("window_closed");
-                        if n > 0 {
-                            log::debug!(
-                                "[aiui] dialog window X-closed — cancelled {n} pending dialog(s)"
-                            );
-                        }
+                        ds.cancel(&closed_label);
                     }
                     log::debug!(
-                        "[aiui] dialog window closed — staying alive for further tool calls"
+                        "[aiui] dialog window {closed_label} X-closed — cancelled its dialog, host stays alive"
                     );
                     return;
                 }

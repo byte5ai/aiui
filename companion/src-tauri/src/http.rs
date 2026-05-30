@@ -1,6 +1,6 @@
 use crate::ack::AckRegistry;
 use crate::config::AppConfig;
-use crate::dialog::{DialogRequest, DialogState, DIALOG_TTL};
+use crate::dialog::{DialogState, DIALOG_TTL};
 use crate::lifetime::LifetimeStats;
 use axum::{
     extract::{Path, State},
@@ -17,28 +17,9 @@ use crate::logging::trace;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
-/// How long the `/render` handler waits for the frontend to acknowledge
-/// receipt of `dialog:show` before concluding the WebView event loop is
-/// dead and triggering a reload.
-const DIALOG_ACK_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Pause after `webview.reload()` before re-emitting `dialog:show`. Gives
-/// the freshly-loaded Svelte app time to mount and register its listener.
-const RELOAD_SETTLE: Duration = Duration::from_millis(300);
-
 /// How long `/health` waits for a `ui:ping` round-trip from the frontend
 /// before concluding the WebView is unresponsive.
 const UI_PING_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// Idle-restart trigger: if the GUI has been alive longer than this AND
-/// hasn't served a render recently (see `IDLE_RESTART_QUIET`), the next
-/// render reloads the WebView before showing — flushes any drift that
-/// accumulated while nobody was watching.
-const IDLE_RESTART_UPTIME: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Minimum time between renders for the long-uptime reload to trigger.
-/// Prevents reloading mid-burst when many renders fire close together.
-const IDLE_RESTART_QUIET: Duration = Duration::from_secs(10 * 60);
 
 /// Header a bridge sets to opt into async `/render` (Step 3). Present →
 /// `POST /render` registers + surfaces the dialog, returns `{id, ttl}`
@@ -76,13 +57,6 @@ struct AppState {
     ui_acks: Arc<AckRegistry>,
     lifetime: Arc<LifetimeStats>,
     app: AppHandle,
-    /// Process-start timestamp for the GUI. Used to evaluate the
-    /// idle-restart condition without requiring an OS sleep/wake hook.
-    started_at: Instant,
-    /// Last time `/render` produced (or attempted to produce) a dialog.
-    /// Mutex<Instant> is fine here — contention is bounded by the rate of
-    /// /render calls.
-    last_render_at: Arc<Mutex<Instant>>,
     /// Buffered terminal results for async renders (Step 3), keyed by dialog
     /// id. Empty in the all-synchronous case.
     async_slots: Arc<Mutex<std::collections::HashMap<String, AsyncSlot>>>,
@@ -93,6 +67,15 @@ struct RenderRequest {
     #[serde(default)]
     _timeout_s: Option<u64>,
     spec: serde_json::Value,
+    /// Human-legible session label set by the caller (Step 4, I8). Shown in
+    /// the dialog window's chrome so the user can tell which session a dialog
+    /// belongs to. Optional.
+    #[serde(default)]
+    session: Option<String>,
+    /// Origin host, auto-injected by the remote Python bridge (its hostname).
+    /// Optional; absent for local callers.
+    #[serde(default)]
+    session_origin: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -182,15 +165,12 @@ pub async fn serve(
     app: AppHandle,
 ) -> std::io::Result<()> {
     let port = cfg.http_port;
-    let now = Instant::now();
     let state = AppState {
         cfg,
         dialog,
         ui_acks,
         lifetime,
         app,
-        started_at: now,
-        last_render_at: Arc::new(Mutex::new(now)),
         async_slots: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
@@ -616,11 +596,12 @@ impl Drop for RenderGuard {
         ));
         // Free the registry slot so the next /render isn't 409'd for 2 h.
         self.dialog.cancel(&self.id);
-        // Tear down the surfaced window so it can't strand empty.
+        // Tear down the surfaced window (labelled by id) so it can't strand.
         if let Some(app) = &self.app {
             let app_for_destroy = app.clone();
+            let id_for_destroy = self.id.clone();
             let _ = app.run_on_main_thread(move || {
-                crate::destroy_dialog_window(&app_for_destroy)
+                crate::destroy_dialog_window(&app_for_destroy, &id_for_destroy)
             });
         }
     }
@@ -668,9 +649,10 @@ async fn resolve_dialog(
     // guarantees a dialog window never outlives its dialog. Idempotent —
     // a no-op on the submit/cancel paths where the window is already gone.
     let app_for_destroy = state.app.clone();
+    let id_for_destroy = id.clone();
     let _ = state
         .app
-        .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy));
+        .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy, &id_for_destroy));
     result
 }
 
@@ -813,193 +795,46 @@ async fn render(
             .into_response();
     }
 
-    // v0.4.36: try_register rejects when a dialog is already in flight
-    // instead of evicting the existing one. Two parallel callers — multi-
-    // call-per-turn, two Claude sessions, or a stale window from a prior
-    // timeout — would otherwise overlay each other in the single dialog
-    // window, with the older request's `oneshot` resolving as `evicted`
-    // exactly while the user was still looking at it. The 409 response
-    // gives the second caller a structured "busy" answer so the agent
-    // can choose to retry or tell the user the dialog is held by
-    // something else. Setup-window-driven UI calls don't go through
-    // /render at all, so this only governs agent dialog traffic.
-    let (id, result_rx, ack_rx) = match state.dialog.try_register() {
-        Ok(triple) => triple,
-        Err(busy) => {
-            trace(&format!(
-                "render: rejected — companion busy (pending={}, oldest_age={}s)",
-                busy.pending_count, busy.oldest_age_secs
-            ));
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "busy",
-                    "pending_count": busy.pending_count,
-                    "oldest_age_secs": busy.oldest_age_secs,
-                })),
-            )
-                .into_response();
-        }
-    };
+    // Multi-window (Step 4, I8): N dialogs may be in flight at once — the
+    // single-occupancy 409 is gone. `register_dialog` stores the request (the
+    // per-id window pulls it via `get_dialog_spec`) and only evicts the oldest
+    // if the hard cap is hit. Setup-window UI calls don't go through /render,
+    // so this governs agent dialog traffic only. Size is estimated from the
+    // spec before it moves into the registry.
+    let size = crate::dialog::estimate_dialog_size(&req.spec);
+    let (id, result_rx) = state.dialog.register_dialog(
+        req.spec,
+        req.session,
+        req.session_origin,
+        DIALOG_TTL.as_secs(),
+    );
     trace(&format!("render: registered id={}", id));
-    // Cancellation-safety net: from here until the explicit terminal teardown
-    // below, a dropped handler future (client give-up) must not leak the
-    // registry entry or strand the window. See `RenderGuard`.
+    // Cancellation-safety net: until the terminal teardown (sync) or the
+    // hand-off to the detached task (async), a dropped handler future must not
+    // leak the registry entry or strand the window. See `RenderGuard`.
     let mut guard = RenderGuard {
         id: id.clone(),
         dialog: state.dialog.clone(),
         app: Some(state.app.clone()),
         armed: true,
     };
-    let dr = DialogRequest {
-        id: id.clone(),
-        spec: req.spec,
-        // Sent so the frontend can schedule warning banners + auto-cancel
-        // a fraction before the backend sweep fires. Single source of
-        // truth lives in `DIALOG_TTL`. v0.4.41.
-        ttl_secs: DIALOG_TTL.as_secs(),
-    };
 
-    // ── Idle-restart check (#41) ────────────────────────────────────────
-    // If the GUI has been up for a long time and the last render was a
-    // while ago, reload the WebView before serving this one. Catches
-    // accumulated drift (sleep/wake artefacts, stuck event listeners)
-    // *exactly* when it would matter — not on a wall-clock timer.
-    //
-    // Important: never reload while a previous dialog is still pending.
-    // The reload tears down the WebView's JS state including any active
-    // dialog the user might be looking at, and the still-awaiting
-    // `/render` handler would get a `channel_dropped` cancellation
-    // instead of the user's actual answer. Only reload when the registry
-    // is empty. Issue #H-6 in v0.4.10 review.
+    // Build a fresh window labelled by the dialog id (Step 4 pull model). The
+    // window reads its own label and fetches the spec via `get_dialog_spec` on
+    // mount — there is no `dialog:show` emit, no ready-handshake, no ack
+    // timeout, and no reload-retry, because the frontend initiates and so
+    // can't race an event it isn't listening for yet. Window ops are
+    // main-thread-only.
     {
-        let last = *state.last_render_at.lock().unwrap();
-        let pending = state.dialog.stats().orphan_count;
-        if state.started_at.elapsed() > IDLE_RESTART_UPTIME
-            && last.elapsed() > IDLE_RESTART_QUIET
-            && pending == 0
-        {
-            trace(&format!(
-                "render: idle-restart trigger (uptime {:?}, last_render {:?} ago, registry empty)",
-                state.started_at.elapsed(),
-                last.elapsed()
-            ));
-            reload_main_webview(&state.app);
-            tokio::time::sleep(RELOAD_SETTLE).await;
-        } else if state.started_at.elapsed() > IDLE_RESTART_UPTIME
-            && last.elapsed() > IDLE_RESTART_QUIET
-        {
-            trace(&format!(
-                "render: idle-restart suppressed — {} pending dialog(s) in registry",
-                pending
-            ));
-        }
-    }
-
-    // Mark this render attempt — done early so the ack/recreate path
-    // still resets the idle clock even if the user closes the dialog.
-    *state.last_render_at.lock().unwrap() = Instant::now();
-
-    // Surface the window from the main thread. If the window is being
-    // built fresh (first render of this session, or after the user
-    // closed it), `ensure_dialog_window` reset the ready flag.
-    // Window-size estimate is per-spec — wide widgets widen, long
-    // forms grow vertically. v0.4.40.
-    let size = crate::dialog::estimate_dialog_size(&dr.spec);
-    surface_main_window(&state.app, &id, size);
-
-    // Window-ready handshake: wait until the frontend signals that
-    // its `dialog:show` listener is registered. Without this gate
-    // we'd race against Vite-bundle-load + Svelte-mount + tauri-listen,
-    // and on the first render of a session the emit would land before
-    // the listener — silent loss, 500 ms ack timeout, webview reload
-    // and a confused user staring at a blank window.
-    wait_for_dialog_ready(&state.app, "pre-emit").await;
-
-    // Emit the dialog to the frontend.
-    if let Err(e) = state
-        .app
-        .emit_to(crate::DIALOG_WINDOW_LABEL, "dialog:show", &dr)
-    {
-        trace(&format!("render: emit FAILED: {e}"));
-    } else {
-        trace(&format!("render: emitted dialog:show id={}", id));
-    }
-
-    // ── Ack-Contract ────────────────────────────────────────────────────
-    // Wait briefly for the frontend to confirm receipt. If no ack arrives,
-    // the WebView event loop is most likely dead — try to revive it by
-    // reloading the webview, then re-emitting once. If the second ack also
-    // fails, give up and surface a structured error to the caller instead
-    // of blocking indefinitely on a dialog the user will never see.
-    match tokio::time::timeout(DIALOG_ACK_TIMEOUT, ack_rx).await {
-        Ok(Ok(())) => {
-            trace(&format!("render: ack ok id={}", id));
-        }
-        _ => {
-            trace(&format!(
-                "render: no ack within {:?}; reloading webview and retrying",
-                DIALOG_ACK_TIMEOUT
-            ));
-            // Reset ready flag — after reload the listeners need to
-            // re-register. We'll wait on the handshake again before
-            // re-emitting.
-            if let Some(tx) = state
-                .app
-                .try_state::<std::sync::Arc<tokio::sync::watch::Sender<bool>>>()
-            {
-                let _ = tx.inner().send(false);
+        let app_for_build = state.app.clone();
+        let id_for_build = id.clone();
+        let _ = state.app.run_on_main_thread(move || {
+            if let Err(e) = crate::build_dialog_window(&app_for_build, &id_for_build, size) {
+                trace(&format!(
+                    "render: build_dialog_window failed id={id_for_build}: {e}"
+                ));
             }
-            reload_main_webview(&state.app);
-            tokio::time::sleep(RELOAD_SETTLE).await;
-
-            // Wait for the freshly-mounted Svelte to signal listeners
-            // are wired up again. Without this the same race that got
-            // us here would just repeat after reload.
-            wait_for_dialog_ready(&state.app, "post-reload").await;
-
-            // After reload the previous ack receiver was consumed. We need a
-            // fresh handshake on the same dialog id — register a new ack
-            // slot tied to the same id is overkill; instead we just re-emit
-            // and wait on the same (already-armed) ack registry by treating
-            // the second emit's resolution as the ack we care about.
-            //
-            // Since `register()` only created one ack channel and we just
-            // consumed its receiver via the timeout, we have to fall back
-            // to a small generic ack via the AckRegistry for the second
-            // round. That keeps DialogState simple.
-            let (probe_id, probe_rx) = state.ui_acks.register();
-            if let Err(e) = state
-                .app
-                .emit_to(crate::DIALOG_WINDOW_LABEL, "ui:ping", &probe_id)
-            {
-                trace(&format!("render: post-reload ui:ping emit failed: {e}"));
-                state.ui_acks.forget(&probe_id);
-            }
-            match tokio::time::timeout(DIALOG_ACK_TIMEOUT, probe_rx).await {
-                Ok(Ok(())) => {
-                    trace("render: post-reload webview is responsive, re-emitting dialog:show");
-                    if let Err(e) =
-                        state.app.emit_to(crate::DIALOG_WINDOW_LABEL, "dialog:show", &dr)
-                    {
-                        trace(&format!("render: re-emit FAILED: {e}"));
-                    }
-                }
-                _ => {
-                    state.ui_acks.forget(&probe_id);
-                    trace("render: webview still unreachable after reload — giving up");
-                    state.dialog.cancel(&id);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": "ui_unreachable",
-                            "detail": "webview did not acknowledge dialog:show after reload",
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
+        });
     }
 
     // ── Async branch (Step 3) ───────────────────────────────────────────
@@ -1057,97 +892,6 @@ async fn render(
         reason: result.reason,
     })
     .into_response()
-}
-
-/// Wait until the dialog window's frontend signals via the
-/// `dialog_window_ready` Tauri command that its `dialog:show` and
-/// `ui:ping` listeners are registered. Times out after
-/// `DIALOG_READY_TIMEOUT` and returns either way — the caller still
-/// emits, falling back to the existing ack/reload contract if the
-/// frontend turns out to be slower than expected.
-///
-/// Called twice in the render path: once before the initial emit
-/// (covers the cold-start race when the window is built fresh), once
-/// after a webview reload (covers the same race after the recovery
-/// path tears down the JS state).
-const DIALOG_READY_TIMEOUT: Duration = Duration::from_millis(3000);
-
-async fn wait_for_dialog_ready(app: &AppHandle, phase: &str) {
-    let Some(tx_state) = app.try_state::<std::sync::Arc<tokio::sync::watch::Sender<bool>>>()
-    else {
-        trace(&format!("render: dialog_ready_tx state missing ({phase})"));
-        return;
-    };
-    let mut rx = tx_state.inner().subscribe();
-    if *rx.borrow() {
-        trace(&format!("render: dialog already ready ({phase})"));
-        return;
-    }
-    let started = std::time::Instant::now();
-    let waited = tokio::time::timeout(DIALOG_READY_TIMEOUT, async {
-        while !*rx.borrow_and_update() {
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    })
-    .await;
-    if waited.is_ok() && *rx.borrow() {
-        trace(&format!(
-            "render: dialog ready ({phase}) after {:?}",
-            started.elapsed()
-        ));
-    } else {
-        trace(&format!(
-            "render: dialog-ready timeout ({phase}) after {:?} — proceeding anyway",
-            started.elapsed()
-        ));
-    }
-}
-
-/// Surface the dialog window for the incoming render. If the window
-/// already exists, show + focus + unminimize + resize to fit this
-/// spec; otherwise build it at the spec-derived inner size.
-/// All Tauri window operations have to run on the main thread, so we
-/// hop there via `run_on_main_thread`.
-fn surface_main_window(app: &AppHandle, id: &str, size: (f64, f64)) {
-    let app_for_show = app.clone();
-    let id_for_log = id.to_string();
-    let rc = app.clone().run_on_main_thread(move || {
-        trace(&format!(
-            "render: main-thread callback id={} size=({:.0},{:.0})",
-            id_for_log, size.0, size.1
-        ));
-        match crate::ensure_dialog_window(&app_for_show, size) {
-            Ok(_win) => {
-                trace("render: main-thread dialog window ready (show/build)");
-            }
-            Err(e) => {
-                trace(&format!("render: main-thread dialog window FAILED: {e}"));
-            }
-        }
-    });
-    trace(&format!("render: run_on_main_thread returned {:?}", rc.is_ok()));
-}
-
-/// Reload the main webview to recover from a stuck JS event loop. Tears
-/// down the JS side (DOM, listeners, setIntervals) and re-runs the Svelte
-/// app from scratch — Tauri's `webview.reload()` is exactly this. We use
-/// it as the recreate path because it's lighter than destroying and
-/// rebuilding the window via `WebviewWindowBuilder` and recovers from the
-/// same class of failure.
-fn reload_main_webview(app: &AppHandle) {
-    let app_for_reload = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        if let Some(win) = app_for_reload.get_webview_window(crate::DIALOG_WINDOW_LABEL) {
-            trace("render: reloading dialog webview");
-            if let Err(e) = win.eval("location.reload()") {
-                trace(&format!("render: reload eval failed: {e}"));
-            }
-        } else {
-            trace("render: reload requested but main window is MISSING");
-        }
-    });
 }
 
 #[cfg(test)]
@@ -1219,10 +963,14 @@ mod render_guard_tests {
     // window-destroy half needs a Tauri app, so these cover the registry half
     // (`app: None`) — the half that produces the 409.
 
+    fn reg(ds: &DialogState) -> (String, tokio::sync::oneshot::Receiver<crate::dialog::DialogResult>) {
+        ds.register_dialog(serde_json::json!({"kind": "confirm"}), None, None, 0)
+    }
+
     #[test]
     fn armed_guard_drop_frees_registry_slot() {
         let ds = Arc::new(DialogState::new());
-        let (id, result_rx, _ack) = ds.try_register().expect("first register is free");
+        let (id, result_rx) = reg(&ds);
         assert_eq!(ds.stats().orphan_count, 1);
         {
             let _guard = RenderGuard {
@@ -1233,9 +981,8 @@ mod render_guard_tests {
             };
             // future "dropped" here
         }
-        // Slot freed → the next render would NOT get a 409.
+        // Slot freed → a later render isn't blocked behind a leaked entry.
         assert_eq!(ds.stats().orphan_count, 0);
-        assert!(ds.try_register().is_ok(), "registry is free again after guard cleanup");
         // The awaiter observes a cancelled terminal result, not a hang.
         let r = result_rx.blocking_recv().expect("result_tx sent on cancel");
         assert!(r.cancelled);
@@ -1246,7 +993,7 @@ mod render_guard_tests {
         // The normal terminal path disarms after its own teardown; the guard
         // must then do nothing (no double-cancel, no spurious slot churn).
         let ds = Arc::new(DialogState::new());
-        let (id, _result_rx, _ack) = ds.try_register().unwrap();
+        let (id, _result_rx) = reg(&ds);
         {
             let mut guard = RenderGuard {
                 id: id.clone(),

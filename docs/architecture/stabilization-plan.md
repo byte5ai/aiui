@@ -1,7 +1,9 @@
 # aiui Stabilization Plan (locked spec — guards against drift)
 
-Status: Step 1 implemented (Refs #137); Steps 2–4 awaiting sign-off.
-See "Step 1 — implementation record" at the end of this document.
+Status: Steps 1–3 implemented + Step 4 multi-window (Refs #137, v0.5.0). The
+only remaining piece is Step 4's **tunnel** rework (aiui-dedicated cleanup) —
+Mac-side, deferred (see the Step 4 note). Per-step implementation records are
+inline under each step.
 Origin: root-cause analysis 2026-05-29 (Opus 4.8 code analysis + independent
 Codex diagnosis, convergent; external validation of the three pivotal facts).
 
@@ -212,6 +214,40 @@ Deciding facts to establish first:
     `:7777` — all share one port — so origin must come from the caller side).
   - Window chrome (title bar / header chip) shows `session` + `session_origin`.
   - Fallback when the agent passes nothing: `session_origin` + short id.
+
+> **Multi-window implemented (2026-05-30, PR #137); tunnel deferred.**
+> User decision (2026-05-30): parallel sessions per remote ARE required →
+> tunnel branch is **aiui-dedicated** (clean up the existing `ssh -NTR`, one
+> Mac-side owner). That cleanup is Mac-side lifecycle work and was **not** done
+> in this PR — it can't be settled or validated from the remote where the work
+> happened (no remote registered here; the deciding `~/.ssh/config` fact lives
+> on the Mac). It remains the open piece of Step 4, best done alongside the
+> integration harness below.
+>
+> Multi-window itself is done, via a **pull model** rather than multiplying the
+> old emit/ack/ready handshake per window:
+> - `dialog.rs`: `try_register` (single-occupancy 409) → `register_dialog`
+>   (N concurrent, evict-oldest only at `DIALOG_HARD_CAP`); the request payload
+>   (spec + ttl + `session`/`session_origin`) is stored and pulled by id.
+>   `cancel_all` removed (per-id cancel only — a blunt drain would kill other
+>   sessions' live dialogs).
+> - `http.rs`: `POST /render` builds a **fresh window labelled by the dialog id**
+>   (`build_dialog_window`) and the whole emit/`dialog_window_ready`/ack-timeout/
+>   reload-retry/idle-restart machinery is gone — the window pulls its spec via
+>   `get_dialog_spec` on mount, so there's no event-before-listener race to
+>   guard. Teardown is per-id.
+> - `lib.rs`: `get_dialog_spec` command; per-id `destroy_dialog_window`;
+>   Accessory demote when no dialog window remains; X-close cancels only the
+>   closed window's own dialog; orphan-sweep is per-id.
+> - Frontend `DialogShell.svelte`: reads its window label (= id), pulls the
+>   spec, renders, and shows a fixed top-right **session chip** (`session` ·
+>   `session_origin`), hidden when neither is set.
+> - Bridges: `session` tool param on both (`mcp.rs`, `server.py`); the **Python
+>   bridge auto-injects `socket.gethostname()` as `session_origin`** (I8
+>   fallback for remotes sharing `:7777`).
+> - Tests: Rust 102, Python 26, svelte-check 0 errors. **GUI behaviour is not
+>   verifiable from the remote — needs validation on the Mac** (the
+>   integration harness below is the right home for it).
 
 ## Cross-cutting — observability + test harness (makes "no regression" real)
 
