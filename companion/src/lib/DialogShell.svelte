@@ -167,6 +167,11 @@
         }
         current = req;
         scheduleTtl(req.ttl_secs, req.id);
+        // Session identity goes in the native title bar (Step 4 / I8) — not a
+        // chip in the work area, which overlapped content (2026-05-31). The
+        // OS title bar is the natural home for window identity.
+        const parts = [req.session, req.session_origin].filter(Boolean);
+        void getCurrentWindow().setTitle(parts.length ? `aiui — ${parts.join(" · ")}` : "aiui");
       } catch (e) {
         console.error(`[aiui] get_dialog_spec failed for ${id}: ${e}`);
       }
@@ -261,117 +266,49 @@
   </div>
 {/if}
 
-<div class="dialog-root">
-  <!-- Session identifier (Step 4, I8): an IN-FLOW strip at the very top of the
-       window so it never overlaps the dialog's own header/content. It was a
-       position:fixed overlay before, which floated over UI elements
-       (2026-05-31 report). Hidden when neither field is set — a normal local
-       single-session dialog looks unchanged. -->
-  {#if current && (current.session || current.session_origin)}
-    <div class="session-bar">
-      <span class="session-chip" role="note" aria-label={$_("dialog.session_aria")}>
-        {#if current.session}<span class="session-name">{current.session}</span>{/if}
-        {#if current.session && current.session_origin}<span class="session-sep">·</span>{/if}
-        {#if current.session_origin}<span class="session-origin">{current.session_origin}</span>{/if}
-      </span>
-    </div>
-  {/if}
-
-  <div class="dialog-body">
-    {#if current}
-      <!-- {#key current.id} forces a fresh widget instance for every new
-        dialog, even when two consecutive renders are the same kind (e.g.
-        two `confirm`s). Without it, Svelte recycles the component and
-        stale field/checkbox/radio state from the previous dialog can bleed
-        into the current one — silently sending wrong answers back to the
-        caller. Issue #H-1 in v0.4.10 review. -->
-      {#key current.id}
-        {#if current.spec.kind === "ask"}
-          <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-        {:else if current.spec.kind === "form"}
-          <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-        {:else if current.spec.kind === "confirm"}
-          <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-        {:else}
-          <main class="window-shell">
-            <div class="window-scroll">
-              <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
-              <pre>{JSON.stringify(current.spec, null, 2)}</pre>
-            </div>
-            <footer class="window-footer">
-              <button onclick={handleCancel}>{$_("dialog.close")}</button>
-            </footer>
-          </main>
-        {/if}
-      {/key}
+{#if current}
+  <!-- {#key current.id} forces a fresh widget instance for every new
+    dialog, even when two consecutive renders are the same kind (e.g.
+    two `confirm`s). Without it, Svelte recycles the component and
+    stale field/checkbox/radio state from the previous dialog can bleed
+    into the current one — silently sending wrong answers back to the
+    caller. Issue #H-1 in v0.4.10 review. Session identity (I8) lives in
+    the native title bar — set via setTitle in onMount — not in the work
+    area, so it can never overlap dialog content. -->
+  {#key current.id}
+    {#if current.spec.kind === "ask"}
+      <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "form"}
+      <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "confirm"}
+      <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else}
-      <!-- Brief idle state — only visible during the few hundred ms
-           between window-show and the spec arriving. -->
       <main class="window-shell">
-        <div class="idle"></div>
+        <div class="window-scroll">
+          <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
+          <pre>{JSON.stringify(current.spec, null, 2)}</pre>
+        </div>
+        <footer class="window-footer">
+          <button onclick={handleCancel}>{$_("dialog.close")}</button>
+        </footer>
       </main>
     {/if}
-  </div>
-</div>
+  {/key}
+{:else}
+  <!-- Brief idle state — only visible during the few hundred ms
+       between window-show and the spec arriving. -->
+  <main class="window-shell">
+    <div class="idle"></div>
+  </main>
+{/if}
 
 <style>
   .idle {
     min-height: 80px;
   }
 
-  /* Window-filling layout (v0.5.2): a flex column so the optional session
-     strip sits IN-FLOW above the dialog and the widget gets the remaining
-     height (each widget's own `.window-shell` is height:100%). #app/body are
-     height:100%, so this chain resolves to a definite height. */
-  .dialog-root {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    overflow: hidden;
-  }
-  .dialog-body {
-    flex: 1 1 auto;
-    min-height: 0;
-  }
-
-  /* Session identifier strip — in-flow at the top, right-aligned, so it can
-     never overlap the dialog's header or content (was a fixed overlay). */
-  .session-bar {
-    flex: 0 0 auto;
-    display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    padding: 5px 10px 0;
-  }
-  .session-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    max-width: 100%;
-    padding: 2px 8px;
-    font-size: 11px;
-    line-height: 1.4;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--fg, #000) 8%, var(--bg, #fff));
-    color: color-mix(in srgb, var(--fg, #000) 62%, var(--bg, #fff));
-    border: 1px solid color-mix(in srgb, var(--fg, #000) 12%, transparent);
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .session-name {
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .session-sep {
-    opacity: 0.5;
-  }
-  .session-origin {
-    font-variant: tabular-nums;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
+  /* Session identity (I8) now lives in the native window title bar (set via
+     setTitle in onMount), so there is no in-work-area chip/markup to style. */
 
   /* TTL countdown banner. Position-fixed so the widget below keeps
      its own three-zone (.window-shell) layout intact — content
