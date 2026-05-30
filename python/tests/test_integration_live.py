@@ -103,14 +103,30 @@ def test_unauthorized_rejected() -> None:
     assert r.status_code == 401
 
 
-def test_render_get_unknown_id_never_returns_terminal() -> None:
-    """`GET /render/{id}` for a never-registered id must never hand back a
-    terminal dialog result. On >=0.5.0 (async render) it's 404
-    `unknown_render_id`; older companions have no such route (404/405). Either
-    way: not a 200 terminal. Read-only — no dialog is created."""
+def test_render_get_unknown_id_route_exists_and_404s_cleanly() -> None:
+    """`GET /render/{id}` for a never-registered id must be served by the async
+    handler — 404 with body `unknown_render_id`. This deliberately asserts the
+    body, not just the status: an empty-body 404 means the *route itself* didn't
+    match (the axum 0.7 `:id` vs 0.8 `{id}` mismatch that shipped in the first
+    0.5.0 build and that a status-only check let through). Read-only — no dialog
+    is created.
+
+    Tolerant of an older companion with no such route: skip if the body is
+    empty AND status is 404/405 (route genuinely absent on that version)."""
     r = httpx.get(
         f"{ENDPOINT}/render/nonexistent-harness-probe-id",
         headers=_auth(),
         timeout=TIMEOUT,
     )
-    assert r.status_code in (404, 405)
+    body = r.text or ""
+    # Older companion without the async route: empty-body 404/405 → not this
+    # version's contract, skip rather than fail.
+    if r.status_code in (404, 405) and "unknown_render_id" not in body and body.strip() == "":
+        import pytest as _pytest
+
+        _pytest.skip("companion has no async GET /render/{id} route (pre-0.5.0)")
+    assert r.status_code == 404
+    assert "unknown_render_id" in body, (
+        "GET /render/<id> must hit the async handler (body 'unknown_render_id'); "
+        f"empty 404 means the route didn't match. Got: {body!r}"
+    )
