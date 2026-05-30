@@ -96,6 +96,20 @@ Files: `setup.rs`, `lib.rs`, `http.rs`, `python/.../server.py`.
   crashes. Tolerate ordinary version skew (the wire contract is versioned and
   stable).
 
+> **Implemented (2026-05-30, PR #137).** `kill_remote_mcp_stdio`
+> (`ssh … pkill -f 'aiui-mcp'`) and all three of its callers — the GUI-startup
+> remote-pin loop, `add_remote` re-add, and `resync_remote` — are deleted. The
+> pin in `~/.claude.json` now takes effect at the next natural spawn; a live
+> session keeps its version until it ends. `resync_remote` is re-pin-only.
+> Deregistration (`remove_remote` / `uninstall_all`) was already
+> config-removal + tunnel-stop, no kill — left as is. Cooperative floor:
+> `WIRE_VERSION = 1` in `http.rs`, surfaced on `/version` + `/probe`; the
+> Python bridge's `_check_wire_compat` reads it once per process and raises a
+> structured "restart this session" error only on a hard wire mismatch (absent
+> field → treated as v1, transient read errors tolerated). Tests: Rust 105
+> green, Python 21 green (4 new wire-compat). The Rust bridge (`mcp.rs`) is the
+> same binary as the companion, so it needs no floor check.
+
 ## Step 3 — Async render + bridge parity (decided; closes the ReadError class)
 
 Files: `http.rs`, `dialog.rs`, `mcp.rs`, `python/.../server.py`.

@@ -80,6 +80,16 @@ ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
 TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
 HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
 
+# Cooperative version floor (Step 2). The wire contract between this bridge and
+# the Mac companion is versioned independently of either side's release version.
+# This bridge speaks wire v1; if the companion reports a *different*
+# wire_version we surface a structured "restart this session" tool error rather
+# than letting the Mac kill us to force a version. Ordinary app-version skew is
+# tolerated — only an incompatible wire_version is fatal. Checked once per
+# process (memoised in `_wire_checked`).
+EXPECTED_WIRE_VERSION = 1
+_wire_checked = False
+
 _INSTRUCTIONS = """\
 aiui is connected — you can render native dialogs on the user's Mac \
 instead of asking via chat. Default behaviour for this session:
@@ -194,6 +204,50 @@ async def _preflight() -> None:
             raise RuntimeError(
                 f"aiui companion /health returned {r.status_code}: {r.text[:200]}"
             )
+
+        # Cooperative version floor (Step 2): once per process, confirm the
+        # companion speaks a compatible wire version. Reuses this client.
+        await _check_wire_compat(client)
+
+
+async def _check_wire_compat(client: httpx.AsyncClient) -> None:
+    """One-time wire-compatibility check against the companion's `/version`.
+
+    Raises a structured ``RuntimeError`` (surfaced to the agent as a tool error)
+    on a hard wire-version mismatch, telling the user to restart this Claude
+    Code session so it respawns ``aiui-mcp`` at a matching version — the
+    cooperative replacement for the Mac externally killing this bridge.
+
+    Tolerant by design: a companion too old to report ``wire_version`` (field
+    absent → treated as v1), or any transient error reading ``/version``, does
+    NOT block — we only hard-fail on an explicit, incompatible ``wire_version``.
+    Memoised via the module-level ``_wire_checked`` so it costs one extra GET
+    per process, on the first render only.
+    """
+    global _wire_checked
+    if _wire_checked:
+        return
+    try:
+        r = await client.get(
+            f"{ENDPOINT}/version",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+        r.raise_for_status()
+        remote_wire = int(r.json().get("wire_version", EXPECTED_WIRE_VERSION))
+    except Exception as e:  # noqa: BLE001 — tolerate skew; never block on a read error
+        log.debug("wire-compat check skipped (could not read /version): %s", _explain_exc(e))
+        _wire_checked = True
+        return
+    if remote_wire != EXPECTED_WIRE_VERSION:
+        # Do NOT memoise a failure — leave it un-set so a subsequent call
+        # (e.g. after the user restarts the companion) re-checks cleanly.
+        raise RuntimeError(
+            f"incompatible aiui versions — this bridge (aiui-mcp {VERSION}) speaks wire "
+            f"v{EXPECTED_WIRE_VERSION}, but the companion on your Mac speaks wire "
+            f"v{remote_wire}. Restart this Claude Code session so it respawns aiui-mcp at "
+            f"a matching version (or update the side that is behind)."
+        )
+    _wire_checked = True
 
 
 _SRC_KEYS = {"src", "thumbnail"}
