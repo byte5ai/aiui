@@ -1002,6 +1002,12 @@ pub(crate) fn build_dialog_window(
         .disable_drag_drop_handler()
         .visible(true)
         .always_on_top(true)
+        // Focus the fresh window so macOS doesn't eat the user's FIRST click
+        // just to make it key ("first mouse" — the 2026-05-31 "have to click
+        // twice" report). The old single-reused-window path called set_focus();
+        // the per-id rewrite dropped it. Belt-and-suspenders with set_focus()
+        // in the inspect below.
+        .focused(true)
         .build()
         .inspect(|win| {
             // Cascade (2026-05-31 report): offset each *additional* open dialog
@@ -1023,6 +1029,9 @@ pub(crate) fn build_dialog_window(
                         .set_position(tauri::PhysicalPosition::new(pos.x + off, pos.y + off));
                 }
             }
+            // Make the window key so the user's first click lands on a control
+            // instead of being consumed to focus the window.
+            let _ = win.set_focus();
             // Briefly always-on-top to win the focus race, then lift it so
             // Cmd+Tab works normally afterwards.
             let app_for_lift = app.clone();
