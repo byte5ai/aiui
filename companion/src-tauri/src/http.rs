@@ -802,6 +802,23 @@ async fn render(
     // so this governs agent dialog traffic only. Size is estimated from the
     // spec before it moves into the registry.
     let size = crate::dialog::estimate_dialog_size(&req.spec);
+    // Native title-bar text (I8): "aiui — <session> · <origin>", computed
+    // before session/origin move into the registry. Set on the window by Rust
+    // (frontend setTitle is permission-gated). Falls back to "aiui".
+    let window_title = {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(s) = req.session.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(s);
+        }
+        if let Some(o) = req.session_origin.as_deref().filter(|o| !o.is_empty()) {
+            parts.push(o);
+        }
+        if parts.is_empty() {
+            "aiui".to_string()
+        } else {
+            format!("aiui — {}", parts.join(" · "))
+        }
+    };
     let (id, result_rx) = state.dialog.register_dialog(
         req.spec,
         req.session,
@@ -828,8 +845,11 @@ async fn render(
     {
         let app_for_build = state.app.clone();
         let id_for_build = id.clone();
+        let title_for_build = window_title;
         let _ = state.app.run_on_main_thread(move || {
-            if let Err(e) = crate::build_dialog_window(&app_for_build, &id_for_build, size) {
+            if let Err(e) =
+                crate::build_dialog_window(&app_for_build, &id_for_build, size, &title_for_build)
+            {
                 trace(&format!(
                     "render: build_dialog_window failed id={id_for_build}: {e}"
                 ));
