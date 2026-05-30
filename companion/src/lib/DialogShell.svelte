@@ -261,69 +261,93 @@
   </div>
 {/if}
 
-<!-- Session identifier chip (Step 4, I8). Top-right, fixed so it never
-     reflows the widget. Shows the caller's session label and/or the remote
-     origin host so the user can tell which session a dialog belongs to when
-     several windows are open at once. Hidden entirely when neither is set
-     (the common local single-session case). -->
-{#if current && (current.session || current.session_origin)}
-  <div class="session-chip" role="note" aria-label={$_("dialog.session_aria")}>
-    {#if current.session}<span class="session-name">{current.session}</span>{/if}
-    {#if current.session && current.session_origin}<span class="session-sep">·</span>{/if}
-    {#if current.session_origin}<span class="session-origin">{current.session_origin}</span>{/if}
-  </div>
-{/if}
+<div class="dialog-root">
+  <!-- Session identifier (Step 4, I8): an IN-FLOW strip at the very top of the
+       window so it never overlaps the dialog's own header/content. It was a
+       position:fixed overlay before, which floated over UI elements
+       (2026-05-31 report). Hidden when neither field is set — a normal local
+       single-session dialog looks unchanged. -->
+  {#if current && (current.session || current.session_origin)}
+    <div class="session-bar">
+      <span class="session-chip" role="note" aria-label={$_("dialog.session_aria")}>
+        {#if current.session}<span class="session-name">{current.session}</span>{/if}
+        {#if current.session && current.session_origin}<span class="session-sep">·</span>{/if}
+        {#if current.session_origin}<span class="session-origin">{current.session_origin}</span>{/if}
+      </span>
+    </div>
+  {/if}
 
-{#if current}
-  <!-- {#key current.id} forces a fresh widget instance for every new
-    dialog, even when two consecutive renders are the same kind (e.g.
-    two `confirm`s). Without it, Svelte recycles the component and
-    stale field/checkbox/radio state from the previous dialog can bleed
-    into the current one — silently sending wrong answers back to the
-    caller. Issue #H-1 in v0.4.10 review. -->
-  {#key current.id}
-    {#if current.spec.kind === "ask"}
-      <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-    {:else if current.spec.kind === "form"}
-      <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
-    {:else if current.spec.kind === "confirm"}
-      <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+  <div class="dialog-body">
+    {#if current}
+      <!-- {#key current.id} forces a fresh widget instance for every new
+        dialog, even when two consecutive renders are the same kind (e.g.
+        two `confirm`s). Without it, Svelte recycles the component and
+        stale field/checkbox/radio state from the previous dialog can bleed
+        into the current one — silently sending wrong answers back to the
+        caller. Issue #H-1 in v0.4.10 review. -->
+      {#key current.id}
+        {#if current.spec.kind === "ask"}
+          <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+        {:else if current.spec.kind === "form"}
+          <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+        {:else if current.spec.kind === "confirm"}
+          <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+        {:else}
+          <main class="window-shell">
+            <div class="window-scroll">
+              <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
+              <pre>{JSON.stringify(current.spec, null, 2)}</pre>
+            </div>
+            <footer class="window-footer">
+              <button onclick={handleCancel}>{$_("dialog.close")}</button>
+            </footer>
+          </main>
+        {/if}
+      {/key}
     {:else}
+      <!-- Brief idle state — only visible during the few hundred ms
+           between window-show and the spec arriving. -->
       <main class="window-shell">
-        <div class="window-scroll">
-          <p class="title">{$_("dialog.unknown_kind", { values: { kind: current.spec.kind } })}</p>
-          <pre>{JSON.stringify(current.spec, null, 2)}</pre>
-        </div>
-        <footer class="window-footer">
-          <button onclick={handleCancel}>{$_("dialog.close")}</button>
-        </footer>
+        <div class="idle"></div>
       </main>
     {/if}
-  {/key}
-{:else}
-  <!-- Brief idle state — only visible during the few hundred ms
-       between window-show and the dialog:show event arriving. -->
-  <main class="window-shell">
-    <div class="idle"></div>
-  </main>
-{/if}
+  </div>
+</div>
 
 <style>
   .idle {
     min-height: 80px;
   }
 
-  /* Session identifier chip — fixed top-right, small and muted so it never
-     competes with the dialog content or reflows it. v0.5.0 (I8). */
-  .session-chip {
-    position: fixed;
-    top: 6px;
-    right: 10px;
-    z-index: 1100;
+  /* Window-filling layout (v0.5.2): a flex column so the optional session
+     strip sits IN-FLOW above the dialog and the widget gets the remaining
+     height (each widget's own `.window-shell` is height:100%). #app/body are
+     height:100%, so this chain resolves to a definite height. */
+  .dialog-root {
     display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+  }
+  .dialog-body {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  /* Session identifier strip — in-flow at the top, right-aligned, so it can
+     never overlap the dialog's header or content (was a fixed overlay). */
+  .session-bar {
+    flex: 0 0 auto;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    padding: 5px 10px 0;
+  }
+  .session-chip {
+    display: inline-flex;
     align-items: center;
     gap: 5px;
-    max-width: 45vw;
+    max-width: 100%;
     padding: 2px 8px;
     font-size: 11px;
     line-height: 1.4;
