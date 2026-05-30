@@ -26,6 +26,28 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 pub const SETUP_WINDOW_LABEL: &str = "setup";
 pub const DIALOG_WINDOW_LABEL: &str = "dialog";
 
+/// Timestamp of the most recent dialog-window teardown (X-close, submit/cancel
+/// close, or programmatic destroy). The macOS `RunEvent::Reopen` handler reads
+/// it to suppress the settings window when a Reopen fires merely as a
+/// *side-effect* of a dialog closing (2026-05-31 report: setup window popped up
+/// after closing a dialog) — as opposed to a genuine user reactivation.
+static LAST_DIALOG_TEARDOWN: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+    std::sync::OnceLock::new();
+
+fn mark_dialog_teardown() {
+    *LAST_DIALOG_TEARDOWN
+        .get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()))
+        .lock()
+        .unwrap() = std::time::Instant::now();
+}
+
+fn dialog_torn_down_recently() -> bool {
+    LAST_DIALOG_TEARDOWN
+        .get()
+        .map(|m| m.lock().unwrap().elapsed() < std::time::Duration::from_millis(1500))
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 fn dialog_submit(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
@@ -115,8 +137,9 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     // If a dialog window just closed and nothing else needs the Dock icon,
     // demote back to Accessory. `build_dialog_window` promoted us to Regular
     // for the dialog's lifetime; this is the matching demote.
-    #[cfg(target_os = "macos")]
     if is_dialog_window_label(&label) {
+        mark_dialog_teardown();
+        #[cfg(target_os = "macos")]
         demote_if_no_dialogs_except(&app, &label);
     }
     Ok(())
@@ -133,6 +156,7 @@ pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle, id: &str) {
     if let Some(win) = app.get_webview_window(id) {
         let _ = win.destroy();
     }
+    mark_dialog_teardown();
     // Matching demote for `build_dialog_window`'s Regular-mode promote: drop
     // back to Accessory once the last dialog is gone (ignoring the one we just
     // destroyed, which may still be in the window list) and setup is hidden.
@@ -975,7 +999,26 @@ pub(crate) fn build_dialog_window(
         .visible(true)
         .always_on_top(true)
         .build()
-        .inspect(|_win| {
+        .inspect(|win| {
+            // Cascade (2026-05-31 report): offset each *additional* open dialog
+            // so stacked windows don't sit exactly on top of each other. Keyed
+            // on the count of OTHER dialog windows currently open — NOT a
+            // monotonic counter — and wrapped at 8 steps, so closing a window
+            // frees its slot, the first/only dialog always opens centered, and
+            // they never march off the bottom-right over a long session.
+            let others = app
+                .webview_windows()
+                .keys()
+                .filter(|l| is_dialog_window_label(l) && l.as_str() != id)
+                .count();
+            if others > 0 {
+                if let Ok(pos) = win.outer_position() {
+                    let sf = win.scale_factor().unwrap_or(1.0);
+                    let off = ((others % 8) as f64 * 28.0 * sf) as i32;
+                    let _ = win
+                        .set_position(tauri::PhysicalPosition::new(pos.x + off, pos.y + off));
+                }
+            }
             // Briefly always-on-top to win the focus race, then lift it so
             // Cmd+Tab works normally afterwards.
             let app_for_lift = app.clone();
@@ -1573,6 +1616,9 @@ pub fn run() {
                     if let Some(ds) = app.try_state::<Arc<dialog::DialogState>>() {
                         ds.cancel(&closed_label);
                     }
+                    // Mark the teardown so a Reopen fired as a side-effect of
+                    // this close doesn't surface the settings window.
+                    mark_dialog_teardown();
                     log::debug!(
                         "[aiui] dialog window {closed_label} X-closed — cancelled its dialog, host stays alive"
                     );
@@ -1675,7 +1721,14 @@ pub fn run() {
                     // would otherwise be greeted by a leftover empty
                     // frame (v0.4.46, Bug B+).
                     sweep_orphan_dialog_window(app);
-                    show_settings_window(app);
+                    // BUT: macOS also fires Reopen as a side-effect of a dialog
+                    // window closing. Surfacing settings then is the
+                    // 2026-05-31 "setup window popped up after I closed a
+                    // dialog" bug. Only surface settings for a *genuine*
+                    // reactivation — i.e. not right after a dialog teardown.
+                    if !dialog_torn_down_recently() {
+                        show_settings_window(app);
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
