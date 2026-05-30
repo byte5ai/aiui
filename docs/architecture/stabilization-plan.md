@@ -4,9 +4,9 @@ Status: Steps 1–4 implemented (Refs #137, v0.5.0). Step 4's tunnel was settled
 empirically (2026-05-30): aiui-dedicated is correct and already in place — no
 refactor needed; piggyback is impossible (Claude Desktop provides no reverse
 forward). Per-step implementation records are inline under each step. The only
-non-code residual is the remote-path integration harness (cross-cutting, below)
-and a UX nicety (auto-discovering Code-tab remotes — needs Claude-Desktop
-support).
+non-code residual is the remote-path **integration test harness** (cross-cutting,
+below) — optional but the highest-value follow-up, since the bug-prone layer is
+exactly the one with no automated coverage today.
 Origin: root-cause analysis 2026-05-29 (Opus 4.8 code analysis + independent
 Codex diagnosis, convergent; external validation of the three pivotal facts).
 
@@ -248,11 +248,11 @@ The original deciding facts:
 > correct aiui-dedicated mechanism and adequately hardened; piggyback is
 > impossible (CD provides no forward). Step 4 is therefore complete bar the
 > optional verified-`/probe` health polish, which was assessed and declined as
-> marginal. The genuinely open, separate item is UX: aiui still requires the
-> user to register each remote manually in its settings (with a working
-> non-interactive ssh alias), independent of the Code-tab connection —
-> auto-discovering CD's connected remotes would need Claude-Desktop support and
-> is out of scope here.
+> marginal. (Note: aiui requires the user to register each remote manually in
+> its settings with a working non-interactive ssh alias — that is current,
+> intended behaviour, not a planned change; Claude Desktop does not expose its
+> Code-tab connections to a third-party app, so there is no clean way to
+> auto-discover them.)
 >
 > Multi-window itself is done, via a **pull model** rather than multiplying the
 > old emit/ack/ready handshake per window:
