@@ -289,6 +289,17 @@ The original deciding facts:
   tunnel-down, GUI-down-mid-call, update-mid-call, parallel sessions (same +
   different remotes), Claude-Desktop-quit, Claude-Desktop-restart.
 
+  > **Design + Stufe 1 landed (2026-05-30):** see
+  > [`integration-harness.md`](./integration-harness.md). Established that the
+  > driver can run **from the remote against the real companion** over the
+  > tunnel. Stufe 1 (read-only smoke: `/ping` `/health` `/version` `/probe`,
+  > 401, unknown render-id) is implemented in
+  > `python/tests/test_integration_live.py` (opt-in `AIUI_LIVE=1`, skipped in
+  > normal/CI runs) and verified live (6 passed vs the installed companion).
+  > Stufe 2 (render path + window lifecycle) is designed: it needs a strictly
+  > test-gated companion hook to answer dialogs without a human / screen-spam,
+  > and the v0.5.0 build running on the Mac to validate this PR's behaviour.
+
 ## Sequencing & no-regression guardrail
 
 Order: **1 → 2 → 3 → 4.** Each step is independently shippable and verifiable.
