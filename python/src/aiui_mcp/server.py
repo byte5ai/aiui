@@ -16,6 +16,7 @@ registered in the companion's settings window.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.metadata
 import importlib.resources as resources
@@ -23,12 +24,13 @@ import logging
 import mimetypes
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 
 def _version() -> str:
@@ -89,6 +91,18 @@ HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
 # process (memoised in `_wire_checked`).
 EXPECTED_WIRE_VERSION = 1
 _wire_checked = False
+
+# Cold-start poll (Step 3, bridge parity with the Rust bridge's wait_for_aiui).
+# Before the first render call we poll the unauthenticated /ping until the
+# companion answers or this budget elapses — so a freshly-launched Claude
+# Desktop / just-up SSH tunnel gets time to start serving instead of failing
+# the first call. Replaces the brittle single 3 s /health preflight.
+COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
+
+# Per-GET timeout for the async-render poll. Must exceed the companion's
+# ~25 s server-side poll window so the server always answers `{pending:true}`
+# before we time out, letting us re-poll cleanly.
+ASYNC_POLL_TIMEOUT_S = 40.0
 
 _INSTRUCTIONS = """\
 aiui is connected — you can render native dialogs on the user's Mac \
@@ -161,6 +175,20 @@ async def _preflight() -> None:
                 f"aiui companion at {ENDPOINT} timed out on /health — likely a stale "
                 f"local aiui instance holding the port. Run `pkill -f '^aiui$'` on "
                 f"this host. ({_explain_exc(e)})"
+            ) from e
+        except httpx.ReadError as e:
+            # Connected at the TCP layer but the stream closed with no HTTP
+            # response — the classic remote signature of "tunnel is up but the
+            # Mac side isn't serving" (stale SSH reverse-forward bound to :7777
+            # with a dead aiui behind it). Distinct from ConnectError (nothing
+            # listening) and from a clean 401/5xx.
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} accepted the connection but sent no "
+                f"response (ReadError). On a remote this means the SSH reverse-tunnel "
+                f"is up but the Mac-side aiui isn't serving — Claude Desktop may be "
+                f"closed, or a stale tunnel is squatting :7777. Open Claude Desktop on "
+                f"the Mac; if it persists, re-register this remote in aiui.app settings. "
+                f"({_explain_exc(e)})"
             ) from e
         except httpx.RemoteProtocolError as e:
             # Connection reset / closed mid-response. The on-Mac mcp-stdio
@@ -322,7 +350,72 @@ def _resolve_local_paths(node: Any) -> None:
             _resolve_local_paths(item)
 
 
-async def _post_render(spec: dict[str, Any]) -> dict[str, Any]:
+async def _wait_for_aiui() -> None:
+    """Poll the unauthenticated `/ping` until the companion answers or
+    `COLDSTART_WAIT_S` elapses (Step 3, parity with the Rust bridge).
+
+    Gives a cold companion (Claude Desktop just launched, SSH tunnel just came
+    up) time to start serving before the first render, instead of failing the
+    call outright. Tolerant: on timeout we simply fall through to `_preflight`,
+    which produces the precise reachability diagnosis. `/ping` is cheap and
+    needs no token, so this is a light readiness gate, not a full health check.
+    """
+    deadline = time.monotonic() + COLDSTART_WAIT_S
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                r = await client.get(f"{ENDPOINT}/ping")
+                if r.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass  # not up yet — keep polling within the budget
+            await asyncio.sleep(0.5)
+
+
+async def _poll_render(
+    client: httpx.AsyncClient,
+    render_id: str,
+    ctx: Context | None,
+) -> dict[str, Any]:
+    """Poll `GET /render/{id}` until the terminal result (Step 3 async render).
+
+    Each GET is bounded by `ASYNC_POLL_TIMEOUT_S` (> the server's ~25 s poll
+    window), so the server always answers `{pending:true}` before we time out
+    and we re-poll — no single connection is held for the user's think-time,
+    which is what immunises the remote path against the multi-minute-ReadError
+    class. Emits an MCP progress notification each pending iteration so the
+    client (Claude Code) knows the tool is alive, not hung.
+    """
+    poll_url = f"{ENDPOINT}/render/{render_id}"
+    iteration = 0
+    while True:
+        pr = await client.get(
+            poll_url,
+            headers={"Authorization": f"Bearer {_token()}"},
+            timeout=ASYNC_POLL_TIMEOUT_S,
+        )
+        if pr.status_code == 404:
+            raise RuntimeError(
+                f"aiui lost track of render {render_id} (expired or never "
+                f"registered). Restart the dialog."
+            )
+        pr.raise_for_status()
+        pv = pr.json()
+        if pv.get("pending") is True:
+            iteration += 1
+            if ctx is not None:
+                # Best-effort: a missing progressToken or any reporting hiccup
+                # must never break the render.
+                try:
+                    await ctx.report_progress(progress=float(iteration), total=None)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("progress report skipped: %s", _explain_exc(e))
+            continue
+        return pv
+
+
+async def _post_render(spec: dict[str, Any], ctx: Context | None = None) -> dict[str, Any]:
+    await _wait_for_aiui()
     await _preflight()
     t0 = datetime.now(timezone.utc)
     log.info("render → kind=%s", spec.get("kind"))
@@ -334,14 +427,26 @@ async def _post_render(spec: dict[str, Any]) -> dict[str, Any]:
     # only handles HTTPS.
     _resolve_local_paths(spec)
     async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        # Async render (Step 3): opt in via the header. A current companion
+        # registers the dialog and answers immediately with `{id, ttl_secs}`
+        # (202); we then poll for the result. An older companion ignores the
+        # header and answers synchronously (200 with the terminal shape) — we
+        # detect that and use it directly (backward-compatible).
         r = await client.post(
             f"{ENDPOINT}/render",
-            headers={"Authorization": f"Bearer {_token()}"},
+            headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
             json={"spec": spec},
         )
         r.raise_for_status()
+        first = r.json()
+        if r.status_code == 202:
+            render_id = first.get("id")
+            if not render_id:
+                raise RuntimeError("async /render: 202 response missing `id`")
+            data = await _poll_render(client, render_id, ctx)
+        else:
+            data = first  # synchronous companion — terminal result already
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
-    data = r.json()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
         spec.get("kind"), data.get("cancelled"), dt,
@@ -362,6 +467,7 @@ async def ask(
     header: str | None = None,
     multi_select: bool = False,
     allow_other: bool = True,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before listing options in chat and waiting for the user to type back
     which one (deploy strategy, migration path, file to act on …), call
@@ -401,7 +507,7 @@ async def ask(
         "multiSelect": multi_select,
         "allowOther": allow_other,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx))
 
 
 @mcp.tool()
@@ -414,6 +520,7 @@ async def form(
     actions: list[dict[str, Any]] | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Whenever the user needs to provide ≥ 2 related inputs, or any single
     input that doesn't belong in chat (secret, date/datetime/range,
@@ -506,7 +613,7 @@ async def form(
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx))
 
 
 @mcp.tool()
@@ -518,6 +625,7 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
     image: dict[str, Any] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before writing any yes/no question into chat, call this tool instead.
     Pass `destructive=True` (red button) for delete / drop / force-push /
@@ -561,7 +669,7 @@ async def confirm(
         "cancelLabel": cancel_label,
         "image": image,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx))
 
 
 @mcp.prompt(name="teach")

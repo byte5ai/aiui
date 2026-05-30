@@ -655,20 +655,23 @@ async fn render_dialog(
     let mut spec = spec;
     crate::imageresolve::resolve_local_paths(&mut spec);
     let body = json!({ "spec": spec });
-    // POST /render is long-poll: the GUI holds the response open
-    // until the user clicks submit/cancel or the companion-side
-    // `DIALOG_TTL` sweep fires (currently 2 h). Override the shared
-    // reqwest client's 300-s default per-call so the user has the
-    // full TTL to fill out the form. We add 60 s slack on top so a
-    // backend-side TTL cancel still reaches us cleanly before our
-    // own timeout. v0.4.41.
+    // Async render (Step 3): POST opts in via `x-aiui-async`; the companion
+    // registers + surfaces the dialog and returns immediately with
+    // `{id, ttl_secs}` (202). We then poll `GET /render/{id}` in bounded
+    // windows until the terminal result. No single connection is held for the
+    // user's think-time, so a tunnel/GUI blip can cost at most one poll
+    // window — never a multi-minute ReadError. The POST itself only covers
+    // registration + the ack handshake, so a short timeout suffices.
+    //
+    // Backward-compatible: an older companion ignores the unknown header and
+    // answers synchronously (200 with the terminal `{cancelled, …}` shape) —
+    // detected after the status checks below and used directly, no polling.
     let resp = http
         .post(&url)
         .bearer_auth(&token)
+        .header("x-aiui-async", "1")
         .json(&body)
-        .timeout(std::time::Duration::from_secs(
-            crate::dialog::DIALOG_TTL.as_secs() + 60,
-        ))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
@@ -711,9 +714,57 @@ async fn render_dialog(
             resp.status()
         )));
     }
-    resp.json::<Value>()
+    let accepted = resp.status() == reqwest::StatusCode::ACCEPTED;
+    let first = resp
+        .json::<Value>()
         .await
-        .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))
+        .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))?;
+    if !accepted {
+        // Synchronous companion (old): `first` is already the terminal result.
+        return Ok(first);
+    }
+    // Async companion: poll `GET /render/{id}` until terminal. Each GET is
+    // bounded (40 s > the server's ~25 s poll window) so the server always
+    // answers `{pending:true}` before we time out, and we re-poll. The loop
+    // ends on the terminal result, a 404 (id expired / never registered), or
+    // the server-side TTL turning into a terminal `cancelled` result.
+    let id = match first.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(RenderError::Transport(
+                "async /render: 202 response missing `id`".into(),
+            ))
+        }
+    };
+    let poll_url = format!("{}/render/{}", base_url(cfg), id);
+    loop {
+        let pr = http
+            .get(&poll_url)
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(40))
+            .send()
+            .await
+            .map_err(|e| RenderError::Transport(format!("GET /render/{id}: {e}")))?;
+        if pr.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RenderError::Transport(format!(
+                "aiui lost track of render {id} (expired or never registered)"
+            )));
+        }
+        if !pr.status().is_success() {
+            return Err(RenderError::Transport(format!(
+                "render poll http {}",
+                pr.status()
+            )));
+        }
+        let pv = pr
+            .json::<Value>()
+            .await
+            .map_err(|e| RenderError::Transport(format!("parse /render/{id}: {e}")))?;
+        if pv.get("pending").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        return Ok(pv);
+    }
 }
 
 /// Tool-call response signaling that the companion is alive but
