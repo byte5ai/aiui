@@ -100,6 +100,19 @@ Files: `setup.rs`, `lib.rs`, `http.rs`, `python/.../server.py`.
 
 Files: `http.rs`, `dialog.rs`, `mcp.rs`, `python/.../server.py`.
 
+> **Interim fix already landed (2026-05-30, with the Step-1 PR #137):** the
+> acute 409-storm + stranded-empty-window pair was a *cancellation-safety* hole,
+> not the full async gap. The synchronous `/render` handler parks on
+> `timeout(DIALOG_TTL=2h, result_rx)` while the MCP client gives up far sooner
+> (the local Rust bridge times out at 300 s). On client give-up Axum drops the
+> handler future, and none of the explicit teardown ran → the registry entry
+> leaked for 2 h (409 for every later render) and the surfaced window stranded
+> empty. A `RenderGuard` (RAII) now cancels the entry + destroys the window on
+> *any* drop, including the future-cancelled case. This makes the current
+> handler cancellation-safe; the async-render protocol below still supersedes it
+> (it removes the held connection entirely and is what properly supports long
+> human fills without the client timing out at all).
+
 - **Async `/render` (RFC point #1, never built):** `POST /render` registers the
   dialog and returns `{id, ttl}` immediately. New `GET /render/{id}` is a
   bounded long-poll (~25 s) returning `{pending}` or the terminal result.

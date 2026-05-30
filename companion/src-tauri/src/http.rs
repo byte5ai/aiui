@@ -517,6 +517,65 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     Ok(())
 }
 
+/// RAII cleanup for a registered render — closes the cancellation-safety hole
+/// behind the 409-storm + stranded-empty-window pair (2026-05-30 report).
+///
+/// `/render` registers a dialog, surfaces a window, then parks on
+/// `timeout(DIALOG_TTL=2h, result_rx)`. The MCP client gives up far sooner —
+/// the local Rust bridge's reqwest client times out at 300 s — and on any
+/// client-side give-up (timeout, ReadError, tunnel blip, slow dialog) Axum
+/// **drops this handler future**. None of the explicit teardown below then
+/// runs, so the registry entry sits pending for the full 2 h TTL — every
+/// subsequent `/render` gets a 409 — and the already-surfaced window is left
+/// stranded empty.
+///
+/// This guard is armed right after `try_register` and runs on *any* drop,
+/// including the future-cancelled case the explicit paths can't reach: it
+/// cancels the registry entry (freeing the slot immediately) and destroys the
+/// dialog window. It is disarmed once the handler completes its own terminal
+/// teardown, so the normal paths keep their precise behaviour and we don't
+/// double-hop the main thread. `dialog.cancel` is a no-op once the entry is
+/// gone and `destroy_dialog_window` is idempotent, so an over-fire is harmless.
+///
+/// Note: this is a targeted robustness fix, not the spec's Step 3 (async
+/// `/render`), which removes the multi-minute held connection entirely. It
+/// makes the *current* synchronous handler cancellation-safe in the meantime.
+struct RenderGuard {
+    id: String,
+    dialog: Arc<DialogState>,
+    /// `None` only in unit tests, where no Tauri app exists to host a window.
+    app: Option<AppHandle>,
+    armed: bool,
+}
+
+impl RenderGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RenderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        trace(&format!(
+            "render: handler future dropped before terminal teardown — \
+             cleaning up id={} (cancel registry entry + destroy window)",
+            self.id
+        ));
+        // Free the registry slot so the next /render isn't 409'd for 2 h.
+        self.dialog.cancel(&self.id);
+        // Tear down the surfaced window so it can't strand empty.
+        if let Some(app) = &self.app {
+            let app_for_destroy = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                crate::destroy_dialog_window(&app_for_destroy)
+            });
+        }
+    }
+}
+
 async fn render(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -591,6 +650,15 @@ async fn render(
         }
     };
     trace(&format!("render: registered id={}", id));
+    // Cancellation-safety net: from here until the explicit terminal teardown
+    // below, a dropped handler future (client give-up) must not leak the
+    // registry entry or strand the window. See `RenderGuard`.
+    let mut guard = RenderGuard {
+        id: id.clone(),
+        dialog: state.dialog.clone(),
+        app: Some(state.app.clone()),
+        armed: true,
+    };
     let dr = DialogRequest {
         id: id.clone(),
         spec: req.spec,
@@ -800,6 +868,9 @@ async fn render(
             .app
             .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy));
     }
+    // Terminal teardown done explicitly above — stand the guard down so it
+    // doesn't redundantly re-cancel/re-destroy on scope exit.
+    guard.disarm();
 
     // Lifecycle-driven update check (#42): fire once after every
     // successful render. Frontend gates with a 30-min cooldown so this is
@@ -963,5 +1034,60 @@ mod validate_tests {
             {"label":"T","fields":[{"kind":"warp","name":"w"}]}
         ]});
         assert!(validate_spec(&spec).is_err());
+    }
+}
+
+#[cfg(test)]
+mod render_guard_tests {
+    use super::RenderGuard;
+    use crate::dialog::DialogState;
+    use std::sync::Arc;
+
+    // Regression: the 409-storm + stranded-empty-window pair (2026-05-30).
+    // When the /render handler future is dropped (client give-up) the registry
+    // entry must be freed immediately, not left pending for the 2 h TTL. The
+    // window-destroy half needs a Tauri app, so these cover the registry half
+    // (`app: None`) — the half that produces the 409.
+
+    #[test]
+    fn armed_guard_drop_frees_registry_slot() {
+        let ds = Arc::new(DialogState::new());
+        let (id, result_rx, _ack) = ds.try_register().expect("first register is free");
+        assert_eq!(ds.stats().orphan_count, 1);
+        {
+            let _guard = RenderGuard {
+                id: id.clone(),
+                dialog: ds.clone(),
+                app: None,
+                armed: true,
+            };
+            // future "dropped" here
+        }
+        // Slot freed → the next render would NOT get a 409.
+        assert_eq!(ds.stats().orphan_count, 0);
+        assert!(ds.try_register().is_ok(), "registry is free again after guard cleanup");
+        // The awaiter observes a cancelled terminal result, not a hang.
+        let r = result_rx.blocking_recv().expect("result_tx sent on cancel");
+        assert!(r.cancelled);
+    }
+
+    #[test]
+    fn disarmed_guard_drop_leaves_terminal_path_untouched() {
+        // The normal terminal path disarms after its own teardown; the guard
+        // must then do nothing (no double-cancel, no spurious slot churn).
+        let ds = Arc::new(DialogState::new());
+        let (id, _result_rx, _ack) = ds.try_register().unwrap();
+        {
+            let mut guard = RenderGuard {
+                id: id.clone(),
+                dialog: ds.clone(),
+                app: None,
+                armed: true,
+            };
+            guard.disarm();
+        }
+        // Entry untouched by the disarmed guard (the real handler's explicit
+        // `complete`/`cancel` owns removal on the terminal path).
+        assert_eq!(ds.stats().orphan_count, 1);
     }
 }
