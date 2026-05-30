@@ -716,15 +716,11 @@ async fn add_remote(
     );
     let config_ok = config_step.ok;
     results.push(config_step);
-    // Fresh add — there shouldn't be a running child yet, but a
-    // re-add (Remove + Add the same host) leaves stale ones; sweep
-    // them so the first tool call respawns clean against the new pin.
-    if matches!(config_patch, Some(setup::RemoteConfigPatch::Patched)) {
-        let sweep = setup::kill_remote_mcp_stdio(&host_alias);
-        if !sweep.ok {
-            results.push(sweep);
-        }
-    }
+    // Step 2: no version-forcing kill here. A re-add re-pins the version in
+    // ~/.claude.json; the new pin takes effect at the next natural Claude Code
+    // spawn. We never `pkill -f aiui-mcp` to force it — that crashed live
+    // sessions mid-call and hit every other session on the host.
+    let _ = config_patch;
 
     if !(token_ok && config_ok) {
         // Don't persist the host or start a tunnel for a half-failed
@@ -762,39 +758,32 @@ async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
     Ok(results)
 }
 
-/// On-demand resync trigger for a single registered remote — wraps
-/// the same patch-pin + kill-stale-mcp-stdio sequence that runs in
-/// the background at every aiui-app startup. Surfaced as a per-remote
-/// button in Settings so the user can re-invoke it without restarting
-/// aiui (and see the StepResult log inline if a sweep fails).
+/// On-demand resync trigger for a single registered remote — re-pins the
+/// aiui-mcp version in the remote's `~/.claude.json`. Surfaced as a per-remote
+/// button in Settings so the user can re-invoke the pin without restarting
+/// aiui (and see the StepResult log inline).
 ///
-/// Why this exists: 0.4.29's auto-resync on GUI-start is silent — if
-/// the SSH-side `pkill` fails (remote temporarily unreachable) the
-/// stale subprocess keeps running with the previous version. Without
-/// a manual trigger, the user would have to close + reopen aiui-app
-/// to retry. v0.4.34 adds the on-demand path.
+/// Step 2 change: this used to also `pkill -f aiui-mcp` on the host to force
+/// the new version onto a running session. That is gone — the kill crashed
+/// live sessions mid-call (Claude Code does not respawn a disconnected MCP)
+/// and had cross-session blast radius. The re-pin alone is the correct,
+/// session-safe action: it takes effect at the next natural spawn while any
+/// in-flight session finishes on its current version. If the user genuinely
+/// wants a running remote session on the new version *now*, the cooperative
+/// path is to end and restart that Claude Code session.
 #[tauri::command]
 async fn resync_remote(
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
     let our_version = env!("CARGO_PKG_VERSION");
-    // Re-pin in `~/.claude.json` on the remote (idempotent — if
-    // already pinned, no rewrite, returns AlreadyCurrent).
-    let (pin_step, patch) = setup::patch_claude_code_config_remote(
+    // Re-pin in `~/.claude.json` on the remote (idempotent — if already
+    // pinned, no rewrite, returns AlreadyCurrent).
+    let (pin_step, _patch) = setup::patch_claude_code_config_remote(
         &host_alias,
         None,
         our_version,
     );
-    let mut results = vec![pin_step];
-    // Sweep stale aiui-mcp children only when the pin actually
-    // changed (or unconditionally? — yes, unconditionally on
-    // user-triggered resync, because the user wouldn't click resync
-    // unless they suspect drift). On unconditional sweep: kills any
-    // running aiui-mcp regardless of pin state, which is what the
-    // user wants from a "force fresh" button.
-    let _ = patch;  // not used here, but kept for tracing
-    results.push(setup::kill_remote_mcp_stdio(&host_alias));
-    Ok(results)
+    Ok(vec![pin_step])
 }
 
 #[tauri::command]
@@ -1497,13 +1486,16 @@ pub fn run() {
                                     None => "unknown",
                                 }
                             ));
-                            if matches!(patch, Some(setup::RemoteConfigPatch::Patched)) {
-                                let sweep = setup::kill_remote_mcp_stdio(&host_for_task);
-                                logging::trace(&format!(
-                                    "remote-pin: {host_for_task}: sweep {}",
-                                    if sweep.ok { "ok" } else { "failed" }
-                                ));
-                            }
+                            // Step 2 (Invariant: never kill a remote bridge to
+                            // force a version): we used to `pkill -f aiui-mcp`
+                            // here whenever the pin changed. That blunt sweep
+                            // crashed live remote sessions mid-call (Claude Code
+                            // does NOT respawn a disconnected MCP) and had
+                            // cross-session blast radius — the remote twin of
+                            // the 0.4.42 Cowork-kill. The pin alone is enough:
+                            // it takes effect at the next *natural* spawn (next
+                            // Claude Code session), while any live session keeps
+                            // its current version until it ends on its own.
                         } else {
                             logging::trace(&format!(
                                 "remote-pin: {host_for_task} sync failed: {} ({})",

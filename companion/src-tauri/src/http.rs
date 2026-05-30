@@ -111,9 +111,23 @@ struct ChildrenHealth {
     attached: usize,
 }
 
+/// Wire-contract version (Step 2, cooperative version floor). Bumped ONLY when
+/// the HTTP request/response shapes between the bridges and the companion
+/// change incompatibly — independent of the app's release version, which moves
+/// on every fix. Both bridges read it from `/version` (and `/probe`) and, on a
+/// hard mismatch, return a structured "restart this session" tool error instead
+/// of being externally killed. Ordinary app-version skew is tolerated as long
+/// as `wire_version` matches.
+///
+/// v1: the original `{spec}` → `{id,cancelled,result,reason}` contract.
+pub const WIRE_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct VersionResponse {
     version: String,
+    /// See [`WIRE_VERSION`]. Surfaced so bridges can enforce a cooperative
+    /// compatibility floor without anyone killing anyone.
+    wire_version: u32,
     build_info: String,
     binary_path: String,
     updater_endpoint: String,
@@ -222,6 +236,7 @@ async fn probe(
     Json(serde_json::json!({
         "aiui": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "wire_version": WIRE_VERSION,
         "pid": std::process::id(),
         "build_sha": env!("AIUI_GIT_SHA"),
     }))
@@ -345,6 +360,7 @@ async fn version(
     }
     Ok(Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        wire_version: WIRE_VERSION,
         build_info: crate::logging::BUILD_INFO.to_string(),
         binary_path: crate::setup::app_binary_path(),
         updater_endpoint:
