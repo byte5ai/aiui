@@ -143,6 +143,33 @@ Files: `http.rs`, `dialog.rs`, `mcp.rs`, `python/.../server.py`.
     HTTP (= ReadError: tunnel up, Mac down) vs. 401 (token). Today the remote
     `ConnectError` branch is dead and ReadError gets a misleading message.
 
+> **Implemented (2026-05-30, PR #137) — additive / backward-compatible.** Async
+> render is opt-in via the `x-aiui-async` request header, *not* a replacement of
+> the synchronous long-poll. This keeps the proven local path intact and means
+> old bridges (which never send the header) keep working unchanged, so
+> `WIRE_VERSION` stays 1.
+> - **Companion (`http.rs`):** `POST /render` with the header registers +
+>   surfaces the dialog, hands resolution to a detached task that fills an
+>   `AsyncSlot`, and returns `202 {id, ttl_secs}`. New `GET /render/{id}`
+>   poll-loops (200 ms ticks, bounded by `ASYNC_POLL_WINDOW` = 25 s) returning
+>   the terminal result (drained once) / `{pending:true}` / `404`. Without the
+>   header, the legacy synchronous path runs untouched. Resolution + window
+>   teardown are shared by both via `resolve_dialog`. Resolved-but-uncollected
+>   slots are swept at `DIALOG_TTL`.
+> - **Both bridges (`mcp.rs`, `server.py`):** POST with the header, then loop
+>   `GET /render/{id}` until terminal; each GET is bounded (40 s > server
+>   window) so a blip costs one poll, never a held connection. Both fall back to
+>   the synchronous result if the companion answers 200 instead of 202 (so a new
+>   bridge works against an old companion too).
+> - **Python parity (I6):** added `_wait_for_aiui` (`/ping` cold-start poll,
+>   ~30 s), MCP progress notifications each pending poll (FastMCP
+>   `Context.report_progress`, best-effort), the async polling loop, and an
+>   explicit `httpx.ReadError` branch ("tunnel up, Mac not serving") distinct
+>   from `ConnectError`. The Rust bridge already had cold-start + progress.
+> - Tests: Rust 106 (slot lifecycle), Python 26 (+5: poll terminal/pending/404,
+>   progress tick, cold-start tolerance). Not yet exercised end-to-end against a
+>   live remote — integration harness is still the open cross-cutting item.
+
 ## Step 4 — Tunnel mechanism + multi-window (one open decision)
 
 Files: `tunnel.rs`, `setup.rs`, `lib.rs`, `dialog.rs`, `http.rs`, frontend.

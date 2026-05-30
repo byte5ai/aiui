@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::dialog::{DialogRequest, DialogState, DIALOG_TTL};
 use crate::lifetime::LifetimeStats;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -40,6 +40,35 @@ const IDLE_RESTART_UPTIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// Prevents reloading mid-burst when many renders fire close together.
 const IDLE_RESTART_QUIET: Duration = Duration::from_secs(10 * 60);
 
+/// Header a bridge sets to opt into async `/render` (Step 3). Present →
+/// `POST /render` registers + surfaces the dialog, returns `{id, ttl}`
+/// immediately (202), and the caller polls `GET /render/{id}`. Absent → the
+/// legacy synchronous long-poll (POST holds the connection until the user
+/// answers). Backward-compatible: old bridges that don't set it keep working
+/// unchanged, so the wire contract stays v1.
+const ASYNC_RENDER_HEADER: &str = "x-aiui-async";
+
+/// How long a single `GET /render/{id}` long-poll parks before returning
+/// `{pending:true}` so the caller can re-poll (and emit a progress
+/// notification). Short enough to stay well under any client read timeout, so
+/// a tunnel/GUI blip can only ever cost one poll window, never a multi-minute
+/// held connection (the remote ReadError class this closes).
+const ASYNC_POLL_WINDOW: Duration = Duration::from_secs(25);
+
+/// Buffered terminal result for an async render, keyed by dialog id. The
+/// `POST /render` async branch spawns a task that awaits the user's answer and
+/// fills this; `GET /render/{id}` drains it. Decouples the dialog's lifetime
+/// from any single HTTP connection.
+struct AsyncSlot {
+    /// `Some` once the dialog reached a terminal outcome; drained by the first
+    /// successful GET. A `GET /render/{id}` poll-loops (cheap 200 ms ticks,
+    /// bounded by `ASYNC_POLL_WINDOW`) reading this — no cross-task notifier to
+    /// reason about, and a missed tick costs at most 200 ms, never correctness.
+    result: Option<crate::dialog::DialogResult>,
+    /// For the opportunistic sweep of resolved-but-never-collected slots.
+    created_at: Instant,
+}
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<AppConfig>,
@@ -54,6 +83,9 @@ struct AppState {
     /// Mutex<Instant> is fine here — contention is bounded by the rate of
     /// /render calls.
     last_render_at: Arc<Mutex<Instant>>,
+    /// Buffered terminal results for async renders (Step 3), keyed by dialog
+    /// id. Empty in the all-synchronous case.
+    async_slots: Arc<Mutex<std::collections::HashMap<String, AsyncSlot>>>,
 }
 
 #[derive(Deserialize)]
@@ -159,11 +191,13 @@ pub async fn serve(
         app,
         started_at: now,
         last_render_at: Arc::new(Mutex::new(now)),
+        async_slots: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     let router = Router::new()
         .route("/health", get(health))
         .route("/render", post(render))
+        .route("/render/{id}", get(render_poll))
         .route("/version", get(version))
         .route("/update", post(update))
         .route("/ping", get(ping))
@@ -592,6 +626,148 @@ impl Drop for RenderGuard {
     }
 }
 
+/// Await a registered dialog's terminal outcome (bounded by `DIALOG_TTL`),
+/// then tear its window down. Shared by the synchronous POST path (awaited
+/// inline) and the async path (run in a detached task that fills the
+/// `AsyncSlot`). Factoring it out keeps the two paths byte-for-byte identical
+/// in resolution + teardown semantics.
+async fn resolve_dialog(
+    state: AppState,
+    id: String,
+    result_rx: tokio::sync::oneshot::Receiver<crate::dialog::DialogResult>,
+) -> crate::dialog::DialogResult {
+    trace(&format!("render: awaiting user response id={}", id));
+    let result = match tokio::time::timeout(DIALOG_TTL, result_rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => crate::dialog::DialogResult {
+            id: id.clone(),
+            cancelled: true,
+            result: serde_json::Value::Null,
+            reason: Some("channel_dropped".into()),
+        },
+        Err(_) => {
+            // TTL expired without user response. Cancel the registry entry
+            // (frees its slot) and produce the same 200-OK cancelled shape a
+            // user-driven cancel produces — only `reason` differs (#36, the
+            // v0.4.45 Bug #5 fix: never surface this as a transport error).
+            trace(&format!("render: TTL expired id={}", id));
+            state.dialog.cancel(&id);
+            crate::dialog::DialogResult {
+                id: id.clone(),
+                cancelled: true,
+                result: serde_json::Value::Null,
+                reason: Some("ttl_expired".into()),
+            }
+        }
+    };
+    trace(&format!(
+        "render: got response id={} cancelled={}",
+        result.id, result.cancelled
+    ));
+    // Authoritative window teardown (v0.4.46, Bug B): single point that
+    // guarantees a dialog window never outlives its dialog. Idempotent —
+    // a no-op on the submit/cancel paths where the window is already gone.
+    let app_for_destroy = state.app.clone();
+    let _ = state
+        .app
+        .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy));
+    result
+}
+
+/// Drop async-render result slots older than `DIALOG_TTL` — covers the case
+/// where a caller posts an async render, the dialog resolves, but the caller
+/// never collects the result via GET (process died after POST). Called
+/// opportunistically on each new async render; no background reaper.
+fn sweep_async_slots(state: &AppState) {
+    let now = Instant::now();
+    state
+        .async_slots
+        .lock()
+        .unwrap()
+        .retain(|_, s| now.duration_since(s.created_at) <= DIALOG_TTL);
+}
+
+/// Outcome of looking up an async-render slot by id.
+enum SlotLook {
+    /// Resolved — the terminal result (already removed from the map).
+    Ready(crate::dialog::DialogResult),
+    /// Registered but not yet resolved.
+    Pending,
+    /// No such id — never an async render, or already collected.
+    Gone,
+}
+
+/// Drain an async-render slot: if resolved, take its result and remove the slot
+/// (`Ready`); if still in flight, `Pending`; if absent, `Gone`. Pure over the
+/// map so the `/render/{id}` branching is unit-testable without a Tauri app.
+fn drain_async_slot(
+    slots: &mut std::collections::HashMap<String, AsyncSlot>,
+    id: &str,
+) -> SlotLook {
+    let taken = match slots.get_mut(id) {
+        Some(slot) => slot.result.take(),
+        None => return SlotLook::Gone,
+    };
+    match taken {
+        Some(result) => {
+            slots.remove(id);
+            SlotLook::Ready(result)
+        }
+        None => SlotLook::Pending,
+    }
+}
+
+/// GET `/render/{id}` — bounded long-poll for an async render's result (Step
+/// 3). Returns the terminal `{id, cancelled, result, reason}` once available
+/// (and drains the slot), `{pending: true}` after one `ASYNC_POLL_WINDOW` so
+/// the caller re-polls, or 404 for an unknown id (never an async render, or
+/// already collected). The caller loops GET until terminal or it gives up.
+async fn render_poll(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+
+    let deadline = Instant::now() + ASYNC_POLL_WINDOW;
+    loop {
+        let look = drain_async_slot(&mut state.async_slots.lock().unwrap(), &id);
+        match look {
+            SlotLook::Ready(result) => {
+                trace(&format!("render_poll: delivered id={}", id));
+                return Json(RenderResponse {
+                    id: result.id,
+                    cancelled: result.cancelled,
+                    result: result.result,
+                    reason: result.reason,
+                })
+                .into_response();
+            }
+            SlotLook::Gone => {
+                trace(&format!("render_poll: unknown id={}", id));
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "unknown_render_id", "id": id})),
+                )
+                    .into_response();
+            }
+            SlotLook::Pending => {
+                if Instant::now() >= deadline {
+                    return Json(serde_json::json!({"pending": true, "id": id}))
+                        .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
 async fn render(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -826,66 +1002,44 @@ async fn render(
         }
     }
 
-    // ── Normal path ─────────────────────────────────────────────────────
-    // Wait for the user's submit/cancel — but bounded by `DIALOG_TTL`. A
-    // dialog that nobody answers eventually returns a structured timeout
-    // instead of blocking the caller indefinitely (#36). The same TTL is
-    // used by the registry's opportunistic sweep, so a timed-out entry
-    // gets cancelled regardless of whether this awaiter or the next
-    // `register()` call notices first.
-    trace(&format!("render: awaiting user response id={}", id));
-    let result = match tokio::time::timeout(DIALOG_TTL, result_rx).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(_)) => crate::dialog::DialogResult {
-            id: id.clone(),
-            cancelled: true,
-            result: serde_json::Value::Null,
-            reason: Some("channel_dropped".into()),
-        },
-        Err(_) => {
-            // TTL expired without user response. Cancel the registry
-            // entry (frees its slot) and fall through to the normal
-            // 200-OK response below with cancelled:true + reason.
-            //
-            // v0.4.45 (Bug #5): previously this returned HTTP 408, which
-            // mcp.rs's render_dialog treated as a non-success status →
-            // generic "aiui tool error: render http 408" — a different
-            // shape than a user-driven cancel (200 {cancelled:true}).
-            // The agent then saw a transport error instead of a clean
-            // "user didn't respond" cancellation. Now both the
-            // user-cancel and the TTL-expiry paths produce the exact
-            // same tool-result shape; only `reason` differs.
-            trace(&format!("render: TTL expired id={}", id));
-            state.dialog.cancel(&id);
-            crate::dialog::DialogResult {
-                id: id.clone(),
-                cancelled: true,
-                result: serde_json::Value::Null,
-                reason: Some("ttl_expired".into()),
-            }
+    // ── Async branch (Step 3) ───────────────────────────────────────────
+    // If the caller opted in (header `x-aiui-async`), hand the dialog off to a
+    // detached task and answer immediately with `{id, ttl_secs}` (202). The
+    // caller polls `GET /render/{id}`. This removes the multi-minute open HTTP
+    // connection that a tunnel/GUI blip turns into a remote ReadError —
+    // resolution now lives in a task, not on the wire.
+    if headers.contains_key(ASYNC_RENDER_HEADER) {
+        // The detached task owns resolution + window teardown from here.
+        guard.disarm();
+        sweep_async_slots(&state);
+        {
+            let mut slots = state.async_slots.lock().unwrap();
+            slots.insert(
+                id.clone(),
+                AsyncSlot { result: None, created_at: Instant::now() },
+            );
         }
-    };
-    trace(&format!(
-        "render: got response id={} cancelled={}",
-        result.id, result.cancelled
-    ));
-
-    // Authoritative teardown (v0.4.46, Bug B): the render has reached a
-    // terminal outcome — user submit/cancel, native X-close, TTL expiry,
-    // or channel-drop. Destroy the dialog window now, from Rust, on the
-    // main thread. This is the single point that guarantees a dialog
-    // window never outlives its dialog: it covers the TTL/channel-drop
-    // paths the frontend's own close never reaches (the empty-window
-    // stranding of 2026-05-29), and is a harmless no-op on the
-    // submit/cancel paths where the window is already gone.
-    {
-        let app_for_destroy = state.app.clone();
-        let _ = state
-            .app
-            .run_on_main_thread(move || crate::destroy_dialog_window(&app_for_destroy));
+        let task_state = state.clone();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            let result = resolve_dialog(task_state.clone(), task_id.clone(), result_rx).await;
+            if let Some(slot) = task_state.async_slots.lock().unwrap().get_mut(&task_id) {
+                slot.result = Some(result);
+            }
+        });
+        trace(&format!("render: async accepted id={}", id));
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "id": id, "ttl_secs": DIALOG_TTL.as_secs() })),
+        )
+            .into_response();
     }
-    // Terminal teardown done explicitly above — stand the guard down so it
-    // doesn't redundantly re-cancel/re-destroy on scope exit.
+
+    // ── Synchronous path (legacy, backward-compatible) ──────────────────
+    // No opt-in header → hold the connection until the user answers, exactly
+    // as before. The guard stays armed across the inline await so a dropped
+    // connection still cleans up; `resolve_dialog` runs the terminal teardown.
+    let result = resolve_dialog(state.clone(), id.clone(), result_rx).await;
     guard.disarm();
 
     // Lifecycle-driven update check (#42): fire once after every
@@ -1105,5 +1259,48 @@ mod render_guard_tests {
         // Entry untouched by the disarmed guard (the real handler's explicit
         // `complete`/`cancel` owns removal on the terminal path).
         assert_eq!(ds.stats().orphan_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod async_render_tests {
+    use super::{drain_async_slot, AsyncSlot, SlotLook};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // Step 3: the GET /render/{id} branching — pending → ready (drained once)
+    // → gone — without a Tauri app.
+    #[test]
+    fn slot_lifecycle_pending_ready_gone() {
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        slots.insert(
+            "x".into(),
+            AsyncSlot { result: None, created_at: Instant::now() },
+        );
+
+        // Registered, not resolved → Pending.
+        assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Pending));
+        // Unknown id → Gone.
+        assert!(matches!(drain_async_slot(&mut slots, "nope"), SlotLook::Gone));
+
+        // Resolve it.
+        slots.get_mut("x").unwrap().result = Some(crate::dialog::DialogResult {
+            id: "x".into(),
+            cancelled: true,
+            result: serde_json::Value::Null,
+            reason: Some("window_closed".into()),
+        });
+
+        // First drain delivers the terminal result.
+        match drain_async_slot(&mut slots, "x") {
+            SlotLook::Ready(r) => {
+                assert!(r.cancelled);
+                assert_eq!(r.reason.as_deref(), Some("window_closed"));
+            }
+            _ => panic!("expected Ready"),
+        }
+        // Slot was removed → a second drain is Gone (no double-delivery).
+        assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Gone));
+        assert!(slots.is_empty());
     }
 }
