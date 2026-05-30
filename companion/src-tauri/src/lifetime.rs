@@ -4,10 +4,21 @@
 //! a Windows named pipe on Windows — and each `aiui --mcp-stdio` child
 //! connects on startup and holds the stream open. When the child exits
 //! (Claude Desktop closes it), the OS tears down the stream and the GUI
-//! observes an EOF. Once the last client disconnects the GUI starts a 60s
-//! grace timer and exits if nobody re-connects.
+//! observes an EOF.
 //!
-//! Event-driven, no polling.
+//! Lifetime invariant (I1, stabilization-plan): the child counter does **not**
+//! decide the host's lifetime. The last-child-disconnect edge is only a
+//! *trigger* — it prompts the one question that actually decides whether we may
+//! exit: is our host, Claude Desktop, still alive? While Claude Desktop runs we
+//! stay, regardless of child count (a dropped/re-spawned MCP server, Cowork
+//! churn). Only when Claude Desktop is gone does a short grace then exit follow
+//! (the host follows the Wirt). The 60 s child-count grace that used to gate
+//! exit was itself the root-cause bug — it killed the host during ordinary
+//! churn while Claude Desktop was very much alive.
+//!
+//! Event-driven, no continuous polling: the only liveness probe is a single
+//! `is_claude_desktop_running()` call per disconnect edge (plus one re-check
+//! after the short grace).
 //!
 //! Cross-platform note: the public surface (`socket_path`, `gui_serve`,
 //! `mcp_attach`, `LifetimeStats`) is identical on both OSes. The only
@@ -29,7 +40,87 @@ use tokio::net::windows::named_pipe::{
 };
 use tokio::sync::Notify;
 
-pub const SHUTDOWN_GRACE_SECS: u64 = 60;
+/// Short grace after the last MCP-stdio child disconnects *and* Claude Desktop
+/// is no longer detected, before the host exits. It absorbs two transients:
+/// (a) a Claude Desktop quit→relaunch (its own update / a user restart), and
+/// (b) the brief teardown window where Claude Desktop has already closed its
+/// children's stdin (firing our edge) but its process is still terminating, so
+/// `pgrep` could momentarily either way. We re-check Claude-Desktop liveness at
+/// expiry and only exit if it is *still* gone. ≤5 s per the spec; nothing polls
+/// in a loop.
+pub const SHUTDOWN_GRACE_SECS: u64 = 5;
+
+/// The single exit authority (Invariant I1). A host *planned* exit is legitimate
+/// in exactly three cases: (b) aiui is uninstalled or (c) restarting into an
+/// update — both signalled explicitly via [`ExitAuthority`] by `quit_app` /
+/// the updater — or (a) Claude Desktop, the host process aiui lives with, has
+/// terminated. Every other process exit is a crash, never a clean shutdown.
+///
+/// Pure so it can be unit-tested without a live Claude Desktop or a running
+/// Tauri app: callers pass the two facts in. The impure shell reads them from
+/// [`ExitAuthority`] state and `setup::is_claude_desktop_running()`.
+pub fn host_should_exit(explicit_uninstall_or_update: bool, claude_desktop_running: bool) -> bool {
+    explicit_uninstall_or_update || !claude_desktop_running
+}
+
+/// What the post-grace re-check decides. The child counter participates only as
+/// "did a child come back" — it never independently authorizes an exit; that is
+/// solely `!claude_desktop_running` (Invariant I1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraceOutcome {
+    /// Claude Desktop is alive again, or a child re-attached — stay headless.
+    Stay,
+    /// Claude Desktop is still gone and no child returned — the host follows
+    /// the Wirt and exits.
+    Exit,
+}
+
+/// Decision made when the short grace expires. `child_returned` is true if any
+/// MCP-stdio child re-attached during the grace; `claude_desktop_running` is a
+/// fresh liveness probe. Exit only when the Wirt is gone *and* nothing came
+/// back — Claude-Desktop liveness always wins (I1).
+pub fn grace_outcome(child_returned: bool, claude_desktop_running: bool) -> GraceOutcome {
+    if claude_desktop_running || child_returned {
+        GraceOutcome::Stay
+    } else {
+        GraceOutcome::Exit
+    }
+}
+
+/// Explicit exit authority for the two non-Wirt-death cases (uninstall, update
+/// restart). A plain latch: set once by `quit_app` / the updater right before
+/// they ask Tauri to terminate, read by the `ExitRequested` default-deny gate
+/// so those — and only those — Tauri-initiated exits are honoured. Everything
+/// else Tauri tries (last-window-close, ⌘Q, OS quit-all) is vetoed while Claude
+/// Desktop is alive.
+pub struct ExitAuthority {
+    authorized: std::sync::atomic::AtomicBool,
+}
+
+impl ExitAuthority {
+    pub fn new() -> Self {
+        Self {
+            authorized: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Latch the authority on. Irreversible by design — once we have decided to
+    /// uninstall or restart into an update there is no "un-deciding" before the
+    /// process is gone.
+    pub fn authorize(&self) {
+        self.authorized.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_authorized(&self) -> bool {
+        self.authorized.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for ExitAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Returns the per-OS handle the GUI listens on and MCP-stdio children
 /// connect to.
@@ -74,10 +165,11 @@ impl LifetimeStats {
     }
 }
 
-/// GUI-side: bind the channel, accept connections, and self-terminate after a
-/// grace period once all clients are gone. Increments/decrements the shared
-/// `conns` counter on every connect/disconnect so `/health` can report the
-/// live child count without polling.
+/// GUI-side: bind the channel and accept connections. Increments/decrements the
+/// shared `conns` counter on every connect/disconnect so `/health` can report
+/// the live child count without polling. When the last child leaves it pokes
+/// the shutdown watcher, which exits *only* if the Wirt (Claude Desktop) is also
+/// gone — the counter never terminates the process on its own (Invariant I1).
 ///
 /// Multi-instance hardening (since 0.4.33): if the channel already
 /// answers a connection, another aiui-app is alive and we are the
@@ -276,10 +368,14 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
     }
 }
 
-/// Shared shutdown timer wiring used by both backends. Returns the wake
-/// `Notify` that connect/disconnect handlers signal — armed once when
-/// the last client leaves, and cancellable by a fresh connect within
-/// the grace period.
+/// Shared shutdown watcher used by both backends. Returns the wake `Notify`
+/// that the disconnect handlers signal when the *last* child leaves.
+///
+/// Invariant I1: the child counter is a trigger, not an authority. This edge
+/// does not by itself end the process — it prompts a short grace and then a
+/// single Claude-Desktop liveness probe ([`grace_outcome`]). The host exits
+/// only when its Wirt (Claude Desktop) is gone; while Claude Desktop is alive
+/// we stay headless no matter how the child count moves.
 fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16) -> Arc<Notify> {
     let wake = Arc::new(Notify::new());
     let conns_w = conns.clone();
@@ -287,27 +383,52 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
     tokio::spawn(async move {
         loop {
             wake_w.notified().await;
+            // Edge: the last MCP-stdio child just disconnected. The counter is
+            // only a trigger (I1) — it does not authorize an exit. If a child
+            // re-attached already, there is nothing to decide.
             if conns_w.load(Ordering::SeqCst) > 0 {
                 continue;
             }
+            // Short grace, then let Claude-Desktop liveness — never the child
+            // count — make the call. The grace absorbs (a) a Claude Desktop
+            // quit→relaunch (its own update, a user restart) and (b) the
+            // teardown window where Claude Desktop has already closed our
+            // child's stdin (firing this very edge) but its process is still
+            // terminating, so a probe *now* could read either way.
+            //
+            // We arm the grace even when Claude Desktop currently looks alive:
+            // during ordinary churn it simply expires into `Stay`, and arming
+            // unconditionally is exactly what closes the teardown race that a
+            // "skip the grace if CD looks alive" shortcut would leave open —
+            // otherwise a probe catching CD mid-quit as "alive" would `Stay`
+            // with no further edge ever firing, stranding the host alive after
+            // its Wirt is gone (a Step-2 regression). The cost is a single 5 s
+            // timer + one `pgrep` per disconnect edge — no continuous poll.
             trace(&format!(
-                "lifetime: no clients, grace timer {SHUTDOWN_GRACE_SECS}s"
+                "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
             ));
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)) => {
-                    if conns_w.load(Ordering::SeqCst) == 0 {
-                        trace("lifetime: grace expired, exiting");
-                        // Hard exit bypassing Tauri's ExitRequested dance —
-                        // Cmd-Q and window-close are deliberately blocked
-                        // there, so the only legitimate shutdown path is
-                        // this one.
-                        crate::housekeeping::pre_exit_cleanup(http_port, "grace-expired");
-                        let _ = app;
-                        std::process::exit(0);
-                    }
+            tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
+            let child_returned = conns_w.load(Ordering::SeqCst) > 0;
+            let cd_running = crate::setup::is_claude_desktop_running();
+            match grace_outcome(child_returned, cd_running) {
+                GraceOutcome::Stay => {
+                    trace(&format!(
+                        "lifetime: staying after grace \
+                         (claude_desktop_running={cd_running}, child_returned={child_returned})"
+                    ));
                 }
-                _ = wake_w.notified() => {
-                    trace("lifetime: new client within grace, staying");
+                GraceOutcome::Exit => {
+                    trace(
+                        "lifetime: Claude Desktop gone after grace and no child returned — \
+                         host follows Wirt, exiting",
+                    );
+                    // Hard exit: this is exit case (a), the watcher's own
+                    // authority. It bypasses Tauri's ExitRequested gate (which
+                    // default-denies) because the gate has no way to know the
+                    // watcher already established `!is_claude_desktop_running()`.
+                    crate::housekeeping::pre_exit_cleanup(http_port, "claude-desktop-gone");
+                    let _ = app;
+                    std::process::exit(0);
                 }
             }
         }
@@ -475,5 +596,64 @@ mod tests {
         // we just verify the env-lookup paths exist and the function is
         // pure. Real behavior is exercised in integration tests.
         let _ = is_interactive_session();
+    }
+
+    // --- Step-1 verification mini-harness (stabilization-plan §Step 2) ---
+    //
+    // The decision core is pulled out as pure functions so the two invariants
+    // can be asserted without a live Claude Desktop or a running Tauri app:
+    //   * the host survives a child flap as long as Claude Desktop runs, and
+    //   * the host exits once Claude Desktop quits.
+    // These mirror exactly the (child_returned, claude_desktop_running) facts
+    // the watcher reads at grace expiry and the (explicit, cd_running) facts
+    // the ExitRequested gate reads.
+
+    #[test]
+    fn host_stays_while_claude_desktop_runs() {
+        // I1: with Claude Desktop alive and no explicit uninstall/update, the
+        // host may never plan an exit — whatever the child count did.
+        assert!(!host_should_exit(false, true));
+    }
+
+    #[test]
+    fn host_exits_when_claude_desktop_quits() {
+        // Case (a): Wirt gone, no explicit signal → exit authorized.
+        assert!(host_should_exit(false, false));
+    }
+
+    #[test]
+    fn host_exits_on_explicit_uninstall_or_update_even_if_cd_alive() {
+        // Cases (b)/(c): uninstall / update-restart authorize exit regardless
+        // of Claude-Desktop liveness.
+        assert!(host_should_exit(true, true));
+        assert!(host_should_exit(true, false));
+    }
+
+    #[test]
+    fn child_flap_with_claude_desktop_alive_stays() {
+        // The pivotal regression case: the last child disconnected (Cowork
+        // churn / MCP re-spawn) but Claude Desktop is alive — STAY. This is the
+        // exact scenario the old 60 s child-count grace got wrong by exiting.
+        assert_eq!(grace_outcome(false, true), GraceOutcome::Stay);
+        // A child re-attaching during the grace also keeps us up, trivially.
+        assert_eq!(grace_outcome(true, true), GraceOutcome::Stay);
+        assert_eq!(grace_outcome(true, false), GraceOutcome::Stay);
+    }
+
+    #[test]
+    fn claude_desktop_quit_with_no_child_exits() {
+        // Wirt gone after the grace and nothing came back → host follows Wirt.
+        assert_eq!(grace_outcome(false, false), GraceOutcome::Exit);
+    }
+
+    #[test]
+    fn exit_authority_latches() {
+        let auth = ExitAuthority::new();
+        assert!(!auth.is_authorized());
+        auth.authorize();
+        assert!(auth.is_authorized());
+        // Idempotent — staying latched is the contract.
+        auth.authorize();
+        assert!(auth.is_authorized());
     }
 }
