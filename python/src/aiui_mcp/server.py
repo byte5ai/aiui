@@ -23,6 +23,7 @@ import importlib.resources as resources
 import logging
 import mimetypes
 import os
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -414,7 +415,22 @@ async def _poll_render(
         return pv
 
 
-async def _post_render(spec: dict[str, Any], ctx: Context | None = None) -> dict[str, Any]:
+def _session_origin() -> str:
+    """This bridge's host, auto-attached to every render as `session_origin`
+    (Step 4, I8). The Mac can't tell remotes apart at the shared `:7777`, so
+    the origin must come from the caller side — the user always sees which host
+    a dialog came from even when the agent passes no `session` label."""
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "remote"
+
+
+async def _post_render(
+    spec: dict[str, Any],
+    ctx: Context | None = None,
+    session: str | None = None,
+) -> dict[str, Any]:
     await _wait_for_aiui()
     await _preflight()
     t0 = datetime.now(timezone.utc)
@@ -435,7 +451,11 @@ async def _post_render(spec: dict[str, Any], ctx: Context | None = None) -> dict
         r = await client.post(
             f"{ENDPOINT}/render",
             headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
-            json={"spec": spec},
+            json={
+                "spec": spec,
+                "session": session,
+                "session_origin": _session_origin(),
+            },
         )
         r.raise_for_status()
         first = r.json()
@@ -467,6 +487,7 @@ async def ask(
     header: str | None = None,
     multi_select: bool = False,
     allow_other: bool = True,
+    session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before listing options in chat and waiting for the user to type back
@@ -507,7 +528,7 @@ async def ask(
         "multiSelect": multi_select,
         "allowOther": allow_other,
     }
-    return _format_result(await _post_render(spec, ctx))
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.tool()
@@ -520,6 +541,7 @@ async def form(
     actions: list[dict[str, Any]] | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
+    session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Whenever the user needs to provide ≥ 2 related inputs, or any single
@@ -613,7 +635,7 @@ async def form(
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
     }
-    return _format_result(await _post_render(spec, ctx))
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.tool()
@@ -625,6 +647,7 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
     image: dict[str, Any] | None = None,
+    session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before writing any yes/no question into chat, call this tool instead.
@@ -669,7 +692,7 @@ async def confirm(
         "cancelLabel": cancel_label,
         "image": image,
     }
-    return _format_result(await _post_render(spec, ctx))
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.prompt(name="teach")

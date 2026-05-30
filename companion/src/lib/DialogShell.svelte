@@ -1,13 +1,22 @@
 <script lang="ts">
-  import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { _ } from "svelte-i18n";
   import { onMount } from "svelte";
   import Ask from "./widgets/Ask.svelte";
   import Form from "./widgets/Form.svelte";
   import Confirm from "./widgets/Confirm.svelte";
 
-  type DialogReq = { id: string; spec: any; ttl_secs?: number };
+  type DialogReq = {
+    id: string;
+    spec: any;
+    ttl_secs?: number;
+    // Multi-window (Step 4, I8): caller-set session label + remote-injected
+    // origin host, shown in the window chrome so the user can tell which
+    // session this dialog belongs to when several are open at once.
+    session?: string;
+    session_origin?: string;
+  };
 
   let current = $state<DialogReq | null>(null);
 
@@ -138,53 +147,42 @@
   }
 
   onMount(() => {
-    // Dialog event from Rust. We acknowledge receipt back to the Rust
-    // side immediately so the `/render` handler knows the WebView event
-    // loop is alive — this is the per-request liveness check that
-    // replaces the need for any background UI heartbeat. Backend emits
-    // this event with `emit_to("dialog", ...)`, so the setup window
-    // never sees it.
-    const dialogPromise = listen<DialogReq>("dialog:show", (e) => {
-      current = e.payload;
-      void invoke("dialog_received", { id: e.payload.id });
-      scheduleTtl(e.payload.ttl_secs, e.payload.id);
-    });
-
-    // UI ping from Rust (used by /health to verify the event loop). We
-    // pong back synchronously — the Rust side has a 100 ms timeout and
-    // a missed pong is what flips /health to `degraded`.
-    const pingPromise = listen<string>("ui:ping", (e) => {
-      void invoke("ui_pong", { id: e.payload });
-    });
+    // Multi-window pull model (Step 4): this window's label IS its dialog id.
+    // Fetch our own render payload from Rust by that id — the frontend
+    // initiates, so there's no `dialog:show` emit to race and no
+    // ready-handshake to perform. If the dialog is already gone
+    // (resolved/evicted before we mounted), close the window.
+    const id = getCurrentWindow().label;
+    void (async () => {
+      try {
+        const req = await invoke<DialogReq | null>("get_dialog_spec", { id });
+        if (!req) {
+          // Nothing to show — a stranded/already-resolved window. Close it.
+          try {
+            await invoke("close_window");
+          } catch (e) {
+            console.error(`[aiui] close_window (no spec) failed: ${e}`);
+          }
+          return;
+        }
+        current = req;
+        scheduleTtl(req.ttl_secs, req.id);
+      } catch (e) {
+        console.error(`[aiui] get_dialog_spec failed for ${id}: ${e}`);
+      }
+    })();
 
     window.addEventListener("keydown", onKey);
 
-    // Window-close (native red X / ⌘W) is owned by Rust as of v0.4.46
-    // (on_window_event): it cancels any in-flight dialog and lets the
-    // window close, and the `/render` handler destroys the window on
-    // every terminal outcome. We deliberately no longer register a
-    // frontend `onCloseRequested` here. The 0.4.45 version called
-    // `event.preventDefault()` and then, if its cancel/close path failed
-    // (empty/stale dialog state), left the window stranded — visible,
-    // empty, and unclosable (Bug B, the 2026-05-29 overnight report).
-    // Letting Rust own teardown removes that fragile round-trip.
+    // Window-close (native red X / ⌘W) is owned by Rust (on_window_event):
+    // it cancels THIS window's dialog by its id and lets the window close,
+    // and the `/render` handler destroys the window on every terminal
+    // outcome. We deliberately don't register a frontend `onCloseRequested`
+    // — the 0.4.45 version's `preventDefault()` + failed close stranded
+    // empty windows (Bug B). Letting Rust own teardown removes that race.
 
-    // Window-ready handshake (v0.4.30): tell the Rust render path
-    // that our `dialog:show` listener is installed and we can safely
-    // receive events. Without this, the backend would emit before
-    // Tauri actually wired up the listener — the very-first render of
-    // a fresh window would lose its event, hit the 500 ms ack timeout,
-    // and the user would see a blank window. We await both subscribe
-    // promises to ensure the listeners are *really* up before
-    // signalling, not just queued.
-    void Promise.all([dialogPromise, pingPromise]).then(() => {
-      void invoke("dialog_window_ready");
-    });
-
-    return async () => {
+    return () => {
       clearTtlTimers();
-      (await dialogPromise)();
-      (await pingPromise)();
       window.removeEventListener("keydown", onKey);
     };
   });
@@ -263,6 +261,19 @@
   </div>
 {/if}
 
+<!-- Session identifier chip (Step 4, I8). Top-right, fixed so it never
+     reflows the widget. Shows the caller's session label and/or the remote
+     origin host so the user can tell which session a dialog belongs to when
+     several windows are open at once. Hidden entirely when neither is set
+     (the common local single-session case). -->
+{#if current && (current.session || current.session_origin)}
+  <div class="session-chip" role="note" aria-label={$_("dialog.session_aria")}>
+    {#if current.session}<span class="session-name">{current.session}</span>{/if}
+    {#if current.session && current.session_origin}<span class="session-sep">·</span>{/if}
+    {#if current.session_origin}<span class="session-origin">{current.session_origin}</span>{/if}
+  </div>
+{/if}
+
 {#if current}
   <!-- {#key current.id} forces a fresh widget instance for every new
     dialog, even when two consecutive renders are the same kind (e.g.
@@ -300,6 +311,42 @@
 <style>
   .idle {
     min-height: 80px;
+  }
+
+  /* Session identifier chip — fixed top-right, small and muted so it never
+     competes with the dialog content or reflows it. v0.5.0 (I8). */
+  .session-chip {
+    position: fixed;
+    top: 6px;
+    right: 10px;
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 45vw;
+    padding: 2px 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg, #000) 8%, var(--bg, #fff));
+    color: color-mix(in srgb, var(--fg, #000) 62%, var(--bg, #fff));
+    border: 1px solid color-mix(in srgb, var(--fg, #000) 12%, transparent);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .session-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-sep {
+    opacity: 0.5;
+  }
+  .session-origin {
+    font-variant: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* TTL countdown banner. Position-fixed so the widget below keeps

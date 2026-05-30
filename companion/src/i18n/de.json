@@ -84,6 +84,7 @@
     "confirm.no": "Nein",
     "unknown_kind": "Unbekannter Widget-Typ: {kind}",
     "close": "Schließen",
+    "session_aria": "Sitzung, zu der dieser Dialog gehört",
     "ttl": {
       "yellow": "Noch ca. {countdown} Min zum Abschicken — danach werden die Eingaben automatisch verworfen.",
       "red": "Weniger als {countdown} bis zum automatischen Abbruch. Bitte jetzt abschicken oder abbrechen.",

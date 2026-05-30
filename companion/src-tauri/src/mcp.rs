@@ -275,6 +275,7 @@ fn tools_list() -> Value {
                 "required": ["title"],
                 "properties": {
                     "title": { "type": "string", "description": "Decision as a question, ≤ 10 words." },
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "message": { "type": "string", "description": "One sentence stating the concrete consequence." },
                     "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
                     "destructive": { "type": "boolean", "default": false, "description": "Red confirm button — for deletions/rollbacks only." },
@@ -300,6 +301,7 @@ fn tools_list() -> Value {
                 "type": "object",
                 "required": ["question", "options"],
                 "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "question": { "type": "string", "description": "Full question, imperative or interrogative." },
                     "options": {
                         "type": "array",
@@ -327,6 +329,7 @@ fn tools_list() -> Value {
                 "type": "object",
                 "required": ["title"],
                 "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "title": { "type": "string" },
                     "fields": { "type": "array", "items": { "type": "object" }, "description": "Flat field list. Use this OR `tabs`, not both." },
                     "tabs": {
@@ -533,6 +536,7 @@ async fn tools_call(
                     "cancelLabel": args.get("cancel_label"),
                     "image": args.get("image")
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -550,6 +554,7 @@ async fn tools_call(
                     "multiSelect": args.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false),
                     "allowOther": args.get("allow_other").and_then(|v| v.as_bool()).unwrap_or(false)
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -570,6 +575,7 @@ async fn tools_call(
                     "submitLabel": args.get("submit_label"),
                     "cancelLabel": args.get("cancel_label")
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -639,6 +645,7 @@ enum RenderError {
 
 async fn render_dialog(
     spec: Value,
+    session: Option<String>,
     cfg: &AppConfig,
     http: &reqwest::Client,
 ) -> Result<Value, RenderError> {
@@ -654,7 +661,10 @@ async fn render_dialog(
     // would never see the remote's filesystem.
     let mut spec = spec;
     crate::imageresolve::resolve_local_paths(&mut spec);
-    let body = json!({ "spec": spec });
+    // Step 4 (I8): forward the optional caller `session` label. This is the
+    // local bridge, so there is no `session_origin` (the companion treats an
+    // absent origin as local).
+    let body = json!({ "spec": spec, "session": session });
     // Async render (Step 3): POST opts in via `x-aiui-async`; the companion
     // registers + surfaces the dialog and returns immediately with
     // `{id, ttl_secs}` (202). We then poll `GET /render/{id}` in bounded
