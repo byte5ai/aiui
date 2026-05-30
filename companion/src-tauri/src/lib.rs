@@ -975,6 +975,7 @@ pub(crate) fn build_dialog_window(
     app: &tauri::AppHandle,
     id: &str,
     size: (f64, f64),
+    title: &str,
 ) -> tauri::Result<tauri::WebviewWindow> {
     #[cfg(target_os = "macos")]
     {
@@ -982,7 +983,10 @@ pub(crate) fn build_dialog_window(
     }
     let id_for_lift = id.to_string();
     WebviewWindowBuilder::new(app, id, WebviewUrl::App("dialog.html".into()))
-        .title("aiui")
+        // Session identity (I8) in the native title bar. Set here in Rust —
+        // the frontend `setTitle` is blocked without a `core:window:set-title`
+        // capability, so the Rust builder is the reliable place.
+        .title(title)
         // Initial size from `estimate_dialog_size` — we widen for
         // wireframe/mermaid/table and grow vertically for long forms,
         // clamped to (1100, 900). Resizable so the user always has the last

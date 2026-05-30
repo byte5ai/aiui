@@ -167,11 +167,9 @@
         }
         current = req;
         scheduleTtl(req.ttl_secs, req.id);
-        // Session identity goes in the native title bar (Step 4 / I8) — not a
-        // chip in the work area, which overlapped content (2026-05-31). The
-        // OS title bar is the natural home for window identity.
-        const parts = [req.session, req.session_origin].filter(Boolean);
-        void getCurrentWindow().setTitle(parts.length ? `aiui — ${parts.join(" · ")}` : "aiui");
+        // Session identity (I8) is set as the native window title by Rust in
+        // build_dialog_window — the frontend setTitle is permission-gated
+        // (needs core:window:set-title), so we don't do it here.
       } catch (e) {
         console.error(`[aiui] get_dialog_spec failed for ${id}: ${e}`);
       }
