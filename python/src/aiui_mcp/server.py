@@ -695,6 +695,73 @@ async def confirm(
     return _format_result(await _post_render(spec, ctx, session))
 
 
+@mcp.tool()
+async def gallery(
+    items: list[dict[str, Any]],
+    title: str | None = None,
+    description: str | None = None,
+    header: str | None = None,
+    actions: list[dict[str, Any]] | None = None,
+    comment: bool = False,
+    columns: int | None = None,
+    submit_label: str | None = None,
+    cancel_label: str | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Batch visual review: show several images and/or videos at once and
+    collect a per-item decision (+ optional comment) in ONE window, instead
+    of calling `confirm` once per asset.
+
+    WHEN TO USE: "review these N generated images", "triage this batch of
+    screenshots", "approve/revise/skip each of these renders". For a single
+    image sign-off use `confirm` with `image`; for a one-of-N choice use
+    `ask` with thumbnails.
+
+    Each item needs a stable `value` (the key you get the decision back
+    under) and usually a `src`. `src` follows the standard aiui resolution
+    rules (data: URL, http(s) URL, or absolute / `~/` local path on YOUR
+    host). Videos are detected by `data:video/` MIME or a
+    .mp4/.mov/.m4v/.webm extension and render with native controls.
+
+    Per-item buttons come from `actions` (default Approve / Revise / Skip).
+    Set `comment=True` for a free-text field per item.
+
+    Returns `{cancelled, decisions}` where `decisions` maps each touched
+    item's `value` to `{decision, comment?}`. Items the user didn't touch
+    are omitted.
+
+    Args:
+        items: List of `{value, src?, alt?, label?, detail?, max_height?}`.
+            `value` must be non-empty and unique. Order is preserved.
+        title: What the user is reviewing, e.g. "Review 6 hero renders".
+        description: One sentence of context under the title.
+        header: Chip above the title (≤ 14 chars).
+        actions: Per-item decision buttons as
+            `[{label, value, primary?, success?, destructive?}]`. Defaults
+            to Approve (green) / Revise / Skip.
+        comment: Show a free-text comment field per item.
+        columns: Grid columns. Omit for responsive auto-fill.
+        submit_label: Footer submit button label.
+        cancel_label: Footer cancel button label.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
+    """
+    spec = {
+        "kind": "gallery",
+        "title": title,
+        "description": description,
+        "header": header,
+        "items": items,
+        "actions": actions,
+        "comment": comment,
+        "columns": columns,
+        "submitLabel": submit_label,
+        "cancelLabel": cancel_label,
+    }
+    return _format_result(await _post_render(spec, ctx, session))
+
+
 @mcp.prompt(name="teach")
 def teach_prompt() -> str:
     """Brief the agent on aiui. Loads the full widget catalog, design

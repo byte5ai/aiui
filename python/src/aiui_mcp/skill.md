@@ -51,6 +51,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Yes/no, especially destructive | `confirm` |
 | 2–6 options, possibly with per-option context | `ask` |
 | Multi-field input, multi-action footer | `form` |
+| Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -173,6 +174,27 @@ this field replaces.
 For "pick one (or more) of these N generated images" — logo variants,
 thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
 `multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
+
+`image_grid` *picks* among candidates. For a **separate verdict per item**
+(approve this, revise that, skip the third, optional note each) use the
+`gallery` tool below instead.
+
+## Batch review: `gallery`
+
+A standalone tool (not a `form` field) for reviewing a *batch* of images
+and/or videos and collecting one decision per item in a single window —
+instead of firing `confirm` once per asset.
+
+Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
+`actions?` (per-item buttons, default Approve / Revise / Skip),
+`comment?` (free-text per item), `columns?`. Each item's `value` must be
+non-empty and unique — it keys the result. `src` follows the standard
+image rules; **videos** (`data:video/` URL or `.mp4`/`.mov`/`.m4v`/`.webm`)
+render with native controls. Large local videos exceed the 10 MB inline
+cap and won't transfer yet — keep clips small or host over `http(s)://`.
+
+Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
+touched items appear — an untouched item means "no verdict", not a default.
 
 ## `datetime` field
 

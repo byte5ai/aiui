@@ -112,6 +112,37 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
     let mut width = BASE_W;
     let mut content_h: f64 = 0.0;
 
+    // Gallery has no form `fields`; it is a grid of item cards. Size by
+    // item count and column layout so a batch review opens roomy.
+    if spec.get("kind").and_then(|v| v.as_str()) == Some("gallery") {
+        let items = spec
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let cols = spec
+            .get("columns")
+            .and_then(|v| v.as_u64())
+            .filter(|&c| c > 0)
+            .unwrap_or(if items >= 4 { 3 } else { 2 })
+            .max(1);
+        let w = match cols {
+            1 => BASE_W,
+            2 => 680.0,
+            3 => 880.0,
+            _ => MAX_W,
+        };
+        let rows = ((items as f64) / (cols as f64)).ceil();
+        // Each card ≈ thumbnail (200) + label/detail + action row + optional comment.
+        let per_card = if spec.get("comment").and_then(|v| v.as_bool()).unwrap_or(false) {
+            330.0
+        } else {
+            290.0
+        };
+        let needed = CHROME_H + (rows * per_card).max(per_card);
+        return (w.min(MAX_W), needed.clamp(BASE_H, MAX_H));
+    }
+
     if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
         if !tabs.is_empty() {
             content_h += 40.0;
@@ -498,6 +529,43 @@ mod tests {
         });
         let (w, _h) = estimate_dialog_size(&spec);
         assert_eq!(w, 880.0, "4-col wireframe inside tab should still widen");
+    }
+
+    #[test]
+    fn estimate_size_gallery_scales_with_items() {
+        // Few items → narrower 2-col layout, roomy but bounded height.
+        let small = serde_json::json!({
+            "kind": "gallery",
+            "items": [
+                { "value": "a", "src": "data:image/png;base64,AAAA" },
+                { "value": "b", "src": "data:image/png;base64,BBBB" }
+            ]
+        });
+        let (w_small, h_small) = estimate_dialog_size(&small);
+        assert_eq!(w_small, 680.0, "2 items → 2-col → 680 wide");
+        assert!((480.0..=900.0).contains(&h_small));
+
+        // Many items → 3-col grid widens, more rows push height higher.
+        let mut items = Vec::new();
+        for i in 0..9 {
+            items.push(serde_json::json!({ "value": format!("v{i}"), "src": "data:image/png;base64,AAAA" }));
+        }
+        let big = serde_json::json!({ "kind": "gallery", "items": items });
+        let (w_big, h_big) = estimate_dialog_size(&big);
+        assert_eq!(w_big, 880.0, "≥4 items → 3-col → 880 wide");
+        assert!(h_big > h_small, "9 items should be taller than 2, got {h_big} vs {h_small}");
+        assert!(h_big <= 900.0, "must clamp to MAX_H");
+    }
+
+    #[test]
+    fn estimate_size_gallery_respects_explicit_columns() {
+        let spec = serde_json::json!({
+            "kind": "gallery",
+            "columns": 1,
+            "items": [{ "value": "a" }, { "value": "b" }]
+        });
+        let (w, _h) = estimate_dialog_size(&spec);
+        assert_eq!(w, 520.0, "explicit 1 column → base width");
     }
 
     #[test]

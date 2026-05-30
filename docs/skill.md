@@ -65,6 +65,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Pick one of N images ("A or B or C") | `ask` with `thumbnail` per option |
 | Multi-field input, multi-action footer | `form` |
 | Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
+| Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -236,6 +237,34 @@ For "pick one (or more) of these N generated images" — logo variants,
 thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
 `multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
 Each `src` follows the same rules as `image` — see below.
+
+`image_grid` is a *picker* — one (or N) selected out of many. When you
+instead need a **separate verdict per item** — approve this, revise that,
+skip the third, with an optional note each — use the `gallery` tool below.
+
+## Batch review: `gallery`
+
+A standalone tool (not a `form` field), for reviewing a *batch* of images
+and/or videos and collecting one decision per item in a single window —
+instead of firing `confirm` once per asset.
+
+Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
+`actions?` (per-item buttons, default Approve / Revise / Skip),
+`comment?` (free-text field per item), `columns?` (default responsive).
+Each item's `value` must be non-empty and unique — it keys the result.
+`src` follows the same resolution rules as `image`; **videos** (a
+`data:video/` URL or a `.mp4`/`.mov`/`.m4v`/`.webm` source) render with
+native `<video controls>`. Large local videos exceed the 10 MB inline cap
+and won't transfer yet — keep clips small or host them over `http(s)://`.
+
+Result: `{cancelled, decisions: {"<item value>": {decision, comment?}}}`.
+Only items the user actually touched appear in `decisions` — an untouched
+item means "no verdict", not a default.
+
+Use `gallery` for "review these 6 hero renders", "triage this screenshot
+batch". Use `confirm`+`image` for a single yes/no sign-off, and
+`ask`+`thumbnail` / `image_grid` when the task is *picking* among
+candidates rather than judging each one.
 
 ## Image sources (`src` / `thumbnail`)
 

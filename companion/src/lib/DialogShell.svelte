@@ -6,6 +6,7 @@
   import Ask from "./widgets/Ask.svelte";
   import Form from "./widgets/Form.svelte";
   import Confirm from "./widgets/Confirm.svelte";
+  import Gallery from "./widgets/Gallery.svelte";
 
   type DialogReq = {
     id: string;
@@ -280,6 +281,8 @@
       <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else if current.spec.kind === "confirm"}
       <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "gallery"}
+      <Gallery spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else}
       <main class="window-shell">
         <div class="window-scroll">
