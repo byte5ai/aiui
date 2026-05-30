@@ -6,6 +6,15 @@ companion/src-tauri/gen/schemas/
 # deps
 companion/node_modules/
 
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+python/uv.lock
+python/.venv/
+python/dist/
+*.egg-info/
+
 # packaged release
 aiui-*.zip
 aiui-*.dmg

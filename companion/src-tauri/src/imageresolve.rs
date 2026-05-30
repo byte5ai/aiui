@@ -242,6 +242,12 @@ fn guess_mime_from_extension(path: &Path) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("avif") => "image/avif",
         Some("heic") => "image/heic",
+        // Video — for the gallery widget's `<video controls>`. Small clips
+        // inline as data: here; large ones exceed MAX_IMAGE_BYTES and are
+        // left as-is (the scp/push transfer path handles those).
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
         // Unknown extension: hand it to the WebView as octet-stream.
         // It will likely fail to render, but that's a clear "your file
         // isn't an image" signal rather than a misleading mime guess.

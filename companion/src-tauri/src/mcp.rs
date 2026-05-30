@@ -353,6 +353,55 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "gallery",
+            "description": "Batch visual review: show several images and/or videos at once and collect a per-item decision (+ optional comment) in ONE window, instead of calling `confirm` once per asset. Use this for \"review these N generated images\", \"triage this batch of screenshots\", \"approve/revise/skip each of these renders\". Each item needs a stable `value` (the key you get decisions back under) and a `src` (data: URL, http(s):// URL, or absolute / `~/`-rooted local path on YOUR host — same resolution rules as the form `image` field; videos are detected by data:video/ MIME or .mp4/.mov/.m4v/.webm extension and rendered with native controls). Per-item buttons come from `actions` (default Approve / Revise / Skip); set `comment: true` to show a free-text field per item. Returns {cancelled, decisions: {\"<item value>\": {decision, comment?}}} — only items the user touched appear. For a single image sign-off use `confirm` with `image`; for one-of-N choice use `ask` with thumbnails. **Blocks until the user submits or cancels. Response can take minutes — progress notifications fire every ~10 s.**",
+            "inputSchema": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
+                    "title": { "type": "string", "description": "What the user is reviewing, e.g. \"Review 6 hero renders\"." },
+                    "description": { "type": "string", "description": "One sentence of context shown under the title." },
+                    "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
+                    "items": {
+                        "type": "array",
+                        "description": "The assets to review. Order is preserved.",
+                        "items": {
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {
+                                "value": { "type": "string", "description": "Stable id; keys the returned decision. Must be non-empty and unique." },
+                                "src": { "type": "string", "description": "Image or video source: data: URL, http(s):// URL, or absolute / ~/ local path on YOUR host." },
+                                "alt": { "type": "string" },
+                                "label": { "type": "string", "description": "Caption shown under the thumbnail." },
+                                "detail": { "type": "string", "description": "Short context line beside/under the label." },
+                                "max_height": { "type": "number", "description": "Cap thumbnail height in px." }
+                            }
+                        }
+                    },
+                    "actions": {
+                        "type": "array",
+                        "description": "Per-item decision buttons. Defaults to Approve (green) / Revise / Skip if omitted.",
+                        "items": {
+                            "type": "object",
+                            "required": ["label", "value"],
+                            "properties": {
+                                "label": { "type": "string" },
+                                "value": { "type": "string", "description": "Returned as the item's `decision`." },
+                                "primary": { "type": "boolean" },
+                                "success": { "type": "boolean" },
+                                "destructive": { "type": "boolean" }
+                            }
+                        }
+                    },
+                    "comment": { "type": "boolean", "default": false, "description": "Show a free-text comment field per item." },
+                    "columns": { "type": "number", "description": "Grid columns. Omit for responsive auto-fill." },
+                    "submit_label": { "type": "string" },
+                    "cancel_label": { "type": "string" }
+                }
+            }
+        },
+        {
             "name": "aiui_health",
             "description": "Reachability check against the local aiui companion. Returns version + ready flag if the companion is running and responding.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -572,6 +621,28 @@ async fn tools_call(
                     "fields": args.get("fields"),
                     "tabs": args.get("tabs"),
                     "actions": args.get("actions"),
+                    "submitLabel": args.get("submit_label"),
+                    "cancelLabel": args.get("cancel_label")
+                }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
+                cfg,
+                http,
+            )
+            .await,
+            format_dialog_result,
+        ),
+
+        "gallery" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "gallery",
+                    "title": args.get("title"),
+                    "description": args.get("description"),
+                    "header": args.get("header"),
+                    "items": args.get("items"),
+                    "actions": args.get("actions"),
+                    "comment": args.get("comment").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "columns": args.get("columns"),
                     "submitLabel": args.get("submit_label"),
                     "cancelLabel": args.get("cancel_label")
                 }),

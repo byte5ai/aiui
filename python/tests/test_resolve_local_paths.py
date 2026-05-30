@@ -142,3 +142,28 @@ def test_resolve_local_paths_walks_confirm_image_and_ask_thumbnail(tmp_path: Pat
     assert ask_spec["options"][0]["thumbnail"].startswith("data:image/png;base64,")
     assert ask_spec["options"][1]["thumbnail"] == "https://leave.me/b.png"
     assert "thumbnail" not in ask_spec["options"][2]
+
+
+def test_resolve_local_paths_walks_gallery_items(tmp_path: Path) -> None:
+    """Gallery `items[].src` must resolve the same way — local image and
+    video paths inline as data:, remote/data URLs pass through.
+    """
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfake bytes")
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42fake")
+
+    gallery_spec = {
+        "kind": "gallery",
+        "items": [
+            {"value": "a", "src": str(img)},
+            {"value": "b", "src": str(vid)},
+            {"value": "c", "src": "https://leave.me/c.png"},
+            {"value": "d", "src": "data:image/png;base64,UNCHANGED"},
+        ],
+    }
+    _resolve_local_paths(gallery_spec)
+    assert gallery_spec["items"][0]["src"].startswith("data:image/png;base64,")
+    assert gallery_spec["items"][1]["src"].startswith("data:video/mp4;base64,")
+    assert gallery_spec["items"][2]["src"] == "https://leave.me/c.png"
+    assert gallery_spec["items"][3]["src"] == "data:image/png;base64,UNCHANGED"

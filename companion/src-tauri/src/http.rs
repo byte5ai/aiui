@@ -517,11 +517,44 @@ const KNOWN_FIELD_KINDS: &[&str] = &[
 /// specs.
 fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     let kind = spec.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(kind, "ask" | "form" | "confirm") {
+    if !matches!(kind, "ask" | "form" | "confirm" | "gallery") {
         return Err((
-            format!("top-level 'kind' must be one of ask|form|confirm, got '{kind}'"),
-            "Use confirm for yes/no, ask for one-of-N, form for ≥2 inputs.".into(),
+            format!("top-level 'kind' must be one of ask|form|confirm|gallery, got '{kind}'"),
+            "Use confirm for yes/no, ask for one-of-N, form for ≥2 inputs, gallery for batch image/video review.".into(),
         ));
+    }
+    if kind == "gallery" {
+        match spec.get("items").and_then(|v| v.as_array()) {
+            None => {
+                return Err((
+                    "gallery spec is missing the 'items' array".into(),
+                    "Provide items: [{value, src, label?, detail?}, …].".into(),
+                ));
+            }
+            Some(arr) if arr.is_empty() => {
+                return Err((
+                    "gallery 'items' is empty".into(),
+                    "A gallery needs at least one item to review.".into(),
+                ));
+            }
+            Some(arr) => {
+                for (i, it) in arr.iter().enumerate() {
+                    let has_value = it
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !has_value {
+                        return Err((
+                            format!("gallery item #{i} is missing a non-empty 'value'"),
+                            "Each item needs a stable 'value' string — it keys the returned decision."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
     let mut fields: Vec<&serde_json::Value> = Vec::new();
     if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
@@ -947,6 +980,34 @@ mod validate_tests {
         let err = validate_spec(&json!({"kind":"wizard"})).unwrap_err();
         assert!(err.0.contains("wizard"));
         assert!(err.0.contains("ask|form|confirm"));
+    }
+
+    #[test]
+    fn accepts_gallery_with_items() {
+        let spec = json!({"kind":"gallery","items":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"b","src":"https://x.test/clip.mp4"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_gallery_without_items() {
+        let err = validate_spec(&json!({"kind":"gallery"})).unwrap_err();
+        assert!(err.0.contains("items"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_gallery_empty_items() {
+        let err = validate_spec(&json!({"kind":"gallery","items":[]})).unwrap_err();
+        assert!(err.0.contains("empty"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_gallery_item_without_value() {
+        let spec = json!({"kind":"gallery","items":[{"src":"data:image/png;base64,AAAA"}]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("value"), "got: {}", err.0);
     }
 
     #[test]
