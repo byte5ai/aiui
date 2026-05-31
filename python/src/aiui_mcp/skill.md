@@ -189,9 +189,11 @@ Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
 `actions?` (per-item buttons, default Approve / Revise / Skip),
 `comment?` (free-text per item), `columns?`. Each item's `value` must be
 non-empty and unique — it keys the result. `src` follows the standard
-image rules; **videos** (`data:video/` URL or `.mp4`/`.mov`/`.m4v`/`.webm`)
-render with native controls. Large local videos exceed the 10 MB inline
-cap and won't transfer yet — keep clips small or host over `http(s)://`.
+image rules; **videos** (`data:video/` URL, `http(s)://` URL, or a local
+`.mp4`/`.mov`/`.m4v`/`.webm` path) render with native controls. Local
+videos of any size work — the bridge pushes them to aiui's media cache on
+the Mac and the dialog streams them back, so a remote clip plays without
+hosting it anywhere.
 
 Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
 touched items appear — an untouched item means "no verdict", not a default.

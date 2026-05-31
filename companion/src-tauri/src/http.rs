@@ -3,7 +3,8 @@ use crate::config::AppConfig;
 use crate::dialog::{DialogState, DIALOG_TTL};
 use crate::lifetime::LifetimeStats;
 use axum::{
-    extract::{Path, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -174,6 +175,20 @@ pub async fn serve(
         async_slots: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
+    // Media cache (video feature): resolve the dir up front (before `app`
+    // moves into the router state), serve it range-capably, and sweep any
+    // clips left over from a previous run so a crash can't leak disk.
+    let media_path = crate::media::media_dir(&state.app).unwrap_or_else(|e| {
+        trace(&format!("serve: media_dir unavailable: {e}"));
+        std::env::temp_dir().join("aiui-media")
+    });
+    let _ = std::fs::create_dir_all(&media_path);
+    crate::media::sweep(
+        &media_path,
+        crate::media::MEDIA_TTL,
+        crate::media::MEDIA_TOTAL_CAP,
+    );
+
     let router = Router::new()
         .route("/health", get(health))
         .route("/render", post(render))
@@ -182,6 +197,20 @@ pub async fn serve(
         .route("/update", post(update))
         .route("/ping", get(ping))
         .route("/probe", get(probe))
+        // Bridge pushes media bytes here; capped well above the per-file
+        // ceiling guard inside the handler so the 413 is ours, not axum's
+        // generic one.
+        .route(
+            "/media",
+            post(media_upload)
+                .layer(DefaultBodyLimit::max(crate::media::MEDIA_FILE_CAP as usize)),
+        )
+        // Capability-URL playback: unauthenticated (filename is a UUID),
+        // range-capable for video seeking via tower-http's ServeDir.
+        .nest_service(
+            "/media/blob",
+            tower_http::services::ServeDir::new(&media_path),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -264,6 +293,76 @@ fn auth_ok(headers: &HeaderMap, token: &str) -> bool {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|v| v == token)
         .unwrap_or(false)
+}
+
+/// `POST /media` — the bridge pushes media bytes (video for the gallery/form
+/// widgets) here; we cache them on the Mac and hand back a loopback playback
+/// URL. Authenticated like every mutating endpoint. The body limit is set on
+/// the route layer; this handler adds the documented `MEDIA_FILE_CAP` guard
+/// so an oversize push gets *our* 413 with a clear message. The `?ext=`
+/// query names the cached file (and thus the served Content-Type); it is
+/// sanitised hard in `media::store`.
+///
+/// Returns `{ url, ttl_secs }`. `url` is `http://127.0.0.1:<port>/media/blob/
+/// <uuid>.<ext>` — valid both on the remote (where the bridge runs, via the
+/// reverse tunnel) and on the Mac (where the WebView plays it), since the
+/// tunnel maps `remote:7777 → mac:7777`.
+async fn media_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    if body.len() as u64 > crate::media::MEDIA_FILE_CAP {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "media too large: {} bytes (max {})",
+                body.len(),
+                crate::media::MEDIA_FILE_CAP
+            ),
+        )
+            .into_response();
+    }
+    let ext = params.get("ext").map(String::as_str).unwrap_or("bin");
+    let dir = match crate::media::media_dir(&state.app) {
+        Ok(d) => d,
+        Err(e) => {
+            trace(&format!("media_upload: no cache dir: {e}"));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media cache unavailable")
+                .into_response();
+        }
+    };
+    let name = match crate::media::store(&dir, &body, ext) {
+        Ok(n) => n,
+        Err(e) => {
+            trace(&format!("media_upload: write failed: {e}"));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media write failed").into_response();
+        }
+    };
+    // Bound the cache on the way in — cheap dir scan, never blocks the render.
+    crate::media::sweep(
+        &dir,
+        crate::media::MEDIA_TTL,
+        crate::media::MEDIA_TOTAL_CAP,
+    );
+    let url = format!(
+        "http://127.0.0.1:{}/media/blob/{}",
+        state.cfg.http_port, name
+    );
+    trace(&format!(
+        "media_upload: stored {} ({} bytes)",
+        name,
+        body.len()
+    ));
+    Json(serde_json::json!({
+        "url": url,
+        "ttl_secs": crate::media::MEDIA_TTL.as_secs(),
+    }))
+    .into_response()
 }
 
 /// Composite health check. Probes the WebView event loop with a `ui:ping`

@@ -708,6 +708,54 @@ fn base_url(cfg: &AppConfig) -> String {
     format!("http://127.0.0.1:{}", cfg.http_port)
 }
 
+/// Push a local video file to the companion's `POST /media` cache and return
+/// the playback URL it hands back. Reads the file on *this* host (local Mac,
+/// or the remote for an SSH-tunneled session) and uploads the bytes over the
+/// same :7777 channel the render goes through — so it works identically
+/// local and remote without any Mac→remote access. Errors (file unreadable,
+/// 413, old companion without `/media` → 404) bubble up; the caller treats
+/// them as non-fatal and leaves the original path in place.
+async fn upload_media(
+    http: &reqwest::Client,
+    cfg: &AppConfig,
+    token: &str,
+    path: &str,
+) -> Result<String, String> {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(h) => h.join(rest),
+            None => std::path::PathBuf::from(path),
+        }
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    let bytes = tokio::fs::read(&expanded)
+        .await
+        .map_err(|e| format!("read {}: {e}", expanded.display()))?;
+    let ext = crate::imageresolve::video_ext(path);
+    let url = format!("{}/media?ext={}", base_url(cfg), ext);
+    let resp = http
+        .post(&url)
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(bytes)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("POST /media: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("/media http {}", resp.status()));
+    }
+    let body = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("parse /media: {e}"))?;
+    body.get("url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "/media response missing url".to_string())
+}
+
 /// Per-call dialog rendering can fail in two structurally different
 /// ways. v0.4.36 splits them so the tool dispatcher can convert
 /// `Busy` into a structured tool result (with retry-vs-tell-user
@@ -743,6 +791,25 @@ async fn render_dialog(
     // (imageresolve::resolve_image_srcs) only knows about HTTPS — it
     // would never see the remote's filesystem.
     let mut spec = spec;
+    // Video (2026-05-31): local video files are too big to inline as `data:`
+    // (10 MB cap, base64 bloat), so push them to the companion's /media cache
+    // and swap the path for the returned loopback playback URL. Done BEFORE
+    // `resolve_local_paths` so the image inliner never tries to base64 a
+    // video. Upload failures are non-fatal — the path is simply left as-is
+    // (the WebView shows a broken player rather than the call blowing up).
+    let videos = crate::imageresolve::collect_local_video_paths(&spec);
+    if !videos.is_empty() {
+        let mut map = std::collections::HashMap::new();
+        for path in videos {
+            match upload_media(http, cfg, &token, &path).await {
+                Ok(media_url) => {
+                    map.insert(path, media_url);
+                }
+                Err(e) => trace(&format!("render_dialog: media upload failed for {path}: {e}")),
+            }
+        }
+        crate::imageresolve::replace_srcs(&mut spec, &map);
+    }
     crate::imageresolve::resolve_local_paths(&mut spec);
     // Step 4 (I8): forward the optional caller `session` label. This is the
     // local bridge, so there is no `session_origin` (the companion treats an

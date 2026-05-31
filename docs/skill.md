@@ -253,9 +253,12 @@ Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
 `comment?` (free-text field per item), `columns?` (default responsive).
 Each item's `value` must be non-empty and unique — it keys the result.
 `src` follows the same resolution rules as `image`; **videos** (a
-`data:video/` URL or a `.mp4`/`.mov`/`.m4v`/`.webm` source) render with
-native `<video controls>`. Large local videos exceed the 10 MB inline cap
-and won't transfer yet — keep clips small or host them over `http(s)://`.
+`data:video/` URL, an `http(s)://` URL, or a local `.mp4`/`.mov`/`.m4v`/
+`.webm` path) render with native `<video controls>`. Local video files of
+any size work: the bridge pushes them to aiui's media cache on the Mac and
+the dialog streams them back (range-seekable), so a remote agent's clip
+plays without you hosting it anywhere. `http(s)://` video URLs stream
+directly.
 
 Result: `{cancelled, decisions: {"<item value>": {decision, comment?}}}`.
 Only items the user actually touched appear in `decisions` — an untouched
