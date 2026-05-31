@@ -8,6 +8,7 @@ mod imageresolve;
 mod lifetime;
 mod logging;
 mod mcp;
+mod media;
 mod proc_ext;
 mod setup;
 mod skill;

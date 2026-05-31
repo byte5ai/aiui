@@ -351,6 +351,89 @@ def _resolve_local_paths(node: Any) -> None:
             _resolve_local_paths(item)
 
 
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+
+
+def _is_local_video(s: str) -> bool:
+    """A local-filesystem path pointing at a video by extension. Mirrors
+    `is_local_video_path` in the Rust bridge and `isVideo` in Gallery.svelte.
+    """
+    if not _looks_like_local_path(s):
+        return False
+    stem = s.lower().split("?", 1)[0].split("#", 1)[0]
+    return stem.endswith(_VIDEO_EXTS)
+
+
+def _collect_local_videos(node: Any, out: list[str]) -> None:
+    """Gather distinct local video paths from every `src`/`thumbnail` slot."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _SRC_KEYS and isinstance(value, str) and _is_local_video(value):
+                if value not in out:
+                    out.append(value)
+            else:
+                _collect_local_videos(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_local_videos(item, out)
+
+
+def _replace_srcs(node: Any, mapping: dict[str, str]) -> None:
+    """Swap `src`/`thumbnail` strings that are keys in `mapping`."""
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key in _SRC_KEYS and isinstance(value, str) and value in mapping:
+                node[key] = mapping[value]
+            else:
+                _replace_srcs(value, mapping)
+    elif isinstance(node, list):
+        for item in node:
+            _replace_srcs(item, mapping)
+
+
+async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+    """Push local video files to the companion's `/media` cache and rewrite
+    their `src`/`thumbnail` to the returned loopback playback URL.
+
+    Videos are too big to inline as `data:` (the 10 MB cap + base64 bloat),
+    and a remote agent's file isn't readable from the Mac — so the bridge
+    streams the bytes over the same :7777 channel the render uses (loopback
+    locally, reverse tunnel remotely). Best-effort: a read error, a 413, or
+    an old companion without `/media` (404) leaves the path untouched, and
+    `_resolve_local_paths` then does whatever it can with it.
+    """
+    paths: list[str] = []
+    _collect_local_videos(spec, paths)
+    if not paths:
+        return
+    mapping: dict[str, str] = {}
+    for p in paths:
+        try:
+            data = Path(p).expanduser().read_bytes()
+        except OSError as e:
+            log.warning("video skipped (read failed) %s: %s", p, e)
+            continue
+        ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp4"
+        try:
+            r = await client.post(
+                f"{ENDPOINT}/media",
+                params={"ext": ext},
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "Content-Type": "application/octet-stream",
+                },
+                content=data,
+            )
+            r.raise_for_status()
+            url = r.json().get("url")
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("video upload failed %s: %s", p, e)
+            continue
+        if url:
+            mapping[p] = url
+    _replace_srcs(spec, mapping)
+
+
 async def _wait_for_aiui() -> None:
     """Poll the unauthenticated `/ping` until the companion answers or
     `COLDSTART_WAIT_S` elapses (Step 3, parity with the Rust bridge).
@@ -435,14 +518,18 @@ async def _post_render(
     await _preflight()
     t0 = datetime.now(timezone.utc)
     log.info("render → kind=%s", spec.get("kind"))
-    # Resolve any absolute / `~/`-rooted file paths *before* shipping
-    # the spec down the HTTP wire. This bridge runs on the same host
-    # as the agent — local for Mac use, remote for SSH-tunneled
-    # remotes — so this is the only point in the chain where the
-    # agent's filesystem actually exists. The Mac-side server resolver
-    # only handles HTTPS.
-    _resolve_local_paths(spec)
     async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        # Video first: push local video files to the Mac's /media cache and
+        # swap their `src` for the returned playback URL — BEFORE the image
+        # inliner runs, so it never tries to base64 a huge clip.
+        await _upload_local_videos(spec, client)
+        # Resolve any absolute / `~/`-rooted file paths *before* shipping
+        # the spec down the HTTP wire. This bridge runs on the same host
+        # as the agent — local for Mac use, remote for SSH-tunneled
+        # remotes — so this is the only point in the chain where the
+        # agent's filesystem actually exists. The Mac-side server resolver
+        # only handles HTTPS.
+        _resolve_local_paths(spec)
         # Async render (Step 3): opt in via the header. A current companion
         # registers the dialog and answers immediately with `{id, ttl_secs}`
         # (202); we then poll for the result. An older companion ignores the
