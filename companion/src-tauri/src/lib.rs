@@ -981,6 +981,27 @@ pub(crate) fn build_dialog_window(
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
+    // Clamp the requested start size to the monitor's usable area, so an
+    // agent asking for `size:"l"` (or explicit width/height) on a small
+    // screen can't open a window taller/wider than the display. Leaves a
+    // margin for the menu bar / Dock. The window stays resizable, so the
+    // user can still grow it past this if they want.
+    let size = {
+        let mut s = size;
+        if let Ok(Some(mon)) = app.primary_monitor() {
+            let sf = mon.scale_factor();
+            let phys = mon.size();
+            let avail_w = (phys.width as f64 / sf) * 0.95;
+            let avail_h = (phys.height as f64 / sf) * 0.92;
+            if avail_w > 360.0 {
+                s.0 = s.0.min(avail_w);
+            }
+            if avail_h > 320.0 {
+                s.1 = s.1.min(avail_h);
+            }
+        }
+        s
+    };
     let id_for_lift = id.to_string();
     WebviewWindowBuilder::new(app, id, WebviewUrl::App("dialog.html".into()))
         // Session identity (I8) in the native title bar. Set here in Rust —

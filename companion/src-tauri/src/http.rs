@@ -834,7 +834,7 @@ async fn render(
     // if the hard cap is hit. Setup-window UI calls don't go through /render,
     // so this governs agent dialog traffic only. Size is estimated from the
     // spec before it moves into the registry.
-    let size = crate::dialog::estimate_dialog_size(&req.spec);
+    let size = crate::dialog::resolve_start_size(&req.spec);
     // Native title-bar text (I8): "aiui — <session> · <origin>", computed
     // before session/origin move into the registry. Set on the window by Rust
     // (frontend setTitle is permission-gated). Falls back to "aiui".

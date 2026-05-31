@@ -541,6 +541,9 @@ async def form(
     actions: list[dict[str, Any]] | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
+    size: str | None = None,
+    width: float | None = None,
+    height: float | None = None,
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -623,6 +626,16 @@ async def form(
             Without actions, defaults to Cancel + Submit.
         submit_label: Legacy fallback for the default submit button label.
         cancel_label: Legacy fallback for the default cancel button label.
+        size: Starting window size hint — "s", "m", or "l". aiui picks good
+            local defaults and clamps to the screen. The window is always
+            resizable; this only sets the *initial* size and never opens
+            smaller than the content needs. Use "m"/"l" for forms with
+            images, tables, wireframes, or many fields so they don't open
+            cramped.
+        width: Explicit starting width in logical px (overrides `size`).
+            Rarely needed — prefer `size`.
+        height: Explicit starting height in logical px (overrides `size`).
+            Rarely needed — prefer `size`.
     """
     spec = {
         "kind": "form",
@@ -634,6 +647,9 @@ async def form(
         "actions": actions,
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
+        "size": size,
+        "width": width,
+        "height": height,
     }
     return _format_result(await _post_render(spec, ctx, session))
 
@@ -706,6 +722,9 @@ async def gallery(
     columns: int | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
+    size: str | None = None,
+    width: float | None = None,
+    height: float | None = None,
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -744,6 +763,12 @@ async def gallery(
         columns: Grid columns. Omit for responsive auto-fill.
         submit_label: Footer submit button label.
         cancel_label: Footer cancel button label.
+        size: Starting window size hint — "s", "m", or "l". Defaults to
+            auto-sizing by item count; pass "l" for a large batch or tall
+            thumbnails so the grid opens roomy. Always resizable; never opens
+            smaller than the content needs.
+        width: Explicit starting width in logical px (overrides `size`).
+        height: Explicit starting height in logical px (overrides `size`).
         session: Short human label for this session, shown in the window
             chrome so parallel dialogs stay distinguishable.
     """
@@ -758,6 +783,9 @@ async def gallery(
         "columns": columns,
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
+        "size": size,
+        "width": width,
+        "height": height,
     }
     return _format_result(await _post_render(spec, ctx, session))
 
