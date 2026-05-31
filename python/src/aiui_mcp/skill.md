@@ -196,6 +196,18 @@ cap and won't transfer yet — keep clips small or host over `http(s)://`.
 Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
 touched items appear — an untouched item means "no verdict", not a default.
 
+## Starting window size: `size`
+
+`form` and `gallery` take an optional `size` hint — `"s"`, `"m"`, `"l"` —
+and aiui picks good local defaults, clamped to the screen. (Explicit
+`width`/`height` in logical px override it; rarely needed.) The hint is a
+**floor**: the window opens at `max(content-estimate, hint)`, so it never
+opens smaller than the content needs, but a sparse dialog can be told to
+start roomy. Windows are always resizable — but many users don't realise
+that, so opening at a comfortable size is what separates "polished" from
+"looks broken". Use `"m"`/`"l"` for forms with images/tables/wireframes/many
+fields, or galleries with a large batch; leave unset for short forms.
+
 ## `datetime` field
 
 Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —

@@ -348,7 +348,10 @@ fn tools_list() -> Value {
                     "header": { "type": "string" },
                     "actions": { "type": "array", "items": { "type": "object" } },
                     "submit_label": { "type": "string" },
-                    "cancel_label": { "type": "string" }
+                    "cancel_label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"], "description": "Starting window size hint: s (compact), m (roomy), l (large). aiui picks good local defaults and clamps to the screen. The window is always resizable; this only sets the *initial* size, and never opens smaller than the content needs. Use m/l for forms with images, tables, wireframes, or many fields so they don't open cramped." },
+                    "width": { "type": "number", "description": "Explicit starting window width in logical px (overrides `size`). Rarely needed — prefer `size`." },
+                    "height": { "type": "number", "description": "Explicit starting window height in logical px (overrides `size`). Rarely needed — prefer `size`." }
                 }
             }
         },
@@ -397,7 +400,10 @@ fn tools_list() -> Value {
                     "comment": { "type": "boolean", "default": false, "description": "Show a free-text comment field per item." },
                     "columns": { "type": "number", "description": "Grid columns. Omit for responsive auto-fill." },
                     "submit_label": { "type": "string" },
-                    "cancel_label": { "type": "string" }
+                    "cancel_label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"], "description": "Starting window size hint: s / m / l. Default auto-sizes to the item count; pass l for a large batch or tall thumbnails so the grid opens roomy. Always resizable; never opens smaller than the content needs." },
+                    "width": { "type": "number", "description": "Explicit starting window width in logical px (overrides `size`)." },
+                    "height": { "type": "number", "description": "Explicit starting window height in logical px (overrides `size`)." }
                 }
             }
         },
@@ -622,7 +628,10 @@ async fn tools_call(
                     "tabs": args.get("tabs"),
                     "actions": args.get("actions"),
                     "submitLabel": args.get("submit_label"),
-                    "cancelLabel": args.get("cancel_label")
+                    "cancelLabel": args.get("cancel_label"),
+                    "size": args.get("size"),
+                    "width": args.get("width"),
+                    "height": args.get("height")
                 }),
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
@@ -644,7 +653,10 @@ async fn tools_call(
                     "comment": args.get("comment").and_then(|v| v.as_bool()).unwrap_or(false),
                     "columns": args.get("columns"),
                     "submitLabel": args.get("submit_label"),
-                    "cancelLabel": args.get("cancel_label")
+                    "cancelLabel": args.get("cancel_label"),
+                    "size": args.get("size"),
+                    "width": args.get("width"),
+                    "height": args.get("height")
                 }),
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,

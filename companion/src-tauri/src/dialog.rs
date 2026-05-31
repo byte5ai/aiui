@@ -230,6 +230,64 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
     (width.min(MAX_W), height)
 }
 
+/// Agent-facing start-size presets, in logical px. The agent may pass
+/// `size: "s" | "m" | "l"` on any dialog spec to ask for a roomier starting
+/// window. Picked to be comfortable defaults on a typical laptop screen; the
+/// real upper bound is the monitor-work-area clamp applied at build time.
+fn size_preset(name: &str) -> Option<(f64, f64)> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "s" | "small" => Some((520.0, 480.0)),
+        "m" | "medium" => Some((760.0, 620.0)),
+        "l" | "large" => Some((1040.0, 820.0)),
+        _ => None,
+    }
+}
+
+/// Hard ceiling for an *explicit* `width`/`height` hint, independent of the
+/// auto-estimate's own cap. The monitor-work-area clamp in
+/// `build_dialog_window` is the real upper bound; this just stops a wild
+/// number from constructing an absurd window before that clamp runs.
+const HINT_MAX_W: f64 = 1600.0;
+const HINT_MAX_H: f64 = 1200.0;
+
+/// Resolve the *starting* inner size for a dialog window, combining the
+/// content estimate with an optional agent-supplied size hint.
+///
+/// The hint comes from either explicit `width`/`height` (logical px, take
+/// precedence) or a `size: "s"|"m"|"l"` preset. It acts as a **floor**, not
+/// an override: the window opens at `max(content-estimate, hint)` per
+/// dimension. That means a content-heavy dialog never opens smaller than its
+/// content needs (so `size:"s"` can't cram a 12-image gallery), while a light
+/// dialog *can* be asked to start large (so a sparse form with `size:"l"`
+/// opens roomy instead of at the cramped base size). Addresses the
+/// 2026-05-31 report: dialogs opened too small and users didn't know they
+/// could drag-resize. An unrecognised `size` value falls back to pure
+/// auto-sizing — no error, since the window is resizable regardless.
+pub fn resolve_start_size(spec: &serde_json::Value) -> (f64, f64) {
+    let (auto_w, auto_h) = estimate_dialog_size(spec);
+
+    let explicit_w = spec
+        .get("width")
+        .and_then(|v| v.as_f64())
+        .filter(|w| *w > 0.0);
+    let explicit_h = spec
+        .get("height")
+        .and_then(|v| v.as_f64())
+        .filter(|h| *h > 0.0);
+    let preset = spec
+        .get("size")
+        .and_then(|v| v.as_str())
+        .and_then(size_preset);
+
+    let hint_w = explicit_w.or(preset.map(|p| p.0)).unwrap_or(0.0);
+    let hint_h = explicit_h.or(preset.map(|p| p.1)).unwrap_or(0.0);
+
+    (
+        auto_w.max(hint_w).min(HINT_MAX_W),
+        auto_h.max(hint_h).min(HINT_MAX_H),
+    )
+}
+
 fn collect_visible_fields(spec: &serde_json::Value) -> Vec<&serde_json::Value> {
     let mut out = Vec::new();
     if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
@@ -566,6 +624,65 @@ mod tests {
         });
         let (w, _h) = estimate_dialog_size(&spec);
         assert_eq!(w, 520.0, "explicit 1 column → base width");
+    }
+
+    #[test]
+    fn resolve_start_size_no_hint_equals_estimate() {
+        let spec = serde_json::json!({ "kind": "confirm", "title": "ok?" });
+        assert_eq!(resolve_start_size(&spec), estimate_dialog_size(&spec));
+    }
+
+    #[test]
+    fn resolve_start_size_preset_floors_a_small_dialog() {
+        // A bare confirm auto-sizes to the base (520×480). Asking for "l"
+        // opens it large instead.
+        let spec = serde_json::json!({ "kind": "confirm", "title": "ok?", "size": "l" });
+        let (w, h) = resolve_start_size(&spec);
+        assert_eq!((w, h), (1040.0, 820.0));
+
+        let spec_m = serde_json::json!({ "kind": "confirm", "title": "ok?", "size": "m" });
+        assert_eq!(resolve_start_size(&spec_m), (760.0, 620.0));
+    }
+
+    #[test]
+    fn resolve_start_size_preset_is_a_floor_not_a_cap() {
+        // 9-item gallery auto-sizes large (880 wide). "s" must NOT shrink it
+        // below what the content needs.
+        let mut items = Vec::new();
+        for i in 0..9 {
+            items.push(serde_json::json!({ "value": format!("v{i}"), "src": "data:image/png;base64,AAAA" }));
+        }
+        let spec = serde_json::json!({ "kind": "gallery", "items": items, "size": "s" });
+        let (auto_w, _) = estimate_dialog_size(&serde_json::json!({
+            "kind": "gallery",
+            "items": (0..9).map(|i| serde_json::json!({"value": format!("v{i}")})).collect::<Vec<_>>()
+        }));
+        let (w, _) = resolve_start_size(&spec);
+        assert!(w >= auto_w, "content estimate must win over a smaller preset: {w} < {auto_w}");
+    }
+
+    #[test]
+    fn resolve_start_size_explicit_dims_override_preset() {
+        let spec = serde_json::json!({
+            "kind": "form", "title": "x", "size": "s", "width": 900, "height": 700
+        });
+        let (w, h) = resolve_start_size(&spec);
+        assert_eq!((w, h), (900.0, 700.0));
+    }
+
+    #[test]
+    fn resolve_start_size_clamps_absurd_explicit_dims() {
+        let spec = serde_json::json!({
+            "kind": "form", "title": "x", "width": 99999, "height": 99999
+        });
+        let (w, h) = resolve_start_size(&spec);
+        assert_eq!((w, h), (1600.0, 1200.0), "explicit dims clamp to HINT_MAX");
+    }
+
+    #[test]
+    fn resolve_start_size_ignores_unknown_preset() {
+        let spec = serde_json::json!({ "kind": "confirm", "title": "ok?", "size": "humongous" });
+        assert_eq!(resolve_start_size(&spec), estimate_dialog_size(&spec));
     }
 
     #[test]

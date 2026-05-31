@@ -266,6 +266,24 @@ batch". Use `confirm`+`image` for a single yes/no sign-off, and
 `ask`+`thumbnail` / `image_grid` when the task is *picking* among
 candidates rather than judging each one.
 
+## Starting window size: `size` / `width` / `height`
+
+`form` and `gallery` accept an optional **`size`** hint — `"s"`, `"m"`, or
+`"l"` — and aiui picks good local defaults for each, clamped to the user's
+screen. (Power users can pass explicit `width` / `height` in logical px,
+which override `size`; rarely needed.)
+
+The hint is a **floor, not a cap**: the window opens at
+`max(content-estimate, hint)`. So a content-heavy dialog never opens
+smaller than it needs (you can't cram a 12-image gallery with `size:"s"`),
+but a *sparse* dialog you know will feel cramped at the default can be told
+to start roomy. Windows are always resizable regardless — but many users
+don't realise that, so a dialog that opens at a comfortable size is the
+difference between "looks polished" and "looks broken". Reach for `"m"` or
+`"l"` when a form carries images, tables, wireframes, or many fields, or a
+gallery has a large batch / tall thumbnails. Leave it unset for ordinary
+short forms — the auto-estimate already fits those.
+
 ## Image sources (`src` / `thumbnail`)
 
 aiui takes an image source in five places:
