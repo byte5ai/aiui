@@ -409,7 +409,12 @@ returns only `{written, target, bytes}`, never the value.
   clobbering).
 - **`mode: "substitute"`** — replace a `placeholder` that occurs *exactly
   once* in an existing file (format-agnostic: YAML/TOML/INI/env). 0 or >1
-  matches → error, never a partial write.
+  matches → error, never a partial or wrong write. **Pick a distinctive
+  sentinel** that cannot collide with real file content — e.g.
+  `__AIUI_SECRET_GITHUB_PAT__`, never a common word like `TOKEN` or `X`. The
+  exactly-once rule is the safety net (a colliding placeholder errors instead
+  of being misapplied), but a distinctive sentinel makes the match
+  unambiguous in the first place.
 - **Destination is always your own host** — an aiui module already runs
   there (the native app for a local session, the bridge on a remote SSH
   session), and it performs the write as a plain **local** file operation.
