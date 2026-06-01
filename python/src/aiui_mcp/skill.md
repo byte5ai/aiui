@@ -238,8 +238,33 @@ recordings or to a shoulder-surfer.
 
 Be honest with the user, though — the value still returns to you as
 plaintext in the tool response. For long-lived or high-value secrets,
-tell the user to put them in their keychain or an env var and reference
-them by name instead.
+use the `secret` field with a `target` (below) so the value never enters
+the conversation.
+
+## Secrets & file-write: `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only** (result: `{written, target,
+bytes}`, never the value).
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- `mode:"create"` — write raw value (needs `overwrite:true` to clobber).
+- `mode:"substitute"` — replace a `placeholder` occurring exactly once in
+  an existing file (YAML/TOML/INI/env); 0 or >1 → error.
+- Destination is always your own host (local Mac path, or scp to the
+  registered remote for SSH sessions) — no foreign host. The user sees the
+  path and approves by submitting. Errors: `{written:false, error}`.
+
+Replaces the fragile "guess a shell one-liner to stash a token" pattern.
+QoL + confused-deputy guard, not a hard guarantee. v1: local
+create+substitute, remote create (remote substitute not yet).
 
 ## Anti-patterns (slop vs. clean)
 

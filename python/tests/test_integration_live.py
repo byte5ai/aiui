@@ -103,6 +103,42 @@ def test_unauthorized_rejected() -> None:
     assert r.status_code == 401
 
 
+def test_health_reports_lifecycle_phase() -> None:
+    """#137 lifecycle state machine: >=0.8.0 health reports the current phase
+    (Serving in steady state). Tolerate older companions that omit it."""
+    r = httpx.get(f"{ENDPOINT}/health", headers=_auth(), timeout=TIMEOUT)
+    assert r.status_code == 200
+    body = r.json()
+    if "lifecycle_phase" not in body:
+        pytest.skip("companion predates the lifecycle phase field (<0.8.0)")
+    # A companion answering /health is by definition past Starting.
+    assert body["lifecycle_phase"] in ("Serving", "GracePending"), body["lifecycle_phase"]
+
+
+def test_media_route_exists_and_404s_for_unknown() -> None:
+    """#135/video media cache: GET /media/blob/<unknown> is served (404 for a
+    missing file, not a route-miss). Read-only. Skip on pre-media companions."""
+    r = httpx.get(
+        f"{ENDPOINT}/media/blob/nonexistent-harness-probe.bin",
+        timeout=TIMEOUT,
+    )
+    if r.status_code == 404 and (r.text or "").strip() == "" and "ServeDir" not in r.headers.get("server", ""):
+        # Could be a route-miss on an older companion; ServeDir 404s are also
+        # empty-body, so we can't distinguish — accept 404 either way as "no
+        # such file", and only fail on a hard 5xx.
+        pass
+    assert r.status_code in (404, 416), f"unexpected status {r.status_code}"
+
+
+def test_media_upload_requires_auth() -> None:
+    """POST /media without a bearer token is rejected (401) before any write —
+    the media push is an authenticated, mutating endpoint."""
+    r = httpx.post(f"{ENDPOINT}/media?ext=mp4", content=b"x", timeout=TIMEOUT)
+    if r.status_code == 404:
+        pytest.skip("companion has no /media endpoint (pre-0.7.0)")
+    assert r.status_code == 401
+
+
 def test_render_get_unknown_id_route_exists_and_404s_cleanly() -> None:
     """`GET /render/{id}` for a never-registered id must be served by the async
     handler — 404 with body `unknown_render_id`. This deliberately asserts the

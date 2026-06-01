@@ -38,10 +38,24 @@
     values: Record<string, string | number | null>;
   };
 
+  // Issue #135: optional per-field file-write target. Orthogonal to the field
+  // kind. On affirmative submit aiui writes the entered value to this path on
+  // the agent's host; for a `secret` field the value is written-only (never
+  // returned). The actual write + destination resolution happen Rust-side
+  // (DialogShell → write_dialog_targets); here it only drives the inline note.
+  type WriteTarget = {
+    mode: "create" | "substitute";
+    path: string;
+    perm?: string;
+    overwrite?: boolean;
+    placeholder?: string;
+  };
+
   type Field =
-    | { kind: "text"; name: string; label: string; placeholder?: string; default?: string; multiline?: boolean; required?: boolean }
-    | { kind: "password"; name: string; label: string; placeholder?: string; required?: boolean }
-    | { kind: "number"; name: string; label: string; default?: number; min?: number; max?: number; step?: number; required?: boolean }
+    | { kind: "text"; name: string; label: string; placeholder?: string; default?: string; multiline?: boolean; required?: boolean; target?: WriteTarget }
+    | { kind: "password"; name: string; label: string; placeholder?: string; required?: boolean; target?: WriteTarget }
+    | { kind: "secret"; name: string; label: string; placeholder?: string; required?: boolean; target?: WriteTarget }
+    | { kind: "number"; name: string; label: string; default?: number; min?: number; max?: number; step?: number; required?: boolean; target?: WriteTarget }
     | { kind: "select"; name: string; label: string; options: SelectOption[]; default?: string; required?: boolean }
     | { kind: "checkbox"; name: string; label: string; default?: boolean }
     | { kind: "slider"; name: string; label: string; min: number; max: number; step?: number; default?: number }
@@ -649,6 +663,8 @@
             {/if}
           {:else if f.kind === "password"}
             <input type="password" placeholder={f.placeholder ?? ""} bind:value={values[f.name]} autocomplete="off" />
+          {:else if f.kind === "secret"}
+            <input type="password" placeholder={f.placeholder ?? ""} bind:value={values[f.name]} autocomplete="off" spellcheck="false" />
           {:else if f.kind === "number"}
             <input type="number" min={f.min} max={f.max} step={f.step ?? 1} bind:value={values[f.name]} />
           {:else if f.kind === "select"}
@@ -683,6 +699,20 @@
               <input type="color" bind:value={values[f.name]} style="width: 50px; height: 34px; padding: 2px;" />
               <code>{values[f.name]}</code>
             </div>
+          {/if}
+          {#if "target" in f && f.target}
+            <!-- Issue #135: show the user *where* this value will be written
+                 before they approve by submitting. The affirmative button IS
+                 the per-operation approval. -->
+            <p class="write-target">
+              <span class="wt-icon" aria-hidden="true">↳</span>
+              {f.kind === "secret" ? "Wird geschrieben (nicht an den Agent zurück):" : "Wird zusätzlich geschrieben:"}
+              <code>{f.target.path}</code>
+              <span class="wt-meta"
+                >mode: {f.target.mode}{f.target.perm ? `, ${f.target.perm}` : ""}{f.target.overwrite
+                  ? ", overwrite"
+                  : ""}</span>
+            </p>
           {/if}
         </div>
       {/if}
@@ -724,6 +754,21 @@
   .static-text.info { color: var(--fg); }
   .static-text.warn { border-color: #f59e0b; background: color-mix(in srgb, #f59e0b 10%, var(--surface)); }
   .static-text.muted { color: var(--muted); font-size: 12px; }
+  .write-target {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 6px;
+  }
+  .write-target code {
+    font-size: 11px;
+    word-break: break-all;
+  }
+  .write-target .wt-icon { color: var(--accent); }
+  .write-target .wt-meta { color: var(--muted); opacity: 0.8; }
 
   /* --- markdown --- */
   .markdown-field {

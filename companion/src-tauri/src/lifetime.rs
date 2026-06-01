@@ -242,6 +242,9 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
             Ok((mut stream, _)) => {
                 let n = conns.fetch_add(1, Ordering::SeqCst) + 1;
                 trace(&format!("lifetime: client connected, active={n}"));
+                crate::lifecycle_log::record(
+                    crate::lifecycle_log::LifecycleEvent::ChildAttached { count: n },
+                );
                 let conns = conns.clone();
                 let wake = wake.clone();
                 tokio::spawn(async move {
@@ -254,6 +257,9 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
                     }
                     let left = conns.fetch_sub(1, Ordering::SeqCst) - 1;
                     trace(&format!("lifetime: client disconnected, active={left}"));
+                    crate::lifecycle_log::record(
+                        crate::lifecycle_log::LifecycleEvent::ChildDetached { count: left },
+                    );
                     if left == 0 {
                         wake.notify_one();
                     }
@@ -407,21 +413,42 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
             trace(&format!(
                 "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
             ));
+            crate::lifecycle_log::transition(crate::lifecycle_log::Phase::GracePending);
+            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceArmed {
+                secs: SHUTDOWN_GRACE_SECS,
+            });
             tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
             let child_returned = conns_w.load(Ordering::SeqCst) > 0;
             let cd_running = crate::setup::is_claude_desktop_running();
-            match grace_outcome(child_returned, cd_running) {
+            let outcome = grace_outcome(child_returned, cd_running);
+            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
+                outcome: match outcome {
+                    GraceOutcome::Stay => "stay",
+                    GraceOutcome::Exit => "exit",
+                },
+                claude_desktop_running: cd_running,
+                child_returned,
+            });
+            match outcome {
                 GraceOutcome::Stay => {
+                    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
                     trace(&format!(
                         "lifetime: staying after grace \
                          (claude_desktop_running={cd_running}, child_returned={child_returned})"
                     ));
                 }
                 GraceOutcome::Exit => {
+                    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Exiting);
+                    crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::HostExit {
+                        reason: "claude-desktop-gone",
+                    });
                     trace(
                         "lifetime: Claude Desktop gone after grace and no child returned — \
                          host follows Wirt, exiting",
                     );
+                    for line in crate::lifecycle_log::recent() {
+                        trace(&format!("lifecycle-dump {line}"));
+                    }
                     // Hard exit: this is exit case (a), the watcher's own
                     // authority. It bypasses Tauri's ExitRequested gate (which
                     // default-denies) because the gate has no way to know the

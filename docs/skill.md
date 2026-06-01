@@ -387,8 +387,42 @@ recordings or to a shoulder-surfer.
 
 Be honest with the user, though — the value still returns to you as
 plaintext in the tool response. For long-lived or high-value secrets,
-tell the user to put them in their keychain or an env var and reference
-them by name instead.
+use the `secret` field with a `target` instead (below) so the value
+never enters the conversation.
+
+## Secrets & file-write: the `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only**: aiui writes it to the file and
+returns only `{written, target, bytes}`, never the value.
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- **`mode: "create"`** — write the raw value. Needs `overwrite: true` to
+  replace an existing file (a path typo otherwise fails loudly rather than
+  clobbering).
+- **`mode: "substitute"`** — replace a `placeholder` that occurs *exactly
+  once* in an existing file (format-agnostic: YAML/TOML/INI/env). 0 or >1
+  matches → error, never a partial write.
+- **Destination is always your own host** — a local Mac path, or `scp` back
+  to the registered remote for an SSH session. You cannot target a foreign
+  host; the user sees the resolved path and approves it by submitting.
+- **Errors** come back as `{written:false, error}` — no silent success.
+
+Why it exists: it replaces the fragile "guess a shell one-liner to stash a
+token" pattern with a native dialog + a correct, atomic write whose target
+the user sees first. It's a QoL + confused-deputy guard, **not** a hard
+guarantee the agent can't read the value some other way — for that, the
+user still types it themselves outside any agent path.
+
+v1 covers local create+substitute and remote create. Remote substitute is
+not yet available.
 
 ## Anti-patterns (slop vs. clean)
 
