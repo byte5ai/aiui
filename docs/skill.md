@@ -410,9 +410,13 @@ returns only `{written, target, bytes}`, never the value.
 - **`mode: "substitute"`** — replace a `placeholder` that occurs *exactly
   once* in an existing file (format-agnostic: YAML/TOML/INI/env). 0 or >1
   matches → error, never a partial write.
-- **Destination is always your own host** — a local Mac path, or `scp` back
-  to the registered remote for an SSH session. You cannot target a foreign
-  host; the user sees the resolved path and approves it by submitting.
+- **Destination is always your own host** — an aiui module already runs
+  there (the native app for a local session, the bridge on a remote SSH
+  session), and it performs the write as a plain **local** file operation.
+  So `create` and `substitute` behave identically local and remote (the
+  entered value reaches that module over aiui's own channel, never via the
+  agent). You cannot target a foreign host; the user sees the resolved path
+  and approves it by submitting.
 - **Errors** come back as `{written:false, error}` — no silent success.
 
 Why it exists: it replaces the fragile "guess a shell one-liner to stash a
@@ -420,9 +424,6 @@ token" pattern with a native dialog + a correct, atomic write whose target
 the user sees first. It's a QoL + confused-deputy guard, **not** a hard
 guarantee the agent can't read the value some other way — for that, the
 user still types it themselves outside any agent path.
-
-v1 covers local create+substitute and remote create. Remote substitute is
-not yet available.
 
 ## Anti-patterns (slop vs. clean)
 

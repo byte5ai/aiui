@@ -258,13 +258,14 @@ bytes}`, never the value).
 - `mode:"create"` — write raw value (needs `overwrite:true` to clobber).
 - `mode:"substitute"` — replace a `placeholder` occurring exactly once in
   an existing file (YAML/TOML/INI/env); 0 or >1 → error.
-- Destination is always your own host (local Mac path, or scp to the
-  registered remote for SSH sessions) — no foreign host. The user sees the
-  path and approves by submitting. Errors: `{written:false, error}`.
+- Destination is always your own host: the aiui module there (native app
+  locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
+  `create` and `substitute` both work identically local and remote — no
+  foreign host. The user sees the path and approves by submitting. Errors:
+  `{written:false, error}`.
 
 Replaces the fragile "guess a shell one-liner to stash a token" pattern.
-QoL + confused-deputy guard, not a hard guarantee. v1: local
-create+substitute, remote create (remote substitute not yet).
+QoL + confused-deputy guard, not a hard guarantee.
 
 ## Anti-patterns (slop vs. clean)
 
