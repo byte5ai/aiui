@@ -11,7 +11,6 @@ mod lifetime;
 mod logging;
 mod mcp;
 mod media;
-mod remotewrite;
 mod proc_ext;
 mod setup;
 mod skill;
@@ -71,18 +70,19 @@ fn dialog_cancel(
     Ok(())
 }
 
-/// Issue #135: write the values of `target`-carrying form fields to files on
-/// the agent's host, *before* the dialog result is sent back. The frontend
-/// calls this on affirmative submit with `{field_name: entered_value}` for
-/// every field whose spec carries a `target`. The secret value thus travels
-/// WebView → here (local IPC) → file, and is **never** placed in the
-/// `dialog_submit` result that flows to the bridge/agent.
+/// Issue #135: write the values of `target`-carrying form fields to **local**
+/// files, *before* the dialog result is sent back. The frontend calls this on
+/// affirmative submit **only for a local (native-app) session** with
+/// `{field_name: entered_value}`; for a bridge-served session (`session_origin`
+/// set) the bridge on the agent's host does the local write instead, so this
+/// is never invoked for those. The secret value thus travels WebView → here
+/// (local IPC) → file, and is **never** placed in the `dialog_submit` result
+/// that flows to the bridge/agent.
 ///
-/// The `target`/mode/path are read authoritatively from the **stored spec**
-/// (not from the frontend) so the write destination can't be tampered with
-/// after the user approved it. `session_origin` from the stored request picks
-/// local-Mac vs registered-remote. Returns a per-field outcome map; for a
-/// `secret` field the outcome carries status only, never the value.
+/// `target`/mode/path are read authoritatively from the **stored spec** (not
+/// from the frontend) so the destination can't be tampered with after the user
+/// approved it. Returns a per-field outcome map; for a `secret` field the
+/// outcome carries status only, never the value.
 #[tauri::command]
 fn write_dialog_targets(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
@@ -92,8 +92,6 @@ fn write_dialog_targets(
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
-    let origin = req.session_origin.as_deref();
-    let remotes = setup::load_remotes();
 
     let mut out = std::collections::HashMap::new();
     for field in collect_target_fields(&req.spec) {
@@ -113,10 +111,7 @@ fn write_dialog_targets(
                 }
             };
         let value = values.get(&name).map(String::as_str).unwrap_or("");
-        out.insert(
-            name,
-            filewrite::resolve_and_write(value, &target, origin, &remotes),
-        );
+        out.insert(name, filewrite::write_local(value, &target));
     }
     Ok(out)
 }

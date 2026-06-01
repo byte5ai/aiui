@@ -218,18 +218,26 @@
     clearTtlTimers();
     const id = current.id;
     const spec = current.spec;
+    const sessionOrigin = current.session_origin;
     current = null;
 
-    // Issue #135: write `target`-carrying fields to files on the agent's host
-    // BEFORE the result is sent back. Secret values travel WebView → Rust
-    // (local IPC) → file and are stripped from the result, so they never reach
-    // the bridge/agent/transcript. The target/mode/path are read Rust-side
-    // from the stored spec; we only pass the entered values.
-    const targets = collectTargetFields(spec);
+    // Issue #135: write `target`-carrying fields to files on the agent's host.
+    // The write is always a LOCAL file op on whichever aiui module sits on the
+    // agent's host:
+    //   - Local native-app session (`session_origin` absent): the app writes
+    //     here, on the Mac, and strips secret values from the result so they
+    //     never reach the bridge/agent.
+    //   - Bridge-served session (`session_origin` set — remote SSH, or local
+    //     uvx): the bridge on the agent's host does the local write + strip.
+    //     We must NOT write or strip here, so the entered value reaches that
+    //     bridge over the :7777 channel (never via the agent/LLM).
+    // Form values live under `result.values` ({action, values:{name:val}}).
+    const fieldValues: Record<string, any> = result?.values ?? {};
+    const targets = sessionOrigin ? [] : collectTargetFields(spec);
     if (targets.length > 0) {
       const values: Record<string, string> = {};
       for (const t of targets) {
-        const v = result?.[t.name];
+        const v = fieldValues[t.name];
         values[t.name] = v == null ? "" : String(v);
       }
       let outcomes: Record<string, any> = {};
@@ -243,8 +251,8 @@
           outcomes[t.name] = { written: false, target: "", bytes: 0, error: String(e) };
         }
       }
-      // Merge outcomes into the result; strip raw secret values regardless of
-      // write success so a secret can never leak even on the error path.
+      // Merge outcomes into result.values; strip raw secret values regardless
+      // of write success so a secret can never leak even on the error path.
       for (const t of targets) {
         const outcome = outcomes[t.name] ?? {
           written: false,
@@ -253,10 +261,9 @@
           error: "no outcome returned",
         };
         if (t.kind === "secret") {
-          delete result[t.name];
-          result[t.name] = outcome;
+          fieldValues[t.name] = outcome;
         } else {
-          result[t.name] = { value: result[t.name], ...outcome };
+          fieldValues[t.name] = { value: fieldValues[t.name], ...outcome };
         }
       }
     }

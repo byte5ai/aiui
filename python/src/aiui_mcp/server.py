@@ -25,6 +25,7 @@ import mimetypes
 import os
 import socket
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -434,6 +435,107 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
     _replace_srcs(spec, mapping)
 
 
+def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Form fields carrying a non-null `target` (#135), from flat `fields` and
+    any `tabs[].fields`."""
+    out: list[dict[str, Any]] = []
+
+    def scan(fields: Any) -> None:
+        if isinstance(fields, list):
+            for f in fields:
+                if isinstance(f, dict) and f.get("target") is not None and isinstance(f.get("name"), str):
+                    out.append(f)
+
+    scan(spec.get("fields"))
+    for tab in spec.get("tabs") or []:
+        if isinstance(tab, dict):
+            scan(tab.get("fields"))
+    return out
+
+
+def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
+    """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
+    host (the bridge runs where the agent runs, so the file is always local).
+    `create` (atomic tmp+rename, refuses clobber without overwrite) or
+    `substitute` (replace a placeholder occurring exactly once). Never logs the
+    value. Returns `{written, target, bytes, error?}`.
+    """
+    raw_path = str(target.get("path", ""))
+    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path):
+        return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
+    path = Path(raw_path).expanduser()
+    display = str(path)
+    mode = target.get("mode")
+    perm_s = target.get("perm")
+    try:
+        perm = int(str(perm_s), 8) if perm_s else 0o600
+    except ValueError:
+        perm = 0o600
+
+    def atomic_write(p: Path, data: bytes) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".aiui-write-", dir=str(p.parent))
+        try:
+            os.fchmod(fd, perm)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    try:
+        if mode == "create":
+            if path.exists() and not target.get("overwrite"):
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": "file exists and overwrite is false (mode: create)"}
+            atomic_write(path, value.encode())
+            return {"written": True, "target": display, "bytes": len(value.encode())}
+        if mode == "substitute":
+            placeholder = target.get("placeholder")
+            if not placeholder:
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": "substitute mode requires 'placeholder'"}
+            existing = path.read_text()
+            count = existing.count(placeholder)
+            if count != 1:
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": (f"placeholder '{placeholder}' not found in target file"
+                                  if count == 0
+                                  else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
+            updated = existing.replace(placeholder, value, 1)
+            atomic_write(path, updated.encode())
+            return {"written": True, "target": display, "bytes": len(updated.encode())}
+        return {"written": False, "target": display, "bytes": 0, "error": f"unknown mode '{mode}'"}
+    except OSError as e:
+        return {"written": False, "target": display, "bytes": 0, "error": str(e)}
+
+
+def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
+    """After a render returns, perform the local file writes for `target`
+    fields on THIS host and fold the outcomes back into the result, stripping
+    raw `secret` values so they never reach the agent. No-op on cancel or when
+    no field carries a target. Mutates `data` in place.
+    """
+    if data.get("cancelled"):
+        return
+    targets = _collect_target_fields(spec)
+    if not targets:
+        return
+    values = data.setdefault("result", {}).setdefault("values", {})
+    for field in targets:
+        name = field["name"]
+        v = values.get(name)
+        outcome = _write_local_target("" if v is None else str(v), field["target"])
+        if field.get("kind") == "secret":
+            values[name] = outcome  # write-only: raw value never returned
+        else:
+            values[name] = {"value": v, **outcome}
+
+
 async def _wait_for_aiui() -> None:
     """Poll the unauthenticated `/ping` until the companion answers or
     `COLDSTART_WAIT_S` elapses (Step 3, parity with the Rust bridge).
@@ -553,6 +655,11 @@ async def _post_render(
             data = await _poll_render(client, render_id, ctx)
         else:
             data = first  # synchronous companion — terminal result already
+    # Issue #135: this bridge runs ON the agent's host, so `target` fields are
+    # written here as LOCAL file operations (the value arrived over the :7777
+    # channel, never via the agent). Secret values are written and stripped
+    # before the result is handed to the agent.
+    _apply_target_writes(spec, data)
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
@@ -669,7 +776,7 @@ async def form(
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
     - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.
     - secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you (#135). Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.
-    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…). For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value); a non-secret field with `target` is written AND returned. Destination is always your own host (local Mac path, or scp to the registered remote for SSH sessions) — a foreign host cannot be targeted. Errors: `{written:false, error}`. v1: local create+substitute, remote create; remote substitute is not yet supported.
+    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…). For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value); a non-secret field with `target` is written AND returned. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
     - number:      {kind, name, label, default?, min?, max?, step?, required?}
     - select:      {kind, name, label, options: [{label, value}], default?, required?}
     - checkbox:    {kind, name, label, default?}
