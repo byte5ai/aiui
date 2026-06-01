@@ -257,7 +257,9 @@ bytes}`, never the value).
 
 - `mode:"create"` — write raw value (needs `overwrite:true` to clobber).
 - `mode:"substitute"` — replace a `placeholder` occurring exactly once in
-  an existing file (YAML/TOML/INI/env); 0 or >1 → error.
+  an existing file (YAML/TOML/INI/env); 0 or >1 → error (never misapplied).
+  Pick a **distinctive sentinel** (`__AIUI_SECRET_GITHUB_PAT__`, not a common
+  word) so the single match is unambiguous, not just lucky.
 - Destination is always your own host: the aiui module there (native app
   locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
   `create` and `substitute` both work identically local and remote — no
