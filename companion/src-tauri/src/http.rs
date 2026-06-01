@@ -103,6 +103,9 @@ struct HealthResponse {
     webview: WebviewHealth,
     dialogs: DialogHealth,
     children: ChildrenHealth,
+    /// Current host lifetime phase (Starting/Serving/GracePending/Exiting) —
+    /// issue #137 lifecycle state machine, surfaced for diagnostics.
+    lifecycle_phase: String,
 }
 
 #[derive(Serialize)]
@@ -217,6 +220,8 @@ pub async fn serve(
     let listener = bind_with_reuse(addr)?;
     trace(&format!("serve: listening on {addr}"));
     log::info!("[aiui] http listening on {addr}");
+    crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::Serving { port });
+    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
     axum::serve(listener, router)
         .await
         .map_err(std::io::Error::other)?;
@@ -408,6 +413,7 @@ async fn health(
         webview,
         dialogs,
         children,
+        lifecycle_phase: format!("{:?}", crate::lifecycle_log::current_phase()),
     };
 
     let status = if ready {

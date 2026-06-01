@@ -80,6 +80,30 @@ but is timing-fragile, needs Accessibility permission, and can't suppress the
 on-screen flash. The companion test-mode above is cleaner and is the
 recommended path; this stays a fallback.
 
+## Lifecycle-failure runbook (manual, observable via the event log)
+
+Several spec scenarios are inherently stateful and interactive — they kill a
+process or a tunnel *mid-call* — so they can't be read-only pytest cases
+without orchestrating real subprocesses. The v0.8.0 **lifecycle event log**
+(`lifecycle_log`, issue #137) makes them *verifiable by inspection* instead:
+each transition is named, ring-buffered, and dumped to the trace log on exit.
+`/health` reports the current `lifecycle_phase` live.
+
+Run each against a real build, then read `lifecycle_phase` + the trace dump.
+
+| Scenario | Action | Expected event-log signature |
+|---|---|---|
+| Window-X is not exit (I2) | Close the setup window | `window close treated as hide`; phase stays `Serving`; process alive |
+| ⌘Q with Claude Desktop up | Quit aiui via menu while CD runs | `ExitRequested default-denied`; phase stays `Serving` |
+| Last child gone, CD alive | Quit the only Claude Code session | `phase Serving → GracePending`, `grace armed (5s)`, `grace resolved → stay`, `phase GracePending → Serving` |
+| Wirt gone (CD quit) | Quit Claude Desktop | `… → GracePending`, `grace resolved → exit (claude_desktop_running=false)`, `phase → Exiting`, `host exit authorized (claude-desktop-gone)`, `lifecycle-dump …` |
+| Child churn | Restart Claude Desktop quickly | `child detached`/`child attached` around a `grace resolved → stay` (no exit) |
+| Update-authorized exit | Trigger `/update` install | `host exit authorized (exit-authorized-uninstall-or-update)` |
+
+The point is no longer "did it behave?" inferred from whether a window
+lingered — it's the named transition trail, which is exactly the forensic
+record whose absence made the 0.4.x lifecycle a guessing game.
+
 ## Preconditions & honest scope
 
 - **To validate *this* PR's code, the v0.5.0 build must run on the Mac.** The

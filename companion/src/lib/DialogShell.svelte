@@ -195,11 +195,72 @@
     if (e.key === "Escape") handleCancel();
   }
 
+  /** Fields carrying a `target` (file-write, issue #135), from flat `fields`
+   *  and any `tabs[].fields`. Returns `{name, kind}` so the caller knows which
+   *  values to write out and which (secret) to strip from the result. */
+  function collectTargetFields(spec: any): { name: string; kind: string }[] {
+    const out: { name: string; kind: string }[] = [];
+    const scan = (fields: any) => {
+      if (!Array.isArray(fields)) return;
+      for (const f of fields) {
+        if (f && f.target != null && typeof f.name === "string") {
+          out.push({ name: f.name, kind: f.kind });
+        }
+      }
+    };
+    scan(spec?.fields);
+    if (Array.isArray(spec?.tabs)) for (const t of spec.tabs) scan(t?.fields);
+    return out;
+  }
+
   async function handleSubmit(result: any) {
     if (!current) return;
     clearTtlTimers();
     const id = current.id;
+    const spec = current.spec;
     current = null;
+
+    // Issue #135: write `target`-carrying fields to files on the agent's host
+    // BEFORE the result is sent back. Secret values travel WebView → Rust
+    // (local IPC) → file and are stripped from the result, so they never reach
+    // the bridge/agent/transcript. The target/mode/path are read Rust-side
+    // from the stored spec; we only pass the entered values.
+    const targets = collectTargetFields(spec);
+    if (targets.length > 0) {
+      const values: Record<string, string> = {};
+      for (const t of targets) {
+        const v = result?.[t.name];
+        values[t.name] = v == null ? "" : String(v);
+      }
+      let outcomes: Record<string, any> = {};
+      try {
+        outcomes = await invoke("write_dialog_targets", { id, values });
+      } catch (e) {
+        console.error(`[aiui] write_dialog_targets failed for ${id}: ${e}`);
+        // Synthesise a failure outcome so the agent is informed instead of
+        // silently receiving nothing — and we can still strip secrets below.
+        for (const t of targets) {
+          outcomes[t.name] = { written: false, target: "", bytes: 0, error: String(e) };
+        }
+      }
+      // Merge outcomes into the result; strip raw secret values regardless of
+      // write success so a secret can never leak even on the error path.
+      for (const t of targets) {
+        const outcome = outcomes[t.name] ?? {
+          written: false,
+          target: "",
+          bytes: 0,
+          error: "no outcome returned",
+        };
+        if (t.kind === "secret") {
+          delete result[t.name];
+          result[t.name] = outcome;
+        } else {
+          result[t.name] = { value: result[t.name], ...outcome };
+        }
+      }
+    }
+
     // v0.4.45 (Bug #3): never swallow the invoke result silently. If
     // dialog_submit fails the agent would otherwise hang forever with
     // no signal — at least surface it to the console for diagnosis.

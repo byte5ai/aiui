@@ -5,10 +5,13 @@ mod fsutil;
 mod housekeeping;
 mod http;
 mod imageresolve;
+mod filewrite;
+mod lifecycle_log;
 mod lifetime;
 mod logging;
 mod mcp;
 mod media;
+mod remotewrite;
 mod proc_ext;
 mod setup;
 mod skill;
@@ -66,6 +69,82 @@ fn dialog_cancel(
 ) -> Result<(), String> {
     state.cancel(&id);
     Ok(())
+}
+
+/// Issue #135: write the values of `target`-carrying form fields to files on
+/// the agent's host, *before* the dialog result is sent back. The frontend
+/// calls this on affirmative submit with `{field_name: entered_value}` for
+/// every field whose spec carries a `target`. The secret value thus travels
+/// WebView → here (local IPC) → file, and is **never** placed in the
+/// `dialog_submit` result that flows to the bridge/agent.
+///
+/// The `target`/mode/path are read authoritatively from the **stored spec**
+/// (not from the frontend) so the write destination can't be tampered with
+/// after the user approved it. `session_origin` from the stored request picks
+/// local-Mac vs registered-remote. Returns a per-field outcome map; for a
+/// `secret` field the outcome carries status only, never the value.
+#[tauri::command]
+fn write_dialog_targets(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+    values: std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
+    let req = state
+        .get_request(&id)
+        .ok_or_else(|| "dialog no longer active".to_string())?;
+    let origin = req.session_origin.as_deref();
+    let remotes = setup::load_remotes();
+
+    let mut out = std::collections::HashMap::new();
+    for field in collect_target_fields(&req.spec) {
+        let name = match field.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let target: filewrite::Target =
+            match serde_json::from_value(field.get("target").cloned().unwrap_or_default()) {
+                Ok(t) => t,
+                Err(e) => {
+                    out.insert(
+                        name,
+                        filewrite::WriteOutcome::invalid(format!("bad target spec: {e}")),
+                    );
+                    continue;
+                }
+            };
+        let value = values.get(&name).map(String::as_str).unwrap_or("");
+        out.insert(
+            name,
+            filewrite::resolve_and_write(value, &target, origin, &remotes),
+        );
+    }
+    Ok(out)
+}
+
+/// Collect every form field that carries a non-null `target`, walking both the
+/// flat `fields` array and any `tabs[].fields`.
+fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut consider = |fields: &serde_json::Value| {
+        if let Some(arr) = fields.as_array() {
+            for f in arr {
+                if f.get("target").map(|t| !t.is_null()).unwrap_or(false) {
+                    out.push(f.clone());
+                }
+            }
+        }
+    };
+    if let Some(fields) = spec.get("fields") {
+        consider(fields);
+    }
+    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
+        for t in tabs {
+            if let Some(fields) = t.get("fields") {
+                consider(fields);
+            }
+        }
+    }
+    out
 }
 
 /// Multi-window pull model (Step 4): the per-id dialog window fetches its own
@@ -1172,6 +1251,9 @@ pub fn run_mcp_stdio_only() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
+    lifecycle_log::record(lifecycle_log::LifecycleEvent::Startup {
+        interactive: lifetime::is_interactive_session(),
+    });
 
     // Process-lifetime advisory lock (v0.4.43). Held from the very
     // first line of run() until the process dies. Two GUIs spawned in
@@ -1314,6 +1396,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
+            write_dialog_targets,
             get_dialog_spec,
             ui_pong,
             close_window,
@@ -1675,6 +1758,7 @@ pub fn run() {
                 {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
+                lifecycle_log::record(lifecycle_log::LifecycleEvent::WindowHidden);
                 log::debug!(
                     "[aiui] setup window close → hidden + demoted to Accessory (host stays alive; I2)"
                 );
@@ -1721,6 +1805,7 @@ pub fn run() {
                         "[aiui] veto ExitRequested (default-deny): explicit={explicit}, \
                          claude_desktop_running={cd_running}"
                     ));
+                    lifecycle_log::record(lifecycle_log::LifecycleEvent::ExitDenied);
                     api.prevent_exit();
                     return;
                 }
@@ -1734,6 +1819,14 @@ pub fn run() {
                 } else {
                     "exit-claude-desktop-gone"
                 };
+                lifecycle_log::transition(lifecycle_log::Phase::Exiting);
+                lifecycle_log::record(lifecycle_log::LifecycleEvent::HostExit { reason });
+                // Forensic dump of the lifetime event ring on the way out —
+                // the post-hoc record that was missing during the 0.4.x
+                // instability (#137 cross-cutting).
+                for line in lifecycle_log::recent() {
+                    logging::trace(&format!("[aiui] lifecycle-dump {line}"));
+                }
                 logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
                 housekeeping::pre_exit_cleanup(port, reason);
             }
