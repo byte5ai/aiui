@@ -1376,10 +1376,16 @@ pub fn run() {
                         "[aiui] http-bind-error on :{port_for_error}: {e} — degraded mode, surfacing settings banner"
                     ));
                     if let Ok(mut slot) = http_error_for_serve.lock() {
+                        // The OS-specific diagnostic command (`lsof`,
+                        // `Get-NetTCPConnection`, `ss`) lives in the
+                        // frontend's `settings.http_error.hint.{os}`
+                        // i18n string, rendered just below this text.
+                        // Keep the backend message platform-neutral so
+                        // Windows users don't see a confusing `lsof`
+                        // suggestion above the correct PowerShell one.
                         *slot = Some(format!(
                             "Konnte localhost:{port_for_error} nicht öffnen — \
-                             Port von einem anderen Prozess belegt. Schließe den \
-                             Prozess (lsof -i :{port_for_error}) und starte aiui neu. {e}"
+                             Port von einem anderen Prozess belegt. {e}"
                         ));
                     }
                     // Surface the Settings window so the http_error banner
