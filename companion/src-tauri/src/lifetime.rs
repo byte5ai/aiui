@@ -354,6 +354,9 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
 
         let n = conns.fetch_add(1, Ordering::SeqCst) + 1;
         trace(&format!("lifetime: client connected, active={n}"));
+        crate::lifecycle_log::record(
+            crate::lifecycle_log::LifecycleEvent::ChildAttached { count: n },
+        );
         let conns = conns.clone();
         let wake = wake.clone();
         tokio::spawn(async move {
@@ -367,6 +370,9 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
             }
             let left = conns.fetch_sub(1, Ordering::SeqCst) - 1;
             trace(&format!("lifetime: client disconnected, active={left}"));
+            crate::lifecycle_log::record(
+                crate::lifecycle_log::LifecycleEvent::ChildDetached { count: left },
+            );
             if left == 0 {
                 wake.notify_one();
             }

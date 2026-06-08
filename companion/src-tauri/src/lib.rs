@@ -44,6 +44,15 @@ fn mark_dialog_teardown() {
         .unwrap() = std::time::Instant::now();
 }
 
+/// Only the macOS `RunEvent::Reopen` handler reads this — every other
+/// platform either has no equivalent event (Windows surfaces a second
+/// instance via tauri-plugin-single-instance instead) or treats reopen
+/// without the dialog-teardown discrimination. Keeping the function
+/// `cfg`-gated avoids a `dead_code` warning under
+/// `clippy --target x86_64-pc-windows-msvc -- -D warnings`. The
+/// matching `mark_dialog_teardown` writer stays cross-platform so the
+/// behaviour is identical if anyone wires a non-macOS reader later.
+#[cfg(target_os = "macos")]
 fn dialog_torn_down_recently() -> bool {
     LAST_DIALOG_TEARDOWN
         .get()
