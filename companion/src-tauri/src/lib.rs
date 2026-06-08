@@ -633,13 +633,6 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
         use std::path::PathBuf;
         use std::process::Command;
 
-        // Best-effort graceful close (no `/F`). If Claude is already gone
-        // taskkill returns exit code 128 — we don't surface that.
-        let _ = no_window(
-            Command::new("taskkill").args(["/IM", "Claude.exe"]),
-        )
-        .output();
-
         // Capture the path of the running Claude.exe *before* we tell it
         // to quit — that's the most reliable way to find the right binary
         // (covers MSIX/Store installs, custom install dirs, renames),
@@ -651,6 +644,14 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
         // existing candidate path, which silently picks the older binary
         // when both NSIS and MSIX installs coexist (mid-upgrade), and
         // misses Store-installed Claudes entirely.
+        //
+        // History: an earlier taskkill block was duplicated *above* the
+        // sysinfo lookup at some point between v0.4.40 and v0.4.46, which
+        // defeated the whole point — by the time sysinfo ran, Claude was
+        // already gone and the fallback paths ended up being the only
+        // resolution. Codex spotted the regression in the v0.4.40→main
+        // audit. The single, post-capture taskkill below is the
+        // intended order.
         let running_exe: Option<PathBuf> = {
             use sysinfo::{ProcessRefreshKind, RefreshKind, System};
             let sys = System::new_with_specifics(
@@ -1503,10 +1504,16 @@ pub fn run() {
                         "[aiui] http-bind-error on :{port_for_error}: {e} — degraded mode, surfacing settings banner"
                     ));
                     if let Ok(mut slot) = http_error_for_serve.lock() {
+                        // The OS-specific diagnostic command (`lsof`,
+                        // `Get-NetTCPConnection`, `ss`) lives in the
+                        // frontend's `settings.http_error.hint.{os}`
+                        // i18n string, rendered just below this text.
+                        // Keep the backend message platform-neutral so
+                        // Windows users don't see a confusing `lsof`
+                        // suggestion above the correct PowerShell one.
                         *slot = Some(format!(
                             "Konnte localhost:{port_for_error} nicht öffnen — \
-                             Port von einem anderen Prozess belegt. Schließe den \
-                             Prozess (lsof -i :{port_for_error}) und starte aiui neu. {e}"
+                             Port von einem anderen Prozess belegt. {e}"
                         ));
                     }
                     // Surface the Settings window so the http_error banner
