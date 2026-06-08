@@ -306,19 +306,29 @@ pub fn kill_orphaned_mcp_stdio_children() -> usize {
     n
 }
 
-/// Filter: every `aiui --mcp-stdio` child started *strictly before*
-/// `own_start_time`, excluding `own_pid`. Pure function over a
+/// Filter: every *orphaned* `aiui --mcp-stdio` child started strictly
+/// before `own_start_time`, excluding `own_pid`. Pure function over a
 /// snapshot — caller passes own pid + own start_time so tests don't
 /// need to spoof `std::process::id`.
 ///
-/// Used by the GUI at startup right after it wins the process-lifetime
-/// lock: any mcp-stdio that predates the freshly-started GUI carries
-/// the binary it was spawned with (potentially pre-update RAM), and
-/// `disk_version_if_stale` would only catch the version-drift case on
-/// its own. The newer GUI is the source of truth → all older children
-/// are kicked, Claude Desktop respawns them against the current binary
-/// with all of the current GUI's protections (sibling-kill, periodic
-/// stale-check, etc.). v0.4.43.
+/// Called by the GUI at startup right after it wins the
+/// process-lifetime lock. Original intent (v0.4.43): clear out
+/// mcp-stdio children left over from a *previous* GUI generation —
+/// they carry the pre-update binary in RAM, and `disk_version_if_stale`
+/// alone wouldn't reach them.
+///
+/// Rescoped (v0.8.2): require the child to also be **orphaned**
+/// (`is_orphaned_child` — parent process gone). The previous "older
+/// than the GUI" rule alone tore down the mcp-stdio child that had
+/// just bootstrapped the very GUI which then ran the sweep — Cowork's
+/// 2026-06-08 "Server disconnected, then `housekeeping: killing
+/// pre-GUI mcp-stdio child pid=2483 … cutoff=1780932439`" trace. The
+/// old code's docstring assumed "Claude Desktop respawns them against
+/// the current binary"; Claude Code / Cowork **do not** respawn, so
+/// the bootstrapper just died and the user saw an MCP error every
+/// cold start. Orphan-status is the precise discriminator: a stale
+/// leftover from a dead client has lost its parent; a live
+/// bootstrapper has not.
 fn find_pre_gui_mcp_stdio_to_kill(
     snap: &[ProcSnap],
     own_pid: u32,
@@ -329,6 +339,7 @@ fn find_pre_gui_mcp_stdio_to_kill(
         .filter(|p| has_mcp_stdio_flag(&p.args))
         .filter(|p| is_aiui_binary(&p.exe))
         .filter(|p| p.start_time < own_start_time)
+        .filter(|p| is_orphaned_child(snap, p))
         .map(|p| StaleChild {
             pid: p.pid,
             exe: p.exe.clone(),
@@ -336,10 +347,14 @@ fn find_pre_gui_mcp_stdio_to_kill(
         .collect()
 }
 
-/// Public entry: terminate every `aiui --mcp-stdio` child older than
-/// us. Returns the count of children signalled. Safe to call from
-/// the GUI startup path after winning the process-lifetime lock —
-/// no race because at most one GUI holds the lock.
+/// Public entry: terminate every *orphaned* `aiui --mcp-stdio` child
+/// older than us. Returns the count of children signalled. Safe to
+/// call from the GUI startup path after winning the process-lifetime
+/// lock — no race because at most one GUI holds the lock.
+///
+/// Rescoped in v0.8.2: requires orphan-status (parent gone) so we no
+/// longer take down the live bootstrapper child that just spawned us.
+/// See `find_pre_gui_mcp_stdio_to_kill` for the rationale.
 pub fn kill_mcp_stdio_started_before_self() -> usize {
     let own_pid = std::process::id();
     let snap = snapshot_processes();
@@ -361,14 +376,15 @@ pub fn kill_mcp_stdio_started_before_self() -> usize {
     let victims = find_pre_gui_mcp_stdio_to_kill(&snap, own_pid, own_start_time);
     for victim in &victims {
         trace(&format!(
-            "housekeeping: killing pre-GUI mcp-stdio child pid={} exe={} (cutoff={})",
+            "housekeeping: killing pre-GUI orphan mcp-stdio pid={} exe={} \
+             (older than GUI cutoff={} AND parent gone)",
             victim.pid, victim.exe, own_start_time
         ));
         terminate_pid(victim.pid);
     }
     if !victims.is_empty() {
         trace(&format!(
-            "housekeeping: terminated {} pre-GUI mcp-stdio child(ren) at startup",
+            "housekeeping: terminated {} pre-GUI orphan mcp-stdio child(ren) at startup",
             victims.len()
         ));
     }
@@ -942,6 +958,45 @@ mod tests {
             victims.is_empty(),
             "a python script with --mcp-stdio flag must not match"
         );
+    }
+
+    #[test]
+    fn pre_gui_kill_spares_bootstrapper_with_live_parent() {
+        // THE 2026-06-08 regression test. A fresh Cowork session
+        // spawned mcp-stdio #300, which then cold-started GUI #400.
+        // The GUI's pre-GUI sweep would see #300 as "older than me"
+        // and SIGTERM it — taking down Cowork's still-live MCP
+        // connection. Orphan-gate fix: #300's parent wrapper #200
+        // is alive in the snap → #300 is a live bootstrapper, not a
+        // leak → spared.
+        let snap = vec![
+            snap_full(100, 1, "/Applications/Claude.app/Contents/MacOS/Claude", &["Claude"], 500),
+            snap_full(200, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer", CURRENT, "--mcp-stdio"], 999),
+            // bootstrapper mcp-stdio: older than the GUI, parent (200) alive
+            snap_full(300, 200, CURRENT, &[CURRENT, "--mcp-stdio"], 1000),
+            // us — the freshly started GUI:
+            snap_full(400, 1, "/Applications/aiui.app/Contents/MacOS/aiui", &["aiui"], 2000),
+        ];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 400, 2000);
+        assert!(
+            victims.is_empty(),
+            "bootstrapper child with live parent must be spared (Bug 2026-06-08)"
+        );
+    }
+
+    #[test]
+    fn pre_gui_kill_reaps_orphaned_older_child() {
+        // The legit case the sweep was added for (v0.4.43): an
+        // mcp-stdio left over from a previous, dead Cowork session —
+        // parent wrapper gone, child reparented to launchd. Older
+        // than us AND orphaned → must still be reaped.
+        let snap = vec![
+            snap_full(200, 1, CURRENT, &[CURRENT, "--mcp-stdio"], 1000),
+            snap_full(400, 1, "/Applications/aiui.app/Contents/MacOS/aiui", &["aiui"], 2000),
+        ];
+        let victims = find_pre_gui_mcp_stdio_to_kill(&snap, 400, 2000);
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].pid, 200);
     }
 
     // ---------- ProcessLock ----------

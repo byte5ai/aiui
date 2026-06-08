@@ -1300,11 +1300,17 @@ pub fn run() {
     // generation and may carry stale in-RAM code (the 2026-05-23
     // 0.4.40-children-survive-update scenario). New GUI = new truth.
     // Race-safe because only the lock-winner reaches this line.
+    // v0.8.2: this sweep is now orphan-gated. It only kills pre-GUI
+    // mcp-stdio children whose parent is already gone (real stale
+    // leftovers). The bootstrapper child that just spawned us has a
+    // live parent and is left alone — Cowork / Claude Code don't
+    // respawn disconnected MCP servers, so killing the bootstrapper
+    // is a one-way trip to "Server disconnected".
     let pre_gui_killed = housekeeping::kill_mcp_stdio_started_before_self();
     if pre_gui_killed > 0 {
         logging::trace(&format!(
-            "[aiui] startup: killed {pre_gui_killed} pre-GUI mcp-stdio child(ren); \
-             Claude Desktop will respawn them against the current binary"
+            "[aiui] startup: reaped {pre_gui_killed} pre-GUI orphan mcp-stdio child(ren) \
+             (older than this GUI AND parent gone)"
         ));
     }
 
