@@ -105,6 +105,11 @@ fn expand_tilde(p: &str) -> PathBuf {
 /// Atomically write `bytes` to `path` (tmp in the same dir + rename), applying
 /// `perm` before the rename so a secret never sits world-readable even briefly.
 fn atomic_write(path: &Path, bytes: &[u8], perm: Option<u32>) -> Result<(), String> {
+    // `perm` is applied only on Unix (mode bits); on Windows the file inherits
+    // default ACLs. Bind it so the param isn't flagged unused on non-Unix
+    // (clippy -D warnings on the Windows target).
+    #[cfg(not(unix))]
+    let _ = perm;
     let dir = path
         .parent()
         .ok_or_else(|| "target has no parent directory".to_string())?;
