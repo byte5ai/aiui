@@ -5,9 +5,12 @@ mod fsutil;
 mod housekeeping;
 mod http;
 mod imageresolve;
+mod filewrite;
+mod lifecycle_log;
 mod lifetime;
 mod logging;
 mod mcp;
+mod media;
 mod proc_ext;
 mod setup;
 mod skill;
@@ -25,6 +28,37 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 /// rules that govern when each is created and torn down.
 pub const SETUP_WINDOW_LABEL: &str = "setup";
 pub const DIALOG_WINDOW_LABEL: &str = "dialog";
+
+/// Timestamp of the most recent dialog-window teardown (X-close, submit/cancel
+/// close, or programmatic destroy). The macOS `RunEvent::Reopen` handler reads
+/// it to suppress the settings window when a Reopen fires merely as a
+/// *side-effect* of a dialog closing (2026-05-31 report: setup window popped up
+/// after closing a dialog) — as opposed to a genuine user reactivation.
+static LAST_DIALOG_TEARDOWN: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+    std::sync::OnceLock::new();
+
+fn mark_dialog_teardown() {
+    *LAST_DIALOG_TEARDOWN
+        .get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()))
+        .lock()
+        .unwrap() = std::time::Instant::now();
+}
+
+/// Only the macOS `RunEvent::Reopen` handler reads this — every other
+/// platform either has no equivalent event (Windows surfaces a second
+/// instance via tauri-plugin-single-instance instead) or treats reopen
+/// without the dialog-teardown discrimination. Keeping the function
+/// `cfg`-gated avoids a `dead_code` warning under
+/// `clippy --target x86_64-pc-windows-msvc -- -D warnings`. The
+/// matching `mark_dialog_teardown` writer stays cross-platform so the
+/// behaviour is identical if anyone wires a non-macOS reader later.
+#[cfg(target_os = "macos")]
+fn dialog_torn_down_recently() -> bool {
+    LAST_DIALOG_TEARDOWN
+        .get()
+        .map(|m| m.lock().unwrap().elapsed() < std::time::Duration::from_millis(1500))
+        .unwrap_or(false)
+}
 
 #[tauri::command]
 fn dialog_submit(
@@ -45,16 +79,90 @@ fn dialog_cancel(
     Ok(())
 }
 
-/// Frontend confirms it received the matching `dialog:show` event. The
-/// `/render` handler waits up to 500 ms for this before assuming the WebView
-/// event loop is dead and triggering a recreate.
+/// Issue #135: write the values of `target`-carrying form fields to **local**
+/// files, *before* the dialog result is sent back. The frontend calls this on
+/// affirmative submit **only for a local (native-app) session** with
+/// `{field_name: entered_value}`; for a bridge-served session (`session_origin`
+/// set) the bridge on the agent's host does the local write instead, so this
+/// is never invoked for those. The secret value thus travels WebView → here
+/// (local IPC) → file, and is **never** placed in the `dialog_submit` result
+/// that flows to the bridge/agent.
+///
+/// `target`/mode/path are read authoritatively from the **stored spec** (not
+/// from the frontend) so the destination can't be tampered with after the user
+/// approved it. Returns a per-field outcome map; for a `secret` field the
+/// outcome carries status only, never the value.
 #[tauri::command]
-fn dialog_received(
+fn write_dialog_targets(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
-) -> Result<(), String> {
-    state.ack(&id);
-    Ok(())
+    values: std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
+    let req = state
+        .get_request(&id)
+        .ok_or_else(|| "dialog no longer active".to_string())?;
+
+    let mut out = std::collections::HashMap::new();
+    for field in collect_target_fields(&req.spec) {
+        let name = match field.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let target: filewrite::Target =
+            match serde_json::from_value(field.get("target").cloned().unwrap_or_default()) {
+                Ok(t) => t,
+                Err(e) => {
+                    out.insert(
+                        name,
+                        filewrite::WriteOutcome::invalid(format!("bad target spec: {e}")),
+                    );
+                    continue;
+                }
+            };
+        let value = values.get(&name).map(String::as_str).unwrap_or("");
+        out.insert(name, filewrite::write_local(value, &target));
+    }
+    Ok(out)
+}
+
+/// Collect every form field that carries a non-null `target`, walking both the
+/// flat `fields` array and any `tabs[].fields`.
+fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut consider = |fields: &serde_json::Value| {
+        if let Some(arr) = fields.as_array() {
+            for f in arr {
+                if f.get("target").map(|t| !t.is_null()).unwrap_or(false) {
+                    out.push(f.clone());
+                }
+            }
+        }
+    };
+    if let Some(fields) = spec.get("fields") {
+        consider(fields);
+    }
+    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
+        for t in tabs {
+            if let Some(fields) = t.get("fields") {
+                consider(fields);
+            }
+        }
+    }
+    out
+}
+
+/// Multi-window pull model (Step 4): the per-id dialog window fetches its own
+/// render payload on mount, keyed by its window label (= the dialog id). This
+/// replaces the old `dialog:show` emit + `dialog_window_ready` ack handshake —
+/// the frontend initiates, so there is no event-before-listener race to guard.
+/// Returns `None` if the dialog is already gone (resolved/evicted), and the
+/// window closes itself.
+#[tauri::command]
+fn get_dialog_spec(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<Option<dialog::DialogRequest>, String> {
+    Ok(state.get_request(&id))
 }
 
 /// Frontend response to a `ui:ping` event from `/health`. Same shape as
@@ -68,19 +176,30 @@ fn ui_pong(
     Ok(())
 }
 
-/// Frontend signals that the dialog window is mounted and its
-/// `dialog:show` / `ui:ping` listeners are registered. The render
-/// path on the Rust side waits on this watch *before* emitting, so
-/// a freshly-built dialog window never receives a `dialog:show`
-/// event before the listener is up. Without this handshake we hit
-/// the 500 ms ack timeout, reload the WebView, and lose the user's
-/// dialog (the failure mode reported on 2026-05-03).
-#[tauri::command]
-fn dialog_window_ready(
-    tx: tauri::State<'_, Arc<tokio::sync::watch::Sender<bool>>>,
-) -> Result<(), String> {
-    let _ = tx.send(true);
-    Ok(())
+/// A dialog window's label IS its dialog id (Step 4 multi-window): any window
+/// that isn't the setup window is a dialog window. There is no longer a single
+/// reused `DIALOG_WINDOW_LABEL` window.
+fn is_dialog_window_label(label: &str) -> bool {
+    label != SETUP_WINDOW_LABEL
+}
+
+/// macOS: drop back to Accessory (no Dock icon) once no dialog window remains
+/// open *other than* `except` (the one currently being torn down — `destroy()`
+/// may not have removed it from the window list yet) and the setup window is
+/// hidden. Matches the Regular-mode promote in `build_dialog_window`.
+#[cfg(target_os = "macos")]
+fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
+    let setup_open = app
+        .get_webview_window(SETUP_WINDOW_LABEL)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let other_dialog_open = app
+        .webview_windows()
+        .keys()
+        .any(|l| is_dialog_window_label(l) && l != except);
+    if !other_dialog_open && !setup_open {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
 }
 
 #[tauri::command]
@@ -99,72 +218,63 @@ async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     let _ = window.close();
     log::debug!("[aiui] close_window: closed {label}");
 
-    // If that was the dialog window and no setup window is open,
-    // demote the app back to Accessory mode so we don't permanently
-    // grow a Dock icon. `ensure_dialog_window` promotes us to Regular
+    // If a dialog window just closed and nothing else needs the Dock icon,
+    // demote back to Accessory. `build_dialog_window` promoted us to Regular
     // for the dialog's lifetime; this is the matching demote.
-    #[cfg(target_os = "macos")]
-    if label == DIALOG_WINDOW_LABEL {
-        let setup_open = app
-            .get_webview_window(SETUP_WINDOW_LABEL)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !setup_open {
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        }
+    if is_dialog_window_label(&label) {
+        mark_dialog_teardown();
+        #[cfg(target_os = "macos")]
+        demote_if_no_dialogs_except(&app, &label);
     }
     Ok(())
 }
 
-/// Authoritatively tear down the dialog window from the Rust side
-/// (v0.4.46, Bug B). Uses `destroy()` (immediate) rather than `close()`
-/// so it bypasses the `CloseRequested` → frontend round-trip that could
-/// strand an empty window when the WebView's handler failed to complete
-/// the close. This is the single teardown point for the dialog window:
-/// the `/render` handler calls it once a render reaches *any* terminal
-/// outcome (submit, cancel, X-close, TTL, channel-drop), so the window
-/// can never outlive the dialog it was showing. Idempotent — a no-op
-/// when the window is already gone.
-pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
+/// Authoritatively tear down the dialog window with label `id` from the Rust
+/// side (v0.4.46, Bug B; Step 4: now per-id). Uses `destroy()` (immediate)
+/// rather than `close()` so it bypasses the `CloseRequested` → frontend
+/// round-trip that could strand an empty window. The `/render` handler calls
+/// it once that render reaches *any* terminal outcome (submit, cancel,
+/// X-close, TTL, channel-drop), so a window can never outlive the dialog it
+/// was showing. Idempotent — a no-op when the window is already gone.
+pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle, id: &str) {
+    if let Some(win) = app.get_webview_window(id) {
         let _ = win.destroy();
     }
-    // Matching demote for `ensure_dialog_window`'s Regular-mode promote:
-    // drop back to Accessory once the dialog is gone, unless the setup
-    // window is still up.
+    mark_dialog_teardown();
+    // Matching demote for `build_dialog_window`'s Regular-mode promote: drop
+    // back to Accessory once the last dialog is gone (ignoring the one we just
+    // destroyed, which may still be in the window list) and setup is hidden.
     #[cfg(target_os = "macos")]
-    {
-        let setup_open = app
-            .get_webview_window(SETUP_WINDOW_LABEL)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !setup_open {
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        }
-    }
+    demote_if_no_dialogs_except(app, id);
 }
 
-/// Belt-and-suspenders invariant (v0.4.46, Bug B+): a dialog window may
-/// only exist while a dialog is pending in the registry. If a window is
-/// found with an empty registry, it's a stranded empty window — destroy
-/// it. Cheap (one mutex read + a window lookup); called on app
-/// re-activation, exactly when a user would otherwise notice a leftover
-/// empty frame.
+/// Belt-and-suspenders invariant (v0.4.46, Bug B+; Step 4: per-id): a dialog
+/// window may only exist while its dialog is pending in the registry. Any
+/// dialog-labelled window whose id is no longer registered is a stranded
+/// empty window — destroy it. Called on app re-activation, exactly when a
+/// user would otherwise notice a leftover empty frame.
 ///
-/// Currently wired only to macOS `RunEvent::Reopen`; other platforms
-/// have no trigger yet (Windows surfaces the existing window via the
-/// single-instance plugin), so allow it to be unused there instead of
-/// `#[cfg]`-gating the whole fn — keeps it ready for a future Windows
-/// hook without tripping CI's `-D warnings` dead-code check.
+/// Currently wired only to macOS `RunEvent::Reopen`; other platforms have no
+/// trigger yet (Windows surfaces the existing window via the single-instance
+/// plugin), so allow it to be unused there instead of `#[cfg]`-gating the
+/// whole fn — keeps it ready for a future Windows hook without tripping CI's
+/// `-D warnings` dead-code check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
-    let pending = app
-        .try_state::<Arc<dialog::DialogState>>()
-        .map(|s| s.stats().orphan_count)
-        .unwrap_or(0);
-    if pending == 0 && app.get_webview_window(DIALOG_WINDOW_LABEL).is_some() {
-        log::debug!("[aiui] sweep: destroying orphan dialog window (no pending dialog)");
-        destroy_dialog_window(app);
+    let Some(state) = app.try_state::<Arc<dialog::DialogState>>() else {
+        return;
+    };
+    // Collect dialog-window labels (ids) whose dialog is no longer registered.
+    let orphans: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|l| is_dialog_window_label(l))
+        .filter(|l| state.get_request(l).is_none())
+        .cloned()
+        .collect();
+    for id in orphans {
+        log::debug!("[aiui] sweep: destroying orphan dialog window id={id} (no pending dialog)");
+        destroy_dialog_window(app, &id);
     }
 }
 
@@ -201,10 +311,14 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     // The update dialog is surfaced from whichever window is alive when
     // the check fires — usually the setup window (frontend triggers it
     // from there). We just need *some* visible window to attach the OS
-    // dialog to.
-    let win = app
-        .get_webview_window(SETUP_WINDOW_LABEL)
-        .or_else(|| app.get_webview_window(DIALOG_WINDOW_LABEL));
+    // dialog to; fall back to any open dialog window (Step 4: dialog
+    // windows are labelled by id, so there's no single fixed label).
+    let win = app.get_webview_window(SETUP_WINDOW_LABEL).or_else(|| {
+        app.webview_windows()
+            .into_iter()
+            .find(|(label, _)| is_dialog_window_label(label))
+            .map(|(_, w)| w)
+    });
     if let Some(win) = win {
         let _ = win.show();
         let _ = win.set_focus();
@@ -432,6 +546,12 @@ fn open_url(url: String) -> Result<(), String> {
 /// running. Issue #72.
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    // Case (b): explicit uninstall. Latch the exit authority *first* so the
+    // `ExitRequested` default-deny gate honours the `app.exit(0)` below instead
+    // of vetoing it (Invariant I1).
+    if let Some(auth) = app.try_state::<Arc<lifetime::ExitAuthority>>() {
+        auth.authorize();
+    }
     let killed = housekeeping::kill_all_mcp_stdio_children();
     logging::trace(&format!(
         "quit_app: killed {killed} mcp-stdio child(ren) before exit"
@@ -446,6 +566,21 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
         .unwrap_or(7777);
     housekeeping::pre_exit_cleanup(port, "quit_app/uninstall");
     app.exit(0);
+    Ok(())
+}
+
+/// Latch the exit authority for case (c): an update-restart driven from the
+/// frontend updater. `updater.ts` calls this immediately before
+/// `@tauri-apps/plugin-process`'s `relaunch()`, which (like `app.restart()`)
+/// fires `RunEvent::ExitRequested`. Without the latch the default-deny gate
+/// would veto the relaunch and the update would never apply (Invariant I1).
+/// The HTTP `/update` path latches the same authority directly in Rust.
+#[tauri::command]
+async fn authorize_exit_for_update(
+    exit_authority: tauri::State<'_, Arc<lifetime::ExitAuthority>>,
+) -> Result<(), String> {
+    exit_authority.authorize();
+    logging::trace("authorize_exit_for_update: exit authority latched for update-restart");
     Ok(())
 }
 
@@ -696,15 +831,11 @@ async fn add_remote(
     );
     let config_ok = config_step.ok;
     results.push(config_step);
-    // Fresh add — there shouldn't be a running child yet, but a
-    // re-add (Remove + Add the same host) leaves stale ones; sweep
-    // them so the first tool call respawns clean against the new pin.
-    if matches!(config_patch, Some(setup::RemoteConfigPatch::Patched)) {
-        let sweep = setup::kill_remote_mcp_stdio(&host_alias);
-        if !sweep.ok {
-            results.push(sweep);
-        }
-    }
+    // Step 2: no version-forcing kill here. A re-add re-pins the version in
+    // ~/.claude.json; the new pin takes effect at the next natural Claude Code
+    // spawn. We never `pkill -f aiui-mcp` to force it — that crashed live
+    // sessions mid-call and hit every other session on the host.
+    let _ = config_patch;
 
     if !(token_ok && config_ok) {
         // Don't persist the host or start a tunnel for a half-failed
@@ -742,39 +873,32 @@ async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
     Ok(results)
 }
 
-/// On-demand resync trigger for a single registered remote — wraps
-/// the same patch-pin + kill-stale-mcp-stdio sequence that runs in
-/// the background at every aiui-app startup. Surfaced as a per-remote
-/// button in Settings so the user can re-invoke it without restarting
-/// aiui (and see the StepResult log inline if a sweep fails).
+/// On-demand resync trigger for a single registered remote — re-pins the
+/// aiui-mcp version in the remote's `~/.claude.json`. Surfaced as a per-remote
+/// button in Settings so the user can re-invoke the pin without restarting
+/// aiui (and see the StepResult log inline).
 ///
-/// Why this exists: 0.4.29's auto-resync on GUI-start is silent — if
-/// the SSH-side `pkill` fails (remote temporarily unreachable) the
-/// stale subprocess keeps running with the previous version. Without
-/// a manual trigger, the user would have to close + reopen aiui-app
-/// to retry. v0.4.34 adds the on-demand path.
+/// Step 2 change: this used to also `pkill -f aiui-mcp` on the host to force
+/// the new version onto a running session. That is gone — the kill crashed
+/// live sessions mid-call (Claude Code does not respawn a disconnected MCP)
+/// and had cross-session blast radius. The re-pin alone is the correct,
+/// session-safe action: it takes effect at the next natural spawn while any
+/// in-flight session finishes on its current version. If the user genuinely
+/// wants a running remote session on the new version *now*, the cooperative
+/// path is to end and restart that Claude Code session.
 #[tauri::command]
 async fn resync_remote(
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
     let our_version = env!("CARGO_PKG_VERSION");
-    // Re-pin in `~/.claude.json` on the remote (idempotent — if
-    // already pinned, no rewrite, returns AlreadyCurrent).
-    let (pin_step, patch) = setup::patch_claude_code_config_remote(
+    // Re-pin in `~/.claude.json` on the remote (idempotent — if already
+    // pinned, no rewrite, returns AlreadyCurrent).
+    let (pin_step, _patch) = setup::patch_claude_code_config_remote(
         &host_alias,
         None,
         our_version,
     );
-    let mut results = vec![pin_step];
-    // Sweep stale aiui-mcp children only when the pin actually
-    // changed (or unconditionally? — yes, unconditionally on
-    // user-triggered resync, because the user wouldn't click resync
-    // unless they suspect drift). On unconditional sweep: kills any
-    // running aiui-mcp regardless of pin state, which is what the
-    // user wants from a "force fresh" button.
-    let _ = patch;  // not used here, but kept for tracing
-    results.push(setup::kill_remote_mcp_stdio(&host_alias));
-    Ok(results)
+    Ok(vec![pin_step])
 }
 
 #[tauri::command]
@@ -924,96 +1048,106 @@ pub(crate) fn build_setup_window(
 /// `dialog::estimate_dialog_size`. The window is resizable, so the user
 /// can drag past these defaults — we just pick a sensible starting
 /// geometry given what the agent asked us to render.
-pub(crate) fn ensure_dialog_window(
+/// Build a fresh dialog window labelled by the dialog `id` (Step 4
+/// multi-window: one window per render, never reused — N may be open at once).
+/// It loads `dialog.html`, which reads its own window label (= id) and *pulls*
+/// the render payload via `get_dialog_spec` on mount. Promotes the app to
+/// Regular so the window fronts above Claude Desktop (in Accessory mode macOS
+/// won't bring our windows forward even with `set_focus()`);
+/// `close_window` / `destroy_dialog_window` demote back to Accessory once the
+/// last dialog is gone.
+pub(crate) fn build_dialog_window(
     app: &tauri::AppHandle,
+    id: &str,
     size: (f64, f64),
+    title: &str,
 ) -> tauri::Result<tauri::WebviewWindow> {
-    // Promote the app from Accessory to Regular for the duration of the
-    // dialog. In Accessory mode (LSUIElement-style daemon, no Dock icon)
-    // macOS won't bring our windows to the front above other apps even
-    // with `set_focus()` — the agent renders a dialog and the user
-    // doesn't see it because Claude Desktop covers it. Promoting to
-    // Regular for the dialog window restores normal front/focus
-    // behaviour; we drop back to Accessory in `close_window` once the
-    // dialog finishes so we don't permanently grow a Dock icon.
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     }
-    if let Some(win) = app.get_webview_window(DIALOG_WINDOW_LABEL) {
-        // Resize to fit the new spec before surfacing. Without this,
-        // a confirm rendered after a long form would keep the form's
-        // tall geometry (and vice versa).
-        let _ = win.set_size(tauri::LogicalSize::new(size.0, size.1));
-        let _ = win.show();
-        let _ = win.set_focus();
-        let _ = win.unminimize();
-        // Briefly mark the window always-on-top to win against any
-        // app that's grabbed focus in the meantime, then lift the
-        // flag so the user can naturally Cmd+Tab away later. 800 ms
-        // is enough for the activation to settle without leaving a
-        // sticky front-most window.
-        let _ = win.set_always_on_top(true);
-        let app_for_lift = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
-                let _ = w.set_always_on_top(false);
+    // Clamp the requested start size to the monitor's usable area, so an
+    // agent asking for `size:"l"` (or explicit width/height) on a small
+    // screen can't open a window taller/wider than the display. Leaves a
+    // margin for the menu bar / Dock. The window stays resizable, so the
+    // user can still grow it past this if they want.
+    let size = {
+        let mut s = size;
+        if let Ok(Some(mon)) = app.primary_monitor() {
+            let sf = mon.scale_factor();
+            let phys = mon.size();
+            let avail_w = (phys.width as f64 / sf) * 0.95;
+            let avail_h = (phys.height as f64 / sf) * 0.92;
+            if avail_w > 360.0 {
+                s.0 = s.0.min(avail_w);
             }
-        });
-        return Ok(win);
-    }
-    // Window is being built fresh — its frontend listeners aren't up
-    // yet. Reset the ready flag so the render path waits for the
-    // `dialog_window_ready` signal before emitting `dialog:show`.
-    if let Some(tx) = app.try_state::<Arc<tokio::sync::watch::Sender<bool>>>() {
-        let _ = tx.inner().send(false);
-    }
-    WebviewWindowBuilder::new(
-        app,
-        DIALOG_WINDOW_LABEL,
-        WebviewUrl::App("dialog.html".into()),
-    )
-    .title("aiui")
-    // Initial size from `estimate_dialog_size` — we widen for
-    // wireframe/mermaid/table and grow vertically for long forms,
-    // clamped to (1100, 900). Resizable so the user always has the
-    // last word; min size keeps the dialog usable but prevents
-    // accidental sub-icon collapse. v0.4.40.
-    .inner_size(size.0, size.1)
-    .min_inner_size(360.0, 320.0)
-    .resizable(true)
-    .center()
-    // Native, fully-visible title bar so macOS handles window-drag
-    // for us. Tauri's `data-tauri-drag-region` HTML attribute and
-    // Chromium's `-webkit-app-region: drag` CSS are *both* unreliable
-    // on Tauri 2 + WKWebView (macOS 26): the first sometimes drops
-    // mousedown depending on z-order, the second is a Chromium-only
-    // CSS property that WKWebView doesn't honour at all. The only
-    // robust path is to let macOS run its own title-bar drag, which
-    // means a visible title bar (the previous "Overlay + hiddenTitle"
-    // setup hid the title-bar pixels but kept its drag behaviour
-    // half-broken). We accept the slightly-less-flush look in
-    // exchange for a window the user can actually move.
-    .decorations(true)
-    .disable_drag_drop_handler()
-    .visible(true)
-    .always_on_top(true)
-    .build()
-    .inspect(|_win| {
-        // Fresh dialog windows also get the same lift-after-800 ms
-        // treatment as the reused-window branch above. The
-        // always_on_top flag from the builder ensures the window
-        // appears above everything; we drop it shortly after so
-        // Cmd+Tab works normally afterwards.
-        let app_for_lift = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            if let Some(w) = app_for_lift.get_webview_window(DIALOG_WINDOW_LABEL) {
-                let _ = w.set_always_on_top(false);
+            if avail_h > 320.0 {
+                s.1 = s.1.min(avail_h);
             }
-        });
-    })
+        }
+        s
+    };
+    let id_for_lift = id.to_string();
+    WebviewWindowBuilder::new(app, id, WebviewUrl::App("dialog.html".into()))
+        // Session identity (I8) in the native title bar. Set here in Rust —
+        // the frontend `setTitle` is blocked without a `core:window:set-title`
+        // capability, so the Rust builder is the reliable place.
+        .title(title)
+        // Initial size from `estimate_dialog_size` — we widen for
+        // wireframe/mermaid/table and grow vertically for long forms,
+        // clamped to (1100, 900). Resizable so the user always has the last
+        // word; min size keeps the dialog usable. v0.4.40.
+        .inner_size(size.0, size.1)
+        .min_inner_size(360.0, 320.0)
+        .resizable(true)
+        .center()
+        // Native, fully-visible title bar so macOS handles window-drag for us
+        // (Tauri's HTML drag-region and the `-webkit-app-region` CSS are both
+        // unreliable on Tauri 2 + WKWebView). v0.4.40.
+        .decorations(true)
+        .disable_drag_drop_handler()
+        .visible(true)
+        .always_on_top(true)
+        // Focus the fresh window so macOS doesn't eat the user's FIRST click
+        // just to make it key ("first mouse" — the 2026-05-31 "have to click
+        // twice" report). The old single-reused-window path called set_focus();
+        // the per-id rewrite dropped it. Belt-and-suspenders with set_focus()
+        // in the inspect below.
+        .focused(true)
+        .build()
+        .inspect(|win| {
+            // Cascade (2026-05-31 report): offset each *additional* open dialog
+            // so stacked windows don't sit exactly on top of each other. Keyed
+            // on the count of OTHER dialog windows currently open — NOT a
+            // monotonic counter — and wrapped at 8 steps, so closing a window
+            // frees its slot, the first/only dialog always opens centered, and
+            // they never march off the bottom-right over a long session.
+            let others = app
+                .webview_windows()
+                .keys()
+                .filter(|l| is_dialog_window_label(l) && l.as_str() != id)
+                .count();
+            if others > 0 {
+                if let Ok(pos) = win.outer_position() {
+                    let sf = win.scale_factor().unwrap_or(1.0);
+                    let off = ((others % 8) as f64 * 28.0 * sf) as i32;
+                    let _ = win
+                        .set_position(tauri::PhysicalPosition::new(pos.x + off, pos.y + off));
+                }
+            }
+            // Make the window key so the user's first click lands on a control
+            // instead of being consumed to focus the window.
+            let _ = win.set_focus();
+            // Briefly always-on-top to win the focus race, then lift it so
+            // Cmd+Tab works normally afterwards.
+            let app_for_lift = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if let Some(w) = app_for_lift.get_webview_window(&id_for_lift) {
+                    let _ = w.set_always_on_top(false);
+                }
+            });
+        })
 }
 
 /// True when no aiui window is currently visible to the user. Used by
@@ -1122,6 +1256,9 @@ pub fn run_mcp_stdio_only() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
+    lifecycle_log::record(lifecycle_log::LifecycleEvent::Startup {
+        interactive: lifetime::is_interactive_session(),
+    });
 
     // Process-lifetime advisory lock (v0.4.43). Held from the very
     // first line of run() until the process dies. Two GUIs spawned in
@@ -1174,6 +1311,12 @@ pub fn run() {
     let dialog_state = Arc::new(dialog::DialogState::new());
     let ui_acks = Arc::new(ack::AckRegistry::new());
     let lifetime_stats = Arc::new(lifetime::LifetimeStats::new());
+    // Single exit authority (Invariant I1). Latched only by the two legitimate
+    // non-Wirt-death exits — uninstall (`quit_app`) and update-restart (HTTP
+    // `/update` + the frontend updater) — and read by the `ExitRequested`
+    // default-deny gate so those, and only those, Tauri-initiated terminations
+    // are honoured while Claude Desktop is alive.
+    let exit_authority = Arc::new(lifetime::ExitAuthority::new());
     let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
     // Shared cell that records a fatal HTTP-server bind/serve failure (e.g.
     // port 7777 held by another process). Read by the `status` command and
@@ -1197,17 +1340,9 @@ pub fn run() {
     // it apart from `http_error` (same underlying type).
     let pending_update = Arc::new(PendingUpdate::default());
 
-    // Window-ready handshake: the dialog window's frontend signals
-    // here (via the `dialog_window_ready` Tauri command) once its
-    // listeners are wired up. The render path *waits* on this watch
-    // before emitting `dialog:show`, so a freshly-built dialog window
-    // never receives an event before its listener is registered. The
-    // 0.4.30 fix — without it, a 500 ms ack timeout could fire before
-    // the WebView even finished mounting Svelte (especially on the
-    // very first render of a session, when the window is built fresh
-    // and Vite has to load the bundle).
-    let (dialog_ready_tx, _dialog_ready_rx) = tokio::sync::watch::channel(false);
-    let dialog_ready_tx = Arc::new(dialog_ready_tx);
+    // (Step 4: the old `dialog_window_ready` watch handshake is gone — the
+    // per-id dialog window pulls its spec via `get_dialog_spec` on mount, so
+    // there's no emit to race and nothing to wait on.)
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1259,16 +1394,16 @@ pub fn run() {
         .manage(dialog_state.clone())
         .manage(ui_acks.clone())
         .manage(lifetime_stats.clone())
+        .manage(exit_authority.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
         .manage(pending_update.clone())
-        .manage(dialog_ready_tx.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
-            dialog_received,
+            write_dialog_targets,
+            get_dialog_spec,
             ui_pong,
-            dialog_window_ready,
             close_window,
             surface_for_dialog,
             is_update_safe_to_install,
@@ -1283,6 +1418,7 @@ pub fn run() {
             restart_claude_desktop,
             uninstall_all,
             quit_app,
+            authorize_exit_for_update,
             dismiss_welcome,
             open_url
         ])
@@ -1475,13 +1611,16 @@ pub fn run() {
                                     None => "unknown",
                                 }
                             ));
-                            if matches!(patch, Some(setup::RemoteConfigPatch::Patched)) {
-                                let sweep = setup::kill_remote_mcp_stdio(&host_for_task);
-                                logging::trace(&format!(
-                                    "remote-pin: {host_for_task}: sweep {}",
-                                    if sweep.ok { "ok" } else { "failed" }
-                                ));
-                            }
+                            // Step 2 (Invariant: never kill a remote bridge to
+                            // force a version): we used to `pkill -f aiui-mcp`
+                            // here whenever the pin changed. That blunt sweep
+                            // crashed live remote sessions mid-call (Claude Code
+                            // does NOT respawn a disconnected MCP) and had
+                            // cross-session blast radius — the remote twin of
+                            // the 0.4.42 Cowork-kill. The pin alone is enough:
+                            // it takes effect at the next *natural* spawn (next
+                            // Claude Code session), while any live session keeps
+                            // its current version until it ends on its own.
                         } else {
                             logging::trace(&format!(
                                 "remote-pin: {host_for_task} sync failed: {} ({})",
@@ -1568,138 +1707,116 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Multi-window lifecycle (v0.4.25, revised v0.4.36):
+            // Multi-window lifecycle (v0.4.25, revised v0.4.36, Invariant I2):
             //
-            // The setup window and the dialog window are independent.
-            // Closing one shouldn't kill the other — and definitely
-            // shouldn't kill the GUI process while the lifetime
-            // socket still has attached MCP-stdio children depending
-            // on it.
+            // The setup window and the dialog window are independent, and
+            // closing a window is never a process exit — the host lives with
+            // its Wirt (Claude Desktop), not with any window.
             //
-            //  • Red X on setup window: setup goes away. If no other
-            //    window is visible AND no MCP-stdio children are
-            //    attached, the app quits and `mcp_attach`'s
-            //    auto-resurrect path brings it back on the next tool
-            //    call. As long as a child is attached, we stay alive
-            //    headless — the lifetime grace timer (60s after the
-            //    last child detaches) is the only legitimate
-            //    "nobody needs aiui anymore" signal.
-            //  • Red X on dialog window: the dialog is treated as
-            //    cancelled (the frontend's CloseRequested-listener
-            //    fires `dialog_cancel` first; this branch runs after).
-            //    NEVER quits the app, regardless of any-visible state.
-            //    The dialog window is per-call ephemeral — destroyed
-            //    after every submit/cancel by `close_window`. Quitting
-            //    the GUI here would tear down the HTTP server while
-            //    the agent's tool call is still parsing the response,
-            //    producing the 8s `wait_for_aiui` timeouts the user
-            //    saw on 2026-05-04 (trace 16:11:42.197 "GUI is gone"
-            //    20 ms after a successful form submit).
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            //  • Red X on setup window: hide it + demote to Accessory (no Dock
+            //    icon). The host stays alive headless; it is brought back to a
+            //    visible Settings window via Dock-click / `open` (the Reopen
+            //    handler) or the single-instance plugin. No exit here — the
+            //    process only ends when the watcher sees the Wirt gone or an
+            //    uninstall/update latches the exit authority.
+            //  • Red X on dialog window: the dialog is treated as cancelled
+            //    (the frontend's CloseRequested-listener fires `dialog_cancel`
+            //    first; this branch runs after). NEVER quits the app. The
+            //    dialog window is per-call ephemeral — destroyed after every
+            //    submit/cancel by `close_window`. Quitting the GUI here would
+            //    tear down the HTTP server while the agent's tool call is still
+            //    parsing the response, producing the 8s `wait_for_aiui`
+            //    timeouts the user saw on 2026-05-04 (trace 16:11:42.197 "GUI
+            //    is gone" 20 ms after a successful form submit).
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let closed_label = window.label().to_string();
-                if closed_label == DIALOG_WINDOW_LABEL {
-                    // User closed the dialog window with the native X (or
-                    // ⌘W). Resolve any in-flight `/render` as cancelled
-                    // right here in Rust — we no longer depend on a
-                    // frontend CloseRequested handler, which in 0.4.45
-                    // could `preventDefault()` and then fail to complete
-                    // the close, stranding an empty, unclosable window
-                    // (Bug B, the 2026-05-29 overnight report). We do NOT
-                    // prevent the close: the window is allowed to go away.
-                    // The awaiting `/render` will run its end-of-handler
-                    // `destroy_dialog_window` (a no-op by then).
+                if is_dialog_window_label(&closed_label) {
+                    // User closed THIS dialog window with the native X (or
+                    // ⌘W). Multi-window (Step 4): the window label is the
+                    // dialog id, so cancel exactly that dialog — never the
+                    // others that may be open for parallel sessions. Resolve
+                    // it as cancelled right here in Rust (we no longer depend
+                    // on a frontend CloseRequested handler, which in 0.4.45
+                    // could `preventDefault()` then fail to complete the
+                    // close, stranding an empty window — Bug B). We do NOT
+                    // prevent the close; the awaiting `/render` runs its
+                    // end-of-handler `destroy_dialog_window` (a no-op by then).
                     if let Some(ds) = app.try_state::<Arc<dialog::DialogState>>() {
-                        let n = ds.cancel_all("window_closed");
-                        if n > 0 {
-                            log::debug!(
-                                "[aiui] dialog window X-closed — cancelled {n} pending dialog(s)"
-                            );
-                        }
+                        ds.cancel(&closed_label);
                     }
+                    // Mark the teardown so a Reopen fired as a side-effect of
+                    // this close doesn't surface the settings window.
+                    mark_dialog_teardown();
                     log::debug!(
-                        "[aiui] dialog window closed — staying alive for further tool calls"
+                        "[aiui] dialog window {closed_label} X-closed — cancelled its dialog, host stays alive"
                     );
                     return;
                 }
-                // Setup window: quit only if nothing else needs us.
-                let app_for_check = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    let any_visible = app_for_check
-                        .webview_windows()
-                        .iter()
-                        .any(|(label, w)| {
-                            label.as_str() != closed_label
-                                && w.is_visible().unwrap_or(false)
-                        });
-                    let attached = app_for_check
-                        .try_state::<Arc<lifetime::LifetimeStats>>()
-                        .map(|s| s.child_count())
-                        .unwrap_or(0);
-                    if !any_visible && attached == 0 {
-                        log::info!(
-                            "[aiui] setup window closed and no MCP-stdio children attached — quitting; auto-resurrect will bring us back on next tool call"
-                        );
-                        let port = app_for_check
-                            .try_state::<Arc<config::AppConfig>>()
-                            .map(|c| c.http_port)
-                            .unwrap_or(7777);
-                        housekeeping::pre_exit_cleanup(port, "setup-close-no-children");
-                        app_for_check.exit(0);
-                    } else {
-                        log::debug!(
-                            "[aiui] setup window closed, staying alive (visible_others={any_visible}, attached_children={attached})"
-                        );
-                    }
-                });
+                // Setup window: Invariant I2 — window close is NOT process
+                // exit. Hide the window and demote back to Accessory (no Dock
+                // icon) so aiui keeps living headless with its host (Claude
+                // Desktop), serving the lifetime socket + HTTP for local and
+                // remote dialogs. The process only ends when its Wirt quits
+                // (the watcher) or on an explicit uninstall/update — never
+                // because a user dismissed a window. The old
+                // `setup-close-no-children → app.exit(0)` path (which decided
+                // "nobody needs us" from the child count + window visibility,
+                // both proxies) is removed.
+                api.prevent_close();
+                let _ = window.hide();
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+                lifecycle_log::record(lifecycle_log::LifecycleEvent::WindowHidden);
+                log::debug!(
+                    "[aiui] setup window close → hidden + demoted to Accessory (host stays alive; I2)"
+                );
             }
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
         .run(|app, event| {
-            // ExitRequested handler (v0.4.43 introduced cleanup; v0.4.44
-            // adds the veto for the "headless mode" case). Tauri fires
-            // ExitRequested on Cmd-Q, on ⌘W of the last visible
+            // ExitRequested gate — single exit authority (Invariant I1). Tauri
+            // fires ExitRequested on ⌘Q, on ⌘W / close of the last visible
             // window, on OS shutdown, and on `.restart()`. The
-            // last-window-close case is the dangerous one: as soon as
-            // the agent's dialog window closes after a submit, Tauri
-            // wants to terminate the process — but that's wrong while
-            // the GUI is meant to live headless serving the lifetime
-            // socket. v0.4.42 lost the GUI ~18 ms after every Dialog
-            // submit through this path (trace 2026-05-26 17:00:28.181
-            // → 17:00:28.199); the dialog-window-close branch of
-            // on_window_event already returned without exit, but
-            // Tauri's default ExitRequested handler ran *after* it
-            // and killed the process anyway.
+            // last-window-close case is the dangerous one: as soon as the
+            // agent's dialog window closes after a submit, Tauri wants to
+            // terminate the process — but the host is meant to live headless
+            // serving the lifetime socket + HTTP. v0.4.42 lost the GUI ~18 ms
+            // after every dialog submit through exactly this path (trace
+            // 2026-05-26 17:00:28.181 → 17:00:28.199).
             //
-            // Resolution rule:
-            //   • Anyone still depending on us — an attached
-            //     mcp-stdio child or a pending dialog — ⇒ veto the
-            //     exit via `api.prevent_exit()`. The lifetime-grace
-            //     timer (60 s after the last child detaches) remains
-            //     the *only* legitimate "everyone's gone, really
-            //     exit" signal in normal operation.
-            //   • Nobody attached and no pending dialog ⇒ honour the
-            //     exit, but run pre_exit_cleanup first so any ssh-NTR
-            //     tunnel children get SIGTERM instead of becoming
-            //     launchd orphans.
-            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
-                let attached = app
-                    .try_state::<Arc<lifetime::LifetimeStats>>()
-                    .map(|s| s.child_count())
-                    .unwrap_or(0);
-                let pending_dialogs = app
-                    .try_state::<Arc<dialog::DialogState>>()
-                    .map(|s| s.stats().orphan_count)
-                    .unwrap_or(0);
-
-                if code.is_none() && (attached > 0 || pending_dialogs > 0) {
-                    // Tauri-initiated quit (no explicit exit code).
-                    // Someone still needs us — keep the process alive.
+            // The decision no longer reads child count or window visibility —
+            // both were proxies that the 0.4.43–0.4.45 patches kept getting
+            // wrong. It is `host_should_exit(explicit, cd_running)`: honour the
+            // exit only when an uninstall/update latched `ExitAuthority`, or
+            // the Wirt (Claude Desktop) is already gone; otherwise default-deny
+            // via `api.prevent_exit()`. The watcher owns the CD-gone exit in
+            // normal operation; this gate is the backstop for every other
+            // Tauri-initiated termination.
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                // Default-deny (Invariant I1). The only legitimate planned
+                // exits are: (b) uninstall / (c) update-restart — both latch
+                // `ExitAuthority` before asking Tauri to terminate — or (a) the
+                // Wirt (Claude Desktop) is already gone. Every other
+                // Tauri-initiated exit (last-window-close, ⌘Q, OS quit-all) is
+                // vetoed. This is what stops the headless host dying ~18 ms
+                // after a dialog submit (v0.4.42) and on overnight churn
+                // (v0.4.45): the child count and window visibility no longer
+                // enter the decision at all.
+                let explicit = app
+                    .try_state::<Arc<lifetime::ExitAuthority>>()
+                    .map(|a| a.is_authorized())
+                    .unwrap_or(false);
+                let cd_running = setup::is_claude_desktop_running();
+                if !lifetime::host_should_exit(explicit, cd_running) {
                     logging::trace(&format!(
-                        "[aiui] veto tauri-exit-requested: attached_children={attached}, \
-                         pending_dialogs={pending_dialogs}"
+                        "[aiui] veto ExitRequested (default-deny): explicit={explicit}, \
+                         claude_desktop_running={cd_running}"
                     ));
+                    lifecycle_log::record(lifecycle_log::LifecycleEvent::ExitDenied);
                     api.prevent_exit();
                     return;
                 }
@@ -1708,11 +1825,20 @@ pub fn run() {
                     .try_state::<Arc<config::AppConfig>>()
                     .map(|cfg| cfg.http_port)
                     .unwrap_or(7777);
-                let reason = if code.is_some() {
-                    "tauri-exit-requested-explicit"
+                let reason = if explicit {
+                    "exit-authorized-uninstall-or-update"
                 } else {
-                    "tauri-exit-requested-no-attached"
+                    "exit-claude-desktop-gone"
                 };
+                lifecycle_log::transition(lifecycle_log::Phase::Exiting);
+                lifecycle_log::record(lifecycle_log::LifecycleEvent::HostExit { reason });
+                // Forensic dump of the lifetime event ring on the way out —
+                // the post-hoc record that was missing during the 0.4.x
+                // instability (#137 cross-cutting).
+                for line in lifecycle_log::recent() {
+                    logging::trace(&format!("[aiui] lifecycle-dump {line}"));
+                }
+                logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
                 housekeeping::pre_exit_cleanup(port, reason);
             }
 
@@ -1734,7 +1860,14 @@ pub fn run() {
                     // would otherwise be greeted by a leftover empty
                     // frame (v0.4.46, Bug B+).
                     sweep_orphan_dialog_window(app);
-                    show_settings_window(app);
+                    // BUT: macOS also fires Reopen as a side-effect of a dialog
+                    // window closing. Surfacing settings then is the
+                    // 2026-05-31 "setup window popped up after I closed a
+                    // dialog" bug. Only surface settings for a *genuine*
+                    // reactivation — i.e. not right after a dialog teardown.
+                    if !dialog_torn_down_recently() {
+                        show_settings_window(app);
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]

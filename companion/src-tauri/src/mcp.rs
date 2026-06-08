@@ -275,6 +275,7 @@ fn tools_list() -> Value {
                 "required": ["title"],
                 "properties": {
                     "title": { "type": "string", "description": "Decision as a question, ≤ 10 words." },
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "message": { "type": "string", "description": "One sentence stating the concrete consequence." },
                     "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
                     "destructive": { "type": "boolean", "default": false, "description": "Red confirm button — for deletions/rollbacks only." },
@@ -300,6 +301,7 @@ fn tools_list() -> Value {
                 "type": "object",
                 "required": ["question", "options"],
                 "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "question": { "type": "string", "description": "Full question, imperative or interrogative." },
                     "options": {
                         "type": "array",
@@ -322,11 +324,12 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, mermaid, wireframe, image_grid, list, table, tree. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, mermaid, wireframe, image_grid, list, table, tree. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. Non-secret fields with a `target` are written AND returned. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
                 "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
                     "title": { "type": "string" },
                     "fields": { "type": "array", "items": { "type": "object" }, "description": "Flat field list. Use this OR `tabs`, not both." },
                     "tabs": {
@@ -345,7 +348,62 @@ fn tools_list() -> Value {
                     "header": { "type": "string" },
                     "actions": { "type": "array", "items": { "type": "object" } },
                     "submit_label": { "type": "string" },
-                    "cancel_label": { "type": "string" }
+                    "cancel_label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"], "description": "Starting window size hint: s (compact), m (roomy), l (large). aiui picks good local defaults and clamps to the screen. The window is always resizable; this only sets the *initial* size, and never opens smaller than the content needs. Use m/l for forms with images, tables, wireframes, or many fields so they don't open cramped." },
+                    "width": { "type": "number", "description": "Explicit starting window width in logical px (overrides `size`). Rarely needed — prefer `size`." },
+                    "height": { "type": "number", "description": "Explicit starting window height in logical px (overrides `size`). Rarely needed — prefer `size`." }
+                }
+            }
+        },
+        {
+            "name": "gallery",
+            "description": "Batch visual review: show several images and/or videos at once and collect a per-item decision (+ optional comment) in ONE window, instead of calling `confirm` once per asset. Use this for \"review these N generated images\", \"triage this batch of screenshots\", \"approve/revise/skip each of these renders\". Each item needs a stable `value` (the key you get decisions back under) and a `src` (data: URL, http(s):// URL, or absolute / `~/`-rooted local path on YOUR host — same resolution rules as the form `image` field; videos are detected by data:video/ MIME or .mp4/.mov/.m4v/.webm extension and rendered with native controls). Per-item buttons come from `actions` (default Approve / Revise / Skip); set `comment: true` to show a free-text field per item. Returns {cancelled, decisions: {\"<item value>\": {decision, comment?}}} — only items the user touched appear. For a single image sign-off use `confirm` with `image`; for one-of-N choice use `ask` with thumbnails. **Blocks until the user submits or cancels. Response can take minutes — progress notifications fire every ~10 s.**",
+            "inputSchema": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
+                    "title": { "type": "string", "description": "What the user is reviewing, e.g. \"Review 6 hero renders\"." },
+                    "description": { "type": "string", "description": "One sentence of context shown under the title." },
+                    "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
+                    "items": {
+                        "type": "array",
+                        "description": "The assets to review. Order is preserved.",
+                        "items": {
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {
+                                "value": { "type": "string", "description": "Stable id; keys the returned decision. Must be non-empty and unique." },
+                                "src": { "type": "string", "description": "Image or video source: data: URL, http(s):// URL, or absolute / ~/ local path on YOUR host." },
+                                "alt": { "type": "string" },
+                                "label": { "type": "string", "description": "Caption shown under the thumbnail." },
+                                "detail": { "type": "string", "description": "Short context line beside/under the label." },
+                                "max_height": { "type": "number", "description": "Cap thumbnail height in px." }
+                            }
+                        }
+                    },
+                    "actions": {
+                        "type": "array",
+                        "description": "Per-item decision buttons. Defaults to Approve (green) / Revise / Skip if omitted.",
+                        "items": {
+                            "type": "object",
+                            "required": ["label", "value"],
+                            "properties": {
+                                "label": { "type": "string" },
+                                "value": { "type": "string", "description": "Returned as the item's `decision`." },
+                                "primary": { "type": "boolean" },
+                                "success": { "type": "boolean" },
+                                "destructive": { "type": "boolean" }
+                            }
+                        }
+                    },
+                    "comment": { "type": "boolean", "default": false, "description": "Show a free-text comment field per item." },
+                    "columns": { "type": "number", "description": "Grid columns. Omit for responsive auto-fill." },
+                    "submit_label": { "type": "string" },
+                    "cancel_label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"], "description": "Starting window size hint: s / m / l. Default auto-sizes to the item count; pass l for a large batch or tall thumbnails so the grid opens roomy. Always resizable; never opens smaller than the content needs." },
+                    "width": { "type": "number", "description": "Explicit starting window width in logical px (overrides `size`)." },
+                    "height": { "type": "number", "description": "Explicit starting window height in logical px (overrides `size`)." }
                 }
             }
         },
@@ -533,6 +591,7 @@ async fn tools_call(
                     "cancelLabel": args.get("cancel_label"),
                     "image": args.get("image")
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -550,6 +609,7 @@ async fn tools_call(
                     "multiSelect": args.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false),
                     "allowOther": args.get("allow_other").and_then(|v| v.as_bool()).unwrap_or(false)
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -568,8 +628,37 @@ async fn tools_call(
                     "tabs": args.get("tabs"),
                     "actions": args.get("actions"),
                     "submitLabel": args.get("submit_label"),
-                    "cancelLabel": args.get("cancel_label")
+                    "cancelLabel": args.get("cancel_label"),
+                    "size": args.get("size"),
+                    "width": args.get("width"),
+                    "height": args.get("height")
                 }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
+                cfg,
+                http,
+            )
+            .await,
+            format_dialog_result,
+        ),
+
+        "gallery" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "gallery",
+                    "title": args.get("title"),
+                    "description": args.get("description"),
+                    "header": args.get("header"),
+                    "items": args.get("items"),
+                    "actions": args.get("actions"),
+                    "comment": args.get("comment").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "columns": args.get("columns"),
+                    "submitLabel": args.get("submit_label"),
+                    "cancelLabel": args.get("cancel_label"),
+                    "size": args.get("size"),
+                    "width": args.get("width"),
+                    "height": args.get("height")
+                }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
             )
@@ -619,6 +708,54 @@ fn base_url(cfg: &AppConfig) -> String {
     format!("http://127.0.0.1:{}", cfg.http_port)
 }
 
+/// Push a local video file to the companion's `POST /media` cache and return
+/// the playback URL it hands back. Reads the file on *this* host (local Mac,
+/// or the remote for an SSH-tunneled session) and uploads the bytes over the
+/// same :7777 channel the render goes through — so it works identically
+/// local and remote without any Mac→remote access. Errors (file unreadable,
+/// 413, old companion without `/media` → 404) bubble up; the caller treats
+/// them as non-fatal and leaves the original path in place.
+async fn upload_media(
+    http: &reqwest::Client,
+    cfg: &AppConfig,
+    token: &str,
+    path: &str,
+) -> Result<String, String> {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(h) => h.join(rest),
+            None => std::path::PathBuf::from(path),
+        }
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    let bytes = tokio::fs::read(&expanded)
+        .await
+        .map_err(|e| format!("read {}: {e}", expanded.display()))?;
+    let ext = crate::imageresolve::video_ext(path);
+    let url = format!("{}/media?ext={}", base_url(cfg), ext);
+    let resp = http
+        .post(&url)
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(bytes)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("POST /media: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("/media http {}", resp.status()));
+    }
+    let body = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("parse /media: {e}"))?;
+    body.get("url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "/media response missing url".to_string())
+}
+
 /// Per-call dialog rendering can fail in two structurally different
 /// ways. v0.4.36 splits them so the tool dispatcher can convert
 /// `Busy` into a structured tool result (with retry-vs-tell-user
@@ -639,6 +776,7 @@ enum RenderError {
 
 async fn render_dialog(
     spec: Value,
+    session: Option<String>,
     cfg: &AppConfig,
     http: &reqwest::Client,
 ) -> Result<Value, RenderError> {
@@ -653,22 +791,47 @@ async fn render_dialog(
     // (imageresolve::resolve_image_srcs) only knows about HTTPS — it
     // would never see the remote's filesystem.
     let mut spec = spec;
+    // Video (2026-05-31): local video files are too big to inline as `data:`
+    // (10 MB cap, base64 bloat), so push them to the companion's /media cache
+    // and swap the path for the returned loopback playback URL. Done BEFORE
+    // `resolve_local_paths` so the image inliner never tries to base64 a
+    // video. Upload failures are non-fatal — the path is simply left as-is
+    // (the WebView shows a broken player rather than the call blowing up).
+    let videos = crate::imageresolve::collect_local_video_paths(&spec);
+    if !videos.is_empty() {
+        let mut map = std::collections::HashMap::new();
+        for path in videos {
+            match upload_media(http, cfg, &token, &path).await {
+                Ok(media_url) => {
+                    map.insert(path, media_url);
+                }
+                Err(e) => trace(&format!("render_dialog: media upload failed for {path}: {e}")),
+            }
+        }
+        crate::imageresolve::replace_srcs(&mut spec, &map);
+    }
     crate::imageresolve::resolve_local_paths(&mut spec);
-    let body = json!({ "spec": spec });
-    // POST /render is long-poll: the GUI holds the response open
-    // until the user clicks submit/cancel or the companion-side
-    // `DIALOG_TTL` sweep fires (currently 2 h). Override the shared
-    // reqwest client's 300-s default per-call so the user has the
-    // full TTL to fill out the form. We add 60 s slack on top so a
-    // backend-side TTL cancel still reaches us cleanly before our
-    // own timeout. v0.4.41.
+    // Step 4 (I8): forward the optional caller `session` label. This is the
+    // local bridge, so there is no `session_origin` (the companion treats an
+    // absent origin as local).
+    let body = json!({ "spec": spec, "session": session });
+    // Async render (Step 3): POST opts in via `x-aiui-async`; the companion
+    // registers + surfaces the dialog and returns immediately with
+    // `{id, ttl_secs}` (202). We then poll `GET /render/{id}` in bounded
+    // windows until the terminal result. No single connection is held for the
+    // user's think-time, so a tunnel/GUI blip can cost at most one poll
+    // window — never a multi-minute ReadError. The POST itself only covers
+    // registration + the ack handshake, so a short timeout suffices.
+    //
+    // Backward-compatible: an older companion ignores the unknown header and
+    // answers synchronously (200 with the terminal `{cancelled, …}` shape) —
+    // detected after the status checks below and used directly, no polling.
     let resp = http
         .post(&url)
         .bearer_auth(&token)
+        .header("x-aiui-async", "1")
         .json(&body)
-        .timeout(std::time::Duration::from_secs(
-            crate::dialog::DIALOG_TTL.as_secs() + 60,
-        ))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
@@ -711,9 +874,57 @@ async fn render_dialog(
             resp.status()
         )));
     }
-    resp.json::<Value>()
+    let accepted = resp.status() == reqwest::StatusCode::ACCEPTED;
+    let first = resp
+        .json::<Value>()
         .await
-        .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))
+        .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))?;
+    if !accepted {
+        // Synchronous companion (old): `first` is already the terminal result.
+        return Ok(first);
+    }
+    // Async companion: poll `GET /render/{id}` until terminal. Each GET is
+    // bounded (40 s > the server's ~25 s poll window) so the server always
+    // answers `{pending:true}` before we time out, and we re-poll. The loop
+    // ends on the terminal result, a 404 (id expired / never registered), or
+    // the server-side TTL turning into a terminal `cancelled` result.
+    let id = match first.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(RenderError::Transport(
+                "async /render: 202 response missing `id`".into(),
+            ))
+        }
+    };
+    let poll_url = format!("{}/render/{}", base_url(cfg), id);
+    loop {
+        let pr = http
+            .get(&poll_url)
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(40))
+            .send()
+            .await
+            .map_err(|e| RenderError::Transport(format!("GET /render/{id}: {e}")))?;
+        if pr.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RenderError::Transport(format!(
+                "aiui lost track of render {id} (expired or never registered)"
+            )));
+        }
+        if !pr.status().is_success() {
+            return Err(RenderError::Transport(format!(
+                "render poll http {}",
+                pr.status()
+            )));
+        }
+        let pv = pr
+            .json::<Value>()
+            .await
+            .map_err(|e| RenderError::Transport(format!("parse /render/{id}: {e}")))?;
+        if pv.get("pending").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        return Ok(pv);
+    }
 }
 
 /// Tool-call response signaling that the companion is alive but
