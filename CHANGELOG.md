@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.2] — 2026-06-08
+
+Targeted Cowork cold-start fix. (CHANGELOG entries for v0.5.0 – v0.8.1
+live with the release notes on GitHub for those tags; the file resumes
+here.)
+
+### Fixed
+
+- **Cowork: "MCP aiui Server disconnected" on every cold start.** When
+  Cowork (or any Claude Code client) spawned a fresh `aiui --mcp-stdio`
+  and no GUI was already running, that child cold-started the GUI —
+  and the freshly-launched GUI then ran `kill_mcp_stdio_started_before_self`
+  (v0.4.43) and SIGTERM'd its own bootstrapper. The bootstrapper carried
+  the assumption "Claude Desktop will respawn them" right in its trace
+  message; Cowork / Claude Code don't respawn, so the user's MCP
+  connection died on the first call of every cold start. (2026-06-08
+  trace: `housekeeping: killing pre-GUI mcp-stdio child pid=2483 …
+  cutoff=…`, 138 ms after the bootstrapper attached.) The pre-GUI sweep
+  is now **orphan-gated** the same way `kill_orphaned_mcp_stdio_children`
+  (v0.4.46, Bug A) handled the sibling-kill: it still reaps mcp-stdio
+  children older than the new GUI, but only when their parent wrapper
+  is already gone (`ppid==1` / absent from the snapshot). A live
+  bootstrapper has a live parent → spared. Regression tests cover both
+  the bootstrapper-spared case and the orphan-reaped case.
+
 ## [0.4.46] — 2026-05-29
 
 Dialog-lifecycle hardening. Two field-reported regressions from the
