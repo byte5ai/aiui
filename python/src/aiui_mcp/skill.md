@@ -51,6 +51,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Yes/no, especially destructive | `confirm` |
 | 2–6 options, possibly with per-option context | `ask` |
 | Multi-field input, multi-action footer | `form` |
+| Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -174,6 +175,41 @@ For "pick one (or more) of these N generated images" — logo variants,
 thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
 `multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
 
+`image_grid` *picks* among candidates. For a **separate verdict per item**
+(approve this, revise that, skip the third, optional note each) use the
+`gallery` tool below instead.
+
+## Batch review: `gallery`
+
+A standalone tool (not a `form` field) for reviewing a *batch* of images
+and/or videos and collecting one decision per item in a single window —
+instead of firing `confirm` once per asset.
+
+Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
+`actions?` (per-item buttons, default Approve / Revise / Skip),
+`comment?` (free-text per item), `columns?`. Each item's `value` must be
+non-empty and unique — it keys the result. `src` follows the standard
+image rules; **videos** (`data:video/` URL, `http(s)://` URL, or a local
+`.mp4`/`.mov`/`.m4v`/`.webm` path) render with native controls. Local
+videos of any size work — the bridge pushes them to aiui's media cache on
+the Mac and the dialog streams them back, so a remote clip plays without
+hosting it anywhere.
+
+Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
+touched items appear — an untouched item means "no verdict", not a default.
+
+## Starting window size: `size`
+
+`form` and `gallery` take an optional `size` hint — `"s"`, `"m"`, `"l"` —
+and aiui picks good local defaults, clamped to the screen. (Explicit
+`width`/`height` in logical px override it; rarely needed.) The hint is a
+**floor**: the window opens at `max(content-estimate, hint)`, so it never
+opens smaller than the content needs, but a sparse dialog can be told to
+start roomy. Windows are always resizable — but many users don't realise
+that, so opening at a comfortable size is what separates "polished" from
+"looks broken". Use `"m"`/`"l"` for forms with images/tables/wireframes/many
+fields, or galleries with a large batch; leave unset for short forms.
+
 ## `datetime` field
 
 Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
@@ -202,8 +238,36 @@ recordings or to a shoulder-surfer.
 
 Be honest with the user, though — the value still returns to you as
 plaintext in the tool response. For long-lived or high-value secrets,
-tell the user to put them in their keychain or an env var and reference
-them by name instead.
+use the `secret` field with a `target` (below) so the value never enters
+the conversation.
+
+## Secrets & file-write: `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only** (result: `{written, target,
+bytes}`, never the value).
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- `mode:"create"` — write raw value (needs `overwrite:true` to clobber).
+- `mode:"substitute"` — replace a `placeholder` occurring exactly once in
+  an existing file (YAML/TOML/INI/env); 0 or >1 → error (never misapplied).
+  Pick a **distinctive sentinel** (`__AIUI_SECRET_GITHUB_PAT__`, not a common
+  word) so the single match is unambiguous, not just lucky.
+- Destination is always your own host: the aiui module there (native app
+  locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
+  `create` and `substitute` both work identically local and remote — no
+  foreign host. The user sees the path and approves by submitting. Errors:
+  `{written:false, error}`.
+
+Replaces the fragile "guess a shell one-liner to stash a token" pattern.
+QoL + confused-deputy guard, not a hard guarantee.
 
 ## Anti-patterns (slop vs. clean)
 

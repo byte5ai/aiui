@@ -14,8 +14,11 @@ from pathlib import Path
 import pytest
 
 from aiui_mcp.server import (
+    _collect_local_videos,
+    _is_local_video,
     _looks_like_local_path,
     _read_path_as_data_url,
+    _replace_srcs,
     _resolve_local_paths,
 )
 
@@ -142,3 +145,63 @@ def test_resolve_local_paths_walks_confirm_image_and_ask_thumbnail(tmp_path: Pat
     assert ask_spec["options"][0]["thumbnail"].startswith("data:image/png;base64,")
     assert ask_spec["options"][1]["thumbnail"] == "https://leave.me/b.png"
     assert "thumbnail" not in ask_spec["options"][2]
+
+
+def test_resolve_local_paths_walks_gallery_items(tmp_path: Path) -> None:
+    """Gallery `items[].src` must resolve the same way — local image and
+    video paths inline as data:, remote/data URLs pass through.
+    """
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfake bytes")
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42fake")
+
+    gallery_spec = {
+        "kind": "gallery",
+        "items": [
+            {"value": "a", "src": str(img)},
+            {"value": "b", "src": str(vid)},
+            {"value": "c", "src": "https://leave.me/c.png"},
+            {"value": "d", "src": "data:image/png;base64,UNCHANGED"},
+        ],
+    }
+    _resolve_local_paths(gallery_spec)
+    assert gallery_spec["items"][0]["src"].startswith("data:image/png;base64,")
+    assert gallery_spec["items"][1]["src"].startswith("data:video/mp4;base64,")
+    assert gallery_spec["items"][2]["src"] == "https://leave.me/c.png"
+    assert gallery_spec["items"][3]["src"] == "data:image/png;base64,UNCHANGED"
+
+
+def test_is_local_video_classifies_correctly() -> None:
+    assert _is_local_video("/Users/me/clip.mp4")
+    assert _is_local_video("~/Movies/take.MOV")
+    assert _is_local_video("/tmp/a.webm")
+    assert _is_local_video("/tmp/a.m4v")
+    assert not _is_local_video("https://x.test/clip.mp4")
+    assert not _is_local_video("data:video/mp4;base64,AAAA")
+    assert not _is_local_video("/Users/me/photo.png")
+    assert not _is_local_video("relative/clip.mp4")
+
+
+def test_collect_and_replace_local_videos_mirrors_rust() -> None:
+    spec = {
+        "kind": "gallery",
+        "items": [
+            {"value": "a", "src": "/Users/me/one.mp4"},
+            {"value": "b", "src": "https://x.test/two.mp4"},
+            {"value": "c", "src": "/Users/me/pic.png"},
+            {"value": "d", "thumbnail": "/Users/me/one.mp4"},
+        ],
+    }
+    found: list[str] = []
+    _collect_local_videos(spec, found)
+    # De-duplicated: the same path in two slots appears once.
+    assert found == ["/Users/me/one.mp4"]
+
+    mapping = {"/Users/me/one.mp4": "http://127.0.0.1:7777/media/blob/x.mp4"}
+    _replace_srcs(spec, mapping)
+    assert spec["items"][0]["src"] == "http://127.0.0.1:7777/media/blob/x.mp4"
+    assert spec["items"][3]["thumbnail"] == "http://127.0.0.1:7777/media/blob/x.mp4"
+    # Untouched: https video and the image.
+    assert spec["items"][1]["src"] == "https://x.test/two.mp4"
+    assert spec["items"][2]["src"] == "/Users/me/pic.png"

@@ -16,19 +16,23 @@ registered in the companion's settings window.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.metadata
 import importlib.resources as resources
 import logging
 import mimetypes
 import os
+import socket
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 
 def _version() -> str:
@@ -79,6 +83,28 @@ TOKEN_PATH = Path(os.environ.get("AIUI_TOKEN_PATH", _default_token_path())).expa
 ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
 TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
 HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
+
+# Cooperative version floor (Step 2). The wire contract between this bridge and
+# the Mac companion is versioned independently of either side's release version.
+# This bridge speaks wire v1; if the companion reports a *different*
+# wire_version we surface a structured "restart this session" tool error rather
+# than letting the Mac kill us to force a version. Ordinary app-version skew is
+# tolerated — only an incompatible wire_version is fatal. Checked once per
+# process (memoised in `_wire_checked`).
+EXPECTED_WIRE_VERSION = 1
+_wire_checked = False
+
+# Cold-start poll (Step 3, bridge parity with the Rust bridge's wait_for_aiui).
+# Before the first render call we poll the unauthenticated /ping until the
+# companion answers or this budget elapses — so a freshly-launched Claude
+# Desktop / just-up SSH tunnel gets time to start serving instead of failing
+# the first call. Replaces the brittle single 3 s /health preflight.
+COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
+
+# Per-GET timeout for the async-render poll. Must exceed the companion's
+# ~25 s server-side poll window so the server always answers `{pending:true}`
+# before we time out, letting us re-poll cleanly.
+ASYNC_POLL_TIMEOUT_S = 40.0
 
 _INSTRUCTIONS = """\
 aiui is connected — you can render native dialogs on the user's Mac \
@@ -152,6 +178,20 @@ async def _preflight() -> None:
                 f"local aiui instance holding the port. Run `pkill -f '^aiui$'` on "
                 f"this host. ({_explain_exc(e)})"
             ) from e
+        except httpx.ReadError as e:
+            # Connected at the TCP layer but the stream closed with no HTTP
+            # response — the classic remote signature of "tunnel is up but the
+            # Mac side isn't serving" (stale SSH reverse-forward bound to :7777
+            # with a dead aiui behind it). Distinct from ConnectError (nothing
+            # listening) and from a clean 401/5xx.
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} accepted the connection but sent no "
+                f"response (ReadError). On a remote this means the SSH reverse-tunnel "
+                f"is up but the Mac-side aiui isn't serving — Claude Desktop may be "
+                f"closed, or a stale tunnel is squatting :7777. Open Claude Desktop on "
+                f"the Mac; if it persists, re-register this remote in aiui.app settings. "
+                f"({_explain_exc(e)})"
+            ) from e
         except httpx.RemoteProtocolError as e:
             # Connection reset / closed mid-response. The on-Mac mcp-stdio
             # child's auto-resurrect normally brings aiui.app back on the
@@ -194,6 +234,50 @@ async def _preflight() -> None:
             raise RuntimeError(
                 f"aiui companion /health returned {r.status_code}: {r.text[:200]}"
             )
+
+        # Cooperative version floor (Step 2): once per process, confirm the
+        # companion speaks a compatible wire version. Reuses this client.
+        await _check_wire_compat(client)
+
+
+async def _check_wire_compat(client: httpx.AsyncClient) -> None:
+    """One-time wire-compatibility check against the companion's `/version`.
+
+    Raises a structured ``RuntimeError`` (surfaced to the agent as a tool error)
+    on a hard wire-version mismatch, telling the user to restart this Claude
+    Code session so it respawns ``aiui-mcp`` at a matching version — the
+    cooperative replacement for the Mac externally killing this bridge.
+
+    Tolerant by design: a companion too old to report ``wire_version`` (field
+    absent → treated as v1), or any transient error reading ``/version``, does
+    NOT block — we only hard-fail on an explicit, incompatible ``wire_version``.
+    Memoised via the module-level ``_wire_checked`` so it costs one extra GET
+    per process, on the first render only.
+    """
+    global _wire_checked
+    if _wire_checked:
+        return
+    try:
+        r = await client.get(
+            f"{ENDPOINT}/version",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+        r.raise_for_status()
+        remote_wire = int(r.json().get("wire_version", EXPECTED_WIRE_VERSION))
+    except Exception as e:  # noqa: BLE001 — tolerate skew; never block on a read error
+        log.debug("wire-compat check skipped (could not read /version): %s", _explain_exc(e))
+        _wire_checked = True
+        return
+    if remote_wire != EXPECTED_WIRE_VERSION:
+        # Do NOT memoise a failure — leave it un-set so a subsequent call
+        # (e.g. after the user restarts the companion) re-checks cleanly.
+        raise RuntimeError(
+            f"incompatible aiui versions — this bridge (aiui-mcp {VERSION}) speaks wire "
+            f"v{EXPECTED_WIRE_VERSION}, but the companion on your Mac speaks wire "
+            f"v{remote_wire}. Restart this Claude Code session so it respawns aiui-mcp at "
+            f"a matching version (or update the side that is behind)."
+        )
+    _wire_checked = True
 
 
 _SRC_KEYS = {"src", "thumbnail"}
@@ -268,26 +352,315 @@ def _resolve_local_paths(node: Any) -> None:
             _resolve_local_paths(item)
 
 
-async def _post_render(spec: dict[str, Any]) -> dict[str, Any]:
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+
+
+def _is_local_video(s: str) -> bool:
+    """A local-filesystem path pointing at a video by extension. Mirrors
+    `is_local_video_path` in the Rust bridge and `isVideo` in Gallery.svelte.
+    """
+    if not _looks_like_local_path(s):
+        return False
+    stem = s.lower().split("?", 1)[0].split("#", 1)[0]
+    return stem.endswith(_VIDEO_EXTS)
+
+
+def _collect_local_videos(node: Any, out: list[str]) -> None:
+    """Gather distinct local video paths from every `src`/`thumbnail` slot."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _SRC_KEYS and isinstance(value, str) and _is_local_video(value):
+                if value not in out:
+                    out.append(value)
+            else:
+                _collect_local_videos(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_local_videos(item, out)
+
+
+def _replace_srcs(node: Any, mapping: dict[str, str]) -> None:
+    """Swap `src`/`thumbnail` strings that are keys in `mapping`."""
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key in _SRC_KEYS and isinstance(value, str) and value in mapping:
+                node[key] = mapping[value]
+            else:
+                _replace_srcs(value, mapping)
+    elif isinstance(node, list):
+        for item in node:
+            _replace_srcs(item, mapping)
+
+
+async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+    """Push local video files to the companion's `/media` cache and rewrite
+    their `src`/`thumbnail` to the returned loopback playback URL.
+
+    Videos are too big to inline as `data:` (the 10 MB cap + base64 bloat),
+    and a remote agent's file isn't readable from the Mac — so the bridge
+    streams the bytes over the same :7777 channel the render uses (loopback
+    locally, reverse tunnel remotely). Best-effort: a read error, a 413, or
+    an old companion without `/media` (404) leaves the path untouched, and
+    `_resolve_local_paths` then does whatever it can with it.
+    """
+    paths: list[str] = []
+    _collect_local_videos(spec, paths)
+    if not paths:
+        return
+    mapping: dict[str, str] = {}
+    for p in paths:
+        try:
+            data = Path(p).expanduser().read_bytes()
+        except OSError as e:
+            log.warning("video skipped (read failed) %s: %s", p, e)
+            continue
+        ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp4"
+        try:
+            r = await client.post(
+                f"{ENDPOINT}/media",
+                params={"ext": ext},
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "Content-Type": "application/octet-stream",
+                },
+                content=data,
+            )
+            r.raise_for_status()
+            url = r.json().get("url")
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("video upload failed %s: %s", p, e)
+            continue
+        if url:
+            mapping[p] = url
+    _replace_srcs(spec, mapping)
+
+
+def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Form fields carrying a non-null `target` (#135), from flat `fields` and
+    any `tabs[].fields`."""
+    out: list[dict[str, Any]] = []
+
+    def scan(fields: Any) -> None:
+        if isinstance(fields, list):
+            for f in fields:
+                if isinstance(f, dict) and f.get("target") is not None and isinstance(f.get("name"), str):
+                    out.append(f)
+
+    scan(spec.get("fields"))
+    for tab in spec.get("tabs") or []:
+        if isinstance(tab, dict):
+            scan(tab.get("fields"))
+    return out
+
+
+def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
+    """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
+    host (the bridge runs where the agent runs, so the file is always local).
+    `create` (atomic tmp+rename, refuses clobber without overwrite) or
+    `substitute` (replace a placeholder occurring exactly once). Never logs the
+    value. Returns `{written, target, bytes, error?}`.
+    """
+    raw_path = str(target.get("path", ""))
+    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path):
+        return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
+    path = Path(raw_path).expanduser()
+    display = str(path)
+    mode = target.get("mode")
+    perm_s = target.get("perm")
+    try:
+        perm = int(str(perm_s), 8) if perm_s else 0o600
+    except ValueError:
+        perm = 0o600
+
+    def atomic_write(p: Path, data: bytes) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".aiui-write-", dir=str(p.parent))
+        try:
+            os.fchmod(fd, perm)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    try:
+        if mode == "create":
+            if path.exists() and not target.get("overwrite"):
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": "file exists and overwrite is false (mode: create)"}
+            atomic_write(path, value.encode())
+            return {"written": True, "target": display, "bytes": len(value.encode())}
+        if mode == "substitute":
+            placeholder = target.get("placeholder")
+            if not placeholder:
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": "substitute mode requires 'placeholder'"}
+            existing = path.read_text()
+            count = existing.count(placeholder)
+            if count != 1:
+                return {"written": False, "target": display, "bytes": 0,
+                        "error": (f"placeholder '{placeholder}' not found in target file"
+                                  if count == 0
+                                  else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
+            updated = existing.replace(placeholder, value, 1)
+            atomic_write(path, updated.encode())
+            return {"written": True, "target": display, "bytes": len(updated.encode())}
+        return {"written": False, "target": display, "bytes": 0, "error": f"unknown mode '{mode}'"}
+    except OSError as e:
+        return {"written": False, "target": display, "bytes": 0, "error": str(e)}
+
+
+def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
+    """After a render returns, perform the local file writes for `target`
+    fields on THIS host and fold the outcomes back into the result, stripping
+    raw `secret` values so they never reach the agent. No-op on cancel or when
+    no field carries a target. Mutates `data` in place.
+    """
+    if data.get("cancelled"):
+        return
+    targets = _collect_target_fields(spec)
+    if not targets:
+        return
+    values = data.setdefault("result", {}).setdefault("values", {})
+    for field in targets:
+        name = field["name"]
+        v = values.get(name)
+        outcome = _write_local_target("" if v is None else str(v), field["target"])
+        if field.get("kind") == "secret":
+            values[name] = outcome  # write-only: raw value never returned
+        else:
+            values[name] = {"value": v, **outcome}
+
+
+async def _wait_for_aiui() -> None:
+    """Poll the unauthenticated `/ping` until the companion answers or
+    `COLDSTART_WAIT_S` elapses (Step 3, parity with the Rust bridge).
+
+    Gives a cold companion (Claude Desktop just launched, SSH tunnel just came
+    up) time to start serving before the first render, instead of failing the
+    call outright. Tolerant: on timeout we simply fall through to `_preflight`,
+    which produces the precise reachability diagnosis. `/ping` is cheap and
+    needs no token, so this is a light readiness gate, not a full health check.
+    """
+    deadline = time.monotonic() + COLDSTART_WAIT_S
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                r = await client.get(f"{ENDPOINT}/ping")
+                if r.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass  # not up yet — keep polling within the budget
+            await asyncio.sleep(0.5)
+
+
+async def _poll_render(
+    client: httpx.AsyncClient,
+    render_id: str,
+    ctx: Context | None,
+) -> dict[str, Any]:
+    """Poll `GET /render/{id}` until the terminal result (Step 3 async render).
+
+    Each GET is bounded by `ASYNC_POLL_TIMEOUT_S` (> the server's ~25 s poll
+    window), so the server always answers `{pending:true}` before we time out
+    and we re-poll — no single connection is held for the user's think-time,
+    which is what immunises the remote path against the multi-minute-ReadError
+    class. Emits an MCP progress notification each pending iteration so the
+    client (Claude Code) knows the tool is alive, not hung.
+    """
+    poll_url = f"{ENDPOINT}/render/{render_id}"
+    iteration = 0
+    while True:
+        pr = await client.get(
+            poll_url,
+            headers={"Authorization": f"Bearer {_token()}"},
+            timeout=ASYNC_POLL_TIMEOUT_S,
+        )
+        if pr.status_code == 404:
+            raise RuntimeError(
+                f"aiui lost track of render {render_id} (expired or never "
+                f"registered). Restart the dialog."
+            )
+        pr.raise_for_status()
+        pv = pr.json()
+        if pv.get("pending") is True:
+            iteration += 1
+            if ctx is not None:
+                # Best-effort: a missing progressToken or any reporting hiccup
+                # must never break the render.
+                try:
+                    await ctx.report_progress(progress=float(iteration), total=None)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("progress report skipped: %s", _explain_exc(e))
+            continue
+        return pv
+
+
+def _session_origin() -> str:
+    """This bridge's host, auto-attached to every render as `session_origin`
+    (Step 4, I8). The Mac can't tell remotes apart at the shared `:7777`, so
+    the origin must come from the caller side — the user always sees which host
+    a dialog came from even when the agent passes no `session` label."""
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "remote"
+
+
+async def _post_render(
+    spec: dict[str, Any],
+    ctx: Context | None = None,
+    session: str | None = None,
+) -> dict[str, Any]:
+    await _wait_for_aiui()
     await _preflight()
     t0 = datetime.now(timezone.utc)
     log.info("render → kind=%s", spec.get("kind"))
-    # Resolve any absolute / `~/`-rooted file paths *before* shipping
-    # the spec down the HTTP wire. This bridge runs on the same host
-    # as the agent — local for Mac use, remote for SSH-tunneled
-    # remotes — so this is the only point in the chain where the
-    # agent's filesystem actually exists. The Mac-side server resolver
-    # only handles HTTPS.
-    _resolve_local_paths(spec)
     async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        # Video first: push local video files to the Mac's /media cache and
+        # swap their `src` for the returned playback URL — BEFORE the image
+        # inliner runs, so it never tries to base64 a huge clip.
+        await _upload_local_videos(spec, client)
+        # Resolve any absolute / `~/`-rooted file paths *before* shipping
+        # the spec down the HTTP wire. This bridge runs on the same host
+        # as the agent — local for Mac use, remote for SSH-tunneled
+        # remotes — so this is the only point in the chain where the
+        # agent's filesystem actually exists. The Mac-side server resolver
+        # only handles HTTPS.
+        _resolve_local_paths(spec)
+        # Async render (Step 3): opt in via the header. A current companion
+        # registers the dialog and answers immediately with `{id, ttl_secs}`
+        # (202); we then poll for the result. An older companion ignores the
+        # header and answers synchronously (200 with the terminal shape) — we
+        # detect that and use it directly (backward-compatible).
         r = await client.post(
             f"{ENDPOINT}/render",
-            headers={"Authorization": f"Bearer {_token()}"},
-            json={"spec": spec},
+            headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
+            json={
+                "spec": spec,
+                "session": session,
+                "session_origin": _session_origin(),
+            },
         )
         r.raise_for_status()
+        first = r.json()
+        if r.status_code == 202:
+            render_id = first.get("id")
+            if not render_id:
+                raise RuntimeError("async /render: 202 response missing `id`")
+            data = await _poll_render(client, render_id, ctx)
+        else:
+            data = first  # synchronous companion — terminal result already
+    # Issue #135: this bridge runs ON the agent's host, so `target` fields are
+    # written here as LOCAL file operations (the value arrived over the :7777
+    # channel, never via the agent). Secret values are written and stripped
+    # before the result is handed to the agent.
+    _apply_target_writes(spec, data)
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
-    data = r.json()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
         spec.get("kind"), data.get("cancelled"), dt,
@@ -308,6 +681,8 @@ async def ask(
     header: str | None = None,
     multi_select: bool = False,
     allow_other: bool = True,
+    session: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before listing options in chat and waiting for the user to type back
     which one (deploy strategy, migration path, file to act on …), call
@@ -347,7 +722,7 @@ async def ask(
         "multiSelect": multi_select,
         "allowOther": allow_other,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.tool()
@@ -360,6 +735,11 @@ async def form(
     actions: list[dict[str, Any]] | None = None,
     submit_label: str | None = None,
     cancel_label: str | None = None,
+    size: str | None = None,
+    width: float | None = None,
+    height: float | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Whenever the user needs to provide ≥ 2 related inputs, or any single
     input that doesn't belong in chat (secret, date/datetime/range,
@@ -395,6 +775,8 @@ async def form(
     FIELD KINDS:
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
     - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.
+    - secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you (#135). Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.
+    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value); a non-secret field with `target` is written AND returned. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
     - number:      {kind, name, label, default?, min?, max?, step?, required?}
     - select:      {kind, name, label, options: [{label, value}], default?, required?}
     - checkbox:    {kind, name, label, default?}
@@ -440,6 +822,16 @@ async def form(
             Without actions, defaults to Cancel + Submit.
         submit_label: Legacy fallback for the default submit button label.
         cancel_label: Legacy fallback for the default cancel button label.
+        size: Starting window size hint — "s", "m", or "l". aiui picks good
+            local defaults and clamps to the screen. The window is always
+            resizable; this only sets the *initial* size and never opens
+            smaller than the content needs. Use "m"/"l" for forms with
+            images, tables, wireframes, or many fields so they don't open
+            cramped.
+        width: Explicit starting width in logical px (overrides `size`).
+            Rarely needed — prefer `size`.
+        height: Explicit starting height in logical px (overrides `size`).
+            Rarely needed — prefer `size`.
     """
     spec = {
         "kind": "form",
@@ -451,8 +843,11 @@ async def form(
         "actions": actions,
         "submitLabel": submit_label,
         "cancelLabel": cancel_label,
+        "size": size,
+        "width": width,
+        "height": height,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.tool()
@@ -464,6 +859,8 @@ async def confirm(
     confirm_label: str | None = None,
     cancel_label: str | None = None,
     image: dict[str, Any] | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Before writing any yes/no question into chat, call this tool instead.
     Pass `destructive=True` (red button) for delete / drop / force-push /
@@ -507,7 +904,86 @@ async def confirm(
         "cancelLabel": cancel_label,
         "image": image,
     }
-    return _format_result(await _post_render(spec))
+    return _format_result(await _post_render(spec, ctx, session))
+
+
+@mcp.tool()
+async def gallery(
+    items: list[dict[str, Any]],
+    title: str | None = None,
+    description: str | None = None,
+    header: str | None = None,
+    actions: list[dict[str, Any]] | None = None,
+    comment: bool = False,
+    columns: int | None = None,
+    submit_label: str | None = None,
+    cancel_label: str | None = None,
+    size: str | None = None,
+    width: float | None = None,
+    height: float | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Batch visual review: show several images and/or videos at once and
+    collect a per-item decision (+ optional comment) in ONE window, instead
+    of calling `confirm` once per asset.
+
+    WHEN TO USE: "review these N generated images", "triage this batch of
+    screenshots", "approve/revise/skip each of these renders". For a single
+    image sign-off use `confirm` with `image`; for a one-of-N choice use
+    `ask` with thumbnails.
+
+    Each item needs a stable `value` (the key you get the decision back
+    under) and usually a `src`. `src` follows the standard aiui resolution
+    rules (data: URL, http(s) URL, or absolute / `~/` local path on YOUR
+    host). Videos are detected by `data:video/` MIME or a
+    .mp4/.mov/.m4v/.webm extension and render with native controls.
+
+    Per-item buttons come from `actions` (default Approve / Revise / Skip).
+    Set `comment=True` for a free-text field per item.
+
+    Returns `{cancelled, decisions}` where `decisions` maps each touched
+    item's `value` to `{decision, comment?}`. Items the user didn't touch
+    are omitted.
+
+    Args:
+        items: List of `{value, src?, alt?, label?, detail?, max_height?}`.
+            `value` must be non-empty and unique. Order is preserved.
+        title: What the user is reviewing, e.g. "Review 6 hero renders".
+        description: One sentence of context under the title.
+        header: Chip above the title (≤ 14 chars).
+        actions: Per-item decision buttons as
+            `[{label, value, primary?, success?, destructive?}]`. Defaults
+            to Approve (green) / Revise / Skip.
+        comment: Show a free-text comment field per item.
+        columns: Grid columns. Omit for responsive auto-fill.
+        submit_label: Footer submit button label.
+        cancel_label: Footer cancel button label.
+        size: Starting window size hint — "s", "m", or "l". Defaults to
+            auto-sizing by item count; pass "l" for a large batch or tall
+            thumbnails so the grid opens roomy. Always resizable; never opens
+            smaller than the content needs.
+        width: Explicit starting width in logical px (overrides `size`).
+        height: Explicit starting height in logical px (overrides `size`).
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
+    """
+    spec = {
+        "kind": "gallery",
+        "title": title,
+        "description": description,
+        "header": header,
+        "items": items,
+        "actions": actions,
+        "comment": comment,
+        "columns": columns,
+        "submitLabel": submit_label,
+        "cancelLabel": cancel_label,
+        "size": size,
+        "width": width,
+        "height": height,
+    }
+    return _format_result(await _post_render(spec, ctx, session))
 
 
 @mcp.prompt(name="teach")

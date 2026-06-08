@@ -65,6 +65,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Pick one of N images ("A or B or C") | `ask` with `thumbnail` per option |
 | Multi-field input, multi-action footer | `form` |
 | Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
+| Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -237,6 +238,55 @@ thumbnail candidates, asset triage. Spec: `images: [{value, src, label?}]`,
 `multi_select?`, `columns?` (default 3). Result: `{selected: [values]}`.
 Each `src` follows the same rules as `image` — see below.
 
+`image_grid` is a *picker* — one (or N) selected out of many. When you
+instead need a **separate verdict per item** — approve this, revise that,
+skip the third, with an optional note each — use the `gallery` tool below.
+
+## Batch review: `gallery`
+
+A standalone tool (not a `form` field), for reviewing a *batch* of images
+and/or videos and collecting one decision per item in a single window —
+instead of firing `confirm` once per asset.
+
+Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
+`actions?` (per-item buttons, default Approve / Revise / Skip),
+`comment?` (free-text field per item), `columns?` (default responsive).
+Each item's `value` must be non-empty and unique — it keys the result.
+`src` follows the same resolution rules as `image`; **videos** (a
+`data:video/` URL, an `http(s)://` URL, or a local `.mp4`/`.mov`/`.m4v`/
+`.webm` path) render with native `<video controls>`. Local video files of
+any size work: the bridge pushes them to aiui's media cache on the Mac and
+the dialog streams them back (range-seekable), so a remote agent's clip
+plays without you hosting it anywhere. `http(s)://` video URLs stream
+directly.
+
+Result: `{cancelled, decisions: {"<item value>": {decision, comment?}}}`.
+Only items the user actually touched appear in `decisions` — an untouched
+item means "no verdict", not a default.
+
+Use `gallery` for "review these 6 hero renders", "triage this screenshot
+batch". Use `confirm`+`image` for a single yes/no sign-off, and
+`ask`+`thumbnail` / `image_grid` when the task is *picking* among
+candidates rather than judging each one.
+
+## Starting window size: `size` / `width` / `height`
+
+`form` and `gallery` accept an optional **`size`** hint — `"s"`, `"m"`, or
+`"l"` — and aiui picks good local defaults for each, clamped to the user's
+screen. (Power users can pass explicit `width` / `height` in logical px,
+which override `size`; rarely needed.)
+
+The hint is a **floor, not a cap**: the window opens at
+`max(content-estimate, hint)`. So a content-heavy dialog never opens
+smaller than it needs (you can't cram a 12-image gallery with `size:"s"`),
+but a *sparse* dialog you know will feel cramped at the default can be told
+to start roomy. Windows are always resizable regardless — but many users
+don't realise that, so a dialog that opens at a comfortable size is the
+difference between "looks polished" and "looks broken". Reach for `"m"` or
+`"l"` when a form carries images, tables, wireframes, or many fields, or a
+gallery has a large batch / tall thumbnails. Leave it unset for ordinary
+short forms — the auto-estimate already fits those.
+
 ## Image sources (`src` / `thumbnail`)
 
 aiui takes an image source in five places:
@@ -337,8 +387,48 @@ recordings or to a shoulder-surfer.
 
 Be honest with the user, though — the value still returns to you as
 plaintext in the tool response. For long-lived or high-value secrets,
-tell the user to put them in their keychain or an env var and reference
-them by name instead.
+use the `secret` field with a `target` instead (below) so the value
+never enters the conversation.
+
+## Secrets & file-write: the `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only**: aiui writes it to the file and
+returns only `{written, target, bytes}`, never the value.
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- **`mode: "create"`** — write the raw value. Needs `overwrite: true` to
+  replace an existing file (a path typo otherwise fails loudly rather than
+  clobbering).
+- **`mode: "substitute"`** — replace a `placeholder` that occurs *exactly
+  once* in an existing file (format-agnostic: YAML/TOML/INI/env). 0 or >1
+  matches → error, never a partial or wrong write. **Pick a distinctive
+  sentinel** that cannot collide with real file content — e.g.
+  `__AIUI_SECRET_GITHUB_PAT__`, never a common word like `TOKEN` or `X`. The
+  exactly-once rule is the safety net (a colliding placeholder errors instead
+  of being misapplied), but a distinctive sentinel makes the match
+  unambiguous in the first place.
+- **Destination is always your own host** — an aiui module already runs
+  there (the native app for a local session, the bridge on a remote SSH
+  session), and it performs the write as a plain **local** file operation.
+  So `create` and `substitute` behave identically local and remote (the
+  entered value reaches that module over aiui's own channel, never via the
+  agent). You cannot target a foreign host; the user sees the resolved path
+  and approves it by submitting.
+- **Errors** come back as `{written:false, error}` — no silent success.
+
+Why it exists: it replaces the fragile "guess a shell one-liner to stash a
+token" pattern with a native dialog + a correct, atomic write whose target
+the user sees first. It's a QoL + confused-deputy guard, **not** a hard
+guarantee the agent can't read the value some other way — for that, the
+user still types it themselves outside any agent path.
 
 ## Anti-patterns (slop vs. clean)
 

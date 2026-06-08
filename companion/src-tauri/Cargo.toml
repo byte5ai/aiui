@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.4.46"
+version = "0.8.1"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""
@@ -39,7 +39,7 @@ log = "0.4"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 rand = "0.8"

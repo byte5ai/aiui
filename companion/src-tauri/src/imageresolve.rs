@@ -242,11 +242,81 @@ fn guess_mime_from_extension(path: &Path) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("avif") => "image/avif",
         Some("heic") => "image/heic",
+        // Video — for the gallery widget's `<video controls>`. Small clips
+        // inline as data: here; large ones exceed MAX_IMAGE_BYTES and are
+        // left as-is (the scp/push transfer path handles those).
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
         // Unknown extension: hand it to the WebView as octet-stream.
         // It will likely fail to render, but that's a clear "your file
         // isn't an image" signal rather than a misleading mime guess.
         _ => "application/octet-stream",
     }
+}
+
+/// True for a local-filesystem path that points at a video by extension.
+/// Used to route video through the push-to-cache `/media` path instead of
+/// the (10 MB-capped, base64-bloating) `data:` inliner. Mirrors the
+/// `isVideo` extension check in `Gallery.svelte` and the Python bridge.
+pub fn is_local_video_path(s: &str) -> bool {
+    if !looks_like_local_path(s) {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Strip any query/fragment a path-ish string might carry before matching.
+    let stem = lower.split(['?', '#']).next().unwrap_or(&lower);
+    stem.ends_with(".mp4")
+        || stem.ends_with(".mov")
+        || stem.ends_with(".m4v")
+        || stem.ends_with(".webm")
+}
+
+/// File extension (lowercase, no dot) of a local video path — for naming the
+/// uploaded cache file. Defaults to `mp4` if somehow absent.
+pub fn video_ext(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let stem = lower.split(['?', '#']).next().unwrap_or(&lower);
+    stem.rsplit('.').next().filter(|e| !e.is_empty()).unwrap_or("mp4").to_string()
+}
+
+/// Collect every distinct local video path referenced in a `src`/`thumbnail`
+/// slot anywhere in the spec. The bridge uploads each to the Mac's `/media`
+/// endpoint, then calls [`replace_srcs`] to swap the paths for the returned
+/// playback URLs — all *before* [`resolve_local_paths`] runs, so the image
+/// inliner never sees (and never tries to base64 a 200 MB) video.
+pub fn collect_local_video_paths(spec: &Value) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    walk(spec, &mut |key, value| {
+        if !SRC_KEYS.contains(&key) {
+            return;
+        }
+        if let Some(s) = value.as_str() {
+            if is_local_video_path(s) && !found.iter().any(|f| f == s) {
+                found.push(s.to_string());
+            }
+        }
+    });
+    found
+}
+
+/// Replace every `src`/`thumbnail` string that appears as a key in `map`
+/// with its mapped value. Used to swap uploaded local video paths for their
+/// `/media/blob/...` playback URLs.
+pub fn replace_srcs(spec: &mut Value, map: &std::collections::HashMap<String, String>) {
+    if map.is_empty() {
+        return;
+    }
+    walk_mut(spec, &mut |key, value| {
+        if !SRC_KEYS.contains(&key) {
+            return;
+        }
+        if let Some(s) = value.as_str() {
+            if let Some(url) = map.get(s) {
+                *value = Value::String(url.clone());
+            }
+        }
+    });
 }
 
 fn walk(value: &Value, f: &mut impl FnMut(&str, &Value)) {
@@ -329,6 +399,62 @@ async fn fetch_as_data_url(client: &reqwest::Client, url: &str) -> Result<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn is_local_video_path_classifies_correctly() {
+        assert!(is_local_video_path("/Users/me/clip.mp4"));
+        assert!(is_local_video_path("~/Movies/take.MOV"));
+        assert!(is_local_video_path("/tmp/a.webm"));
+        assert!(is_local_video_path("/tmp/a.m4v"));
+        // Not local, or not video.
+        assert!(!is_local_video_path("https://x.test/clip.mp4"));
+        assert!(!is_local_video_path("data:video/mp4;base64,AAAA"));
+        assert!(!is_local_video_path("/Users/me/photo.png"));
+        assert!(!is_local_video_path("relative/clip.mp4"));
+    }
+
+    #[test]
+    fn collect_and_replace_local_videos() {
+        let spec = json!({
+            "kind": "gallery",
+            "items": [
+                {"value": "a", "src": "/Users/me/one.mp4"},
+                {"value": "b", "src": "https://x.test/two.mp4"},
+                {"value": "c", "src": "/Users/me/pic.png"},
+                {"value": "d", "thumbnail": "/Users/me/one.mp4"}
+            ]
+        });
+        let mut found = collect_local_video_paths(&spec);
+        found.sort();
+        // De-duplicated: the same path in two slots appears once.
+        assert_eq!(found, vec!["/Users/me/one.mp4".to_string()]);
+
+        let mut spec = spec;
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "/Users/me/one.mp4".to_string(),
+            "http://127.0.0.1:7777/media/blob/x.mp4".to_string(),
+        );
+        replace_srcs(&mut spec, &map);
+        assert_eq!(
+            spec["items"][0]["src"].as_str().unwrap(),
+            "http://127.0.0.1:7777/media/blob/x.mp4"
+        );
+        assert_eq!(
+            spec["items"][3]["thumbnail"].as_str().unwrap(),
+            "http://127.0.0.1:7777/media/blob/x.mp4"
+        );
+        // Untouched: https video and the image.
+        assert_eq!(spec["items"][1]["src"].as_str().unwrap(), "https://x.test/two.mp4");
+        assert_eq!(spec["items"][2]["src"].as_str().unwrap(), "/Users/me/pic.png");
+    }
+
+    #[test]
+    fn video_ext_extracts_lowercase_extension() {
+        assert_eq!(video_ext("/a/b.MP4"), "mp4");
+        assert_eq!(video_ext("~/x.webm"), "webm");
+        assert_eq!(video_ext("/a/take.mov"), "mov");
+    }
 
     #[test]
     fn collects_src_at_any_depth() {
