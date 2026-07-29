@@ -1197,6 +1197,54 @@ else:
     })
 }
 
+/// Cheap liveness probe run before remote cleanup in the removal/uninstall
+/// paths: a single `BatchMode` ssh that runs `true`. ssh exits 255 when it
+/// cannot establish or authenticate the connection — an unreachable host, a
+/// refused connection, or (the case that motivated this: the user removes a
+/// host precisely *because* its key no longer works) "Permission denied".
+/// Any exit code the remote command itself produced (0..=254) means we got
+/// in, so the host counts as reachable. A spawn failure or a signal-killed
+/// ssh (no exit code) is treated as unreachable — better to skip remote
+/// cleanup than to spew errors we can do nothing about. `ConnectTimeout`
+/// keeps a dead host from hanging the probe on the default TCP timeout.
+pub fn host_reachable(host_alias: &str) -> bool {
+    if !is_valid_host_alias(host_alias) {
+        return false;
+    }
+    no_window(Command::new("ssh").args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=6",
+        "--",
+        host_alias,
+        "true",
+    ]))
+    .output()
+    .map(|o| matches!(o.status.code(), Some(c) if c != 255))
+    .unwrap_or(false)
+}
+
+/// Informational step emitted in place of the three remote-cleanup steps when
+/// a host is unreachable (see [`host_reachable`]). The user's action — remove
+/// this host — has still succeeded locally (ssh forward + `remotes.json`),
+/// which is all that is meaningful for a host aiui can no longer reach. We
+/// say plainly what was left behind instead of reporting red "failed" lines
+/// for remote files we have no way to touch.
+pub fn remote_cleanup_skipped(host_alias: &str) -> StepResult {
+    StepResult {
+        ok: true,
+        message: format!(
+            "Host {host_alias} nicht erreichbar — lokal deregistriert, Remote-Cleanup übersprungen."
+        ),
+        details: Some(
+            "Token, ~/.claude.json-Eintrag und Skill verbleiben auf dem Host (harmlos). \
+             Sobald der Host wieder erreichbar ist, kann er dort manuell entfernt werden."
+                .into(),
+        ),
+    }
+}
+
 pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
     if !is_valid_host_alias(host_alias) {
         return StepResult {
@@ -1262,6 +1310,18 @@ mod tests {
     #[test]
     fn classify_none() {
         assert!(classify_aiui_entry(None).is_none());
+    }
+
+    #[test]
+    fn remote_cleanup_skipped_is_a_non_error() {
+        // Removing an unreachable host is a success (deregistered locally),
+        // not a failure — it must not render as a red log line, and it must
+        // name the host and say what was left behind.
+        let r = remote_cleanup_skipped("dev@devhost");
+        assert!(r.ok);
+        assert!(r.message.contains("dev@devhost"));
+        assert!(r.message.contains("nicht erreichbar"));
+        assert!(r.details.is_some());
     }
 
     #[test]
