@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# ⚠️ LEGACY — releases run in CI now. Use the `Release (macOS)` workflow
+# (.github/workflows/release-macos.yml, workflow_dispatch) instead of this
+# script. It is the CI port of this file; signing + notarization happen on
+# GitHub-hosted macOS runners via Developer ID + App Store Connect API key.
+# This script stays as documented emergency fallback ONLY (e.g. GitHub
+# Actions outage) and requires the local prerequisites below.
+#
 # Build, sign, notarize, and publish an aiui release, including the updater
 # feed (latest.json) used by tauri-plugin-updater on running clients.
 #

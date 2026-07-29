@@ -1,16 +1,17 @@
 # Windows release pipeline for aiui — companion side only.
 #
-# Why a separate workflow: macOS releases still run through
-# `scripts/release.sh` locally (Apple-signing keys + notarytool live in
-# the maintainer's keychain, not in CI). Windows has no such anchor —
-# CI is the only practical place to produce a signed NSIS installer.
+# Why a separate workflow: macOS releases run through
+# `release-macos.yml` (workflow_dispatch; Developer ID + notarytool via
+# App Store Connect API key, all in CI). Windows artifacts are attached
+# in a second step because the Windows port is WIP and not every release
+# ships one.
 #
 # This workflow is **manually triggered** (`workflow_dispatch`) against
-# a tag the maintainer already created with `scripts/release.sh`. That
-# script publishes the macOS GitHub release plus the initial
-# `latest.json`; this workflow then attaches the Windows installer +
-# updater bundle to the same release and rewrites `latest.json` to add
-# the `windows-x86_64` platform entry.
+# a tag/release that `release-macos.yml` already created. That workflow
+# publishes the macOS GitHub release plus the initial `latest.json`;
+# this workflow then attaches the Windows installer + updater bundle to
+# the same release and rewrites `latest.json` to add the
+# `windows-x86_64` platform entry.
 #
 # One-time setup (see also: scripts/release.sh header):
 #
