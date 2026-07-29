@@ -6,6 +6,16 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **macOS releases moved to CI (`release-macos.yml`).** The full release
+  pipeline — Tauri build, Developer-ID codesign, notarization + stapling
+  (App Store Connect API key), DMG, signed updater bundle +
+  `latest.json`, tag + GitHub release, PyPI publish — now runs as a
+  manually dispatched GitHub Actions workflow on a macOS runner, ported
+  from `scripts/release.sh`. The script stays as documented emergency
+  fallback; signing material lives in Actions secrets, not in a local
+  keychain. Inputs: `version` (sync-checked against all three manifests
+  before any build minute is spent), `prerelease` (validate-first flow),
+  `publish-pypi`.
 - **Forward-compat guard for the MCP 2026-07-28 spec.** The new stateless
   spec retires the `initialize` handshake; modern clients probe a stdio
   server with `server/discover` first and fall back to `initialize` on

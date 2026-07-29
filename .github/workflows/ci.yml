@@ -95,7 +95,8 @@ jobs:
 
       # Windows-only: produce a real NSIS installer so we can hand the
       # `.exe` to a tester or run it on a Windows VM. Mac CI stays
-      # bundle-less — releases are still cut manually via scripts/release.sh.
+      # bundle-less — macOS release bundles are built by release-macos.yml
+      # (workflow_dispatch).
       - name: Install Tauri CLI
         if: matrix.build_bundle
         run: npm install --global @tauri-apps/cli@^2

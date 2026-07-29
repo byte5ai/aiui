@@ -1,0 +1,302 @@
+# macOS release pipeline for aiui — CI port of scripts/release.sh.
+#
+# Why CI and not the maintainer's Mac: signing + notarization run
+# exclusively in GitHub Actions per the global convention
+# (~/.claude/references/macos_signing.md — Developer ID Application
+# certificate + App Store Connect API key, no Apple-ID password, no 2FA).
+# The keychain/notary steps below are inlined from the reusable template
+# `iret77/host-admin skills/devhost-setup/templates/macos-sign.yml`
+# instead of called via `workflow_call`, because aiui signs and notarizes
+# THREE artifacts in sequence (app → zip, dmg, updater bundle) and the
+# DMG must be built from the already-stapled .app — a single
+# `artifact-path` invocation in a separate job cannot express that.
+#
+# Manually triggered (workflow_dispatch) — never on push. macOS runners
+# bill at 10× Linux; a release run is a deliberate, single-job spend.
+# The version-sync check runs FIRST so a drifted dispatch dies in
+# seconds, not after a 20-minute build (CI playbook: cheap before
+# expensive).
+#
+# Required secrets (org- or repo-level on byte5ai/aiui):
+#   MACOS_CERTIFICATE_P12_BASE64      Developer ID Application .p12, base64
+#   MACOS_CERTIFICATE_PASSWORD        .p12 export password
+#   MACOS_NOTARY_KEY_ID               App Store Connect API key ID
+#   MACOS_NOTARY_ISSUER_ID            App Store Connect issuer ID
+#   MACOS_NOTARY_KEY_P8_BASE64        .p8 API private key, base64
+#   TAURI_SIGNING_PRIVATE_KEY         minisign private key (literal content)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (empty string if none)
+#   UV_PUBLISH_TOKEN                  PyPI token, project-scoped to aiui-mcp
+#
+# The Windows installer is attached afterwards by release-windows.yml
+# (also workflow_dispatch, against the release this workflow creates).
+
+name: Release (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.8.3) — must match Cargo.toml / tauri.conf.json / pyproject.toml"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as GitHub pre-release (updater clients skip it; promote later)"
+        required: false
+        type: boolean
+        default: false
+      publish-pypi:
+        description: "Publish aiui-mcp to PyPI (PyPI versions are permanent — disable for validate-first runs)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # tag push + release creation
+
+concurrency:
+  group: release-macos
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Four places must agree on the version BEFORE we spend build
+      # minutes: Cargo.toml (build), tauri.conf.json (Info.plist),
+      # pyproject.toml (PyPI artifact → what `uvx aiui-mcp` resolves on
+      # remote hosts), and the dispatched version (tag/release). Drift
+      # between them produced #82 (updater confusion) and the
+      # v0.4.2/v0.4.21 Tauri-vs-PyPI split on 2026-04-28.
+      - name: Check version sync
+        run: |
+          set -euo pipefail
+          grep -q "^version = \"${VERSION}\"" companion/src-tauri/Cargo.toml \
+            || { echo "Cargo.toml does not match ${VERSION}"; exit 1; }
+          CONF="$(python3 -c 'import json;print(json.load(open("companion/src-tauri/tauri.conf.json"))["version"])')"
+          [ "$CONF" = "$VERSION" ] \
+            || { echo "tauri.conf.json is ${CONF}, expected ${VERSION}"; exit 1; }
+          PYV="$(grep -E '^version = ' python/pyproject.toml | awk -F'"' '{print $2}')"
+          [ "$PYV" = "$VERSION" ] \
+            || { echo "pyproject.toml is ${PYV}, expected ${VERSION}"; exit 1; }
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — bump the version or delete the tag first."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: companion/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion/src-tauri -> target
+          key: release-aarch64-apple-darwin
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      # Ephemeral keychain + Developer ID import — from the macos-sign.yml
+      # template. The keychain password is generated per run and never a
+      # secret; the .p12 is removed as soon as it is imported.
+      - name: Import Developer ID certificate
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$CERT_B64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$CERT_PATH" -P "$CERT_PW" -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk '/Developer ID Application/{print $2; exit}')"
+          [ -n "$IDENTITY" ] || { echo "No 'Developer ID Application' identity in the .p12"; exit 1; }
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          rm -f "$CERT_PATH"
+
+      - name: Build frontend
+        working-directory: companion
+        run: npm ci && npm run build
+
+      # APPLE_SIGNING_IDENTITY is picked up by the Tauri bundler (signs the
+      # .app during build); TAURI_SIGNING_PRIVATE_KEY produces the signed
+      # updater artifacts (createUpdaterArtifacts: true).
+      - name: Tauri build (aarch64, signed + updater artifacts)
+        working-directory: companion
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target aarch64-apple-darwin
+
+      # The in-app updater reads CFBundleShortVersionString to decide
+      # what's "current" — a drifted bundle reproduces #82 on the next
+      # update. Fail here, before notarization spends minutes.
+      - name: Verify bundled Info.plist version
+        run: |
+          set -euo pipefail
+          APP="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          [ "$PLIST_VERSION" = "$VERSION" ] \
+            || { echo "Info.plist is ${PLIST_VERSION}, expected ${VERSION}"; exit 1; }
+
+      - name: Codesign with entitlements
+        run: |
+          set -euo pipefail
+          APP="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
+          codesign --force --deep --options runtime \
+            --keychain "$SIGN_KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" \
+            --entitlements companion/src-tauri/entitlements.plist \
+            "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Write notary API key
+        env:
+          KEY_B64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+
+      - name: Notarize + staple app
+        env:
+          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          APP="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
+          ZIP="aiui-${VERSION}-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          # Re-create the distributable zip AFTER stapling so the ticket
+          # ships inside it.
+          rm -f "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
+      - name: Build, sign, notarize DMG
+        env:
+          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          DMG="$PWD/aiui-${VERSION}-arm64.dmg"
+          rm -f "$DMG"
+          (cd companion && npx appdmg src-tauri/dmg/config.json "$DMG")
+          codesign --force --keychain "$SIGN_KEYCHAIN" \
+            --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+          xcrun stapler staple "$DMG"
+
+      # Updater bundle is re-created from the STAPLED app, then signed with
+      # the minisign key; tauri-updater expects the literal .sig content in
+      # latest.json.
+      - name: Build updater bundle + latest.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP_DIR="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
+          BUNDLE="$APP_DIR/aiui.app.tar.gz"
+          rm -f "$BUNDLE" "$BUNDLE.sig"
+          tar -C "$APP_DIR" -czf "$BUNDLE" aiui.app
+          (cd companion && npx tauri signer sign "$GITHUB_WORKSPACE/$BUNDLE") >/dev/null
+          SIG_JSON="$(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' "$BUNDLE.sig")"
+          cp "$BUNDLE" "aiui-${VERSION}-updater-arm64.tar.gz"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > latest.json <<JSON
+          {
+            "version": "${VERSION}",
+            "notes": "aiui ${TAG} — see https://github.com/byte5ai/aiui/releases/tag/${TAG}",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": ${SIG_JSON},
+                "url": "https://github.com/byte5ai/aiui/releases/download/${TAG}/aiui-${VERSION}-updater-arm64.tar.gz"
+              }
+            }
+          }
+          JSON
+
+      # Built before tagging/publishing so a packaging regression aborts
+      # the release with nothing shipped yet.
+      - name: Build Python package
+        working-directory: python
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          uv build
+          ls dist/aiui_mcp-${VERSION}-*.whl dist/aiui_mcp-${VERSION}.tar.gz
+
+      - name: Tag + GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          cat > notes.md <<NOTES_EOF
+          ## aiui ${TAG}
+
+          Signed + notarized by high5 ventures GmbH. From v0.1.2 on, existing installations
+          update themselves in place via the in-app updater.
+
+          **Fresh install:** Download \`aiui-${VERSION}-arm64.dmg\`, double-click, drag aiui.app into Applications, launch once.
+
+          (Zip also provided for scripted installs: \`ditto -xk aiui-${VERSION}-arm64.zip /Applications/\`.)
+
+          See the [full diff](https://github.com/byte5ai/aiui/commits/${TAG}).
+          NOTES_EOF
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            "aiui-${VERSION}-arm64.dmg" \
+            "aiui-${VERSION}-arm64.zip" \
+            "aiui-${VERSION}-updater-arm64.tar.gz" \
+            "latest.json" \
+            --repo byte5ai/aiui \
+            --title "aiui ${TAG}" \
+            --notes-file notes.md \
+            $PRERELEASE_FLAG
+
+      # PyPI LAST, after the GitHub release succeeded — PyPI versions are
+      # permanent. If this step fails, the Tauri side is already shipped;
+      # recovery is re-running with the same version and publish-pypi only
+      # after fixing the token (uv publish is idempotent-safe: re-uploading
+      # an existing version fails loudly instead of overwriting).
+      - name: Publish aiui-mcp to PyPI
+        if: ${{ inputs.publish-pypi }}
+        working-directory: python
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+        run: uv publish
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$SIGN_KEYCHAIN" 2>/dev/null || true
