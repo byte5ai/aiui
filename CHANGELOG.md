@@ -2,6 +2,56 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.3] — 2026-07-29
+
+### Added
+
+- **Forward-compat guard for the MCP 2026-07-28 spec.** The new stateless
+  spec retires the `initialize` handshake; modern clients probe a stdio
+  server with `server/discover` first and fall back to `initialize` on
+  any non-modern JSON-RPC error. Both aiui servers already answer that
+  probe correctly (Rust: `-32601`, Python/FastMCP: `-32602`) — but
+  nothing pinned the behavior down. Now covered by unit tests on the
+  Rust dispatcher (probe → `-32601`; `initialize` → protocol version
+  `2025-06-18` + non-empty `instructions`) and a CI smoke assertion
+  against the built Python wheel, so a refactor can't silently break
+  the fallback signal modern clients rely on.
+
+### Changed
+
+- **Python `mcp` dependency capped at `<2`.** The MCP spec release
+  2026-07-28 makes the protocol stateless and comes with substantially
+  reworked SDKs ("SDK v2" / client-server split). Remote hosts install
+  `aiui-mcp` via `uvx aiui-mcp==<version>`, which re-resolves the open
+  `mcp>=1.26.0` dependency on every cold start — so a breaking 2.x SDK
+  release would have taken down every remote session without any change
+  on our side. The pin (`mcp>=1.26.0,<2`) freezes the remote path on the
+  1.x line until aiui migrates to the new spec deliberately.
+
+### Fixed
+
+- **Removing an unreachable remote reported red failures instead of
+  succeeding.** Deleting a host (or running a full uninstall) fires three
+  ssh-based cleanup steps — remote token, `~/.claude.json` entry, remote
+  skill. When the host is unreachable — which is often *exactly why* it's
+  being removed, e.g. its key no longer authenticates — each of those
+  steps failed with `Permission denied (publickey)` and surfaced as a red
+  error line, even though the local deregistration (ssh forward +
+  `remotes.json`) had already succeeded and the remote files are
+  untouchable anyway. Removal now probes reachability once
+  (`host_reachable`, a `BatchMode` ssh that treats exit 255 as
+  unreachable) and, for a dead host, emits a single calm "lokal
+  deregistriert, Remote-Cleanup übersprungen" line naming what was left
+  behind — instead of three failures for files aiui can't reach. Also
+  fixed a latent dishonesty in the skill-removal step, which used to
+  report green regardless of the ssh exit status; gated behind the same
+  probe, it now reports a real failure only when a *reachable* host's
+  removal genuinely fails.
+- **Contact address corrected in package metadata and SECURITY.md.**
+  Both carried a non-existent alias as author/security contact; they now
+  point to the real byte5 address. Wheels published before 0.8.3 keep
+  the old author field — PyPI metadata is immutable per release.
+
 ## [0.8.2] — 2026-06-08
 
 Targeted Cowork cold-start fix. (CHANGELOG entries for v0.5.0 – v0.8.1

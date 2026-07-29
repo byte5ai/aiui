@@ -910,12 +910,19 @@ async fn remove_remote(
     // Stop the tunnel first so the forward port is freed before we touch
     // ssh config and remote token.
     tm.stop(&host_alias).await;
-    let results = vec![
-        setup::remove_ssh_forward(&host_alias, cfg.http_port),
-        setup::remove_token_from_remote(&host_alias),
-        setup::remove_claude_code_config_remote(&host_alias),
-        skill::remove_from_remote(&host_alias),
-    ];
+    // ssh-forward removal is local, so it always runs. The remaining three
+    // steps reach into the host over ssh; if the host is unreachable — which
+    // is often exactly why it's being removed — probe once and emit a single
+    // calm "skipped" line instead of three red failures. Local dereg below
+    // runs regardless, so the host still disappears from the list. See #142-ff.
+    let mut results = vec![setup::remove_ssh_forward(&host_alias, cfg.http_port)];
+    if setup::host_reachable(&host_alias) {
+        results.push(setup::remove_token_from_remote(&host_alias));
+        results.push(setup::remove_claude_code_config_remote(&host_alias));
+        results.push(skill::remove_from_remote(&host_alias));
+    } else {
+        results.push(setup::remote_cleanup_skipped(&host_alias));
+    }
     let list: Vec<String> = setup::load_remotes()
         .into_iter()
         .filter(|h| h != &host_alias)
@@ -953,9 +960,15 @@ async fn uninstall_all(
     results.push(setup::remove_claude_code_config());
     for host in setup::load_remotes() {
         results.push(setup::remove_ssh_forward(&host, cfg.http_port));
-        results.push(setup::remove_token_from_remote(&host));
-        results.push(setup::remove_claude_code_config_remote(&host));
-        results.push(skill::remove_from_remote(&host));
+        // Same reachability gate as remove_remote: unreachable hosts get one
+        // "skipped" line rather than three failures during a full uninstall.
+        if setup::host_reachable(&host) {
+            results.push(setup::remove_token_from_remote(&host));
+            results.push(setup::remove_claude_code_config_remote(&host));
+            results.push(skill::remove_from_remote(&host));
+        } else {
+            results.push(setup::remote_cleanup_skipped(&host));
+        }
     }
     results.push(skill::remove_locally());
     let _ = std::fs::remove_file(&cfg.token_path);

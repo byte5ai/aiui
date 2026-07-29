@@ -163,6 +163,15 @@ pub fn remove_from_remote(host_alias: &str) -> StepResult {
             message: format!("ssh {host_alias} failed"),
             details: Some(e.to_string()),
         },
+        // Report the ssh exit status honestly: callers gate this behind a
+        // reachability probe, so a non-success here means the host answered
+        // but the removal itself failed — that deserves a red line, not the
+        // unconditional green this used to return.
+        Ok(o) if !o.status.success() => StepResult {
+            ok: false,
+            message: format!("Skill-Entfernung auf {host_alias} fehlgeschlagen"),
+            details: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
         Ok(_) => StepResult {
             ok: true,
             message: format!("Skill auf {host_alias} entfernt."),

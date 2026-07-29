@@ -1,12 +1,12 @@
 [project]
 name = "aiui-mcp"
-version = "0.8.2"
+version = "0.8.3"
 description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    { name = "byte5 GmbH", email = "cw@byte5.de" },
+    { name = "byte5 GmbH", email = "cwendler@byte5.de" },
 ]
 keywords = ["mcp", "claude", "ui", "dialog", "macos", "tauri"]
 classifiers = [
@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: User Interfaces",
 ]
 dependencies = [
-    "mcp>=1.26.0",
+    "mcp>=1.26.0,<2",
     "httpx>=0.27",
 ]
 

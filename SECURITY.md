@@ -12,7 +12,7 @@ Settings).
 
 **Please do not open a public issue for security vulnerabilities.**
 
-Email the details to <cw@byte5.de> with a clear subject line
+Email the details to <cwendler@byte5.de> with a clear subject line
 (`[aiui] security report — <brief summary>`) and include:
 
 - What the vulnerability is and where in the code it lives
