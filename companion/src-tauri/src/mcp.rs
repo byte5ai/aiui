@@ -220,6 +220,7 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
     let _ = writer_task.await;
 }
 
+#[derive(Debug)]
 struct RpcError {
     code: i64,
     message: String,
@@ -1129,4 +1130,62 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
             "content": { "type": "text", "text": text }
         }]
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_cfg() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            token: "test-token".into(),
+            config_dir: PathBuf::from("/nonexistent"),
+            token_path: PathBuf::from("/nonexistent/token"),
+            http_port: 0,
+        })
+    }
+
+    /// MCP 2026-07-28 clients probe a stdio server with `server/discover`
+    /// before anything else and fall back to the legacy `initialize`
+    /// handshake on any error that is not a recognized modern error
+    /// (spec: basic/versioning, "Backward Compatibility"). Our
+    /// `-32601 method not found` IS that fallback signal — if a dispatcher
+    /// refactor ever answers `server/discover` differently (or swallows
+    /// unknown methods), modern clients lose the probe response and treat
+    /// aiui as broken instead of falling back.
+    #[tokio::test]
+    async fn server_discover_probe_gets_method_not_found() {
+        let (tx, _rx) = mpsc::channel(1);
+        let err = dispatch(
+            "server/discover",
+            json!({}),
+            &test_cfg(),
+            &reqwest::Client::new(),
+            &tx,
+        )
+        .await
+        .expect_err("server/discover must be rejected, not answered");
+        assert_eq!(err.code, -32601);
+    }
+
+    /// The legacy handshake aiui speaks until the 2026-07-28 migration:
+    /// protocol version pinned to 2025-06-18, and `instructions` present —
+    /// the one hook that breaks the model's chat-first default. Losing
+    /// either silently degrades every session.
+    #[tokio::test]
+    async fn initialize_advertises_legacy_protocol_and_instructions() {
+        let (tx, _rx) = mpsc::channel(1);
+        let res = dispatch(
+            "initialize",
+            json!({}),
+            &test_cfg(),
+            &reqwest::Client::new(),
+            &tx,
+        )
+        .await
+        .expect("initialize must succeed");
+        assert_eq!(res["protocolVersion"], "2025-06-18");
+        assert!(!res["instructions"].as_str().unwrap_or("").is_empty());
+    }
 }

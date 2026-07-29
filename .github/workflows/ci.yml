@@ -148,3 +148,11 @@ jobs:
           # initialize handshake — timeout after 2s
           (printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'; sleep 1) \
             | timeout 5 aiui-mcp | head -2
+          # MCP 2026-07-28 stdio backward-compat probe: modern clients send
+          # server/discover FIRST and fall back to initialize on any
+          # non-modern JSON-RPC error. The wheel must answer that probe
+          # deterministically with an error response (FastMCP: -32602) —
+          # silence or a hang would make modern clients treat aiui as dead
+          # instead of falling back to the legacy handshake.
+          (printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"server/discover","params":{}}'; sleep 1) \
+            | timeout 5 aiui-mcp | grep -q '"error"'
