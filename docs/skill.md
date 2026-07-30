@@ -1,15 +1,17 @@
 ---
 name: aiui
-description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation.
+description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation, `compare` for A/B(/C) side-by-side picks, `gallery` for batch image/video review.
 ---
 
 # aiui — Dialog design for Claude agents
 
-aiui exposes three MCP tools that render native dialogs on the user's machine:
+aiui exposes five MCP tools that render native dialogs on the user's machine:
 
 - `confirm` — irreversible yes/no
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback
 - `form` — composite window with typed fields and multiple action buttons
+- `gallery` — batch review of images/videos, one decision per item
+- `compare` — side-by-side A/B (or A/B/C) content compare, pick one
 
 ## Default to a dialog, not to chat
 
@@ -44,6 +46,10 @@ instead:
 - Any step that asks **"which of these images?"** with 2–6 candidates
   → `ask` with `thumbnail` per option. Use `form` + `image_grid` only
   when there are many candidates (≥ 7) or the picker needs multi-select.
+- Any step where the user needs to see **full content side by side**
+  before choosing one — two drafts, three headlines, before/after an
+  edit — → `compare`. Don't reach for `ask`+thumbnail here: a thumbnail
+  is too small to actually compare, `compare` renders the full pane.
 
 ## When chat actually wins
 
@@ -66,6 +72,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Multi-field input, multi-action footer | `form` |
 | Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
+| Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -305,9 +312,59 @@ Blocks until the user picks or dismisses the picker, exactly like the
 dialog tools — progress notifications fire every ~10 s while you wait, so
 a slow response just means the user is browsing, not that aiui broke.
 
+## Side-by-side compare: `compare`
+
+A standalone tool (not a `form` field), for an A/B or A/B/C compare:
+render 2 or more full-content **variants** next to each other and let
+the user click ONE to pick. Use it for "which draft is better", "which
+of these three headlines", "before vs. after this edit", "GPT vs.
+Claude's answer" — anywhere the full content, not a thumbnail, needs to
+be visible to decide.
+
+Spec: `variants: [{value, label?, content?, src?, alt?, detail?,
+max_height?}]` (≥ 2 entries), `sync_scroll?`, `columns?` (default
+`variants.length`, capped at 4). Each variant needs a stable `value`
+(the key returned as `selected`) and at least one of:
+
+- `content` — Markdown text: a draft, a diff, a code snippet.
+- `src` — an image or video, same resolution rules as everywhere else
+  in aiui (data:, http(s)://, or absolute/`~/` local path). Videos
+  render with native controls.
+
+A variant may carry both (an image plus a caption). `label` defaults
+to A / B / C / … by position if omitted. `detail` is a short caption
+line under the pane (source, score, timestamp).
+
+```json
+{
+  "title": "Which opening line?",
+  "variants": [
+    {"value": "a", "label": "Direct", "content": "Your invoice is 12 days overdue."},
+    {"value": "b", "label": "Soft",   "content": "Just a friendly nudge about invoice #4471."}
+  ]
+}
+```
+
+Result: `{cancelled, selected}` — `selected` is the `value` of the
+picked variant, present only when the user actually submits (Cancel/
+Escape leaves it absent, same as everywhere else in aiui).
+
+**`sync_scroll: true`** locks scroll position across all panes — reach
+for it when comparing long text so the user can scroll once and see
+matching passages line up. Leave it off for short copy or images.
+
+**`max_height` is dialog-wide, not per-variant**: set it on any one
+variant and it caps *every* pane's height, because unequal pane heights
+break the "side by side" framing. Omit it and aiui picks a sensible
+default that grows a little for image/video variants.
+
+Use `compare` instead of `ask`+`thumbnail` (thumbnails are too small to
+actually compare) or `gallery` (per-item batch review with an
+independent verdict per asset, not a single either/or pick).
+
 ## Starting window size: `size` / `width` / `height`
 
-`form` and `gallery` accept an optional **`size`** hint — `"s"`, `"m"`, or
+`form`, `gallery`, and `compare` accept an optional **`size`** hint — `"s"`, `"m"`, or
 `"l"` — and aiui picks good local defaults for each, clamped to the user's
 screen. (Power users can pass explicit `width` / `height` in logical px,
 which override `size`; rarely needed.)
@@ -325,13 +382,15 @@ short forms — the auto-estimate already fits those.
 
 ## Image sources (`src` / `thumbnail`)
 
-aiui takes an image source in five places:
+aiui takes an image source in these places:
 
 - `confirm` → `image: {src, alt?, max_height?}` — visual yes/no
 - `ask` → `options[].thumbnail` — visual pick-one-of-N
 - `form` → `image` field → `src`
 - `form` → `image_grid` → `images[].src`
 - `form` → `list` → `items[].thumbnail`
+- `gallery` → `items[].src` — batch review, images or videos
+- `compare` → `variants[].src` — side-by-side pick, images or videos
 
 In all of them the same three input formats render correctly:
 
