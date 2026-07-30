@@ -771,8 +771,8 @@ async fn update(
 const KNOWN_FIELD_KINDS: &[&str] = &[
     "text", "password", "secret", "number", "select", "checkbox", "slider",
     "date", "datetime", "date_range", "color", "static_text", "markdown",
-    "image", "annotated_image", "mermaid", "wireframe", "image_grid", "list",
-    "table", "tree",
+    "image", "annotated_image", "audio", "mermaid", "wireframe", "image_grid",
+    "list", "table", "tree",
 ];
 
 /// Validate a dialog spec *before* any window is created (v0.4.46,
@@ -1274,6 +1274,14 @@ mod validate_tests {
         // frontend widget gets a chance to render it.
         let spec = json!({"kind":"form","fields":[
             {"kind":"annotated_image","name":"spot","src":"~/shot.png","mode":"point"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_form_with_audio_field() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"audio","src":"data:audio/mpeg;base64,AAAA","label":"Sample"}
         ]});
         assert!(validate_spec(&spec).is_ok());
     }
