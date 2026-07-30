@@ -42,6 +42,21 @@ All notable changes to this project are documented here.
   the Markdown-to-sanitized-HTML renderer (previously private to
   `Form.svelte`) into `companion/src/lib/markdown.ts` so both widgets
   share one DOMPurify allowlist instead of drifting.
+- **New form field `annotated_image` — mark a point or region on an
+  image (#24).** When the answer the agent needs is spatial ("where should
+  the logo go?", "which part do I crop?", "point at the bug in this
+  screenshot"), words are a poor carrier. The field shows an image and lets
+  the user mark it directly: `mode: "point"` (click a crosshair marker,
+  default), `mode: "region"` (drag a rectangle), or `mode: "both"` (a
+  Point/Region toggle; both can be set). The `src` reuses the existing image
+  resolution (absolute / `~/` local path inlined by the bridge, `http(s)://`
+  fetched Mac-side, or `data:`). The result — under the field `name` —
+  carries **normalized 0..1** coordinates: `{point: {x, y} | null, region:
+  {x, y, w, h} | null, natural: {width, height} | null}`, resolution
+  independent, with `natural` (the image's intrinsic pixel size) so the agent
+  can recover pixel coordinates losslessly. `required` gates the submit
+  action on an annotation being present. Documented in the skill field
+  catalog and mirrored in the Rust and Python `form` tool descriptions.
 
 ## [0.8.3] — 2026-07-29
 

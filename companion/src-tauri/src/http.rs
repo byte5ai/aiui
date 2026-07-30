@@ -771,7 +771,8 @@ async fn update(
 const KNOWN_FIELD_KINDS: &[&str] = &[
     "text", "password", "secret", "number", "select", "checkbox", "slider",
     "date", "datetime", "date_range", "color", "static_text", "markdown",
-    "image", "mermaid", "wireframe", "image_grid", "list", "table", "tree",
+    "image", "annotated_image", "mermaid", "wireframe", "image_grid", "list",
+    "table", "tree",
 ];
 
 /// Validate a dialog spec *before* any window is created (v0.4.46,
@@ -1263,6 +1264,16 @@ mod validate_tests {
             {"kind":"text","name":"a"},
             {"kind":"secret","name":"tok"},
             {"kind":"slider","name":"n"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_form_with_annotated_image() {
+        // #24: the annotated_image field must pass spec validation so the
+        // frontend widget gets a chance to render it.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"annotated_image","name":"spot","src":"~/shot.png","mode":"point"}
         ]});
         assert!(validate_spec(&spec).is_ok());
     }
