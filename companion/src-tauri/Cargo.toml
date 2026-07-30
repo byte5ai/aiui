@@ -33,6 +33,11 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-process = "2"
+# Native OS notification for the `notify` MCP tool (#17) — fire-and-forget
+# agent → user signal ("tests green", "deploy done") that doesn't block on a
+# dialog response. On macOS this drives UNUserNotificationCenter (one-time
+# permission prompt on first send, same as any other native app).
+tauri-plugin-notification = "2"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"

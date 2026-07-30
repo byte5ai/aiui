@@ -70,6 +70,24 @@ All notable changes to this project are documented here.
   host. Both bridges (Rust companion and the `aiui-mcp` PyPI package for
   remote/headless use) implement the same routing so behavior doesn't
   drift between the two.
+- **`notify` tool — native macOS notification (#17).** A fire-and-forget
+  async-completion signal for the agent ("tests green", "deploy done",
+  "merge conflicts, need you") that, unlike `confirm`/`ask`/`form`/
+  `gallery`, does not block on a user response: the companion hands the
+  notification to macOS's `UNUserNotificationCenter` (via
+  `tauri-plugin-notification`) and the tool call returns `{ok: true}`
+  immediately — no dialog window, no registry entry, no progress
+  keepalive. Takes `title`/`body` (required) plus optional `subtitle` and
+  `sound`. New `POST /notify` companion endpoint, registered in both the
+  native Rust MCP server (`mcp.rs`) and the Python remote bridge
+  (`aiui_mcp/server.py`) with matching behavior. First send triggers the
+  one-time macOS notification-permission prompt, same as any native app.
+
+### Changed
+
+- **`docs/skill.md`** documents `notify` alongside `confirm`/`ask`/`form`/
+  `gallery`, with the "when NOT to use chat" guidance extended to cover
+  async-completion signals.
 
 ## [0.8.3] — 2026-07-29
 
