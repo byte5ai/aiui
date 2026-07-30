@@ -107,6 +107,7 @@ back in chat — without it, the agent might forget aiui exists.
 | Destructive actions with a vague "please confirm" | Red-styled yes/no, unambiguous |
 | Ad-hoc local web UIs for one-off tasks | No longer needed |
 | Remote hosts where the agent has no way to ask you | Dialogs tunnel back to your Mac automatically |
+| A long task finishes while you've tabbed away | A native macOS notification — no dialog, nothing to click |
 
 <p align="center">
   <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">

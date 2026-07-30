@@ -1,15 +1,19 @@
 ---
 name: aiui
-description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native macOS dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm.
+description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native macOS dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents
 
-aiui exposes three MCP tools that render native dialogs on the user's Mac:
+aiui exposes MCP tools that render native dialogs on the user's Mac, plus
+one that doesn't wait for the user at all:
 
 - `confirm` — irreversible yes/no
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback
 - `form` — composite window with typed fields and multiple action buttons
+- `gallery` — batch review of images/videos with a per-item verdict
+- `notify` — fire-and-forget native OS notification; no dialog, no
+  response, returns immediately
 
 ## Default to a dialog, not to chat
 
@@ -37,6 +41,10 @@ instead:
   or generated sound clip** before confirming, choosing, or triaging it
   → `form` with an `audio` field (native `<audio controls>`). Don't
   paste a file path in chat and ask the user to open it themselves.
+- Any **async-completion signal** the user doesn't need to answer — "tests
+  are green", "deploy finished", "hit a merge conflict, need you" — where
+  the point is exactly that they don't have to be watching this session
+  → `notify`, not a chat message and not `confirm`.
 
 ## When chat actually wins
 
@@ -46,7 +54,8 @@ Skip the dialog for content the user reads, doesn't answer:
   in chat.
 - Single free-text answers where the user would type the same thing into
   a dialog box anyway — just ask in chat.
-- Anything where the answer is "go on", and the user is paying attention.
+- Anything where the answer is "go on", and the user is paying attention
+  (otherwise see `notify` above).
 
 ## Tool choice
 
@@ -57,8 +66,27 @@ Skip the dialog for content the user reads, doesn't answer:
 | Multi-field input, multi-action footer | `form` |
 | Listen to a TTS sample / voice memo / sound clip before deciding | `form` with an `audio` field |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
+| Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
+
+## Fire-and-forget: `notify`
+
+`notify` does not open a window and does not wait for the user. Call it,
+get `{ok: true}` back immediately. Use it for the class of thing you'd
+otherwise announce in chat and hope the user notices — "tests green",
+"deploy finished", "merge conflict, need you" — when they may not be
+looking at this session at all. That's also what separates it from
+`confirm`: if the message expects a reply, use `confirm`/`ask`/`form`
+instead — `notify` has no way to carry an answer back.
+
+Spec: `{title, body, subtitle?, sound?}` — `title`/`body` required.
+`title` is a short headline (banners truncate past ~40 chars); `body`
+carries the detail; `subtitle` is optional extra context (folded into
+`body` where there's no distinct subtitle slot); `sound` is an optional
+OS sound name, omit for silent. First call triggers the one-time macOS
+notification-permission prompt; a denied permission comes back as
+`{ok: false, error}`, not a tool error.
 
 ## Writing labels and copy
 

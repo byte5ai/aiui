@@ -1409,6 +1409,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
+        // Backs the `notify` MCP tool (#17) — native OS notification shown
+        // directly from Rust (http.rs `/notify`), no capability grant needed
+        // since it's never invoked from the WebView side.
+        .plugin(tauri_plugin_notification::init())
         .manage(cfg.clone())
         .manage(dialog_state.clone())
         .manage(ui_acks.clone())

@@ -1,17 +1,20 @@
 ---
 name: aiui
-description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation, `compare` for A/B(/C) side-by-side picks, `gallery` for batch image/video review.
+description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation, `compare` for A/B(/C) side-by-side picks, `gallery` for batch image/video review, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents
 
-aiui exposes five MCP tools that render native dialogs on the user's machine:
+aiui exposes MCP tools that render native dialogs on the user's machine,
+plus one that doesn't wait for the user at all:
 
 - `confirm` — irreversible yes/no
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback
 - `form` — composite window with typed fields and multiple action buttons
 - `gallery` — batch review of images/videos, one decision per item
 - `compare` — side-by-side A/B (or A/B/C) content compare, pick one
+- `notify` — fire-and-forget native OS notification; no dialog, no
+  response, returns immediately
 
 ## Default to a dialog, not to chat
 
@@ -54,6 +57,12 @@ instead:
   before choosing one — two drafts, three headlines, before/after an
   edit — → `compare`. Don't reach for `ask`+thumbnail here: a thumbnail
   is too small to actually compare, `compare` renders the full pane.
+- Any **async-completion signal** the user doesn't need to answer — "tests
+  are green", "deploy finished", "hit a merge conflict, need you" — where
+  the point is exactly that they don't have to be watching this session
+  → `notify`, not a chat message and not `confirm`. If you catch yourself
+  about to end a turn with nothing but "done!" while the user has tabbed
+  away, that's a `notify`, not silence.
 
 ## When chat actually wins
 
@@ -63,7 +72,9 @@ Skip the dialog for content the user reads, doesn't answer:
   in chat.
 - Single free-text answers where the user would type the same thing into
   a dialog box anyway — just ask in chat.
-- Anything where the answer is "go on", and the user is paying attention.
+- Anything where the answer is "go on", and the user is paying attention
+  (i.e. they're actually looking at this session — otherwise see `notify`
+  above).
 
 ## Tool choice
 
@@ -79,8 +90,45 @@ Skip the dialog for content the user reads, doesn't answer:
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
 | Mark *where* on an image (point / region) | `form` with `annotated_image` |
+| Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
+
+## Fire-and-forget: `notify`
+
+`notify` is the odd one out: it does not open a window and does not wait
+for the user. Call it, get `{ok: true}` back immediately, move on. Use it
+for the class of thing you'd otherwise announce in chat and hope the user
+notices — "tests green", "deploy finished", "hit a merge conflict, need
+you" — when they may not be looking at this session at all. That's also
+the line that separates it from `confirm`: if the message expects a reply,
+it's the wrong tool — `notify` has no way to carry an answer back.
+
+Spec: `{title, body, subtitle?, sound?}`. `title` and `body` are required.
+
+- `title` — short headline, notification banners truncate anything past
+  ~40 characters. State the outcome, not the process ("Deploy finished",
+  not "Deploying...").
+- `body` — the detail: what finished, what needs attention, what broke.
+- `subtitle` — optional extra context line (folded into `body` on
+  platforms/backends without a distinct subtitle slot — don't rely on it
+  rendering as a visually separate line).
+- `sound` — optional OS sound name (e.g. `"default"`); omit for a silent
+  notification.
+
+First call triggers the one-time macOS notification-permission prompt,
+same as any other native app — if the user has denied it, `notify`
+returns `{ok: false, error}` rather than erroring the tool call; that's
+an expected outcome, not a bug to retry around.
+
+**Anti-patterns:**
+
+- Using `notify` for anything that expects an answer — that's `confirm`/
+  `ask`/`form`. `notify` is one-way.
+- Firing `notify` for routine intermediate progress ("step 3 of 10") —
+  reserve it for the completion/attention-worthy moment, or every step
+  becomes a notification and the signal drowns.
+- Padding `title` with a full sentence — put the sentence in `body`.
 
 ## Writing labels and copy
 
