@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **File upload from the Mac into the agent session (`upload` tool +
+  `/aiui:upload` slash-command, #146).** The first aiui data flow that
+  runs *Mac → agent-host* instead of the other way around. Calling
+  `upload` opens a **native file picker** on the user's Mac (via the
+  Tauri dialog plugin); the chosen file streams back over the existing
+  authenticated `:7777` channel — the reverse direction of `POST /media`
+  — and is written to `target_dir/<filename>` on the host the agent runs
+  on (the remote for an SSH session). It replaces the "please `scp` me
+  that file" round-trip. `target_dir` is optional (defaults to the
+  bridge's cwd); the filename comes from the selection, so the write is
+  deterministic with no temp/staging path. Existing files are never
+  overwritten — a name clash returns an error rather than clobbering.
+  Robust error paths (`{status:"error", error}`) cover a cancelled
+  picker, an unreadable file, the 512 MB size cap (413), and a
+  missing/unwritable target directory. The tool blocks until the user
+  picks or dismisses the picker, with the usual `notifications/progress`
+  keepalive. Implemented consistently in the native Rust MCP server
+  (`companion/src-tauri/src/{mcp,http}.rs`) and the Python bridge
+  (`aiui-mcp`, used by remote SSH hosts via `uvx`), plus a new
+  `/aiui:upload` prompt and an `INSTRUCTIONS` trigger on both.
+
 ## [0.8.3] — 2026-07-29
 
 ### Added

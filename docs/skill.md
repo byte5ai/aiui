@@ -269,6 +269,42 @@ batch". Use `confirm`+`image` for a single yes/no sign-off, and
 `ask`+`thumbnail` / `image_grid` when the task is *picking* among
 candidates rather than judging each one.
 
+## File upload: `upload` (Mac → your host)
+
+Every other aiui data flow goes *your host → Mac* (dialog specs down,
+image bytes inlined). `upload` is the one that reverses it: it pulls a
+file **from the user's Mac into your session**, over the same
+authenticated `:7777` channel the dialogs use (loopback locally, the SSH
+reverse-tunnel remotely). It's the native replacement for "please `scp`
+me that file".
+
+Call `upload` whenever the user wants to hand you a local file — "take
+this file", "here's the screenshot/PDF/CSV", or the `/aiui:upload`
+slash-command. It opens a **native file picker on the Mac**; the file the
+user chooses is streamed back and written to `target_dir/<filename>` on
+**your** host (the remote for an SSH session).
+
+- **Pass `target_dir`** — an absolute or `~/`-rooted directory on your
+  host, chosen from context (usually your cwd or the active project dir).
+  Omit it only when you genuinely have no context (defaults to your
+  process's cwd). Relative paths are rejected; the directory must already
+  exist and be writable.
+- **Don't ask which file or where** — the user picks the file in the
+  native dialog, and you infer the target. One tool call, no back-and-forth.
+- **Deterministic destination:** the filename comes from the selection,
+  so the file lands at exactly `target_dir/<filename>` — no temp/staging
+  path. Existing files are **never overwritten**; a name clash returns an
+  error instead of clobbering (pick another `target_dir` or move the old
+  file first).
+- **Result:** `{status: "ok", path, filename, bytes}` on success, or
+  `{status: "error", error}` for a cancelled picker, an unreadable file, a
+  file over the 512 MB cap, or a missing/unwritable target dir. Report it
+  briefly; on `ok`, name the path the file landed at.
+
+Blocks until the user picks or dismisses the picker, exactly like the
+dialog tools — progress notifications fire every ~10 s while you wait, so
+a slow response just means the user is browsing, not that aiui broke.
+
 ## Starting window size: `size` / `width` / `height`
 
 `form` and `gallery` accept an optional **`size`** hint — `"s"`, `"m"`, or
