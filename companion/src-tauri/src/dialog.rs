@@ -252,6 +252,9 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
                     .unwrap_or(320.0);
                 (BASE_W, (img_h + 90.0).min(560.0))
             }
+            // Audio (#25): just a native `<audio controls>` bar (~40px) plus
+            // an optional caption — far shallower than an image preview.
+            "audio" => (BASE_W, 90.0),
             "tree" => (BASE_W, 240.0),
             "list" => {
                 let items = field
@@ -612,6 +615,17 @@ mod tests {
         let (w, h) = estimate_dialog_size(&spec);
         assert_eq!(w, 720.0);
         assert!(h > 480.0, "mermaid should push height past base, got {h}");
+    }
+
+    #[test]
+    fn estimate_size_audio_stays_narrow_and_short() {
+        let spec = serde_json::json!({
+            "kind": "form",
+            "fields": [{ "kind": "audio", "src": "data:audio/mpeg;base64,AAAA", "label": "Sample" }]
+        });
+        let (w, h) = estimate_dialog_size(&spec);
+        assert_eq!(w, 520.0, "audio field should not widen the window");
+        assert_eq!(h, 480.0, "a single short audio field should stay at base height");
     }
 
     #[test]

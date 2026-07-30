@@ -43,6 +43,10 @@ instead:
 - Any step that asks **"is this generated image OK?"** → `confirm`
   with `image: {src}`. Don't fall back to a `form`-with-image-and-two-
   buttons when the question is a plain yes/no.
+- Any step that wants the user to **listen to a TTS sample, voice memo,
+  or generated sound clip** before confirming, choosing, or triaging it
+  → `form` with an `audio` field (native `<audio controls>`). Don't
+  paste a file path in chat and ask the user to open it themselves.
 - Any step that asks **"which of these images?"** with 2–6 candidates
   → `ask` with `thumbnail` per option. Use `form` + `image_grid` only
   when there are many candidates (≥ 7) or the picker needs multi-select.
@@ -70,6 +74,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | 2–6 options, possibly with per-option context | `ask` |
 | Pick one of N images ("A or B or C") | `ask` with `thumbnail` per option |
 | Multi-field input, multi-action footer | `form` |
+| Listen to a TTS sample / voice memo / sound clip before deciding | `form` with an `audio` field |
 | Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
@@ -295,6 +300,35 @@ These don't ask anything — they sit between input fields to give context
 - `static_text` — plain styled note with `tone: "info"|"warn"|"muted"`.
   Lighter weight than `markdown` when no formatting is needed.
 
+## Audio playback: `audio`
+
+Read-only, like `image` — sits between input fields for the user to
+listen to before deciding. Spec: `{kind: "audio", src, label?}`. Renders
+a native `<audio controls>` player; no value is returned in the form
+result.
+
+```json
+{ "kind": "audio", "src": "~/Downloads/tts-sample.mp3", "label": "Voice: warm" }
+```
+
+`src` follows the **same resolution rules as `image`** (see
+[Image sources](#image-sources-src--thumbnail) below), plus one twist:
+a **local** audio path (`mp3`/`m4a`/`wav`/`aac`/`ogg`/`flac`) is never
+inlined as a `data:` URL, no matter how small. It's pushed through the
+same size-unbounded `/media` cache the `gallery` tool uses for local
+video — the bridge uploads the bytes to the Mac and the dialog streams
+them back over a loopback URL, working identically whether you run
+locally or on a remote SSH host. `http(s)://` and `data:` audio URLs
+work exactly like they do for `image` — no special handling needed.
+
+Use `audio` for "does this TTS voice sound right?", "confirm this
+generated jingle", "here's the voice memo the user attached — does it
+transcribe correctly?". For a plain yes/no on the clip, still reach for
+`confirm` if there's nothing else to fill in; use `audio` inside a
+`form` when the listen-then-decide step needs other inputs alongside it
+(a text field for feedback, a `select` for which voice to use next,
+etc.).
+
 ## Visual pickers: `image_grid`
 
 For "pick one (or more) of these N generated images" — logo variants,
@@ -448,6 +482,11 @@ aiui takes an image source in these places:
 - `form` → `list` → `items[].thumbnail`
 - `gallery` → `items[].src` — batch review, images or videos
 - `compare` → `variants[].src` — side-by-side pick, images or videos
+
+(`form` → `audio` field → `src` accepts the same three formats too —
+see [Audio playback](#audio-playback-audio) above — with one difference:
+a local path never inlines as `data:`, it always routes through the
+`/media` cache, size-unbounded.)
 
 In all of them the same three input formats render correctly:
 

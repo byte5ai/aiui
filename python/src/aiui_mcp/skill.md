@@ -33,6 +33,10 @@ instead:
   sortable `list` field.
 - Any step that wants a **date, datetime, range, color, or numeric value
   in a bounded interval** → `form` with the matching field.
+- Any step that wants the user to **listen to a TTS sample, voice memo,
+  or generated sound clip** before confirming, choosing, or triaging it
+  → `form` with an `audio` field (native `<audio controls>`). Don't
+  paste a file path in chat and ask the user to open it themselves.
 
 ## When chat actually wins
 
@@ -51,6 +55,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Yes/no, especially destructive | `confirm` |
 | 2–6 options, possibly with per-option context | `ask` |
 | Multi-field input, multi-action footer | `form` |
+| Listen to a TTS sample / voice memo / sound clip before deciding | `form` with an `audio` field |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
@@ -126,6 +131,23 @@ These don't ask anything — they sit between input fields to give context
   next decision.
 - `static_text` — plain styled note with `tone: "info"|"warn"|"muted"`.
   Lighter weight than `markdown` when no formatting is needed.
+
+## Audio playback: `audio`
+
+Read-only, like `image` — sits between input fields for the user to
+listen to before deciding. Spec: `{kind: "audio", src, label?}`. Renders
+a native `<audio controls>` player; no value is returned in the form
+result. `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an
+absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac). A local audio path
+is never inlined as `data:` — even a small clip — it's always pushed
+through the same size-unbounded `/media` cache the `gallery` tool uses
+for local video, so it works identically whether this bridge runs on
+the user's Mac or a remote SSH host it's reaching over the reverse
+tunnel.
+
+Use `audio` for "does this TTS voice sound right?", "confirm this
+generated jingle", "here's the voice memo — does it transcribe
+correctly?".
 
 ## Schematic diagrams: `mermaid`
 
