@@ -26,6 +26,22 @@ All notable changes to this project are documented here.
   (`companion/src-tauri/src/{mcp,http}.rs`) and the Python bridge
   (`aiui-mcp`, used by remote SSH hosts via `uvx`), plus a new
   `/aiui:upload` prompt and an `INSTRUCTIONS` trigger on both.
+- **`compare` tool — side-by-side A/B (or A/B/C) content compare (#23).**
+  New standalone MCP tool (alongside `confirm`/`ask`/`form`/`gallery`) that
+  renders 2+ variants as equal-width panes next to each other and lets the
+  user click one to pick, instead of a small thumbnail (`ask`) or a
+  per-item batch review (`gallery`). Each variant carries a stable `value`
+  plus `content` (Markdown text — drafts, diffs, code) and/or `src`
+  (image/video, the same resolution rules as every other aiui image
+  field). Optional `sync_scroll` locks scroll position across all panes
+  for long-text compares; `max_height` set on any variant caps every
+  pane's height so they stay visually equal. Returns `{cancelled,
+  selected}`. New `Compare.svelte` widget, `compare` case in the Rust
+  spec validator + window-size estimator, and a mirrored `compare` tool
+  in the Python `aiui-mcp` package for remote/headless sessions. Extracted
+  the Markdown-to-sanitized-HTML renderer (previously private to
+  `Form.svelte`) into `companion/src/lib/markdown.ts` so both widgets
+  share one DOMPurify allowlist instead of drifting.
 
 ## [0.8.3] — 2026-07-29
 

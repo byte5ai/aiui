@@ -143,6 +143,46 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
         return (w.min(MAX_W), needed.clamp(BASE_H, MAX_H));
     }
 
+    // Compare has no `fields` either; it's N equal-width panes shown side
+    // by side. Width scales with the pane count (capped at 4, matching the
+    // frontend's grid cap); height is generous by default since panes
+    // typically hold either a full paragraph of markdown or an image.
+    if spec.get("kind").and_then(|v| v.as_str()) == Some("compare") {
+        let variants = spec
+            .get("variants")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(2)
+            .max(1);
+        let cols = spec
+            .get("columns")
+            .and_then(|v| v.as_u64())
+            .filter(|&c| c > 0)
+            .map(|c| c as usize)
+            .unwrap_or(variants)
+            .clamp(1, 4);
+        let w = match cols {
+            1 => BASE_W,
+            2 => 760.0,
+            3 => 980.0,
+            _ => MAX_W,
+        };
+        let has_media = spec
+            .get("variants")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|it| {
+                    it.get("src")
+                        .and_then(|s| s.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let h: f64 = if has_media { 640.0 } else { 560.0 };
+        return (w.min(MAX_W), h.clamp(BASE_H, MAX_H));
+    }
+
     if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
         if !tabs.is_empty() {
             content_h += 40.0;
@@ -624,6 +664,55 @@ mod tests {
         });
         let (w, _h) = estimate_dialog_size(&spec);
         assert_eq!(w, 520.0, "explicit 1 column → base width");
+    }
+
+    #[test]
+    fn estimate_size_compare_scales_with_variant_count() {
+        let two = serde_json::json!({
+            "kind": "compare",
+            "variants": [
+                { "value": "a", "content": "Draft A" },
+                { "value": "b", "content": "Draft B" }
+            ]
+        });
+        let (w2, h2) = estimate_dialog_size(&two);
+        assert_eq!(w2, 760.0, "2 variants → 760 wide");
+        assert_eq!(h2, 560.0, "no media → 560 tall");
+
+        let three = serde_json::json!({
+            "kind": "compare",
+            "variants": [
+                { "value": "a", "content": "A" },
+                { "value": "b", "content": "B" },
+                { "value": "c", "content": "C" }
+            ]
+        });
+        let (w3, _h3) = estimate_dialog_size(&three);
+        assert_eq!(w3, 980.0, "3 variants → 980 wide");
+    }
+
+    #[test]
+    fn estimate_size_compare_grows_taller_with_media() {
+        let spec = serde_json::json!({
+            "kind": "compare",
+            "variants": [
+                { "value": "a", "src": "data:image/png;base64,AAAA" },
+                { "value": "b", "src": "data:image/png;base64,BBBB" }
+            ]
+        });
+        let (_w, h) = estimate_dialog_size(&spec);
+        assert_eq!(h, 640.0, "image variants → taller default than text-only");
+    }
+
+    #[test]
+    fn estimate_size_compare_respects_explicit_columns_cap() {
+        let mut variants = Vec::new();
+        for i in 0..6 {
+            variants.push(serde_json::json!({ "value": format!("v{i}"), "content": "x" }));
+        }
+        let spec = serde_json::json!({ "kind": "compare", "variants": variants });
+        let (w, _h) = estimate_dialog_size(&spec);
+        assert_eq!(w, 1100.0, "variant count above the 4-col cap → MAX_W");
     }
 
     #[test]

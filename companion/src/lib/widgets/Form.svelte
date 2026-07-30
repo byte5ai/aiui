@@ -1,7 +1,6 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
-  import { marked } from "marked";
-  import DOMPurify from "dompurify";
+  import { renderMarkdown } from "../markdown";
   import TreeNode from "./TreeNode.svelte";
   import MermaidView from "./MermaidView.svelte";
   import WireframeView from "./WireframeView.svelte";
@@ -422,28 +421,7 @@
   }
 
   // --- markdown rendering -------------------------------------------------
-  // Configured once, used by all `markdown` fields. We keep it sync (no
-  // remote includes, no async resolvers) so reactivity is straightforward.
-  // Output is piped through DOMPurify before `{@html}` so an MCP caller
-  // (potentially a compromised remote host reaching us through the
-  // SSH-reverse-tunnel) cannot inject `<script>` or event handlers.
-  // Issue #H-2 in v0.4.10 review.
-  marked.setOptions({ gfm: true, breaks: true });
-  function renderMd(src: string): string {
-    let raw: string;
-    try {
-      raw = marked.parse(src, { async: false }) as string;
-    } catch {
-      raw = `<pre>${src.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]!))}</pre>`;
-    }
-    return DOMPurify.sanitize(raw, {
-      // No <script>, no event handlers, no javascript: URLs, no <iframe>.
-      // Keep links + basic markup. Defaults are conservative; we explicitly
-      // forbid form-related tags to prevent autofill-driven exfiltration.
-      FORBID_TAGS: ["script", "iframe", "form", "input", "button"],
-      FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus"],
-    });
-  }
+  // Shared renderer — see ../markdown.ts for the sanitization rationale.
 </script>
 
 <main class="window-shell">
@@ -478,7 +456,7 @@
       {:else if f.kind === "markdown"}
         <div class="markdown-field">
           <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-          {@html renderMd(f.text)}
+          {@html renderMarkdown(f.text)}
         </div>
       {:else if f.kind === "image"}
         <figure class="image-field" style={f.max_height ? `max-height: ${f.max_height}px` : ""}>
