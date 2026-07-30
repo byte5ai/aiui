@@ -73,6 +73,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
+| Mark *where* on an image (point / region) | `form` with `annotated_image` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
@@ -220,6 +221,62 @@ Read-only — sits between input fields to give layout context, like
   into more panels with `col_span` / `row_span`.
 - Free-form HTML / markdown inside `content` — content is plain
   text, rendered monospace; everything else is intentionally ignored.
+
+## Mark a point or region on an image: `annotated_image`
+
+When the answer you need is *spatial* — "where should the logo go?", "which
+part do I crop?", "point at the bug in this screenshot" — words are a poor
+carrier. Show the image and let the user mark it directly.
+
+Spec:
+`{kind: "annotated_image", name, src, label?, alt?, mode?, max_height?, required?, default?}`.
+
+- `src` — same resolution rules as `image` (absolute / `~/` local path,
+  `http(s)://` URL, or `data:` URL). See [Image sources](#image-sources-src--thumbnail).
+- `mode` — what the user can mark:
+  - `"point"` (default) — click to drop a single crosshair marker.
+  - `"region"` — drag to draw a rectangle.
+  - `"both"` — a Point/Region toggle appears; the user can set a point
+    *and* a region (both are returned).
+- `default` — optionally seed `{point?: {x, y}, region?: {x, y, w, h}}` in
+  normalized units to pre-place a marker the user then nudges.
+- `required` — the submit action stays disabled until the user has marked
+  the annotation the mode calls for.
+
+**Result** (under the field `name`):
+
+```
+{
+  "point":  {"x": 0.42, "y": 0.31} | null,
+  "region": {"x": 0.10, "y": 0.20, "w": 0.30, "h": 0.25} | null,
+  "natural": {"width": 1920, "height": 1080} | null
+}
+```
+
+All coordinates are **normalized 0..1** relative to the image — resolution
+independent, so they survive the image being displayed at any size. `region`
+is top-left `x,y` plus `w,h`. Multiply by `natural` (the image's intrinsic
+pixel size, filled in once it loads) to get pixel coordinates:
+`px = point.x * natural.width`.
+
+```
+{
+  "kind": "annotated_image",
+  "name": "logo_spot",
+  "label": "Where should the logo sit?",
+  "src": "~/renders/hero.png",
+  "mode": "point"
+}
+```
+
+**Anti-patterns:**
+
+- Asking "top-left or bottom-right?" in a `select` when the honest answer
+  is a spot on the image — that's exactly what this field is for.
+- Using it for *picking one image out of many* — that's `image_grid` (this
+  field annotates a **single** image).
+- Expecting pixel coordinates in the result without reading `natural` — the
+  raw `x/y/w/h` are fractions, not pixels.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 
