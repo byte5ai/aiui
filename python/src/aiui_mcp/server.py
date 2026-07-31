@@ -27,6 +27,7 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,14 @@ COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
 # before we time out, letting us re-poll cleanly.
 ASYNC_POLL_TIMEOUT_S = 40.0
 
+# Timeout for the `upload` tool's held `POST /upload` (#146). The picker + byte
+# transfer runs on one request and the user may browse their filesystem before
+# choosing, so this is deliberately generous — far beyond any realistic
+# file-picker think-time. A periodic progress notification keeps the MCP client
+# reassured while the call is held.
+UPLOAD_TIMEOUT_S = float(os.environ.get("AIUI_UPLOAD_TIMEOUT_S", "900"))
+UPLOAD_FILE_CAP = 512 * 1024 * 1024  # mirrors the companion's cap
+
 _INSTRUCTIONS = """\
 aiui is connected — you can render native dialogs on the user's Mac \
 instead of asking via chat. Default behaviour for this session:
@@ -115,6 +124,9 @@ instead of asking via chat. Default behaviour for this session:
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
   table-row triage, image confirm/grid → call `form`.
+- User wants to hand you a file from their Mac (`/aiui:upload`, \
+  "take this file", "upload …") → call `upload` with the target \
+  directory on your host; don't ask them to `scp` it.
 - Pure information the user only reads → keep it in chat.
 
 Type `/aiui:teach` for the full widget catalog when composing a \
@@ -534,6 +546,73 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
             values[name] = outcome  # write-only: raw value never returned
         else:
             values[name] = {"value": v, **outcome}
+
+
+def _upload_safe_base_name(raw: str) -> str | None:
+    """Reduce a filename to a safe base name (#146): strip any directory
+    components so a selection can never escape the target dir, reject
+    empty / `.` / `..`. Mirrors `safe_base_name` in the Rust bridge.
+    """
+    base = os.path.basename(raw).strip()
+    if not base or base in (".", ".."):
+        return None
+    return base
+
+
+def _upload_expand_dir(raw: str) -> Path | None:
+    """Expand a `~/`-rooted or absolute target directory. Returns None for a
+    relative path — there is no stable cwd contract to resolve it against, so
+    it's treated as a caller error (the cwd default is applied by the caller
+    only when `target_dir` is absent). Mirrors `expand_dir` in the Rust bridge.
+    """
+    if raw.startswith("~"):
+        return Path(raw).expanduser()
+    p = Path(raw)
+    return p if p.is_absolute() else None
+
+
+def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
+    """Atomically write the uploaded bytes to `dest_dir/<filename>` on THIS host,
+    never overwriting an existing file. Mirrors `do_upload`'s write half in the
+    Rust bridge. Returns the `{status, …}` payload.
+    """
+    dest = dest_dir / filename
+    if dest.exists():
+        return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".aiui-upload-", dir=str(dest_dir))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        return {"status": "error", "error": f"writing {dest}: {e}"}
+    return {"status": "ok", "path": str(dest), "filename": filename, "bytes": len(data)}
+
+
+async def _upload_heartbeat(ctx: Context) -> None:
+    """Emit a progress notification every ~10 s while `POST /upload` is held, so
+    the MCP client knows the tool is alive while the user browses the picker.
+    Cancelled by the caller once the POST returns. Best-effort — a missing
+    progressToken or any reporting hiccup must never break the upload.
+    """
+    iteration = 0
+    try:
+        while True:
+            await asyncio.sleep(10)
+            iteration += 1
+            try:
+                await ctx.report_progress(progress=float(iteration), total=None)
+            except Exception as e:  # noqa: BLE001
+                log.debug("upload progress skipped: %s", _explain_exc(e))
+    except asyncio.CancelledError:
+        pass
 
 
 async def _wait_for_aiui() -> None:
@@ -986,6 +1065,105 @@ async def gallery(
     return _format_result(await _post_render(spec, ctx, session))
 
 
+@mcp.tool()
+async def upload(
+    target_dir: str | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Pull a file FROM the user's Mac INTO this agent session.
+
+    Calling this opens a native file picker on the user's Mac; the file they
+    choose is streamed back over aiui's channel and written to `target_dir` on
+    YOUR host (the machine you run on — the remote for an SSH session). This is
+    the counterpart to the user having to `scp` a file over: reach for it
+    whenever the user says "take this file", "upload …", "here's the
+    file/screenshot/PDF", or triggers `/aiui:upload`.
+
+    WHEN TO USE: the user wants to give you a local Mac file. Do NOT ask them
+    which file — they pick it in the native dialog. Do NOT ask where to put it;
+    infer `target_dir` from the conversation (usually your cwd or the active
+    project dir) and pass it.
+
+    BEHAVIOUR:
+    - `target_dir` is optional but you should almost always pass it — an
+      absolute or `~/`-rooted directory ON YOUR HOST. Omit it only when you
+      have no context (defaults to your process's cwd). Relative paths are
+      rejected. The directory must already exist and be writable.
+    - The filename comes from the user's selection; the file lands at
+      `target_dir/<filename>` — a deterministic path, no temp/staging dir.
+    - Existing files are never overwritten: if `target_dir/<filename>` already
+      exists the call errors instead of clobbering. Pick a different
+      `target_dir` or move the old file first.
+    - Blocks until the user picks a file or dismisses the picker. Progress
+      notifications fire every ~10 s meanwhile — a slow response just means the
+      user is choosing a file, not that aiui is broken.
+
+    Returns `{status: "ok", path, filename, bytes}` on success, or
+    `{status: "error", error}` on any failure (user cancelled, file unreadable,
+    file too large — 512 MB cap, target directory missing/not writable). Report
+    briefly; on `ok`, mention the path the file landed at.
+
+    Args:
+        target_dir: Absolute or `~/`-rooted directory on your host where the
+            picked file is written as `<target_dir>/<filename>`. Defaults to
+            your process's cwd.
+        session: Short human label for this session, shown in aiui's window
+            chrome so parallel dialogs stay distinguishable.
+    """
+    # Resolve the destination up front so a bad target_dir fails before the
+    # picker even opens (nothing worse than picking a file only to be rejected).
+    if target_dir is not None and target_dir.strip():
+        dest_dir = _upload_expand_dir(target_dir.strip())
+        if dest_dir is None:
+            return {
+                "status": "error",
+                "error": f"target_dir must be an absolute or ~/-rooted path, got '{target_dir}'",
+            }
+    else:
+        dest_dir = Path.cwd()
+    if not dest_dir.is_dir():
+        return {"status": "error", "error": f"target directory does not exist: {dest_dir}"}
+
+    await _wait_for_aiui()
+    await _preflight()
+
+    heartbeat = asyncio.create_task(_upload_heartbeat(ctx)) if ctx is not None else None
+    try:
+        async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT_S) as client:
+            r = await client.post(
+                f"{ENDPOINT}/upload",
+                headers={"Authorization": f"Bearer {_token()}"},
+            )
+    except httpx.HTTPError as e:
+        return {"status": "error", "error": f"POST /upload failed: {_explain_exc(e)}"}
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+
+    if r.status_code == 204:
+        return {"status": "error", "error": "upload cancelled — no file was selected"}
+    if r.status_code == 413:
+        return {"status": "error", "error": f"selected file too large: {r.text[:200]}"}
+    if r.status_code != 200:
+        return {
+            "status": "error",
+            "error": f"companion /upload failed ({r.status_code}): {r.text[:200]}",
+        }
+
+    # Filename travels in a percent-encoded header; the body is the raw bytes.
+    raw_header = r.headers.get("x-aiui-filename", "")
+    decoded = urllib.parse.unquote_to_bytes(raw_header).decode("utf-8", "replace")
+    filename = _upload_safe_base_name(decoded) or "upload.bin"
+    data = r.content
+    if len(data) > UPLOAD_FILE_CAP:
+        return {"status": "error", "error": f"uploaded file exceeds cap: {len(data)} bytes"}
+
+    result = _upload_write(dest_dir, filename, data)
+    log.info("upload ← filename=%s bytes=%d status=%s", filename, len(data), result.get("status"))
+    return result
+
+
 @mcp.prompt(name="teach")
 def teach_prompt() -> str:
     """Brief the agent on aiui. Loads the full widget catalog, design
@@ -1100,6 +1278,20 @@ def remotes_prompt() -> str:
     """Quick rundown of registered aiui remotes in chat (same set the
     Settings window shows). Surfaces as `/aiui:remotes` in Claude Code."""
     return _REMOTES_PROMPT
+
+
+_UPLOAD_PROMPT = """\
+Call the `upload` tool to let me hand you a file from my Mac. \
+Use my current working directory as the target unless I say otherwise.
+"""
+
+
+@mcp.prompt(name="upload")
+def upload_prompt() -> str:
+    """Hand a file from the Mac to the agent session — opens a native file
+    picker and writes the chosen file to the agent host. Surfaces as
+    `/aiui:upload` in Claude Code."""
+    return _UPLOAD_PROMPT
 
 
 @mcp.tool()

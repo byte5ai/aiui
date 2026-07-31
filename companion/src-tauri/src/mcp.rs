@@ -44,6 +44,9 @@ instead of asking via chat. Default behaviour for this session:
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
   table-row triage, image confirm/grid → call `form`.
+- User wants to hand you a file from their Mac (`/aiui:upload`, \
+  \"take this file\", \"upload …\") → call `upload` with the target \
+  directory on your host; don't ask them to `scp` it.
 - Pure information the user only reads → keep it in chat.
 
 Type `/aiui:teach` for the full widget catalog when composing a \
@@ -94,6 +97,11 @@ Call the `confirm` tool with:
 
 Report the outcome in one line: \"aiui ok — you clicked '{label}'\" if the \
 window opened and returned, or the underlying error if it didn't.
+";
+
+const UPLOAD_PROMPT: &str = "\
+Call the `upload` tool to let me hand you a file from my Mac. \
+Use my current working directory as the target unless I say otherwise.
 ";
 
 const REMOTES_PROMPT: &str = "\
@@ -409,6 +417,17 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "upload",
+            "description": "Pull a file FROM the user's Mac INTO this agent session. Calling this opens a native file picker on the user's Mac; the file they choose is streamed back over aiui's channel and written to `target_dir` on YOUR host (the machine you run on — the remote for an SSH session). This is the counterpart to the user having to `scp` a file over: reach for it whenever the user says \"take this file\", \"upload …\", \"here's the file/screenshot/PDF\", or triggers `/aiui:upload`. **`target_dir` is optional and you should almost always pass it:** set it to the directory the file belongs in given the conversation — usually your current working directory or the active project dir. Do NOT ask the user where to put it or which file to pick; just call the tool and let them choose the file in the native dialog. If you have no context at all, omit `target_dir` (defaults to your process's cwd) or ask in one short sentence. The filename comes from the user's selection — the file lands at `target_dir/<filename>`, a deterministic path, no temp/staging dir. **Existing files are never overwritten:** if `target_dir/<filename>` already exists the call returns an error rather than clobbering — pick a different `target_dir` or move the old file first. Returns `{status: \"ok\", path, filename, bytes}` on success, or `{status: \"error\", error}` on any failure — user cancelled the picker, file unreadable, file too large (512 MB cap), or target directory missing/not writable. Report the result briefly; on `ok` mention the path the file landed at. **This tool blocks until the user picks a file or dismisses the picker. Response can take a while — do not assume aiui is broken; the user is choosing a file. Progress notifications fire every ~10 s while waiting.**",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target_dir": { "type": "string", "description": "Absolute or `~/`-rooted directory ON YOUR HOST where the picked file is written as `<target_dir>/<filename>`. Optional; defaults to your process's current working directory. Relative paths are rejected (no stable cwd contract). The directory must already exist and be writable." },
+                    "session": { "type": "string", "description": "Optional short human label for the session this upload belongs to (project/task name), shown in aiui's window chrome." }
+                }
+            }
+        },
+        {
             "name": "aiui_health",
             "description": "Reachability check against the local aiui companion. Returns version + ready flag if the companion is running and responding.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -440,6 +459,14 @@ fn tools_list() -> Value {
 /// MCP-client tool timeout, so a genuinely-down aiui still fails fast
 /// enough to surface the diagnostic message.
 const COLDSTART_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the `upload` tool waits on `POST /upload` before giving up. Unlike
+/// a dialog render — which the async poll loop keeps off a single held
+/// connection — the picker + byte transfer runs on one request, and the user
+/// may browse their filesystem for a while before choosing. A generous ceiling
+/// (well above any think-time a file picker realistically takes) keeps the call
+/// alive; the MCP progress notifications reassure the client meanwhile. #146.
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Poll `/ping` until the HTTP server answers, or `COLDSTART_WAIT` elapses.
 /// `/ping` is unauthenticated and cheap, returning `pong` in plain text —
@@ -667,6 +694,8 @@ async fn tools_call(
             format_dialog_result,
         ),
 
+        "upload" => Ok(do_upload(&args, cfg, http).await),
+
         "aiui_health" => get_json(http, cfg, "/health").await.map(value_to_tool_text),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
         "update" => post_empty(http, cfg, "/update")
@@ -755,6 +784,169 @@ async fn upload_media(
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| "/media response missing url".to_string())
+}
+
+/// Percent-decode a filename the companion sent in the `x-aiui-filename`
+/// header (RFC-3986, produced by `http::pct_encode_filename`). Returns the raw
+/// bytes; invalid `%` sequences are passed through literally rather than
+/// erroring, so a mangled header degrades to a slightly-odd name, never a lost
+/// upload.
+fn pct_decode_bytes(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Reduce a filename to a safe base name: strip any directory components (the
+/// companion sends a base name already, but a hostile/odd selection must never
+/// escape `target_dir`), reject `.`/`..`/empty. Returns `None` if nothing safe
+/// remains.
+fn safe_base_name(raw: &str) -> Option<String> {
+    let base = std::path::Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())?
+        .trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+/// Expand a `~/`-rooted or absolute directory path. Relative paths return
+/// `None` — there is no stable cwd contract to resolve them against, so we
+/// treat "relative" as a caller error rather than guessing (the cwd default is
+/// applied by the caller *before* this, only when `target_dir` is absent).
+fn expand_dir(raw: &str) -> Option<std::path::PathBuf> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return dirs::home_dir().map(|h| h.join(rest));
+    }
+    if raw == "~" {
+        return dirs::home_dir();
+    }
+    let p = std::path::PathBuf::from(raw);
+    if p.is_absolute() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn upload_error(msg: impl Into<String>) -> Value {
+    value_to_tool_text(json!({ "status": "error", "error": msg.into() }))
+}
+
+/// Implements the `upload` tool (#146): ask the companion to open a native file
+/// picker on the Mac, receive the picked file's bytes over the :7777 channel,
+/// and write them to `target_dir/<filename>` on THIS host. Returns the MCP
+/// tool-result shape wrapping `{status, path, filename, bytes}` (ok) or
+/// `{status, error}` (any failure, including a user-cancelled picker).
+async fn do_upload(args: &Value, cfg: &AppConfig, http: &reqwest::Client) -> Value {
+    // Resolve the destination directory up front so a bad `target_dir` fails
+    // before we even open the picker (nothing more annoying than picking a file
+    // only to be told the target was invalid).
+    let target_dir = match args.get("target_dir").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => match expand_dir(s.trim()) {
+            Some(p) => p,
+            None => {
+                return upload_error(format!(
+                    "target_dir must be an absolute or ~/-rooted path, got '{s}'"
+                ))
+            }
+        },
+        // No target_dir → default to this process's cwd.
+        _ => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => return upload_error(format!("no target_dir given and cwd unavailable: {e}")),
+        },
+    };
+    if !target_dir.is_dir() {
+        return upload_error(format!(
+            "target directory does not exist: {}",
+            target_dir.display()
+        ));
+    }
+
+    let token = match load_token(cfg) {
+        Ok(t) => t,
+        Err(e) => return upload_error(e),
+    };
+    let url = format!("{}/upload", base_url(cfg));
+    let resp = match http
+        .post(&url)
+        .bearer_auth(&token)
+        .timeout(UPLOAD_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return upload_error(format!("POST /upload: {e}")),
+    };
+
+    match resp.status() {
+        reqwest::StatusCode::NO_CONTENT => {
+            return upload_error("upload cancelled — no file was selected");
+        }
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+            let detail = resp.text().await.unwrap_or_default();
+            return upload_error(format!("selected file too large: {detail}"));
+        }
+        s if !s.is_success() => {
+            let detail = resp.text().await.unwrap_or_default();
+            return upload_error(format!("companion /upload failed ({s}): {detail}"));
+        }
+        _ => {}
+    }
+
+    // Filename travels in a header (percent-encoded); the body is the raw bytes.
+    let filename_raw = resp
+        .headers()
+        .get("x-aiui-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| String::from_utf8_lossy(&pct_decode_bytes(s)).into_owned())
+        .unwrap_or_default();
+    let filename = match safe_base_name(&filename_raw) {
+        Some(f) => f,
+        None => "upload.bin".to_string(),
+    };
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return upload_error(format!("reading uploaded bytes: {e}")),
+    };
+
+    let dest = target_dir.join(&filename);
+    // Never clobber: a deterministic path is the point, but silently
+    // overwriting the user's existing file is not. Fail loudly instead.
+    if dest.exists() {
+        return upload_error(format!(
+            "target already exists, not overwriting: {}",
+            dest.display()
+        ));
+    }
+    if let Err(e) = crate::fsutil::atomic_write(&dest, &bytes) {
+        return upload_error(format!("writing {}: {e}", dest.display()));
+    }
+
+    value_to_tool_text(json!({
+        "status": "ok",
+        "path": dest.display().to_string(),
+        "filename": filename,
+        "bytes": bytes.len(),
+    }))
 }
 
 /// Per-call dialog rendering can fail in two structurally different
@@ -1099,6 +1291,11 @@ fn prompts_list() -> Value {
             "name": "remotes",
             "description": "List the user's registered aiui remotes in chat (same set the Settings window shows).",
             "arguments": []
+        },
+        {
+            "name": "upload",
+            "description": "Hand a file from your Mac to the agent session — opens a native file picker and writes the chosen file to the agent host.",
+            "arguments": []
         }
     ])
 }
@@ -1116,6 +1313,7 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
         "health" => HEALTH_PROMPT,
         "test-dialog" => TEST_DIALOG_PROMPT,
         "remotes" => REMOTES_PROMPT,
+        "upload" => UPLOAD_PROMPT,
         _ => {
             return Err(RpcError {
                 code: -32602,
