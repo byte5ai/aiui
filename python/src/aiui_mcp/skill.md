@@ -198,6 +198,26 @@ hosting it anywhere.
 Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
 touched items appear — an untouched item means "no verdict", not a default.
 
+## File upload: `upload` (Mac → your host)
+
+The one reversed flow: `upload` pulls a file **from the user's Mac into
+your session** over the same `:7777` channel (loopback locally, the SSH
+reverse-tunnel remotely) — the native replacement for "please `scp` me
+that file". Call it whenever the user wants to hand you a local file
+("take this file", "here's the screenshot/PDF", `/aiui:upload`). It opens
+a **native file picker on the Mac**; the chosen file is written to
+`target_dir/<filename>` on **your** host.
+
+- Pass `target_dir` (absolute or `~/`-rooted, on your host) inferred from
+  context — usually your cwd/project dir. Omit only with no context
+  (defaults to cwd). Relative paths rejected; dir must exist and be writable.
+- Don't ask which file or where — the user picks in the dialog, you infer
+  the target. Deterministic: lands at exactly `target_dir/<filename>`, no
+  staging path. Existing files are never overwritten (a clash errors).
+- Returns `{status:"ok", path, filename, bytes}` or `{status:"error", error}`
+  (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir).
+  Blocks until pick/cancel; progress fires every ~10 s meanwhile.
+
 ## Starting window size: `size`
 
 `form` and `gallery` take an optional `size` hint — `"s"`, `"m"`, `"l"` —

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::logging::trace;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 
 /// How long `/health` waits for a `ui:ping` round-trip from the frontend
@@ -208,6 +209,12 @@ pub async fn serve(
             post(media_upload)
                 .layer(DefaultBodyLimit::max(crate::media::MEDIA_FILE_CAP as usize)),
         )
+        // Inbound file transfer (#146): the bridge asks the Mac to open a
+        // native file picker; on selection the picked file's bytes stream
+        // back over the same :7777 channel (the reverse direction of
+        // `POST /media`). This is the "get a Mac file into the agent
+        // session" path.
+        .route("/upload", post(upload_pick))
         // Capability-URL playback: unauthenticated (filename is a UUID),
         // range-capable for video seeking via tower-http's ServeDir.
         .nest_service(
@@ -368,6 +375,161 @@ async fn media_upload(
         "ttl_secs": crate::media::MEDIA_TTL.as_secs(),
     }))
     .into_response()
+}
+
+/// Largest single inbound file accepted through `POST /upload` (#146). The
+/// picked file is buffered in memory once before it streams back to the
+/// bridge, so this caps a runaway pick (a multi-GB file the user selected by
+/// mistake) rather than letting it exhaust RAM. Mirrors the outbound
+/// `media::MEDIA_FILE_CAP` so both directions share one ceiling.
+const UPLOAD_FILE_CAP: u64 = 512 * 1024 * 1024;
+
+/// HTTP header carrying the picked file's base name (percent-encoded, RFC
+/// 3986) on a successful `POST /upload`. The bridge decodes it, sanitises it
+/// to a base name, and writes `target_dir/<filename>`.
+const UPLOAD_FILENAME_HEADER: &str = "x-aiui-filename";
+
+/// Percent-encode a filename for transport in an ASCII HTTP header. Encodes
+/// every byte that isn't an RFC-3986 unreserved char, so UTF-8 names, spaces,
+/// and control bytes all survive the round-trip and the header stays valid.
+fn pct_encode_filename(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// `POST /upload` — open a native file picker on the Mac and stream the picked
+/// file's bytes back to the caller (#146). This is the reverse of
+/// `POST /media`: bytes flow Mac → agent-host, over the same authenticated
+/// :7777 channel (loopback locally, the SSH reverse-tunnel remotely).
+///
+/// Responses:
+/// - `200 OK` — body is the raw file bytes; `x-aiui-filename` header carries
+///   the percent-encoded base name. `Content-Length` gives the byte count.
+///   A legitimately empty file is still a 200 with a `0`-length body and the
+///   filename header present — distinct from the cancel case below.
+/// - `204 No Content` — the user dismissed the picker without choosing a file.
+///   No body, no filename header.
+/// - `413 Payload Too Large` — the picked file exceeds `UPLOAD_FILE_CAP`.
+/// - `500` — the file could not be read, or the picker failed unexpectedly.
+///
+/// The handler blocks until the user picks or cancels; the caller's MCP
+/// progress notifications keep the client alive meanwhile (same keepalive the
+/// dialog tools use). Authenticated like every mutating endpoint.
+async fn upload_pick(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    // The native picker is callback-based; bridge it to async via a oneshot.
+    // `pick_file` dispatches to the main thread internally (rfd requirement on
+    // macOS), so calling it from this tokio task is safe.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.app.dialog().file().pick_file(move |picked| {
+        let _ = tx.send(picked);
+    });
+
+    let picked = match rx.await {
+        Ok(p) => p,
+        Err(_) => {
+            trace("upload_pick: picker channel dropped");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "picker closed unexpectedly")
+                .into_response();
+        }
+    };
+
+    let Some(file_path) = picked else {
+        trace("upload_pick: user cancelled the picker");
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    let path = match file_path.into_path() {
+        Ok(p) => p,
+        Err(e) => {
+            trace(&format!("upload_pick: non-filesystem selection: {e}"));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "selection is not a local file")
+                .into_response();
+        }
+    };
+
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => {
+            trace(&format!("upload_pick: stat failed: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot read selected file: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if !meta.is_file() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "selection is not a regular file")
+            .into_response();
+    }
+    if meta.len() > UPLOAD_FILE_CAP {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "selected file is {} bytes (max {})",
+                meta.len(),
+                UPLOAD_FILE_CAP
+            ),
+        )
+            .into_response();
+    }
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| "upload.bin".to_string());
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            trace(&format!("upload_pick: read failed: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot read selected file: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    trace(&format!(
+        "upload_pick: delivering '{}' ({} bytes)",
+        filename,
+        bytes.len()
+    ));
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::HeaderName::from_static(UPLOAD_FILENAME_HEADER),
+                pct_encode_filename(&filename),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// Composite health check. Probes the WebView event loop with a `ui:ping`
@@ -1235,5 +1397,59 @@ mod async_render_tests {
         // Slot was removed → a second drain is Gone (no double-delivery).
         assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Gone));
         assert!(slots.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::pct_encode_filename;
+
+    #[test]
+    fn plain_ascii_name_is_unchanged() {
+        assert_eq!(pct_encode_filename("report.pdf"), "report.pdf");
+        assert_eq!(pct_encode_filename("a-b_c.1~2"), "a-b_c.1~2");
+    }
+
+    #[test]
+    fn spaces_and_specials_are_encoded() {
+        assert_eq!(pct_encode_filename("my file.txt"), "my%20file.txt");
+        assert_eq!(pct_encode_filename("a/b"), "a%2Fb");
+        assert_eq!(pct_encode_filename("a+b&c"), "a%2Bb%26c");
+    }
+
+    #[test]
+    fn utf8_survives_roundtrip() {
+        // Umlaut + emoji: every non-unreserved byte becomes %XX, so the
+        // header stays pure ASCII and the bridge can reconstruct the name.
+        let encoded = pct_encode_filename("Prüfung.md");
+        assert!(encoded.is_ascii());
+        assert!(encoded.starts_with("Pr%"));
+        assert!(encoded.ends_with("fung.md"));
+        // Decoding the percent-escapes yields the original UTF-8 bytes.
+        let decoded = pct_decode(&encoded);
+        assert_eq!(decoded, "Prüfung.md".as_bytes());
+    }
+
+    /// Reference percent-decoder mirroring what the bridges do, used to prove
+    /// the encoder round-trips. Not used in production Rust (the encoder lives
+    /// on the companion; the bridges own decoding).
+    fn pct_decode(s: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        out
     }
 }
