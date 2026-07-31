@@ -262,7 +262,7 @@ jobs:
           cat > notes.md <<NOTES_EOF
           ## aiui ${TAG}
 
-          Signed + notarized by high5 ventures GmbH. From v0.1.2 on, existing installations
+          Signed + notarized by byte5 GmbH. From v0.1.2 on, existing installations
           update themselves in place via the in-app updater.
 
           **Fresh install:** Download \`aiui-${VERSION}-arm64.dmg\`, double-click, drag aiui.app into Applications, launch once.
