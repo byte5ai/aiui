@@ -7,6 +7,7 @@
   import Form from "./widgets/Form.svelte";
   import Confirm from "./widgets/Confirm.svelte";
   import Gallery from "./widgets/Gallery.svelte";
+  import Compare from "./widgets/Compare.svelte";
 
   type DialogReq = {
     id: string;
@@ -351,6 +352,8 @@
       <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else if current.spec.kind === "gallery"}
       <Gallery spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+    {:else if current.spec.kind === "compare"}
+      <Compare spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else}
       <main class="window-shell">
         <div class="window-scroll">

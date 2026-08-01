@@ -172,6 +172,28 @@ def test_resolve_local_paths_walks_gallery_items(tmp_path: Path) -> None:
     assert gallery_spec["items"][3]["src"] == "data:image/png;base64,UNCHANGED"
 
 
+def test_resolve_local_paths_walks_compare_variants(tmp_path: Path) -> None:
+    """Compare `variants[].src` must resolve the same generic way as every
+    other `src`/`thumbnail` slot — local image path inlines as data:,
+    remote/data URLs pass through untouched.
+    """
+    img = tmp_path / "draft-a.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfake bytes")
+
+    compare_spec = {
+        "kind": "compare",
+        "variants": [
+            {"value": "a", "src": str(img)},
+            {"value": "b", "src": "https://leave.me/b.png"},
+            {"value": "c", "content": "Just markdown text, no src."},
+        ],
+    }
+    _resolve_local_paths(compare_spec)
+    assert compare_spec["variants"][0]["src"].startswith("data:image/png;base64,")
+    assert compare_spec["variants"][1]["src"] == "https://leave.me/b.png"
+    assert "src" not in compare_spec["variants"][2]
+
+
 def test_is_local_video_classifies_correctly() -> None:
     assert _is_local_video("/Users/me/clip.mp4")
     assert _is_local_video("~/Movies/take.MOV")

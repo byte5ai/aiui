@@ -784,11 +784,44 @@ const KNOWN_FIELD_KINDS: &[&str] = &[
 /// specs.
 fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     let kind = spec.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(kind, "ask" | "form" | "confirm" | "gallery") {
+    if !matches!(kind, "ask" | "form" | "confirm" | "gallery" | "compare") {
         return Err((
-            format!("top-level 'kind' must be one of ask|form|confirm|gallery, got '{kind}'"),
-            "Use confirm for yes/no, ask for one-of-N, form for ≥2 inputs, gallery for batch image/video review.".into(),
+            format!("top-level 'kind' must be one of ask|form|confirm|gallery|compare, got '{kind}'"),
+            "Use confirm for yes/no, ask for one-of-N, form for ≥2 inputs, gallery for batch image/video review, compare for A/B(/C) side-by-side pick.".into(),
         ));
+    }
+    if kind == "compare" {
+        match spec.get("variants").and_then(|v| v.as_array()) {
+            None => {
+                return Err((
+                    "compare spec is missing the 'variants' array".into(),
+                    "Provide variants: [{value, label?, content?, src?}, …] — at least 2.".into(),
+                ));
+            }
+            Some(arr) if arr.len() < 2 => {
+                return Err((
+                    format!("compare 'variants' has {} entr{}, needs at least 2", arr.len(), if arr.len() == 1 { "y" } else { "ies" }),
+                    "A/B needs 2 variants, A/B/C needs 3 — compare is for comparing options side by side, not showing one.".into(),
+                ));
+            }
+            Some(arr) => {
+                for (i, it) in arr.iter().enumerate() {
+                    let has_value = it
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !has_value {
+                        return Err((
+                            format!("compare variant #{i} is missing a non-empty 'value'"),
+                            "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
     if kind == "gallery" {
         match spec.get("items").and_then(|v| v.as_array()) {
@@ -1280,6 +1313,54 @@ mod validate_tests {
     #[test]
     fn rejects_missing_top_level_kind() {
         assert!(validate_spec(&json!({"title":"x"})).is_err());
+    }
+
+    #[test]
+    fn accepts_compare_with_two_variants() {
+        let spec = json!({"kind":"compare","variants":[
+            {"value":"a","content":"Draft A"},
+            {"value":"b","content":"Draft B"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_compare_with_three_variants() {
+        let spec = json!({"kind":"compare","variants":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"b","src":"data:image/png;base64,BBBB"},
+            {"value":"c","src":"data:image/png;base64,CCCC"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_compare_without_variants() {
+        let err = validate_spec(&json!({"kind":"compare"})).unwrap_err();
+        assert!(err.0.contains("variants"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_compare_with_fewer_than_two_variants() {
+        let spec = json!({"kind":"compare","variants":[{"value":"a","content":"only one"}]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("at least 2"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_compare_empty_variants() {
+        let err = validate_spec(&json!({"kind":"compare","variants":[]})).unwrap_err();
+        assert!(err.0.contains("at least 2"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_compare_variant_without_value() {
+        let spec = json!({"kind":"compare","variants":[
+            {"content":"A"},
+            {"value":"b","content":"B"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("value"), "got: {}", err.0);
     }
 
     #[test]
