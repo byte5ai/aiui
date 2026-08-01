@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 
 from aiui_mcp.server import (
+    _collect_local_audios,
     _collect_local_videos,
+    _is_local_audio,
     _is_local_video,
     _looks_like_local_path,
     _read_path_as_data_url,
@@ -227,3 +229,62 @@ def test_collect_and_replace_local_videos_mirrors_rust() -> None:
     # Untouched: https video and the image.
     assert spec["items"][1]["src"] == "https://x.test/two.mp4"
     assert spec["items"][2]["src"] == "/Users/me/pic.png"
+
+
+def test_read_path_as_data_url_uses_audio_mime_overrides(tmp_path: Path) -> None:
+    for ext, mime in (
+        ("mp3", "audio/mpeg"),
+        ("m4a", "audio/mp4"),
+        ("wav", "audio/wav"),
+        ("aac", "audio/aac"),
+        ("ogg", "audio/ogg"),
+        ("flac", "audio/flac"),
+    ):
+        f = tmp_path / f"sample.{ext}"
+        f.write_bytes(b"fake audio bytes")
+        url = _read_path_as_data_url(str(f))
+        assert url.startswith(f"data:{mime};base64,"), f"{ext}: {url}"
+
+
+def test_is_local_audio_classifies_correctly() -> None:
+    assert _is_local_audio("/Users/me/sample.mp3")
+    assert _is_local_audio("~/Music/voice.M4A")
+    assert _is_local_audio("/tmp/a.wav")
+    assert _is_local_audio("/tmp/a.aac")
+    assert _is_local_audio("/tmp/a.ogg")
+    assert _is_local_audio("/tmp/a.flac")
+    assert not _is_local_audio("https://x.test/clip.mp3")
+    assert not _is_local_audio("data:audio/mpeg;base64,AAAA")
+    assert not _is_local_audio("/Users/me/photo.png")
+    assert not _is_local_audio("/Users/me/clip.mp4")  # video, not audio
+    assert not _is_local_audio("relative/clip.mp3")
+
+
+def test_collect_and_replace_local_audio_mirrors_rust() -> None:
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "audio", "src": "/Users/me/sample.mp3"},
+            {"kind": "audio", "src": "https://x.test/two.mp3"},
+            {"kind": "image", "src": "/Users/me/pic.png"},
+            {
+                "kind": "list",
+                "items": [{"label": "L", "value": "l", "thumbnail": "/Users/me/sample.mp3"}],
+            },
+        ],
+    }
+    found: list[str] = []
+    _collect_local_audios(spec, found)
+    # De-duplicated: the same path in two slots appears once.
+    assert found == ["/Users/me/sample.mp3"]
+
+    mapping = {"/Users/me/sample.mp3": "http://127.0.0.1:7777/media/blob/x.mp3"}
+    _replace_srcs(spec, mapping)
+    assert spec["fields"][0]["src"] == "http://127.0.0.1:7777/media/blob/x.mp3"
+    assert (
+        spec["fields"][3]["items"][0]["thumbnail"]
+        == "http://127.0.0.1:7777/media/blob/x.mp3"
+    )
+    # Untouched: https audio and the image.
+    assert spec["fields"][1]["src"] == "https://x.test/two.mp3"
+    assert spec["fields"][2]["src"] == "/Users/me/pic.png"

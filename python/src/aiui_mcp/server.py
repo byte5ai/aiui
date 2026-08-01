@@ -299,6 +299,18 @@ _LOCAL_PATH_MIME_OVERRIDES = {
     # Pythons, and `image/svg` (without `+xml`) on others. Lock it down
     # so the WebView always sees the canonical `image/svg+xml`.
     ".svg": "image/svg+xml",
+    # Audio (#25): `mimetypes.guess_type` returns None or an inconsistent
+    # value for several of these across Python/OS combinations (notably
+    # `.m4a` and `.flac`). Local audio is normally routed through
+    # `_upload_local_audios` before this function ever runs, but pin these
+    # down anyway so the `data:` fallback path stays correct too — mirrors
+    # `guess_mime_from_extension` in the Rust bridge.
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
 }
 
 
@@ -441,6 +453,79 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
             url = r.json().get("url")
         except (httpx.HTTPError, ValueError) as e:
             log.warning("video upload failed %s: %s", p, e)
+            continue
+        if url:
+            mapping[p] = url
+    _replace_srcs(spec, mapping)
+
+
+_AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac")
+
+
+def _is_local_audio(s: str) -> bool:
+    """A local-filesystem path pointing at an audio file by extension.
+    Mirrors `is_local_audio_path` in the Rust bridge (#25). Covers the
+    common lossy/lossless formats a TTS sample, voice memo, or generated
+    sound clip is likely to arrive in.
+    """
+    if not _looks_like_local_path(s):
+        return False
+    stem = s.lower().split("?", 1)[0].split("#", 1)[0]
+    return stem.endswith(_AUDIO_EXTS)
+
+
+def _collect_local_audios(node: Any, out: list[str]) -> None:
+    """Gather distinct local audio paths from every `src`/`thumbnail` slot."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _SRC_KEYS and isinstance(value, str) and _is_local_audio(value):
+                if value not in out:
+                    out.append(value)
+            else:
+                _collect_local_audios(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_local_audios(item, out)
+
+
+async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+    """Push local audio files to the companion's `/media` cache and rewrite
+    their `src`/`thumbnail` to the returned loopback playback URL (#25).
+
+    Same reasoning as `_upload_local_videos`: local files are too big (or
+    simply unnecessary) to inline as `data:` given the 10 MB cap + base64
+    bloat, and a remote agent's file isn't readable from the Mac — so the
+    bridge streams the bytes over the same :7777 channel the render uses.
+    Best-effort: a read error, a 413, or an old companion without `/media`
+    (404) leaves the path untouched, and `_resolve_local_paths` then does
+    whatever it can with it.
+    """
+    paths: list[str] = []
+    _collect_local_audios(spec, paths)
+    if not paths:
+        return
+    mapping: dict[str, str] = {}
+    for p in paths:
+        try:
+            data = Path(p).expanduser().read_bytes()
+        except OSError as e:
+            log.warning("audio skipped (read failed) %s: %s", p, e)
+            continue
+        ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp3"
+        try:
+            r = await client.post(
+                f"{ENDPOINT}/media",
+                params={"ext": ext},
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "Content-Type": "application/octet-stream",
+                },
+                content=data,
+            )
+            r.raise_for_status()
+            url = r.json().get("url")
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("audio upload failed %s: %s", p, e)
             continue
         if url:
             mapping[p] = url
@@ -704,6 +789,10 @@ async def _post_render(
         # swap their `src` for the returned playback URL — BEFORE the image
         # inliner runs, so it never tries to base64 a huge clip.
         await _upload_local_videos(spec, client)
+        # Audio (#25): same reasoning — local audio for the form `audio`
+        # field is routed through the /media cache instead of the 10 MB
+        # `data:` inliner, uniformly regardless of clip size.
+        await _upload_local_audios(spec, client)
         # Resolve any absolute / `~/`-rooted file paths *before* shipping
         # the spec down the HTTP wire. This bridge runs on the same host
         # as the agent — local for Mac use, remote for SSH-tunneled
@@ -868,6 +957,7 @@ async def form(
     - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
     - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the Mac), or a `data:` URL. Use for visual confirmation of agent-generated previews.
     - annotated_image: {kind, name, src, label?, alt?, mode?, max_height?, required?, default?}  — let the user MARK a spot on an image (logo placement, crop hint, bug location). `src` follows the same rules as `image`. `mode` ∈ {"point" (click one marker, default), "region" (drag a rectangle), "both" (user flips a Point/Region tool)}. `default` may seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized units. Result under `name`: {point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null} — all coordinates normalized 0..1; multiply by `natural` for pixels.
+    - audio:       {kind, src, label?}  — read-only native `<audio controls>` player. Use for "listen to this TTS sample / voice memo / generated sound clip before deciding". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner.
     - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders to SVG and DOMPurify-sanitises before display.
     - wireframe:   {kind, panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}  — read-only UI-layout mockup. Real CSS-Grid panels with optional header (`title`) and multi-line monospace body (`content`, escape `\n`). `tone` ∈ {"default","muted","highlight"}. Use this for *UI-layouts* (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) instead of ASCII boxes-and-pipes — `mermaid` is for *diagrams* (graphs, sequence/state, gantt). Wireframe complements it for the layout class.
     - image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}
