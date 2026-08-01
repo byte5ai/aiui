@@ -47,6 +47,9 @@ instead of asking via chat. Default behaviour for this session:
 - User wants to hand you a file from their Mac (`/aiui:upload`, \
   \"take this file\", \"upload …\") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
+- Async-completion signal the user doesn't need to answer (tests green, \
+  deploy done, merge conflict) → call `notify` — it returns immediately, \
+  no dialog, no reply expected.
 - Pure information the user only reads → keep it in chat.
 
 Type `/aiui:teach` for the full widget catalog when composing a \
@@ -467,6 +470,20 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "notify",
+            "description": "Fire a native macOS notification and return immediately — use this for an async-completion signal to a user who isn't watching this session (\"tests green\", \"deploy finished\", \"merge conflicts, need you\"). Unlike confirm/ask/form/gallery, this tool does NOT wait for the user: it hands the notification to the OS and returns {ok: true} right away, with no dialog, no window, no response to parse. Use it instead of a chat message when the point is exactly that the user doesn't have to be looking at this session to notice. For anything that needs an answer (yes/no, a choice, input), use confirm/ask/form — notify has no way to carry a reply back. `title` is required and short (≤ ~40 chars, notification banners truncate); `body` carries the detail. `subtitle` is optional extra context (folded into the body on platforms without a distinct subtitle slot). `sound` is an optional OS sound name (e.g. \"default\"); omit for a silent notification.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["title", "body"],
+                "properties": {
+                    "title": { "type": "string", "description": "Short headline, ≤ ~40 chars — notification banners truncate longer text." },
+                    "body": { "type": "string", "description": "The detail — what finished, what needs attention." },
+                    "subtitle": { "type": "string", "description": "Optional extra context line." },
+                    "sound": { "type": "string", "description": "Optional OS notification sound name (e.g. \"default\"). Omit for silent." }
+                }
+            }
+        },
+        {
             "name": "aiui_health",
             "description": "Reachability check against the local aiui companion. Returns version + ready flag if the companion is running and responding.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -758,6 +775,20 @@ async fn tools_call(
             .await,
             format_dialog_result,
         ),
+
+        "notify" => post_json(
+            http,
+            cfg,
+            "/notify",
+            json!({
+                "title": args.get("title"),
+                "body": args.get("body"),
+                "subtitle": args.get("subtitle"),
+                "sound": args.get("sound")
+            }),
+        )
+        .await
+        .map(value_to_tool_text),
 
         "aiui_health" => get_json(http, cfg, "/health").await.map(value_to_tool_text),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
@@ -1293,6 +1324,42 @@ async fn post_empty(
         .map_err(|e| format!("POST {path}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("{path} http {}", resp.status()));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// POST with a JSON body, returning the parsed response. Backs `notify`
+/// (#17) — unlike `render_dialog`, there is no async-poll dance here: the
+/// companion's `/notify` handler is itself fire-and-forget and answers
+/// synchronously the moment the OS accepts the notification. A non-2xx
+/// status surfaces the response body (if any) so a 422 `invalid_request`
+/// detail from the companion reaches the agent instead of a bare status
+/// code.
+async fn post_json(
+    http: &reqwest::Client,
+    cfg: &AppConfig,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let token = load_token(cfg)?;
+    let url = format!("{}{}", base_url(cfg), path);
+    let resp = http
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {path}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(if detail.is_empty() {
+            format!("{path} http {status}")
+        } else {
+            format!("{path} http {status}: {detail}")
+        });
     }
     resp.json::<Value>()
         .await

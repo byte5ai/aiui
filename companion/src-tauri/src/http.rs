@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::logging::trace;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
 /// How long `/health` waits for a `ui:ping` round-trip from the frontend
@@ -162,6 +163,34 @@ struct UpdateResponse {
     note: Option<String>,
 }
 
+/// Body for `POST /notify` — backs the `notify` MCP tool (#17). Unlike
+/// confirm/ask/form/gallery this is fire-and-forget: no dialog window, no
+/// registry entry, no wait on a user response. `title` and `body` are
+/// required (empty `title` is rejected below, mirroring the `confirm`
+/// tool's requirement); `subtitle` and `sound` are optional and silently
+/// ignored on platforms/notification backends that don't support them.
+#[derive(Deserialize)]
+struct NotifyRequest {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    subtitle: Option<String>,
+    /// Notification sound name. macOS: a system sound name (e.g.
+    /// `"default"`) or omit for silent. Passed through as-is; an invalid
+    /// name is swallowed by the OS rather than erroring the call.
+    #[serde(default)]
+    sound: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NotifyResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 pub async fn serve(
     cfg: Arc<AppConfig>,
     dialog: Arc<DialogState>,
@@ -197,6 +226,7 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/render", post(render))
         .route("/render/:id", get(render_poll))
+        .route("/notify", post(notify))
         .route("/version", get(version))
         .route("/update", post(update))
         .route("/ping", get(ping))
@@ -1248,6 +1278,93 @@ async fn render(
     .into_response()
 }
 
+/// A `notify` title must carry actual text — an empty/whitespace-only title
+/// would show a blank banner headline. Pulled out as a pure predicate (like
+/// `validate_spec` above) so the rule is unit-testable without a Tauri app.
+fn notify_title_is_valid(title: &str) -> bool {
+    !title.trim().is_empty()
+}
+
+/// Combine `body` and an optional `subtitle` into the single text handed to
+/// `NotificationBuilder::body`. `tauri-plugin-notification`'s builder has no
+/// dedicated `subtitle()` — that concept only exists on macOS's notification
+/// banner — so a caller-supplied subtitle is folded into the body instead of
+/// silently disappearing cross-platform. Returns `None` when there is
+/// nothing to show (both blank), so the caller can skip `.body()` entirely
+/// rather than rendering an empty line.
+fn compose_notify_body(body: &str, subtitle: Option<&str>) -> Option<String> {
+    let subtitle = subtitle.map(str::trim).filter(|s| !s.is_empty());
+    let body = Some(body.trim()).filter(|s| !s.is_empty());
+    match (subtitle, body) {
+        (Some(s), Some(b)) => Some(format!("{s}\n{b}")),
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// `POST /notify` — fire a native OS notification and return immediately
+/// (#17). Deliberately NOT modeled on `/render`: there is no dialog window,
+/// no registry entry, no user response to wait on — the whole point of
+/// `notify` (vs. `confirm`/`ask`/`form`) is that the agent doesn't block on
+/// it. `tauri-plugin-notification` hands the request to the OS notification
+/// center (`UNUserNotificationCenter` on macOS) and returns as soon as that
+/// hand-off succeeds; it does not wait for the user to see or dismiss it.
+async fn notify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<NotifyRequest>,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    if !notify_title_is_valid(&req.title) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "detail": "title must not be empty",
+            })),
+        )
+            .into_response();
+    }
+
+    let mut builder = state.app.notification().builder().title(&req.title);
+    if let Some(body) = compose_notify_body(&req.body, req.subtitle.as_deref()) {
+        builder = builder.body(body);
+    }
+    if let Some(sound) = req.sound.as_deref().filter(|s| !s.is_empty()) {
+        builder = builder.sound(sound);
+    }
+
+    match builder.show() {
+        Ok(()) => {
+            trace("notify: shown");
+            (StatusCode::OK, Json(NotifyResponse { ok: true, error: None })).into_response()
+        }
+        Err(e) => {
+            // Not fatal to the caller — surface `{ok: false, error}` rather
+            // than a 5xx, mirroring the tolerant style of the other
+            // best-effort endpoints (e.g. media upload). A missing/denied
+            // OS notification permission is the expected failure mode here,
+            // not a bug.
+            trace(&format!("notify: show failed: {e}"));
+            (
+                StatusCode::OK,
+                Json(NotifyResponse {
+                    ok: false,
+                    error: Some(e.to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod validate_tests {
     use super::validate_spec;
@@ -1454,6 +1571,66 @@ mod render_guard_tests {
         // Entry untouched by the disarmed guard (the real handler's explicit
         // `complete`/`cancel` owns removal on the terminal path).
         assert_eq!(ds.stats().orphan_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::{compose_notify_body, notify_title_is_valid};
+
+    #[test]
+    fn title_must_be_non_empty() {
+        assert!(!notify_title_is_valid(""));
+        assert!(!notify_title_is_valid("   "));
+        assert!(!notify_title_is_valid("\t\n"));
+    }
+
+    #[test]
+    fn title_with_content_is_valid() {
+        assert!(notify_title_is_valid("Deploy finished"));
+        // Leading/trailing whitespace around real content is fine — only
+        // whitespace-*only* titles are rejected.
+        assert!(notify_title_is_valid("  Deploy finished  "));
+    }
+
+    #[test]
+    fn compose_body_prefers_both_when_present() {
+        assert_eq!(
+            compose_notify_body("All tests passed.", Some("CI")),
+            Some("CI\nAll tests passed.".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_body_falls_back_to_subtitle_only() {
+        assert_eq!(
+            compose_notify_body("", Some("CI finished")),
+            Some("CI finished".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_body_falls_back_to_body_only() {
+        assert_eq!(
+            compose_notify_body("All tests passed.", None),
+            Some("All tests passed.".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_body_none_when_both_blank() {
+        assert_eq!(compose_notify_body("", None), None);
+        assert_eq!(compose_notify_body("   ", Some("  ")), None);
+    }
+
+    #[test]
+    fn compose_body_ignores_blank_subtitle() {
+        // A whitespace-only subtitle must not produce a spurious blank line
+        // above the real body text.
+        assert_eq!(
+            compose_notify_body("All tests passed.", Some("   ")),
+            Some("All tests passed.".to_string())
+        );
     }
 }
 
