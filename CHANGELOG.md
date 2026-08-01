@@ -57,6 +57,19 @@ All notable changes to this project are documented here.
   can recover pixel coordinates losslessly. `required` gates the submit
   action on an annotation being present. Documented in the skill field
   catalog and mirrored in the Rust and Python `form` tool descriptions.
+- **`audio` field in `form` dialogs (#25).** Native `<audio controls>`
+  player for TTS-sample review, voice-memo confirmation, or triaging a
+  generated sound clip — read-only like `image`/`mermaid`/`wireframe`,
+  no value in the form result. Spec: `{kind: "audio", src, label?}`.
+  `src` accepts the same three formats as `image` (`data:`, `http(s)://`,
+  absolute/`~/` local path), but a local audio file
+  (mp3/m4a/wav/aac/ogg/flac) is never inlined as `data:` — it's always
+  routed through the same size-unbounded `/media` cache the `gallery`
+  tool already uses for local video, so clips of any size work
+  identically whether the agent runs on the user's Mac or a remote SSH
+  host. Both bridges (Rust companion and the `aiui-mcp` PyPI package for
+  remote/headless use) implement the same routing so behavior doesn't
+  drift between the two.
 
 ## [0.8.3] — 2026-07-29
 

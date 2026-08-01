@@ -333,7 +333,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, mermaid, wireframe, image_grid, list, table, tree. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. Non-secret fields with a `target` are written AND returned. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. Non-secret fields with a `target` are written AND returned. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -801,18 +801,24 @@ fn base_url(cfg: &AppConfig) -> String {
     format!("http://127.0.0.1:{}", cfg.http_port)
 }
 
-/// Push a local video file to the companion's `POST /media` cache and return
-/// the playback URL it hands back. Reads the file on *this* host (local Mac,
-/// or the remote for an SSH-tunneled session) and uploads the bytes over the
-/// same :7777 channel the render goes through — so it works identically
-/// local and remote without any Mac→remote access. Errors (file unreadable,
-/// 413, old companion without `/media` → 404) bubble up; the caller treats
-/// them as non-fatal and leaves the original path in place.
+/// Push a local video or audio file to the companion's `POST /media` cache
+/// and return the playback URL it hands back. Reads the file on *this* host
+/// (local Mac, or the remote for an SSH-tunneled session) and uploads the
+/// bytes over the same :7777 channel the render goes through — so it works
+/// identically local and remote without any Mac→remote access. Errors (file
+/// unreadable, 413, old companion without `/media` → 404) bubble up; the
+/// caller treats them as non-fatal and leaves the original path in place.
+///
+/// `ext` names the cached file's extension (and thus the served
+/// Content-Type) — pass [`crate::imageresolve::video_ext`] or
+/// [`crate::imageresolve::audio_ext`] depending on which collector matched
+/// `path`.
 async fn upload_media(
     http: &reqwest::Client,
     cfg: &AppConfig,
     token: &str,
     path: &str,
+    ext: &str,
 ) -> Result<String, String> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
         match dirs::home_dir() {
@@ -825,7 +831,6 @@ async fn upload_media(
     let bytes = tokio::fs::read(&expanded)
         .await
         .map_err(|e| format!("read {}: {e}", expanded.display()))?;
-    let ext = crate::imageresolve::video_ext(path);
     let url = format!("{}/media?ext={}", base_url(cfg), ext);
     let resp = http
         .post(&url)
@@ -1057,7 +1062,26 @@ async fn render_dialog(
     if !videos.is_empty() {
         let mut map = std::collections::HashMap::new();
         for path in videos {
-            match upload_media(http, cfg, &token, &path).await {
+            let ext = crate::imageresolve::video_ext(&path);
+            match upload_media(http, cfg, &token, &path, &ext).await {
+                Ok(media_url) => {
+                    map.insert(path, media_url);
+                }
+                Err(e) => trace(&format!("render_dialog: media upload failed for {path}: {e}")),
+            }
+        }
+        crate::imageresolve::replace_srcs(&mut spec, &map);
+    }
+    // Audio (#25): same reasoning as video — route local audio through the
+    // /media cache rather than the 10 MB-capped `data:` inliner, so a form's
+    // `audio` field works uniformly regardless of clip size or whether the
+    // agent runs locally or on a remote SSH host.
+    let audios = crate::imageresolve::collect_local_audio_paths(&spec);
+    if !audios.is_empty() {
+        let mut map = std::collections::HashMap::new();
+        for path in audios {
+            let ext = crate::imageresolve::audio_ext(&path);
+            match upload_media(http, cfg, &token, &path, &ext).await {
                 Ok(media_url) => {
                     map.insert(path, media_url);
                 }

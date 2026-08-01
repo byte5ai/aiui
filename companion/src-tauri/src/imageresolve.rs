@@ -248,6 +248,17 @@ fn guess_mime_from_extension(path: &Path) -> &'static str {
         Some("mp4" | "m4v") => "video/mp4",
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
+        // Audio — for the form `audio` field's `<audio controls>` (#25). Like
+        // video, local audio is routed through the /media cache before this
+        // function ever sees it (see `is_local_audio_path`), so these
+        // branches mainly document the contract / cover the data:-URL and
+        // http(s) resolver paths, which reuse this mime table too.
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("wav") => "audio/wav",
+        Some("aac") => "audio/aac",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
         // Unknown extension: hand it to the WebView as octet-stream.
         // It will likely fail to render, but that's a clear "your file
         // isn't an image" signal rather than a misleading mime guess.
@@ -293,6 +304,62 @@ pub fn collect_local_video_paths(spec: &Value) -> Vec<String> {
         }
         if let Some(s) = value.as_str() {
             if is_local_video_path(s) && !found.iter().any(|f| f == s) {
+                found.push(s.to_string());
+            }
+        }
+    });
+    found
+}
+
+/// True for a local-filesystem path that points at an audio file by
+/// extension. Used to route audio through the push-to-cache `/media` path
+/// instead of the (10 MB-capped, base64-bloating) `data:` inliner — mirrors
+/// [`is_local_video_path`] above, the Python bridge's `_is_local_audio`, and
+/// the analogous check that will land in the `form` widget's `audio` field.
+/// Covers the common lossy/lossless formats a TTS sample, voice memo, or
+/// generated sound clip is likely to arrive in (#25).
+pub fn is_local_audio_path(s: &str) -> bool {
+    if !looks_like_local_path(s) {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Strip any query/fragment a path-ish string might carry before matching.
+    let stem = lower.split(['?', '#']).next().unwrap_or(&lower);
+    stem.ends_with(".mp3")
+        || stem.ends_with(".m4a")
+        || stem.ends_with(".wav")
+        || stem.ends_with(".aac")
+        || stem.ends_with(".ogg")
+        || stem.ends_with(".flac")
+}
+
+/// File extension (lowercase, no dot) of a local audio path — for naming the
+/// uploaded cache file. Defaults to `mp3` if somehow absent. Mirrors
+/// [`video_ext`].
+pub fn audio_ext(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let stem = lower.split(['?', '#']).next().unwrap_or(&lower);
+    stem.rsplit('.')
+        .next()
+        .filter(|e| !e.is_empty())
+        .unwrap_or("mp3")
+        .to_string()
+}
+
+/// Collect every distinct local audio path referenced in a `src`/`thumbnail`
+/// slot anywhere in the spec. Mirrors [`collect_local_video_paths`] — the
+/// bridge uploads each to the Mac's `/media` endpoint, then calls
+/// [`replace_srcs`] to swap the paths for the returned playback URLs — all
+/// *before* [`resolve_local_paths`] runs, so the image inliner never tries to
+/// base64 a large audio file.
+pub fn collect_local_audio_paths(spec: &Value) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    walk(spec, &mut |key, value| {
+        if !SRC_KEYS.contains(&key) {
+            return;
+        }
+        if let Some(s) = value.as_str() {
+            if is_local_audio_path(s) && !found.iter().any(|f| f == s) {
                 found.push(s.to_string());
             }
         }
@@ -454,6 +521,67 @@ mod tests {
         assert_eq!(video_ext("/a/b.MP4"), "mp4");
         assert_eq!(video_ext("~/x.webm"), "webm");
         assert_eq!(video_ext("/a/take.mov"), "mov");
+    }
+
+    #[test]
+    fn is_local_audio_path_classifies_correctly() {
+        assert!(is_local_audio_path("/Users/me/sample.mp3"));
+        assert!(is_local_audio_path("~/Music/voice.M4A"));
+        assert!(is_local_audio_path("/tmp/a.wav"));
+        assert!(is_local_audio_path("/tmp/a.aac"));
+        assert!(is_local_audio_path("/tmp/a.ogg"));
+        assert!(is_local_audio_path("/tmp/a.flac"));
+        // Not local, or not audio.
+        assert!(!is_local_audio_path("https://x.test/clip.mp3"));
+        assert!(!is_local_audio_path("data:audio/mpeg;base64,AAAA"));
+        assert!(!is_local_audio_path("/Users/me/photo.png"));
+        assert!(!is_local_audio_path("/Users/me/clip.mp4")); // video, not audio
+        assert!(!is_local_audio_path("relative/clip.mp3"));
+    }
+
+    #[test]
+    fn audio_ext_extracts_lowercase_extension() {
+        assert_eq!(audio_ext("/a/b.MP3"), "mp3");
+        assert_eq!(audio_ext("~/x.flac"), "flac");
+        assert_eq!(audio_ext("/a/take.WAV"), "wav");
+    }
+
+    #[test]
+    fn collect_and_replace_local_audio() {
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "audio", "src": "/Users/me/sample.mp3"},
+                {"kind": "audio", "src": "https://x.test/two.mp3"},
+                {"kind": "image", "src": "/Users/me/pic.png"},
+                {"kind": "list", "items": [
+                    {"label": "L", "value": "l", "thumbnail": "/Users/me/sample.mp3"}
+                ]}
+            ]
+        });
+        let mut found = collect_local_audio_paths(&spec);
+        found.sort();
+        // De-duplicated: the same path in two slots appears once.
+        assert_eq!(found, vec!["/Users/me/sample.mp3".to_string()]);
+
+        let mut spec = spec;
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "/Users/me/sample.mp3".to_string(),
+            "http://127.0.0.1:7777/media/blob/x.mp3".to_string(),
+        );
+        replace_srcs(&mut spec, &map);
+        assert_eq!(
+            spec["fields"][0]["src"].as_str().unwrap(),
+            "http://127.0.0.1:7777/media/blob/x.mp3"
+        );
+        assert_eq!(
+            spec["fields"][3]["items"][0]["thumbnail"].as_str().unwrap(),
+            "http://127.0.0.1:7777/media/blob/x.mp3"
+        );
+        // Untouched: https audio and the image.
+        assert_eq!(spec["fields"][1]["src"].as_str().unwrap(), "https://x.test/two.mp3");
+        assert_eq!(spec["fields"][2]["src"].as_str().unwrap(), "/Users/me/pic.png");
     }
 
     #[test]
@@ -629,6 +757,9 @@ mod tests {
         assert_eq!(guess_mime_from_extension(Path::new("a.png")), "image/png");
         assert_eq!(guess_mime_from_extension(Path::new("a.JPG")), "image/jpeg");
         assert_eq!(guess_mime_from_extension(Path::new("a.svg")), "image/svg+xml");
+        assert_eq!(guess_mime_from_extension(Path::new("a.mp3")), "audio/mpeg");
+        assert_eq!(guess_mime_from_extension(Path::new("a.M4A")), "audio/mp4");
+        assert_eq!(guess_mime_from_extension(Path::new("a.wav")), "audio/wav");
         assert_eq!(
             guess_mime_from_extension(Path::new("a.unknown")),
             "application/octet-stream"

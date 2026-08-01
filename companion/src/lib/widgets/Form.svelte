@@ -80,6 +80,7 @@
           region?: { x: number; y: number; w: number; h: number };
         };
       }
+    | { kind: "audio"; src: string; label?: string }
     | { kind: "mermaid"; source: string; label?: string; max_height?: number }
     | {
         kind: "wireframe";
@@ -208,6 +209,7 @@
       case "static_text":
       case "markdown":
       case "image":
+      case "audio":
       case "mermaid":
       case "wireframe":
         return undefined;
@@ -256,6 +258,7 @@
         f.kind !== "static_text" &&
         f.kind !== "markdown" &&
         f.kind !== "image" &&
+        f.kind !== "audio" &&
         f.kind !== "mermaid" &&
         f.kind !== "wireframe"
     );
@@ -490,6 +493,7 @@
       f.kind === "static_text" ||
       f.kind === "markdown" ||
       f.kind === "image" ||
+      f.kind === "audio" ||
       f.kind === "mermaid" ||
       f.kind === "wireframe"
     )
@@ -693,6 +697,12 @@
             {/if}
           </div>
         </div>
+      {:else if f.kind === "audio"}
+        <figure class="audio-field">
+          {#if f.label}<figcaption>{f.label}</figcaption>{/if}
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <audio src={f.src} controls preload="metadata"></audio>
+        </figure>
       {:else if f.kind === "mermaid"}
         <MermaidView source={f.source} label={f.label} max_height={f.max_height} />
       {:else if f.kind === "wireframe"}
@@ -1124,6 +1134,22 @@
   }
   .annimg-readout code { font-size: 11.5px; }
   .annimg-empty { font-size: 11.5px; color: var(--muted); }
+
+  /* --- audio --- */
+  .audio-field {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .audio-field figcaption {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .audio-field audio {
+    display: block;
+    width: 100%;
+  }
 
   /* --- image grid --- */
   .image-grid {
