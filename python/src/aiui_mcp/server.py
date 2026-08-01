@@ -127,6 +127,9 @@ instead of asking via chat. Default behaviour for this session:
 - User wants to hand you a file from their Mac (`/aiui:upload`, \
   "take this file", "upload …") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
+- Async-completion signal the user doesn't need to answer (tests green, \
+  deploy done, merge conflict) → call `notify` — it returns immediately, \
+  no dialog, no reply expected.
 - Pure information the user only reads → keep it in chat.
 
 Type `/aiui:teach` for the full widget catalog when composing a \
@@ -1327,6 +1330,73 @@ async def compare(
         "height": height,
     }
     return _format_result(await _post_render(spec, ctx, session))
+
+
+@mcp.tool()
+async def notify(
+    title: str,
+    body: str,
+    subtitle: str | None = None,
+    sound: str | None = None,
+) -> dict[str, Any]:
+    """Fire a native macOS notification and return immediately — use this
+    for an async-completion signal to a user who isn't watching this
+    session ("tests green", "deploy finished", "merge conflicts, need
+    you"). Unlike `confirm`/`ask`/`form`/`gallery`, this tool does NOT wait
+    for the user: it hands the notification to the OS and returns
+    `{ok: True}` right away, with no dialog, no window, no response to
+    parse.
+
+    WHEN TO USE: the point is exactly that the user doesn't have to be
+    looking at this session to notice — a long-running task just finished,
+    something needs their attention whenever they get to it. Use it
+    instead of a chat message for that case.
+
+    WHEN NOT TO USE: anything that needs an answer (yes/no, a choice,
+    input) — `notify` has no way to carry a reply back. Use `confirm`,
+    `ask`, or `form` instead.
+
+    Runs against the *user's Mac*, regardless of whether this MCP is local
+    or reached via an SSH reverse-tunnel — same as `update`/`version`,
+    the notification always renders on the Mac side.
+
+    Returns `{ok: bool, error?: str}`. `ok: False` most commonly means the
+    user hasn't granted aiui notification permission on macOS yet (the OS
+    prompts for this once, on the first `notify` call) — not a bug to
+    retry around.
+
+    Args:
+        title: Short headline, ≤ ~40 chars — notification banners
+            truncate longer text.
+        body: The detail — what finished, what needs attention.
+        subtitle: Optional extra context line.
+        sound: Optional OS notification sound name (e.g. "default").
+            Omit for silent.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+            r = await client.post(
+                f"{ENDPOINT}/notify",
+                headers={"Authorization": f"Bearer {_token()}"},
+                json={"title": title, "body": body, "subtitle": subtitle, "sound": sound},
+            )
+            if r.status_code == 422:
+                # Structured invalid_request from the companion (e.g. empty
+                # title) — surface detail so the agent can fix the call.
+                try:
+                    detail = r.json().get("detail", r.text)
+                except ValueError:
+                    detail = r.text
+                raise RuntimeError(f"aiui rejected the notification: {detail}")
+            r.raise_for_status()
+            return r.json()
+    except RuntimeError:
+        raise  # our own structured error above — pass through verbatim
+    except Exception as e:
+        raise RuntimeError(
+            f"aiui /notify failed at {ENDPOINT}: {_explain_exc(e)}. "
+            f"Run `aiui_health` first to check whether aiui.app is reachable."
+        ) from e
 
 
 @mcp.prompt(name="teach")
