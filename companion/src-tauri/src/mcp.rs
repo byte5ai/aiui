@@ -428,6 +428,45 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "compare",
+            "description": "Side-by-side A/B (or A/B/C) compare: render 2+ variants as full-content panes next to each other and let the user click ONE to pick. Use this instead of `ask`+thumbnail (which only shows a small icon per option, not the full content) or `gallery` (per-item batch review — approve/revise/skip each, not a single pick). Fits \"which draft is better\", \"which image edit\", \"before vs. after\", \"which of these three headlines\". Each variant needs a stable `value` (the key returned as `selected`) and at least one of `content` (markdown text — drafts, diffs, code) or `src` (image/video, same resolution rules as elsewhere: data: URL, http(s):// URL, or absolute / `~/`-rooted local path on YOUR host; videos render with native controls). A variant may carry both — e.g. an image plus a caption. Set `sync_scroll: true` when comparing long text so scrolling one pane scrolls all of them together. If `max_height` is set on any variant, it caps every pane's height (equal-height panes read as \"side by side\"; independent per-pane heights don't). Returns {cancelled, selected} — `selected` is the `value` of the picked variant (only set when the user actually submits; Cancel/Escape leaves it absent). For a plain yes/no use `confirm`; for choosing among many small thumbnails use `ask`+thumbnail or `image_grid`; for per-item batch verdicts use `gallery`. **Blocks until the user picks and submits or cancels. Response can take minutes — progress notifications fire every ~10 s.**",
+            "inputSchema": {
+                "type": "object",
+                "required": ["variants"],
+                "properties": {
+                    "session": { "type": "string", "description": "Optional short human label for the session this dialog belongs to (project/task name). Shown in the window chrome so the user can tell parallel dialogs apart." },
+                    "title": { "type": "string", "description": "What's being compared, e.g. \"Which intro paragraph?\"." },
+                    "description": { "type": "string", "description": "One sentence of context shown under the title." },
+                    "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
+                    "variants": {
+                        "type": "array",
+                        "minItems": 2,
+                        "description": "The options to compare, rendered as equal-width panes in order. Needs at least 2 (A/B) — 3 for A/B/C.",
+                        "items": {
+                            "type": "object",
+                            "required": ["value"],
+                            "properties": {
+                                "value": { "type": "string", "description": "Stable id; returned as `selected` when this variant is picked. Must be non-empty." },
+                                "label": { "type": "string", "description": "Pane header. Defaults to A / B / C / … by position." },
+                                "content": { "type": "string", "description": "Markdown text for a text variant — draft copy, a before/after diff, code." },
+                                "src": { "type": "string", "description": "Image or video source: data: URL, http(s):// URL, or absolute / ~/ local path on YOUR host." },
+                                "alt": { "type": "string" },
+                                "detail": { "type": "string", "description": "Short caption under the pane — source, score, timestamp." },
+                                "max_height": { "type": "number", "description": "Cap this pane's height in px. If set on ANY variant, it applies to ALL panes so they stay equal-height." }
+                            }
+                        }
+                    },
+                    "sync_scroll": { "type": "boolean", "default": false, "description": "Lock scroll position across all panes — useful when comparing long text side by side." },
+                    "columns": { "type": "number", "description": "Override the number of columns. Defaults to variants.length, capped at 4." },
+                    "submit_label": { "type": "string" },
+                    "cancel_label": { "type": "string" },
+                    "size": { "type": "string", "enum": ["s", "m", "l"], "description": "Starting window size hint: s / m / l. Default auto-sizes to variant count and content. Always resizable; never opens smaller than the content needs." },
+                    "width": { "type": "number", "description": "Explicit starting window width in logical px (overrides `size`)." },
+                    "height": { "type": "number", "description": "Explicit starting window height in logical px (overrides `size`)." }
+                }
+            }
+        },
+        {
             "name": "aiui_health",
             "description": "Reachability check against the local aiui companion. Returns version + ready flag if the companion is running and responding.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -695,6 +734,30 @@ async fn tools_call(
         ),
 
         "upload" => Ok(do_upload(&args, cfg, http).await),
+
+        "compare" => dispatch_render(
+            render_dialog(
+                json!({
+                    "kind": "compare",
+                    "title": args.get("title"),
+                    "description": args.get("description"),
+                    "header": args.get("header"),
+                    "variants": args.get("variants"),
+                    "syncScroll": args.get("sync_scroll").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "columns": args.get("columns"),
+                    "submitLabel": args.get("submit_label"),
+                    "cancelLabel": args.get("cancel_label"),
+                    "size": args.get("size"),
+                    "width": args.get("width"),
+                    "height": args.get("height")
+                }),
+                args.get("session").and_then(|v| v.as_str()).map(String::from),
+                cfg,
+                http,
+            )
+            .await,
+            format_dialog_result,
+        ),
 
         "aiui_health" => get_json(http, cfg, "/health").await.map(value_to_tool_text),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),

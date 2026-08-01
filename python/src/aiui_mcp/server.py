@@ -1164,6 +1164,80 @@ async def upload(
     return result
 
 
+@mcp.tool()
+async def compare(
+    variants: list[dict[str, Any]],
+    title: str | None = None,
+    description: str | None = None,
+    header: str | None = None,
+    sync_scroll: bool = False,
+    columns: int | None = None,
+    submit_label: str | None = None,
+    cancel_label: str | None = None,
+    size: str | None = None,
+    width: float | None = None,
+    height: float | None = None,
+    session: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Side-by-side A/B (or A/B/C) compare: render 2+ variants as full-content
+    panes next to each other and let the user click ONE to pick.
+
+    WHEN TO USE: "which draft is better", "which image edit", "before vs.
+    after", "which of these three headlines". Use this instead of `ask` with
+    `thumbnail` (which only shows a small icon per option, not the full
+    content) or `gallery` (per-item batch review — approve/revise/skip each,
+    not a single pick).
+
+    Each variant needs a stable `value` (the key returned as `selected`) and
+    at least one of `content` (markdown text — drafts, diffs, code) or `src`
+    (image/video, standard aiui resolution rules: data: URL, http(s) URL, or
+    absolute / `~/` local path on YOUR host; videos render with native
+    controls). A variant may carry both — e.g. an image plus a caption.
+
+    Returns `{cancelled, selected}` — `selected` is the `value` of the picked
+    variant (only set when the user actually submits).
+
+    Args:
+        variants: List of `{value, label?, content?, src?, alt?, detail?,
+            max_height?}`. Needs at least 2 entries (A/B) — 3 for A/B/C.
+            `value` must be non-empty. `label` defaults to A / B / C / … by
+            position. `max_height` set on ANY variant caps every pane's
+            height so they stay equal-height and read as side-by-side.
+        title: What's being compared, e.g. "Which intro paragraph?".
+        description: One sentence of context under the title.
+        header: Chip above the title (≤ 14 chars).
+        sync_scroll: Lock scroll position across all panes — useful when
+            comparing long text side by side.
+        columns: Override the number of columns. Defaults to
+            `len(variants)`, capped at 4.
+        submit_label: Footer submit button label.
+        cancel_label: Footer cancel button label.
+        size: Starting window size hint — "s", "m", or "l". Default
+            auto-sizes to variant count and content. Always resizable;
+            never opens smaller than the content needs.
+        width: Explicit starting width in logical px (overrides `size`).
+        height: Explicit starting height in logical px (overrides `size`).
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
+    """
+    spec = {
+        "kind": "compare",
+        "title": title,
+        "description": description,
+        "header": header,
+        "variants": variants,
+        "syncScroll": sync_scroll,
+        "columns": columns,
+        "submitLabel": submit_label,
+        "cancelLabel": cancel_label,
+        "size": size,
+        "width": width,
+        "height": height,
+    }
+    return _format_result(await _post_render(spec, ctx, session))
+
+
 @mcp.prompt(name="teach")
 def teach_prompt() -> str:
     """Brief the agent on aiui. Loads the full widget catalog, design
