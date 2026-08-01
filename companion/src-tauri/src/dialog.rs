@@ -242,6 +242,16 @@ pub fn estimate_dialog_size(spec: &serde_json::Value) -> (f64, f64) {
                 (w, (rows * 130.0 + 30.0).max(160.0))
             }
             "image" => (BASE_W, 220.0),
+            "annotated_image" => {
+                // Interactive: image + tool/clear toolbar + coordinate readout.
+                // Reserve extra vertical room over a plain `image` so the stage
+                // isn't cramped and the drag surface stays usable.
+                let img_h = field
+                    .get("max_height")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(320.0);
+                (BASE_W, (img_h + 90.0).min(560.0))
+            }
             "tree" => (BASE_W, 240.0),
             "list" => {
                 let items = field

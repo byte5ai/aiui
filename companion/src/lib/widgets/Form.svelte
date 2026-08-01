@@ -65,6 +65,21 @@
     | { kind: "static_text"; text: string; tone?: "info" | "warn" | "muted" }
     | { kind: "markdown"; text: string }
     | { kind: "image"; src: string; label?: string; alt?: string; max_height?: number }
+    | {
+        kind: "annotated_image";
+        name: string;
+        src: string;
+        label?: string;
+        alt?: string;
+        /** point → single marker, region → rectangle, both → user picks a tool. Default "point". */
+        mode?: "point" | "region" | "both";
+        max_height?: number;
+        required?: boolean;
+        default?: {
+          point?: { x: number; y: number };
+          region?: { x: number; y: number; w: number; h: number };
+        };
+      }
     | { kind: "mermaid"; source: string; label?: string; max_height?: number }
     | {
         kind: "wireframe";
@@ -217,6 +232,14 @@
         };
       case "image_grid":
         return { selected: [...(f.default_selected ?? [])] };
+      case "annotated_image":
+        // Normalized (0..1) coordinates. `natural` is filled in once the
+        // image loads so the agent can recover pixel coordinates losslessly.
+        return {
+          point: f.default?.point ?? null,
+          region: f.default?.region ?? null,
+          natural: null as { width: number; height: number } | null,
+        };
       case "tree":
         return {
           selected: [...(f.default_selected ?? [])],
@@ -319,6 +342,128 @@
     values[name] = { ...g, selected };
   }
 
+  // --- annotated image ----------------------------------------------------
+  // A single point marker and/or a rectangular region, both stored as
+  // normalized 0..1 coordinates relative to the *displayed* image (which,
+  // because the overlay exactly covers the <img>, are also fractions of the
+  // natural image — resolution-independent). `mode` decides which gestures
+  // are available; in "both" the user flips an explicit Point/Region tool so
+  // the gesture is never ambiguous.
+  type AnnValue = {
+    point: { x: number; y: number } | null;
+    region: { x: number; y: number; w: number; h: number } | null;
+    natural: { width: number; height: number } | null;
+  };
+  type AnnField = Extract<Field, { kind: "annotated_image" }>;
+  // Below this drag distance (in normalized units) a region gesture counts as
+  // a stray click and is discarded rather than committing a degenerate rect.
+  const ANN_MIN_REGION = 0.01;
+
+  let annTool = $state<Record<string, "point" | "region">>({});
+  let annDrag = $state<{
+    name: string;
+    tool: "point" | "region";
+    startX: number;
+    startY: number;
+    prevRegion: AnnValue["region"];
+  } | null>(null);
+
+  function annActiveTool(f: AnnField): "point" | "region" {
+    if (f.mode === "region") return "region";
+    if (f.mode !== "both") return "point";
+    return annTool[f.name] ?? "point";
+  }
+
+  function annSetTool(f: AnnField, tool: "point" | "region") {
+    annTool = { ...annTool, [f.name]: tool };
+  }
+
+  function annNormFromEvent(e: PointerEvent, stage: HTMLElement): { x: number; y: number } {
+    const rect = stage.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 };
+    const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    return { x: round4(x), y: round4(y) };
+  }
+
+  function round4(n: number): number {
+    return Math.round(n * 1e4) / 1e4;
+  }
+
+  function annOnImageLoad(name: string, img: HTMLImageElement) {
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const v = values[name] as AnnValue;
+    values[name] = { ...v, natural: { width: img.naturalWidth, height: img.naturalHeight } };
+  }
+
+  function annPointerDown(f: AnnField, e: PointerEvent, stage: HTMLElement) {
+    // Only react to the primary (left / touch / pen) button.
+    if (e.button !== 0) return;
+    e.preventDefault();
+    stage.setPointerCapture?.(e.pointerId);
+    const tool = annActiveTool(f);
+    const p = annNormFromEvent(e, stage);
+    const v = values[f.name] as AnnValue;
+    annDrag = { name: f.name, tool, startX: p.x, startY: p.y, prevRegion: v.region };
+    if (tool === "point") {
+      values[f.name] = { ...v, point: p };
+    } else {
+      // Start a zero-size region; it grows on move.
+      values[f.name] = { ...v, region: { x: p.x, y: p.y, w: 0, h: 0 } };
+    }
+  }
+
+  function annPointerMove(f: AnnField, e: PointerEvent, stage: HTMLElement) {
+    if (!annDrag || annDrag.name !== f.name) return;
+    e.preventDefault();
+    const p = annNormFromEvent(e, stage);
+    const v = values[f.name] as AnnValue;
+    if (annDrag.tool === "point") {
+      values[f.name] = { ...v, point: p };
+    } else {
+      const x = Math.min(annDrag.startX, p.x);
+      const y = Math.min(annDrag.startY, p.y);
+      const w = Math.abs(p.x - annDrag.startX);
+      const h = Math.abs(p.y - annDrag.startY);
+      values[f.name] = {
+        ...v,
+        region: { x: round4(x), y: round4(y), w: round4(w), h: round4(h) },
+      };
+    }
+  }
+
+  function annPointerUp(f: AnnField, e: PointerEvent, stage: HTMLElement) {
+    if (!annDrag || annDrag.name !== f.name) return;
+    e.preventDefault();
+    stage.releasePointerCapture?.(e.pointerId);
+    const drag = annDrag;
+    annDrag = null;
+    if (drag.tool === "region") {
+      const v = values[f.name] as AnnValue;
+      const r = v.region;
+      // Discard a degenerate drag (a stray click) — restore what was there.
+      if (!r || r.w < ANN_MIN_REGION || r.h < ANN_MIN_REGION) {
+        values[f.name] = { ...v, region: drag.prevRegion };
+      }
+    }
+  }
+
+  function annClear(f: AnnField) {
+    const v = values[f.name] as AnnValue;
+    values[f.name] = { ...v, point: null, region: null };
+  }
+
+  function annHasAnnotation(f: AnnField): boolean {
+    const v = values[f.name] as AnnValue | undefined;
+    if (!v) return false;
+    const tool = annActiveTool(f);
+    if (f.mode === "point") return !!v.point;
+    if (f.mode === "region") return !!v.region;
+    // "both": either satisfies. Use tool only as a hint; presence wins.
+    void tool;
+    return !!v.point || !!v.region;
+  }
+
   function toggleTreeExpand(name: string, value: string) {
     const t = values[name] as { selected: string[]; expanded: Set<string> };
     const expanded = new Set(t.expanded);
@@ -360,6 +505,10 @@
       if (!("required" in f) || !f.required) return true;
       const v = values[f.name] as { selected: string[] };
       return v.selected.length > 0;
+    }
+    if (f.kind === "annotated_image") {
+      if (!f.required) return true;
+      return annHasAnnotation(f);
     }
     if (!("required" in f) || !f.required) return true;
     const v = values[(f as any).name];
@@ -463,6 +612,87 @@
           <img src={f.src} alt={f.alt ?? f.label ?? ""} />
           {#if f.label}<figcaption>{f.label}</figcaption>{/if}
         </figure>
+      {:else if f.kind === "annotated_image"}
+        {@const ann = values[f.name] as AnnValue}
+        {@const annMode = f.mode ?? "point"}
+        <div class="annimg">
+          {#if f.label}<label>{f.label}{f.required ? " *" : ""}</label>{/if}
+          <div class="annimg-toolbar">
+            {#if annMode === "both"}
+              <div class="annimg-tools" role="group" aria-label="Annotation tool">
+                <button
+                  type="button"
+                  class="annimg-tool"
+                  class:active={annActiveTool(f) === "point"}
+                  onclick={() => annSetTool(f, "point")}>● Point</button>
+                <button
+                  type="button"
+                  class="annimg-tool"
+                  class:active={annActiveTool(f) === "region"}
+                  onclick={() => annSetTool(f, "region")}>▭ Region</button>
+              </div>
+            {:else}
+              <span class="annimg-hint">
+                {annMode === "region" ? "Drag to mark a region" : "Click to mark a point"}
+              </span>
+            {/if}
+            <button
+              type="button"
+              class="annimg-clear"
+              disabled={!ann.point && !ann.region}
+              onclick={() => annClear(f)}>Clear</button>
+          </div>
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="annimg-stage"
+            class:region-tool={annActiveTool(f) === "region"}
+            style={f.max_height ? `max-height: ${f.max_height}px` : ""}
+            onpointerdown={(e) => annPointerDown(f, e, e.currentTarget as HTMLElement)}
+            onpointermove={(e) => annPointerMove(f, e, e.currentTarget as HTMLElement)}
+            onpointerup={(e) => annPointerUp(f, e, e.currentTarget as HTMLElement)}
+            onpointercancel={(e) => annPointerUp(f, e, e.currentTarget as HTMLElement)}
+          >
+            <img
+              src={f.src}
+              alt={f.alt ?? f.label ?? ""}
+              draggable="false"
+              onload={(e) => annOnImageLoad(f.name, e.currentTarget as HTMLImageElement)}
+            />
+            <svg
+              class="annimg-overlay"
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {#if ann.region}
+                <rect
+                  class="ann-region"
+                  x={ann.region.x * 100}
+                  y={ann.region.y * 100}
+                  width={ann.region.w * 100}
+                  height={ann.region.h * 100}
+                />
+              {/if}
+              {#if ann.point}
+                <line class="ann-cross" x1={ann.point.x * 100} y1="0" x2={ann.point.x * 100} y2="100" />
+                <line class="ann-cross" x1="0" y1={ann.point.y * 100} x2="100" y2={ann.point.y * 100} />
+                <circle class="ann-point" cx={ann.point.x * 100} cy={ann.point.y * 100} r="1.6" />
+              {/if}
+            </svg>
+          </div>
+          <div class="annimg-readout">
+            {#if ann.point}
+              <code>point {ann.point.x.toFixed(3)}, {ann.point.y.toFixed(3)}</code>
+            {/if}
+            {#if ann.region}
+              <code
+                >region {ann.region.x.toFixed(3)}, {ann.region.y.toFixed(3)} · {ann.region.w.toFixed(3)}×{ann.region.h.toFixed(3)}</code>
+            {/if}
+            {#if !ann.point && !ann.region}
+              <span class="annimg-empty">No annotation yet</span>
+            {/if}
+          </div>
+        </div>
       {:else if f.kind === "mermaid"}
         <MermaidView source={f.source} label={f.label} max_height={f.max_height} />
       {:else if f.kind === "wireframe"}
@@ -806,6 +1036,94 @@
     border-top: 1px solid var(--border);
     text-align: center;
   }
+
+  /* --- annotated image --- */
+  .annimg { display: flex; flex-direction: column; gap: 6px; }
+  .annimg-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .annimg-hint { font-size: 12px; color: var(--muted); }
+  .annimg-tools { display: inline-flex; gap: 0; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .annimg-tool {
+    background: var(--surface);
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .annimg-tool + .annimg-tool { border-left: 1px solid var(--border); }
+  .annimg-tool.active { background: var(--accent); color: var(--accent-fg); }
+  .annimg-clear {
+    margin-left: auto;
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    cursor: pointer;
+  }
+  .annimg-clear:disabled { opacity: 0.5; cursor: default; }
+  .annimg-stage {
+    position: relative;
+    width: fit-content;
+    max-width: 100%;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    cursor: crosshair;
+    touch-action: none;
+    user-select: none;
+  }
+  .annimg-stage.region-tool { cursor: crosshair; }
+  .annimg-stage img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    -webkit-user-drag: none;
+    user-select: none;
+  }
+  .annimg-overlay {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .ann-region {
+    fill: color-mix(in srgb, var(--accent) 18%, transparent);
+    stroke: var(--accent);
+    stroke-width: 0.5;
+    vector-effect: non-scaling-stroke;
+  }
+  .ann-cross {
+    stroke: var(--accent);
+    stroke-width: 1;
+    stroke-dasharray: 2 2;
+    vector-effect: non-scaling-stroke;
+    opacity: 0.7;
+  }
+  .ann-point {
+    fill: var(--accent);
+    stroke: var(--accent-fg, #fff);
+    stroke-width: 0.5;
+    vector-effect: non-scaling-stroke;
+  }
+  .annimg-readout {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .annimg-readout code { font-size: 11.5px; }
+  .annimg-empty { font-size: 11.5px; color: var(--muted); }
 
   /* --- image grid --- */
   .image-grid {
