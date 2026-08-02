@@ -12,6 +12,7 @@ one that doesn't wait for the user at all:
 - `ask` — single- or multi-choice with descriptions and optional free-text fallback
 - `form` — composite window with typed fields and multiple action buttons
 - `gallery` — batch review of images/videos with a per-item verdict
+- `compare` — side-by-side A/B (or A/B/C) content compare, pick one
 - `notify` — fire-and-forget native OS notification; no dialog, no
   response, returns immediately
 
@@ -62,10 +63,15 @@ Skip the dialog for content the user reads, doesn't answer:
 | Intent | Tool |
 |---|---|
 | Yes/no, especially destructive | `confirm` |
+| Yes/no on a generated image ("is this OK?") | `confirm` with `image: {src}` |
 | 2–6 options, possibly with per-option context | `ask` |
+| Pick one of N images ("A or B or C") | `ask` with `thumbnail` per option |
 | Multi-field input, multi-action footer | `form` |
 | Listen to a TTS sample / voice memo / sound clip before deciding | `form` with an `audio` field |
+| Pick one of *many* images (e.g. 12 logo variants) | `form` with `image_grid` |
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
+| Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
+| Mark *where* on an image (point / region) | `form` with `annotated_image` |
 | Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
@@ -219,6 +225,31 @@ Read-only, sits between input fields. Anti-pattern: ASCII
 boxes-and-pipes for *anything* layout-shaped — that is exactly what
 this field replaces.
 
+## Mark a point or region on an image: `annotated_image`
+
+When the answer is *spatial* — "where should the logo go?", "which part
+do I crop?", "point at the bug" — show the image and let the user mark it
+directly instead of describing it in words. A `form` field. Spec:
+`{kind: "annotated_image", name, src, label?, alt?, mode?, max_height?, required?, default?}`.
+
+- `src` — same resolution rules as `image` (absolute / `~/` local path on
+  your host, `http(s)://` URL, or `data:` URL). See
+  [Image sources](#image-sources-src--thumbnail).
+- `mode` — `"point"` (default, click one crosshair), `"region"` (drag a
+  rectangle), or `"both"` (a Point/Region toggle; both are returned).
+- `default` — seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized
+  units to pre-place a marker the user then nudges.
+- `required` — submit stays disabled until the user has marked what the
+  mode calls for.
+
+Result under the field `name`:
+`{point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null}`.
+All coordinates are **normalized 0..1**, resolution-independent; multiply
+by `natural` (the image's intrinsic pixel size) to get pixels. Use it
+instead of a `select` full of "top-left / bottom-right" options; for
+*picking one image out of many* use `image_grid` (this annotates a
+**single** image).
+
 ## Visual pickers: `image_grid`
 
 For "pick one (or more) of these N generated images" — logo variants,
@@ -268,17 +299,97 @@ a **native file picker on the Mac**; the chosen file is written to
   (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir).
   Blocks until pick/cancel; progress fires every ~10 s meanwhile.
 
+## Side-by-side compare: `compare`
+
+A standalone tool (not a `form` field) for an A/B or A/B/C compare: render
+2+ full-content **variants** side by side and let the user click ONE to
+pick. Use for "which draft is better", "which of these three headlines",
+"before vs. after", "GPT vs. Claude's answer" — anywhere the full content,
+not a thumbnail, has to be visible to decide.
+
+Spec: `variants: [{value, label?, content?, src?, alt?, detail?, max_height?}]`
+(≥ 2), `sync_scroll?`, `columns?` (default `variants.length`, capped at 4).
+Each variant needs a stable `value` (returned as `selected`) and at least
+one of `content` (Markdown — draft, diff, code) or `src` (image/video,
+same resolution rules as everywhere else; videos render with native
+controls). A variant may carry both. `label` defaults to A / B / C … by
+position; `detail` is a short caption under the pane.
+
+Result: `{cancelled, selected}` — `selected` is the picked variant's
+`value`, set only when the user submits. `sync_scroll: true` locks scroll
+across panes (reach for it on long text). `max_height` is dialog-wide, not
+per-variant: set on any one variant it caps *every* pane so they stay
+equal-height. Use `compare` instead of `ask`+`thumbnail` (too small to
+actually compare) or `gallery` (independent per-item verdict, not one
+either/or pick).
+
 ## Starting window size: `size`
 
-`form` and `gallery` take an optional `size` hint — `"s"`, `"m"`, `"l"` —
-and aiui picks good local defaults, clamped to the screen. (Explicit
-`width`/`height` in logical px override it; rarely needed.) The hint is a
-**floor**: the window opens at `max(content-estimate, hint)`, so it never
-opens smaller than the content needs, but a sparse dialog can be told to
-start roomy. Windows are always resizable — but many users don't realise
-that, so opening at a comfortable size is what separates "polished" from
-"looks broken". Use `"m"`/`"l"` for forms with images/tables/wireframes/many
-fields, or galleries with a large batch; leave unset for short forms.
+`form`, `gallery`, and `compare` take an optional `size` hint — `"s"`,
+`"m"`, `"l"` — and aiui picks good local defaults, clamped to the screen.
+(Explicit `width`/`height` in logical px override it; rarely needed.) The
+hint is a **floor**: the window opens at `max(content-estimate, hint)`, so
+it never opens smaller than the content needs, but a sparse dialog can be
+told to start roomy. Windows are always resizable — but many users don't
+realise that, so opening at a comfortable size is what separates "polished"
+from "looks broken". Use `"m"`/`"l"` for forms with
+images/tables/wireframes/many fields, or galleries/compares with heavy
+content; leave unset for short forms.
+
+## Image sources (`src` / `thumbnail`)
+
+aiui takes an image source in `confirm` (`image: {src}`), `ask`
+(`options[].thumbnail`), the `form` fields `image` / `image_grid` /
+`annotated_image` / `list` (`items[].thumbnail`), and the `gallery` /
+`compare` tools (`items[].src` / `variants[].src`, images or videos). The
+`audio` field takes the same three formats too, with one twist: a local
+audio path never inlines as `data:`, it always routes through the
+size-unbounded `/media` cache (see [Audio playback](#audio-playback-audio)).
+
+Three input formats render correctly:
+
+- **Local filesystem path** (`/home/me/foo.png`, `~/renders/x.jpg`) — the
+  natural choice when the file is already on disk. This bridge reads the
+  file and inlines it as a `data:` URL before the spec leaves your host.
+  **The path must exist on the host *you*, the agent, run on** — for an
+  SSH-tunneled session that's the remote, not the user's Mac. Absolute or
+  `~/`-rooted only; relative paths are not resolved (no stable `cwd`
+  contract on MCP bridges). 10 MB cap.
+- **`http(s)://` URL** — fetched on the user's Mac and inlined (5 s
+  timeout, 10 MB cap, parallel for grids). Use when the image already
+  lives on a reachable server; the Mac contacts the URL, aiui never phones
+  home.
+- **`data:` URL** (`data:image/png;base64,…`) — the fallback when neither
+  path nor URL fits (e.g. bytes generated in-memory). Embed the encoded
+  bytes directly in the tool-call `src` — never roundtrip through a shell
+  pipeline (see below). Over ~2 MB it starts to feel laggy in the MCP
+  transport.
+
+**Pick the simplest one that works:** path if the file's on disk, then URL
+if reachable, `data:` only as last resort.
+
+Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
+against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
+file on the user's Mac won't resolve from a remote agent, or vice versa —
+the bridge that reads it is on the agent's host; use `http(s)://` or inline
+`data:`); **bare URLs in `markdown` field text** (`![alt](url)` follows the
+same CSP — the resolver only walks `src` / `thumbnail`, not markdown
+bodies); **`<a href="https://…">` links** work as a click target but open
+in the user's default browser, not an image-rendering path. A missing file,
+a CSP block, and a 404 all look identical to the user — if they report a
+broken image, ask once whether anything appeared at all.
+
+### Anti-pattern: shell-encoding `data:` URLs
+
+Don't write the encoded bytes to a tempfile then `cat` / `printf` them back
+through bash to construct the JSON tool call. Two failure modes seen in the
+wild: the terminal recognises the `data:image/...` prefix in stdout and
+tries to render it inline (eating the rest of the pipeline), and the
+encoded payload spans multiple shell-line buffers and gets word-split or
+quoting-mangled. The fix is structural — the tool call is JSON, not shell:
+build the spec in your runtime and pass
+`src=f"data:image/png;base64,{b64}"` straight into the call, or hand aiui
+the path and let the bridge do the encoding.
 
 ## `datetime` field
 
