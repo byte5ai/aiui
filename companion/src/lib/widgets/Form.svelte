@@ -650,7 +650,6 @@
           <div
             class="annimg-stage"
             class:region-tool={annActiveTool(f) === "region"}
-            style={f.max_height ? `max-height: ${f.max_height}px` : ""}
             onpointerdown={(e) => annPointerDown(f, e, e.currentTarget as HTMLElement)}
             onpointermove={(e) => annPointerMove(f, e, e.currentTarget as HTMLElement)}
             onpointerup={(e) => annPointerUp(f, e, e.currentTarget as HTMLElement)}
@@ -660,6 +659,7 @@
               src={f.src}
               alt={f.alt ?? f.label ?? ""}
               draggable="false"
+              style={f.max_height ? `max-height: ${f.max_height}px` : ""}
               onload={(e) => annOnImageLoad(f.name, e.currentTarget as HTMLImageElement)}
             />
             <svg
