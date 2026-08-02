@@ -91,6 +91,21 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Upload never clobbers a concurrently-created file (codex review P2).**
+  The `upload` write replaced a check-then-write (`exists()` then
+  `os.replace`/`rename` — which could overwrite a file created in the race
+  window) with an atomic hard-link into place that fails with an "already
+  exists" error instead. Fixed in both the Rust companion
+  (`fsutil::write_new`) and the Python bridge (`os.link`).
+- **`compare` rejects duplicate variant `value`s (codex review P2).** Two
+  variants sharing a `value` collided as the keyed-`{#each}` key and as the
+  returned `selected`; `validate_spec` now rejects duplicates before render,
+  covering both the native and remote (Python) paths.
+- **`annotated_image` scales the image into `max_height` instead of clipping
+  it (codex review P2).** The height cap now applies to the image itself, not
+  just the overflow-hidden stage, so the whole image stays visible and click
+  coordinates normalize correctly (a click near the visible bottom previously
+  mapped to the wrong `y`).
 - **Reconciled skill.md drift between the two shipped copies + added a CI
   drift guard.** The canonical agent skill (`docs/skill.md`, embedded in
   the native Rust MCP server) and the copy shipped with the Python bridge

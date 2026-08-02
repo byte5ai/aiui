@@ -1029,15 +1029,18 @@ async fn do_upload(args: &Value, cfg: &AppConfig, http: &reqwest::Client) -> Val
 
     let dest = target_dir.join(&filename);
     // Never clobber: a deterministic path is the point, but silently
-    // overwriting the user's existing file is not. Fail loudly instead.
-    if dest.exists() {
-        return upload_error(format!(
-            "target already exists, not overwriting: {}",
-            dest.display()
-        ));
-    }
-    if let Err(e) = crate::fsutil::atomic_write(&dest, &bytes) {
-        return upload_error(format!("writing {}: {e}", dest.display()));
+    // overwriting the user's existing file is not. `write_new` links the
+    // file into place atomically, so a file created between here and the
+    // write cannot be lost — no check-then-write race (codex review P2).
+    match crate::fsutil::write_new(&dest, &bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return upload_error(format!(
+                "target already exists, not overwriting: {}",
+                dest.display()
+            ));
+        }
+        Err(e) => return upload_error(format!("writing {}: {e}", dest.display())),
     }
 
     value_to_tool_text(json!({
