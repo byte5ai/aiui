@@ -89,6 +89,28 @@ All notable changes to this project are documented here.
   `gallery`, with the "when NOT to use chat" guidance extended to cover
   async-completion signals.
 
+### Fixed
+
+- **Reconciled skill.md drift between the two shipped copies + added a CI
+  drift guard.** The canonical agent skill (`docs/skill.md`, embedded in
+  the native Rust MCP server) and the copy shipped with the Python bridge
+  (`python/src/aiui_mcp/skill.md`, used by remote SSH hosts via `uvx`) had
+  drifted: the Python copy was missing whole sections for capabilities that
+  **both** bridges expose — the `compare` tool, the `annotated_image` form
+  field, and the `Image sources` (`src`/`thumbnail`) resolution rules plus
+  the `data:`-URL shell-encoding anti-pattern. Those sections are now
+  present in the Python copy (worded for the bridge's host — local file
+  paths resolve on the agent's host, the remote for an SSH session), and
+  the `compare` tool is reflected in the intro list, the tool-choice table,
+  and the window-size section. Deliberate per-bridge tailoring (frontmatter
+  description, intro wording, the terser Python prose, the `width`/`height`
+  size overrides) is preserved — this is a targeted reconcile, not a
+  flattening. A new `scripts/check-skill-drift.sh` compares the field/tool
+  section headers of the two copies and fails if either documents a
+  field/tool the other doesn't (with a small, commented allowlist for
+  intentional divergences); it runs as the lightweight `skill-drift` job in
+  CI so the two copies can't silently diverge again.
+
 ## [0.8.3] — 2026-07-29
 
 ### Added

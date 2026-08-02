@@ -123,6 +123,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  skill-drift:
+    name: skill.md drift guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # docs/skill.md (canonical, embedded in the Rust MCP server) and
+      # python/src/aiui_mcp/skill.md (shipped with the Python bridge) must
+      # document the same field/tool surface — both bridges expose the same
+      # MCP tools. The two copies are deliberately tailored per bridge, so
+      # this is a field/tool-section check, not a byte diff. See the script
+      # header for how to allowlist a deliberate divergence.
+      - name: Check skill.md copies are in sync
+        run: ./scripts/check-skill-drift.sh
+
   mcp:
     name: aiui-mcp (Python)
     runs-on: ubuntu-latest
