@@ -665,20 +665,25 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
     Rust bridge. Returns the `{status, …}` payload.
     """
     dest = dest_dir / filename
-    if dest.exists():
-        return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
     try:
         fd, tmp = tempfile.mkstemp(prefix=".aiui-upload-", dir=str(dest_dir))
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            os.replace(tmp, dest)
-        except BaseException:
+                f.flush()
+                os.fsync(f.fileno())
+            # Hard-link into place: atomic, and raises FileExistsError if the
+            # destination already exists — no check-then-write race window a
+            # prior `exists()` guard + `os.replace` left open (codex review P2).
+            try:
+                os.link(tmp, dest)
+            except FileExistsError:
+                return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+        finally:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
-            raise
     except OSError as e:
         return {"status": "error", "error": f"writing {dest}: {e}"}
     return {"status": "ok", "path": str(dest), "filename": filename, "bytes": len(data)}

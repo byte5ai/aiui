@@ -836,18 +836,32 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 ));
             }
             Some(arr) => {
+                let mut seen = std::collections::HashSet::new();
                 for (i, it) in arr.iter().enumerate() {
-                    let has_value = it
+                    let value = it
                         .get("value")
                         .and_then(|v| v.as_str())
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    if !has_value {
-                        return Err((
-                            format!("compare variant #{i} is missing a non-empty 'value'"),
-                            "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
-                                .into(),
-                        ));
+                        .filter(|s| !s.is_empty());
+                    match value {
+                        None => {
+                            return Err((
+                                format!("compare variant #{i} is missing a non-empty 'value'"),
+                                "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
+                                    .into(),
+                            ));
+                        }
+                        // Duplicate values collide as the keyed-`{#each}` key and
+                        // as the returned `selected`, making two options
+                        // indistinguishable — reject before render (codex review P2).
+                        Some(v) => {
+                            if !seen.insert(v) {
+                                return Err((
+                                    format!("compare has a duplicate variant 'value': {v:?}"),
+                                    "Each variant's 'value' must be unique — it keys the rendered list and the returned selection."
+                                        .into(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1401,6 +1415,27 @@ mod validate_tests {
             {"kind":"audio","src":"data:audio/mpeg;base64,AAAA","label":"Sample"}
         ]});
         assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_compare_with_unique_values() {
+        let spec = json!({"kind":"compare","variants":[
+            {"value":"a","content":"Draft A"},
+            {"value":"b","content":"Draft B"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_compare_with_duplicate_values() {
+        // Duplicate variant values collide as the keyed-`{#each}` key and the
+        // returned `selected` — must be rejected before render (codex review P2).
+        let spec = json!({"kind":"compare","variants":[
+            {"value":"a","content":"Draft A"},
+            {"value":"a","content":"Draft A prime"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"));
     }
 
     #[test]
