@@ -2,6 +2,10 @@
 
 These rules apply to all AI agents working on this repository (Claude, Codex, Copilot, etc.).
 
+## Memory
+
+Durable memory lives in the `basic-memory` MCP server — call `recall` before acting, `write_note` to save.
+
 ## Git Workflow
 - **Never push directly to `main`.** All changes go through feature branches and pull requests.
 - **Branch naming:** `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`, `test/`, `release/`, `dev/` prefixes.
