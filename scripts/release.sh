@@ -2,7 +2,7 @@
 # aiui does NOT release locally — not on CI-less machines, not on anyone's Mac.
 #
 # Releases run exclusively in GitHub Actions, on a GitHub-hosted macOS
-# runner, exactly like every other devhost project (***, ***):
+# runner, exactly like every other project of ours:
 # Developer-ID signing + notarization (App Store Connect API key), DMG +
 # signed updater bundle + latest.json, GitHub release, PyPI publish. The
 # signing material lives in GitHub Actions secrets — never in a local
