@@ -2,6 +2,31 @@
 
 These rules apply to all AI agents working on this repository (Claude, Codex, Copilot, etc.).
 
+## When to use aiui (dogfooding)
+
+This repo dogfoods its own product. When you work here with aiui's MCP tools
+available — Claude Desktop, or Codex/Claude Code tunnelling to the maintainer's
+Mac — prefer a native dialog over asking in chat, the same rule the
+[aiui skill](docs/skill.md) gives end users. Defaults:
+
+- **Destructive or hard-to-undo yes/no** (delete, drop, force-push, rollback,
+  prod deploy, dispatch a release) → `confirm` with `destructive: true`, even
+  if loose approval was already given.
+- **Pick one of N options where per-option context matters** (which migration
+  path? which release flavour?) → `ask` with a per-option `description`.
+- **Multi-field input, a secret/token, a date or bounded number, or a sortable
+  ranking** → `form` (use a `password` field for secrets — never paste them in
+  chat).
+- **A flow/sequence/state you'd otherwise sketch in ASCII** → `form` with a
+  `mermaid` field.
+- **A completion signal that needs no answer** (tests green, release dispatched,
+  blocked on a conflict) while the maintainer may be tabbed away → `notify`.
+
+Chat still wins for content the user reads but doesn't answer — status,
+summaries, logs, single free-text replies. [`docs/skill.md`](docs/skill.md) is
+the source of truth for the full tool set and field types; keep this section in
+sync with it rather than forking the guidance.
+
 ## Git Workflow
 - **Never push directly to `main`.** All changes go through feature branches and pull requests.
 - **Branch naming:** `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`, `test/`, `release/`, `dev/` prefixes.
