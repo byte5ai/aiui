@@ -468,15 +468,6 @@ pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
             }
         }
     };
-    let had_entry = existing
-        .as_deref()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .and_then(|d| {
-            d.get("mcp_servers")
-                .and_then(|i| i.as_table())
-                .map(|t| t.contains_key("aiui"))
-        })
-        .unwrap_or(false);
     let new_toml = match codex_toml_upsert(existing.as_deref(), app_binary_path) {
         Ok(s) => s,
         Err(e) => {
@@ -487,6 +478,19 @@ pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
             }
         }
     };
+    // Idempotent: if the on-disk file already matches, don't rewrite it — and
+    // don't drop a fresh timestamped `.bak` — on every GUI launch. Mirrors the
+    // already-correct short-circuit in `patch_claude_code_config`. Because
+    // `codex_toml_upsert` is stable (see the idempotency test), this settles
+    // after at most one write.
+    if existing.as_deref() == Some(new_toml.as_str()) {
+        return StepResult {
+            ok: true,
+            message: "aiui already registered in ~/.codex/config.toml".into(),
+            details: None,
+        };
+    }
+    let was_new = existing.is_none();
     if let Err(e) = backup(&path) {
         return StepResult {
             ok: false,
@@ -497,10 +501,10 @@ pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
     match atomic_write(&path, new_toml.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
-            message: if had_entry {
-                "Updated aiui entry in ~/.codex/config.toml".into()
-            } else {
+            message: if was_new {
                 "Added aiui to ~/.codex/config.toml — available in every Codex session".into()
+            } else {
+                "Updated aiui entry in ~/.codex/config.toml".into()
             },
             details: Some(format!("Datei: {}", path.display())),
         },
