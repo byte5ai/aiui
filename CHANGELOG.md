@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.0] — 2026-08-17
+
+### Added
+
+- **OpenAI Codex / ChatGPT is now a first-class host (#168).** aiui
+  registers itself with Codex the same self-contained way it already does
+  with Claude Desktop and Claude Code — on launch it writes its own
+  `~/.codex/config.toml` entry (`[mcp_servers.aiui]`, pointing at the
+  bundled `--mcp-stdio` server, no `uv`/`uvx`). No manual config, no
+  Claude-specific glue: install aiui.app and Codex sees the
+  `confirm`/`ask`/`form` dialogs immediately. The `~/.codex/config.toml`
+  edit is format-preserving (`toml_edit`), so any comments and other MCP
+  servers the user has are left untouched.
+
+### Changed
+
+- **Host registration is now gated on detection (#168).** aiui writes a
+  host's MCP config only when that host is actually installed — Claude
+  Desktop (app bundle or config dir), Claude Code (`~/.claude.json` /
+  `~/.claude/` / `claude` on `PATH`), or Codex (`~/.codex/` / `codex` on
+  `PATH`) — instead of writing the Claude configs unconditionally. No more
+  phantom config files for hosts you don't use. It re-checks on every
+  launch, so a host you install later is picked up automatically on the
+  next start.
+
+### Fixed
+
+- aiui no longer rewrites `~/.codex/config.toml` (and drops a fresh
+  timestamped `.bak`) on every launch when the entry is already correct —
+  the same idempotent short-circuit the Claude paths already had (#170).
+
 ## [0.9.0] — 2026-08-02
 
 ### Added
