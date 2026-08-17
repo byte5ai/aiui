@@ -4,7 +4,7 @@
 
 ## Was aiui ist
 
-aiui ist ein Kanal, über den Coding-Agenten auf dem Mac des Users echte UI rendern — strukturierte Eingaben, die im Chat zu unhandlich oder zu fehleranfällig wären. Topologie heute: Tauri-Companion am Mac, läuft als lokaler MCP-Server in Claude Desktop; Remote-Agenten (Claude Code via SSH) erreichen ihn über Reverse-Tunnel und POSTen Dialog-Specs an `localhost:7777`.
+aiui ist ein Kanal, über den Coding-Agenten auf dem Mac des Users echte UI rendern — strukturierte Eingaben, die im Chat zu unhandlich oder zu fehleranfällig wären. Topologie heute: Tauri-Companion am Mac, der einen host-agnostischen MCP-/HTTP-Kontrakt auf `localhost:7777` exponiert. Lokale MCP-Hosts (Claude Desktop, Codex/ChatGPT) sprechen ihn direkt an; Remote-Agenten (Claude Code oder Codex via SSH) erreichen ihn über Reverse-Tunnel und POSTen Dialog-Specs an `localhost:7777`. Der Companion auto-registriert sich heute nur bei Claude Desktop; andere Hosts binden sich über einen manuellen MCP-Eintrag (z. B. Codex' `~/.codex/config.toml`) an denselben Kontrakt an. Genau diese Host-Agnostik ist der Hebel: dieselbe Capability ist über jeden MCP-fähigen Host portabel, ohne dass je gegen einen einzelnen Client gebaut wurde.
 
 ## Designregel
 
