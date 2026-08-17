@@ -128,6 +128,48 @@ settings.
 | `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
 
+## Using aiui with Codex / ChatGPT
+
+aiui isn't Claude-specific. The companion speaks the [Model Context
+Protocol](https://modelcontextprotocol.io) over `127.0.0.1:7777`, so any
+MCP-capable client can render the same native dialogs. OpenAI's **Codex**
+(the ChatGPT coding agent) is supported today — it discovers and drives
+aiui's `confirm` / `ask` / `form` tools with no Claude-specific glue.
+
+Two things differ from the Claude Desktop path:
+
+- **No auto-registration.** The companion auto-installs itself only for
+  Claude Desktop. For Codex you register the MCP server once, by hand.
+- **The companion must be running.** Dialogs are rendered by `aiui.app`,
+  so keep it open (launch it from Finder). The Codex-side server only
+  forwards specs to it over `127.0.0.1:7777`.
+
+### Setup
+
+1. Install and launch `aiui.app` once (see [Install](#install)) so it's
+   listening on `127.0.0.1:7777` and the pairing token exists at
+   `~/.config/aiui/token`.
+2. Add the server to Codex's `~/.codex/config.toml`:
+
+   ```toml
+   [mcp_servers.aiui]
+   command = "uvx"
+   args = ["aiui-mcp"]
+   ```
+
+   That's the whole config on the Mac that runs the companion — `aiui-mcp`
+   finds the token and the `127.0.0.1:7777` endpoint on its own. This path
+   needs `uv`/`uvx` on that machine (unlike the drag-and-drop Claude
+   Desktop install, which ships the server natively).
+3. Start Codex and ask it to confirm something with aiui — the native
+   dialog opens on your Mac.
+
+Running Codex on a **remote SSH host**? Same reverse-tunnel story as Claude
+Code: register the host in aiui's settings (it scp's the token and forwards
+`127.0.0.1:7777` to that host), then the same `config.toml` block on the
+remote picks it up. Point `AIUI_ENDPOINT` at a different address only if you
+tunnel to a non-default one.
+
 ## FAQ
 
 **Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
@@ -156,20 +198,23 @@ the Rust core and CI build already target Windows; interactive E2E testing
 and a first release are still outstanding. Follow
 [#118](https://github.com/byte5ai/aiui/pull/118) for status.
 
-**Can I use aiui without Claude Desktop?** The companion is
-auto-spawned by Claude Desktop via its MCP registration, so in the
-default setup, no. You can launch `aiui.app` manually though — as long
-as `localhost:7777` is reachable, any MCP client can render dialogs.
+**Can I use aiui without Claude Desktop?** Yes. Launch `aiui.app`
+manually and point any MCP client at `127.0.0.1:7777` — see
+[Using aiui with Codex / ChatGPT](#using-aiui-with-codex--chatgpt) for a
+worked example. In the default Claude Desktop setup the companion is
+auto-spawned for you, so there you don't have to.
 
 **Why not just use Claude Desktop's built-in AskUserQuestion?** It's
 great for single yes/no or single-choice questions, but doesn't cover
 multi-field forms, sortable lists, colour pickers, date ranges, or
 hierarchical pickers. aiui complements it.
 
-**Does aiui work in other MCP-capable clients?** The `aiui-mcp` server
-is a standard MCP server, so technically yes. The companion is Claude
-Desktop-specific in how it auto-installs, but the HTTP protocol on
-`localhost:7777` is client-agnostic.
+**Does aiui work in other MCP-capable clients?** Yes. `aiui-mcp` is a
+standard MCP server and the companion's `127.0.0.1:7777` protocol is
+client-agnostic. OpenAI's Codex is supported today — see
+[Using aiui with Codex / ChatGPT](#using-aiui-with-codex--chatgpt). Only
+the auto-install is Claude Desktop-specific; every other client registers
+the server by hand.
 
 ## Known limitations
 
