@@ -425,15 +425,30 @@ fn codex_toml_upsert(
     existing: Option<&str>,
     app_binary_path: &str,
 ) -> Result<String, toml_edit::TomlError> {
-    use toml_edit::{value, Array, DocumentMut};
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
     let mut doc: DocumentMut = match existing {
         Some(s) => s.parse()?,
         None => DocumentMut::new(),
     };
-    doc["mcp_servers"]["aiui"]["command"] = value(app_binary_path);
+
+    // Build the aiui entry as an explicit table so it serializes as
+    // `[mcp_servers.aiui]` (the conventional, readable form) rather than dotted
+    // keys (`mcp_servers.aiui.command = …`).
+    let mut aiui = Table::new();
+    aiui["command"] = value(app_binary_path);
     let mut args = Array::new();
     args.push("--mcp-stdio");
-    doc["mcp_servers"]["aiui"]["args"] = value(args);
+    aiui["args"] = value(args);
+
+    // Ensure a `[mcp_servers]` parent table exists — implicit, so we never emit
+    // an empty `[mcp_servers]` header — then set (or replace) `aiui` under it.
+    if doc.get("mcp_servers").and_then(|i| i.as_table()).is_none() {
+        let mut parent = Table::new();
+        parent.set_implicit(true);
+        doc.insert("mcp_servers", Item::Table(parent));
+    }
+    doc["mcp_servers"]["aiui"] = Item::Table(aiui);
+
     Ok(doc.to_string())
 }
 
