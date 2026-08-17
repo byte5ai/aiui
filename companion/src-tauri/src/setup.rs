@@ -346,6 +346,233 @@ pub fn is_claude_code_config_current(app_binary_path: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ─── Installed-host detection (#168) ────────────────────────────────────
+//
+// aiui registers itself only with the MCP hosts actually present on this
+// machine — no phantom config files for hosts the user doesn't use.
+// Detection is "installed", not "running": setup runs when the host may be
+// closed, so a running-check would skip a host the user really uses.
+
+/// Whether Claude Desktop is installed here — its app bundle or its config
+/// directory exists. Deliberately NOT [`is_claude_desktop_running`]:
+/// "running" is too strict for install-time registration.
+pub fn is_claude_desktop_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if PathBuf::from("/Applications/Claude.app").exists() {
+            return true;
+        }
+    }
+    claude_desktop_config_path()
+        .parent()
+        .map(|d| d.exists())
+        .unwrap_or(false)
+}
+
+/// Whether Claude Code (the CLI) is set up here — its global config file or
+/// dot-directory exists, or the `claude` binary is on `PATH`.
+pub fn is_claude_code_installed() -> bool {
+    home().join(".claude.json").exists()
+        || home().join(".claude").is_dir()
+        || binary_on_path("claude")
+}
+
+/// Whether OpenAI Codex is set up here — its config directory exists or the
+/// `codex` binary is on `PATH`.
+pub fn is_codex_installed() -> bool {
+    codex_config_path()
+        .parent()
+        .map(|d| d.exists())
+        .unwrap_or(false)
+        || binary_on_path("codex")
+}
+
+/// Cheap `$PATH` scan for an executable by name — no subprocess, unlike a
+/// `which` shell-out. On Windows also tries the usual executable extensions.
+fn binary_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    std::env::split_paths(&paths)
+        .any(|dir| exts.iter().any(|ext| dir.join(format!("{name}{ext}")).is_file()))
+}
+
+// ─── Codex (OpenAI) registration (#168) ─────────────────────────────────
+//
+// The Codex counterpart of `patch_claude_code_config`, but Codex reads TOML
+// (`~/.codex/config.toml`) rather than JSON. We edit it with `toml_edit` so
+// the user's own comments and other MCP servers survive untouched. The entry
+// points at the same bundled `--mcp-stdio` server as the Claude hosts —
+// self-contained, no `uv`/`uvx`.
+
+/// Path to OpenAI Codex's user config: `~/.codex/config.toml` on all OSes.
+fn codex_config_path() -> PathBuf {
+    home().join(".codex").join("config.toml")
+}
+
+/// Upsert `[mcp_servers.aiui]` into an existing Codex `config.toml` (or an
+/// empty document), pointing `command` at the bundled binary with
+/// `--mcp-stdio`. Everything else — comments, formatting, other
+/// `mcp_servers` — is preserved by `toml_edit`. Overwriting the entry is also
+/// the migration path for a legacy `command = "uvx"` install. Idempotent:
+/// re-running with the same binary yields identical output.
+fn codex_toml_upsert(
+    existing: Option<&str>,
+    app_binary_path: &str,
+) -> Result<String, toml_edit::TomlError> {
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    let mut doc: DocumentMut = match existing {
+        Some(s) => s.parse()?,
+        None => DocumentMut::new(),
+    };
+
+    // Build the aiui entry as an explicit table so it serializes as
+    // `[mcp_servers.aiui]` (the conventional, readable form) rather than dotted
+    // keys (`mcp_servers.aiui.command = …`).
+    let mut aiui = Table::new();
+    aiui["command"] = value(app_binary_path);
+    let mut args = Array::new();
+    args.push("--mcp-stdio");
+    aiui["args"] = value(args);
+
+    // Ensure a `[mcp_servers]` parent table exists — implicit, so we never emit
+    // an empty `[mcp_servers]` header — then set (or replace) `aiui` under it.
+    if doc.get("mcp_servers").and_then(|i| i.as_table()).is_none() {
+        let mut parent = Table::new();
+        parent.set_implicit(true);
+        doc.insert("mcp_servers", Item::Table(parent));
+    }
+    doc["mcp_servers"]["aiui"] = Item::Table(aiui);
+
+    Ok(doc.to_string())
+}
+
+/// Register aiui in `~/.codex/config.toml` so Codex sees it as an MCP server.
+/// Call only when [`is_codex_installed`] is true. Backs up first; leaves a
+/// malformed user config untouched rather than clobbering it.
+pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
+    let path = codex_config_path();
+    let existing: Option<String> = match fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "Could not read ~/.codex/config.toml".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
+    let had_entry = existing
+        .as_deref()
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|d| {
+            d.get("mcp_servers")
+                .and_then(|i| i.as_table())
+                .map(|t| t.contains_key("aiui"))
+        })
+        .unwrap_or(false);
+    let new_toml = match codex_toml_upsert(existing.as_deref(), app_binary_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.codex/config.toml is not valid TOML — left untouched".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
+    if let Err(e) = backup(&path) {
+        return StepResult {
+            ok: false,
+            message: "~/.codex/config.toml backup failed".into(),
+            details: Some(e.to_string()),
+        };
+    }
+    match atomic_write(&path, new_toml.as_bytes()) {
+        Ok(_) => StepResult {
+            ok: true,
+            message: if had_entry {
+                "Updated aiui entry in ~/.codex/config.toml".into()
+            } else {
+                "Added aiui to ~/.codex/config.toml — available in every Codex session".into()
+            },
+            details: Some(format!("Datei: {}", path.display())),
+        },
+        Err(e) => StepResult {
+            ok: false,
+            message: "Writing ~/.codex/config.toml failed".into(),
+            details: Some(e.to_string()),
+        },
+    }
+}
+
+/// Remove aiui from `~/.codex/config.toml` on uninstall — unconditional (safe
+/// if no entry exists); preserves the rest of the user's config.
+pub fn remove_codex_config() -> StepResult {
+    let path = codex_config_path();
+    if !path.exists() {
+        return StepResult {
+            ok: true,
+            message: "~/.codex/config.toml does not exist".into(),
+            details: None,
+        };
+    }
+    let Ok(s) = fs::read_to_string(&path) else {
+        return StepResult {
+            ok: true,
+            message: "~/.codex/config.toml unreadable, skipping".into(),
+            details: None,
+        };
+    };
+    let mut doc: toml_edit::DocumentMut = match s.parse() {
+        Ok(d) => d,
+        Err(_) => {
+            return StepResult {
+                ok: true,
+                message: "~/.codex/config.toml not valid TOML, skipping".into(),
+                details: None,
+            }
+        }
+    };
+    let had = doc
+        .get("mcp_servers")
+        .and_then(|i| i.as_table())
+        .map(|t| t.contains_key("aiui"))
+        .unwrap_or(false);
+    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
+        servers.remove("aiui");
+    }
+    if let Err(e) = backup(&path) {
+        return StepResult {
+            ok: false,
+            message: "~/.codex/config.toml backup failed".into(),
+            details: Some(e.to_string()),
+        };
+    }
+    match atomic_write(&path, doc.to_string().as_bytes()) {
+        Ok(_) => StepResult {
+            ok: true,
+            message: if had {
+                "Removed aiui from ~/.codex/config.toml".into()
+            } else {
+                "aiui was not registered in ~/.codex/config.toml".into()
+            },
+            details: None,
+        },
+        Err(e) => StepResult {
+            ok: false,
+            message: "Writing ~/.codex/config.toml failed".into(),
+            details: Some(e.to_string()),
+        },
+    }
+}
+
 /// Best-effort check whether the Claude Desktop application is currently
 /// running. Used to switch the "Restart Claude Desktop" button label
 /// between Start / Restart so we don't ask the user to "restart"
@@ -1383,5 +1610,41 @@ mod tests {
             classify_aiui_entry(Some(&v)),
             Some(AiuiEntryKind::Other)
         ));
+    }
+
+    const AIUI_BIN: &str = "/Applications/aiui.app/Contents/MacOS/aiui";
+
+    #[test]
+    fn codex_upsert_fresh_document() {
+        let out = codex_toml_upsert(None, AIUI_BIN).unwrap();
+        assert!(out.contains("[mcp_servers.aiui]"), "got: {out}");
+        assert!(out.contains(&format!("command = \"{AIUI_BIN}\"")), "got: {out}");
+        assert!(out.contains(r#"args = ["--mcp-stdio"]"#), "got: {out}");
+    }
+
+    #[test]
+    fn codex_upsert_preserves_other_servers_and_comments() {
+        let existing = "# my codex config\n[mcp_servers.other]\ncommand = \"other-bin\"\nargs = [\"x\"]\n";
+        let out = codex_toml_upsert(Some(existing), AIUI_BIN).unwrap();
+        assert!(out.contains("# my codex config"), "comment preserved: {out}");
+        assert!(out.contains("[mcp_servers.other]"), "other server preserved: {out}");
+        assert!(out.contains("other-bin"));
+        assert!(out.contains("[mcp_servers.aiui]"), "aiui added: {out}");
+    }
+
+    #[test]
+    fn codex_upsert_migrates_legacy_uvx() {
+        let existing = "[mcp_servers.aiui]\ncommand = \"uvx\"\nargs = [\"aiui-mcp\"]\n";
+        let out = codex_toml_upsert(Some(existing), AIUI_BIN).unwrap();
+        assert!(out.contains(&format!("command = \"{AIUI_BIN}\"")), "migrated: {out}");
+        assert!(!out.contains("uvx"), "legacy uvx command replaced: {out}");
+        assert!(out.contains(r#"args = ["--mcp-stdio"]"#), "args replaced: {out}");
+    }
+
+    #[test]
+    fn codex_upsert_is_idempotent() {
+        let once = codex_toml_upsert(None, AIUI_BIN).unwrap();
+        let twice = codex_toml_upsert(Some(&once), AIUI_BIN).unwrap();
+        assert_eq!(once, twice, "second apply changed the document");
     }
 }

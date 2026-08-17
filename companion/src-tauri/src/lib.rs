@@ -958,6 +958,7 @@ async fn uninstall_all(
     let mut results = Vec::new();
     results.push(setup::remove_claude_desktop_config());
     results.push(setup::remove_claude_code_config());
+    results.push(setup::remove_codex_config());
     for host in setup::load_remotes() {
         results.push(setup::remove_ssh_forward(&host, cfg.http_port));
         // Same reachability gate as remove_remote: unreachable hosts get one
@@ -1461,9 +1462,11 @@ pub fn run() {
                 cfg.config_dir.display()
             ));
 
-            // Auto-patch Claude Desktop config — idempotent, GUI mode only.
+            // Auto-patch Claude Desktop config — but only if Claude Desktop is
+            // actually installed here (#168); no phantom config for a host the
+            // user doesn't use. Idempotent, GUI mode only.
             let bin = setup::app_binary_path();
-            if !setup::is_claude_config_current(&bin) {
+            if setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
                 let _ = setup::patch_claude_desktop_config(&bin);
             }
 
@@ -1483,8 +1486,19 @@ pub fn run() {
             // Auto-register aiui as a global MCP server in Claude Code
             // (~/.claude.json) and auto-migrate any legacy `uvx aiui-mcp`
             // entries from ≤ v0.2.x installs to the native app binary, so
-            // every session sees aiui without a uv/uvx dependency.
-            let _ = setup::patch_claude_code_config(&bin);
+            // every session sees aiui without a uv/uvx dependency — but only
+            // if Claude Code is set up here (#168).
+            if setup::is_claude_code_installed() {
+                let _ = setup::patch_claude_code_config(&bin);
+            }
+
+            // Same self-contained registration for OpenAI Codex, if it's set
+            // up here (#168): aiui writes its own ~/.codex/config.toml entry
+            // pointing at the same bundled --mcp-stdio server — no manual setup,
+            // exactly like the Claude hosts.
+            if setup::is_codex_installed() {
+                let _ = setup::patch_codex_config(&bin);
+            }
 
             // Auto-install the aiui skill into the local Claude Code skill
             // directory on every GUI launch. Idempotent: overwrites old copies
