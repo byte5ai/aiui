@@ -37,3 +37,8 @@ latest.json
 # local release credentials
 .env.release
 .claude/
+
+# agent guidance is kept private in the project wrapper (one level above the
+# repo), never in this public repo — guard against accidental re-adds
+/AGENTS.md
+/CLAUDE.md
