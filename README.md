@@ -151,10 +151,15 @@ The underlying WebKit view loads only while a dialog is on screen.
 Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
 if you need it.
 
-**Does it work on Linux or Windows?** Linux: no. Windows: in progress —
-the Rust core and CI build already target Windows; interactive E2E testing
-and a first release are still outstanding. Follow
-[#118](https://github.com/byte5ai/aiui/pull/118) for status.
+**Does it work on Linux or Windows?** Linux: no. Windows: the port builds
+and runs — the Rust core is platform-clean, CI builds an NSIS installer on
+every push, and beta testers have installed and used that build. What's
+still missing is the release itself: no GitHub release carries a Windows
+build yet, and `latest.json` has no `windows-x86_64` entry, so the in-app
+updater can't serve Windows (an update check there currently reports a
+failure rather than "up to date"). When the first Windows build ships it
+will be unsigned — no Authenticode certificate — so SmartScreen will warn
+on first launch; "More info" → "Run anyway" gets past it.
 
 **Can I use aiui without Claude Desktop?** The companion is
 auto-spawned by Claude Desktop via its MCP registration, so in the
