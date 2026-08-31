@@ -257,8 +257,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
+          # Idempotent: a prior run may have pushed the tag but failed later
+          # (e.g. PyPI). Reuse the existing tag instead of aborting on re-run.
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already on origin — reusing"
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
           cat > notes.md <<NOTES_EOF
           ## aiui ${TAG}
 
@@ -275,15 +281,21 @@ jobs:
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             PRERELEASE_FLAG="--prerelease"
           fi
-          gh release create "$TAG" \
-            "aiui-${VERSION}-arm64.dmg" \
-            "aiui-${VERSION}-arm64.zip" \
-            "aiui-${VERSION}-updater-arm64.tar.gz" \
-            "latest.json" \
-            --repo byte5ai/aiui \
-            --title "aiui ${TAG}" \
-            --notes-file notes.md \
-            $PRERELEASE_FLAG
+          # Idempotent: skip creation if the release already exists so a
+          # recovery re-run proceeds to the PyPI step instead of failing here.
+          if gh release view "$TAG" --repo byte5ai/aiui >/dev/null 2>&1; then
+            echo "release $TAG already exists — skipping create; PyPI step still runs"
+          else
+            gh release create "$TAG" \
+              "aiui-${VERSION}-arm64.dmg" \
+              "aiui-${VERSION}-arm64.zip" \
+              "aiui-${VERSION}-updater-arm64.tar.gz" \
+              "latest.json" \
+              --repo byte5ai/aiui \
+              --title "aiui ${TAG}" \
+              --notes-file notes.md \
+              $PRERELEASE_FLAG
+          fi
 
       # PyPI LAST, after the GitHub release succeeded — PyPI versions are
       # permanent. If this step fails, the Tauri side is already shipped;
