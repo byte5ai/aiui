@@ -108,8 +108,8 @@ an oversight.
 
 Note that this differs from the per-push CI build: CI uses
 `tauri.ci.conf.json` (`createUpdaterArtifacts: false`) and produces the
-`.exe` only. The signed `.nsis.zip` + `.sig` that the updater feed needs
-come from `release-windows.yml` alone.
+unsigned `.exe`. The updater signature (`<installer>.exe.sig`) that the
+update feed needs comes from `release-windows.yml` alone.
 
 ## Issues
 

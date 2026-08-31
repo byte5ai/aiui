@@ -37,8 +37,7 @@
 # What the run produces:
 #
 #   - aiui_<version>_x64-setup.exe                attached to release
-#   - aiui_<version>_x64-setup.nsis.zip           attached to release
-#   - aiui_<version>_x64-setup.nsis.zip.sig       attached to release
+#   - aiui_<version>_x64-setup.exe.sig            attached to release
 #   - latest.json patched in-place with the new windows-x86_64 entry
 #
 # Code signing for the `.exe` itself (Authenticode / SmartScreen) is
@@ -50,7 +49,7 @@
 # Note on coverage: the installer produced here differs from the one CI
 # uploads per-push. CI builds with `tauri.ci.conf.json`
 # (`createUpdaterArtifacts: false`), so it yields the `.exe` only — the
-# signed `.nsis.zip` + `.sig` that the updater feed needs are produced
+# signed installer + `.sig` that the updater feed needs are produced
 # *only* by this workflow. Beta feedback on a CI artifact therefore says
 # nothing about the update path.
 
@@ -109,7 +108,7 @@ jobs:
 
       # Use the production tauri.conf.json — `createUpdaterArtifacts:
       # true` is correct here, the secrets are present, the produced
-      # `.nsis.zip` + `.sig` go into the release alongside the `.exe`.
+      # signed installer + `.sig` go into the release.
       - name: Tauri build (NSIS + updater bundle)
         working-directory: companion
         env:
@@ -121,26 +120,32 @@ jobs:
         id: bundle
         shell: pwsh
         working-directory: companion/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+        # Tauri signs the NSIS installer IN PLACE: the updater artifact is
+        # `<name>-setup.exe` itself, with `<name>-setup.exe.sig` beside it.
+        # There is no `.nsis.zip` intermediate — the first real run of this
+        # workflow (v0.10.1) proved that by failing here while the build
+        # log listed exactly those two files. The old lookup's error text
+        # ("check TAURI_SIGNING_PRIVATE_KEY") was doubly misleading: the
+        # key had worked, which is precisely why the .sig existed.
         run: |
-          $exe = Get-ChildItem -Filter *.exe | Select-Object -First 1
-          $zip = Get-ChildItem -Filter *.nsis.zip | Select-Object -First 1
-          $sig = Get-ChildItem -Filter *.nsis.zip.sig | Select-Object -First 1
-          if (-not $exe) { throw "no .exe produced" }
-          if (-not $zip) { throw "no .nsis.zip produced — check TAURI_SIGNING_PRIVATE_KEY" }
-          if (-not $sig) { throw "no .sig produced — check TAURI_SIGNING_PRIVATE_KEY" }
-          "exe=$($exe.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "zip=$($zip.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sig=$($sig.FullName)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $exe = Get-ChildItem -Filter *-setup.exe | Select-Object -First 1
+          if (-not $exe) { throw "no NSIS installer produced" }
+          $sig = Get-ChildItem -Filter "$($exe.Name).sig" | Select-Object -First 1
+          if (-not $sig) {
+            throw "installer $($exe.Name) has no .sig — updater signing did not run; check TAURI_SIGNING_PRIVATE_KEY"
+          }
+          "exe=$($exe.FullName)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sig=$($sig.FullName)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "installer=$($exe.Name)"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "version=$($exe.BaseName -replace '^aiui_' -replace '_x64-setup$','')" `
-                                     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+                                      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Attach installer + updater bundle to GitHub release
+      - name: Attach installer + signature to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ inputs.tag }}" `
             "${{ steps.bundle.outputs.exe }}" `
-            "${{ steps.bundle.outputs.zip }}" `
             "${{ steps.bundle.outputs.sig }}" `
             --repo "${{ github.repository }}" `
             --clobber
@@ -156,12 +161,17 @@ jobs:
           REPO: ${{ github.repository }}
           VERSION: ${{ steps.bundle.outputs.version }}
           SIG_PATH: ${{ steps.bundle.outputs.sig }}
+          INSTALLER: ${{ steps.bundle.outputs.installer }}
         run: |
           # Pull the current latest.json from the release.
           gh release download "$env:TAG" --repo "$env:REPO" --pattern "latest.json" --output latest.json --clobber
 
+          # The updater downloads and runs the installer directly, so the
+          # url points at the .exe — the same artifact the .sig signs.
+          # Built from the actual produced filename rather than re-derived
+          # from VERSION, so a naming change can't silently desync the two.
           $sig = Get-Content -Raw -Path "$env:SIG_PATH"
-          $url = "https://github.com/$env:REPO/releases/download/$env:TAG/aiui_${env:VERSION}_x64-setup.nsis.zip"
+          $url = "https://github.com/$env:REPO/releases/download/$env:TAG/$env:INSTALLER"
 
           $json = Get-Content -Raw -Path latest.json | ConvertFrom-Json
           if (-not $json.platforms) { $json | Add-Member -NotePropertyName platforms -NotePropertyValue (New-Object PSObject) }
@@ -178,7 +188,6 @@ jobs:
           echo "Windows release for ${{ inputs.tag }} attached." >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
           echo "Artifacts:" >> $env:GITHUB_STEP_SUMMARY
-          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.exe" >> $env:GITHUB_STEP_SUMMARY
-          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.nsis.zip" >> $env:GITHUB_STEP_SUMMARY
-          echo "- aiui_${{ steps.bundle.outputs.version }}_x64-setup.nsis.zip.sig" >> $env:GITHUB_STEP_SUMMARY
+          echo "- ${{ steps.bundle.outputs.installer }}" >> $env:GITHUB_STEP_SUMMARY
+          echo "- ${{ steps.bundle.outputs.installer }}.sig" >> $env:GITHUB_STEP_SUMMARY
           echo "- latest.json (patched with windows-x86_64)" >> $env:GITHUB_STEP_SUMMARY
