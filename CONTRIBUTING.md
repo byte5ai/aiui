@@ -120,7 +120,7 @@ saves us a round of „which version are you on?".
 For bug reports, please include:
 
 - aiui version (visible in Settings as a chip, e.g. `v0.2.0`)
-- Your OS and version (macOS, or Windows if you're on a port build)
+- Your OS and version (macOS or Windows)
 - Whether you hit it locally or via a remote host setup
 - What you did / expected / saw
 

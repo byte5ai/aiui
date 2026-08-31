@@ -1,11 +1,11 @@
 ---
 name: aiui
-description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native macOS dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
+description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native desktop dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents
 
-aiui exposes MCP tools that render native dialogs on the user's Mac, plus
+aiui exposes MCP tools that render native dialogs on the user's machine, plus
 one that doesn't wait for the user at all:
 
 - `confirm` — irreversible yes/no
@@ -90,7 +90,7 @@ Spec: `{title, body, subtitle?, sound?}` — `title`/`body` required.
 `title` is a short headline (banners truncate past ~40 chars); `body`
 carries the detail; `subtitle` is optional extra context (folded into
 `body` where there's no distinct subtitle slot); `sound` is an optional
-OS sound name, omit for silent. First call triggers the one-time macOS
+OS sound name, omit for silent. On macOS the first call triggers the one-time
 notification-permission prompt; a denied permission comes back as
 `{ok: false, error}`, not a tool error.
 
@@ -176,7 +176,7 @@ absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac). A local audio path
 is never inlined as `data:` — even a small clip — it's always pushed
 through the same size-unbounded `/media` cache the `gallery` tool uses
 for local video, so it works identically whether this bridge runs on
-the user's Mac or a remote SSH host it's reaching over the reverse
+the user's machine or a remote SSH host it's reaching over the reverse
 tunnel.
 
 Use `audio` for "does this TTS voice sound right?", "confirm this
@@ -273,20 +273,20 @@ non-empty and unique — it keys the result. `src` follows the standard
 image rules; **videos** (`data:video/` URL, `http(s)://` URL, or a local
 `.mp4`/`.mov`/`.m4v`/`.webm` path) render with native controls. Local
 videos of any size work — the bridge pushes them to aiui's media cache on
-the Mac and the dialog streams them back, so a remote clip plays without
+the user's machine and the dialog streams them back, so a remote clip plays without
 hosting it anywhere.
 
 Result: `{cancelled, decisions: {"<value>": {decision, comment?}}}`. Only
 touched items appear — an untouched item means "no verdict", not a default.
 
-## File upload: `upload` (Mac → your host)
+## File upload: `upload` (user's machine → your host)
 
-The one reversed flow: `upload` pulls a file **from the user's Mac into
+The one reversed flow: `upload` pulls a file **from the user's machine into
 your session** over the same `:7777` channel (loopback locally, the SSH
 reverse-tunnel remotely) — the native replacement for "please `scp` me
 that file". Call it whenever the user wants to hand you a local file
 ("take this file", "here's the screenshot/PDF", `/aiui:upload`). It opens
-a **native file picker on the Mac**; the chosen file is written to
+a **native file picker on the user's machine**; the chosen file is written to
 `target_dir/<filename>` on **your** host.
 
 - Pass `target_dir` (absolute or `~/`-rooted, on your host) inferred from
@@ -352,12 +352,12 @@ Three input formats render correctly:
   natural choice when the file is already on disk. This bridge reads the
   file and inlines it as a `data:` URL before the spec leaves your host.
   **The path must exist on the host *you*, the agent, run on** — for an
-  SSH-tunneled session that's the remote, not the user's Mac. Absolute or
+  SSH-tunneled session that's the remote, not the user's machine. Absolute or
   `~/`-rooted only; relative paths are not resolved (no stable `cwd`
   contract on MCP bridges). 10 MB cap.
-- **`http(s)://` URL** — fetched on the user's Mac and inlined (5 s
+- **`http(s)://` URL** — fetched on the user's machine and inlined (5 s
   timeout, 10 MB cap, parallel for grids). Use when the image already
-  lives on a reachable server; the Mac contacts the URL, aiui never phones
+  lives on a reachable server; the user's machine contacts the URL, aiui never phones
   home.
 - **`data:` URL** (`data:image/png;base64,…`) — the fallback when neither
   path nor URL fits (e.g. bytes generated in-memory). Embed the encoded
@@ -370,7 +370,7 @@ if reachable, `data:` only as last resort.
 
 Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
 against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
-file on the user's Mac won't resolve from a remote agent, or vice versa —
+file on the user's machine won't resolve from a remote agent, or vice versa —
 the bridge that reads it is on the agent's host; use `http(s)://` or inline
 `data:`); **bare URLs in `markdown` field text** (`![alt](url)` follows the
 same CSP — the resolver only walks `src` / `thumbnail`, not markdown

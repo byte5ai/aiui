@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **`release-windows.yml` attached no artifacts.** Its first ever run —
+  the v0.10.1 release — failed at the artifact lookup. Tauri signs the
+  NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the
+  step looked for a `.nsis.zip` intermediate that no longer exists and
+  reported it as `check TAURI_SIGNING_PRIVATE_KEY` — misleading, since
+  the key had worked and that is why the `.sig` existed. The lookup now
+  matches the installer and derives the `latest.json` url from the
+  produced filename, so the url can't desync from the signed artifact
+  (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
+  after this fix.
+
+### Changed
+
+- **Documentation updated for a two-platform product.** README, both
+  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
+  doc still described aiui as macOS-only. The README gained per-platform
+  install instructions including the expected SmartScreen warning, and
+  agent-facing path guidance no longer says "the user's Mac" — an agent
+  reading that could reasonably assume POSIX paths on a Windows user's
+  machine.
+
 ## [0.10.1] — 2026-08-31
 
 ### Added
