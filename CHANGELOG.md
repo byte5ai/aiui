@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.1] — 2026-08-31
+
+### Added
+
+- **First Windows release.** aiui ships a Windows installer for the first
+  time: `aiui_0.10.1_x64-setup.exe`, built and signed for the updater on a
+  `windows-latest` runner by `release-windows.yml`, attached to this
+  release alongside the macOS artifacts. `latest.json` now carries a
+  `windows-x86_64` entry, so the in-app updater serves Windows too — until
+  now it had only `darwin-aarch64`, and an update check on Windows landed
+  in the error path rather than reporting "up to date".
+
+  The Windows port itself has been buildable since v0.6.0 and was exercised
+  by beta testers on per-push CI installers; what was missing was the
+  release path, not the app. The installer is **not** Authenticode-signed,
+  so SmartScreen warns on first launch — "More info" → "Run anyway". That
+  is a deliberate v1 decision; an EV certificate is a separate concern.
+
+### Fixed
+
+- **The release workflow is re-runnable.** A run that pushed the version
+  tag and created the GitHub release but then failed at the PyPI step —
+  e.g. a rejected `UV_PUBLISH_TOKEN` — could not be recovered by
+  re-dispatching, because the re-run aborted at the tagging command. Both
+  halves now probe for existing state first, so a recovery dispatch
+  proceeds to the step it was re-dispatched for (#172).
+
+### Changed
+
+- **Release and Windows documentation corrected** (#173). CONTRIBUTING.md
+  still documented a local sign-and-notarize pipeline with its environment
+  variables as the way to ship, years after `scripts/release.sh` became a
+  stub that refuses to run; `release-windows.yml` told the reader the
+  GitHub release is created by that script "from the maintainer's
+  machine". Both now describe the two `workflow_dispatch` pipelines that
+  actually do the work. The README FAQ no longer claims interactive
+  Windows testing is outstanding.
+
 ## [0.10.0] — 2026-08-17
 
 ### Added
