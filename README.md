@@ -7,9 +7,9 @@
 
 # aiui
 
-**Claude Desktop App can ask, confirm, and collect input — as real native macOS dialogs.**
+**Claude Desktop App can ask, confirm, and collect input — as real native desktop dialogs.**
 
-[![Download aiui.app](https://img.shields.io/badge/Download%20for%20Mac-aiui.app-4f46e5?style=for-the-badge&logo=apple)](https://github.com/byte5ai/aiui/releases/latest)
+[![Download aiui](https://img.shields.io/badge/Download-macOS%20%7C%20Windows-4f46e5?style=for-the-badge)](https://github.com/byte5ai/aiui/releases/latest)
 [![MIT License](https://img.shields.io/badge/MIT-Open%20Source-171717?style=for-the-badge)](https://github.com/byte5ai/aiui/blob/main/LICENSE)
 
 </td>
@@ -27,7 +27,8 @@ tailored.
 
 There's a better way.
 
-**aiui** lets Claude Desktop App open real, native dialogs on your Mac:
+**aiui** lets Claude Desktop App open real, native dialogs on your machine —
+macOS and, since 0.10.1, Windows:
 
 - **"Which of these three deploy strategies?"** A window with three
   cards, each with context. One click. Done.
@@ -43,7 +44,7 @@ There's a better way.
 
 The agent gets your answer as structured data and keeps going. No side
 conversations, no throwaway web dashboards cluttering your system — just
-a familiar macOS window that does what it looks like.
+a familiar window from your own operating system that does what it looks like.
 
 <p align="center">
   <img src="assets/aiui%20Demo%200.4.40.gif" alt="aiui demo: Claude Code opens a native dialog, user clicks, agent continues" width="720">
@@ -51,25 +52,40 @@ a familiar macOS window that does what it looks like.
 
 ## Works locally and remotely
 
-Running Claude Desktop App directly on your Mac? aiui plugs in.
+Running Claude Desktop App directly on your Mac or Windows PC? aiui plugs in.
 
 Running it over SSH on a remote machine (dev box, project VM)? aiui
 automatically sets up a tunnel so the remote agent can pop dialogs right
-on your Mac. Register the host once in settings; from then on it just
-works.
+on your own desktop. Register the host once in settings; from then on it
+just works.
 
 ## Install
 
 No Terminal. No Homebrew. No Python. No `uv`.
+
+### macOS (Apple Silicon)
 
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon).
 2. Drag into `Applications`.
 3. Launch it once from Finder.
 
-That's it. aiui registers itself with Claude Desktop App
-automatically. The MCP server ships inside the app bundle as native
-code, so you don't need a Python toolchain on your Mac.
+### Windows (x64)
+
+1. **[Download the installer](https://github.com/byte5ai/aiui/releases/latest)**
+   — `aiui_<version>_x64-setup.exe`.
+2. Run it. **Windows will warn you:** a blue "Windows protected your PC"
+   box appears, because the installer carries no Authenticode signature.
+   Click **More info**, then **Run anyway**. This is expected, not a sign
+   that anything is wrong — a code-signing certificate is on the list, and
+   until it lands every aiui installer triggers this. The download page
+   ships a signature file (`.exe.sig`) next to the installer; that is what
+   aiui's own updater verifies, and it is checked automatically.
+3. Launch aiui once from the Start menu.
+
+That's it, on either platform. aiui registers itself with Claude Desktop
+App automatically. The MCP server ships inside the app itself as native
+code, so you don't need a Python toolchain on your machine.
 
 From now on aiui runs silently in the background — only while Claude
 Desktop App is open. No dock icon, no menu-bar clutter, no lingering
@@ -103,11 +119,11 @@ back in chat — without it, the agent might forget aiui exists.
 
 | What annoys you today | With aiui |
 |---|---|
-| Typing answers that are really single clicks | A real macOS dialog |
+| Typing answers that are really single clicks | A real native dialog |
 | Destructive actions with a vague "please confirm" | Red-styled yes/no, unambiguous |
 | Ad-hoc local web UIs for one-off tasks | No longer needed |
-| Remote hosts where the agent has no way to ask you | Dialogs tunnel back to your Mac automatically |
-| A long task finishes while you've tabbed away | A native macOS notification — no dialog, nothing to click |
+| Remote hosts where the agent has no way to ask you | Dialogs tunnel back to your desktop automatically |
+| A long task finishes while you've tabbed away | A native OS notification — no dialog, nothing to click |
 
 <p align="center">
   <img src="assets/aiui-shot1.jpg" alt="Claude Desktop App session with an aiui dialog on the Mac desktop" width="720">
@@ -115,7 +131,7 @@ back in chat — without it, the agent might forget aiui exists.
 
 ## Privacy
 
-aiui runs purely locally on your Mac. No telemetry, no usage data, no
+aiui runs purely locally on your own machine. No telemetry, no usage data, no
 content leaves your system. A local auth token lives in `~/.config/aiui/`
 (mode 0600) and is only scp'd to hosts you explicitly register in
 settings.
@@ -147,19 +163,14 @@ add the remote in settings.
 **How much memory does it use?** The companion idles around 30–50 MB.
 The underlying WebKit view loads only while a dialog is on screen.
 
-**Does it work on Intel Macs?** Currently Apple Silicon (arm64) only.
-Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
+**Does it work on Intel Macs?** No — the macOS build is Apple Silicon
+(arm64) only. Intel support isn't on the immediate roadmap — [open an issue](https://github.com/byte5ai/aiui/issues/new)
 if you need it.
 
-**Does it work on Linux or Windows?** Linux: no. Windows: the port builds
-and runs — the Rust core is platform-clean, CI builds an NSIS installer on
-every push, and beta testers have installed and used that build. What's
-still missing is the release itself: no GitHub release carries a Windows
-build yet, and `latest.json` has no `windows-x86_64` entry, so the in-app
-updater can't serve Windows (an update check there currently reports a
-failure rather than "up to date"). When the first Windows build ships it
-will be unsigned — no Authenticode certificate — so SmartScreen will warn
-on first launch; "More info" → "Run anyway" gets past it.
+**Does it work on Linux or Windows?** Windows: yes, since 0.10.1 — x64,
+with an installer on the release page and in-app updates like on macOS.
+The installer is not Authenticode-signed, so SmartScreen warns on first
+launch (see [Install](#install)). Linux: no, and not planned for now.
 
 **Can I use aiui without Claude Desktop?** The companion is
 auto-spawned by Claude Desktop via its MCP registration, so in the
@@ -183,24 +194,27 @@ Follow [#158](https://github.com/byte5ai/aiui/issues/158) for status.
 
 ## Known limitations
 
-- **Apple Silicon only** (M1 and later). Intel Macs are not yet
-  supported.
-- **macOS 11 (Big Sur) or later.**
-- **One Mac per companion.** If you want dialogs on multiple Macs
-  simultaneously, each needs its own aiui install; tokens and tunnels
-  are per-Mac.
+- **macOS: Apple Silicon only** (M1 and later), macOS 11 (Big Sur) or
+  later. Intel Macs are not yet supported.
+- **Windows: x64 only**, and the installer is **not Authenticode-signed**,
+  so SmartScreen warns on first launch. An ARM64 build and a signing
+  certificate are both still open.
+- **One machine per companion.** If you want dialogs on several
+  machines simultaneously, each needs its own aiui install; tokens and
+  tunnels are per-machine.
 - **Password fields** mask input while typing but return the value as
   plaintext to the agent — see the [widget catalog](docs/skill.md#password-fields)
   for guidance.
-- **No headless rendering.** aiui needs an active macOS GUI session;
+- **No headless rendering.** aiui needs an active desktop session;
   it won't render dialogs on a server-style headless install.
 
 ## Troubleshooting
 
 | Symptom | What to do |
 |---|---|
-| No dialog appears | Open `/Applications/aiui.app` and check the status dot. The remote must show "connected". |
-| "aiui companion not reachable" in chat | Claude Desktop isn't running, or the Mac is asleep. |
+| No dialog appears | Open aiui (macOS: `/Applications/aiui.app`; Windows: Start menu) and check the status dot. The remote must show "connected". |
+| "aiui companion not reachable" in chat | Claude Desktop isn't running, or your machine is asleep. |
+| "Windows protected your PC" when installing | Expected — the installer isn't Authenticode-signed. "More info" → "Run anyway". See [Install](#install). |
 | "token rejected (401)" | An old aiui process is holding the port on the remote. `pkill -f aiui` on the remote, then "Remove" and "Add" that remote again in aiui settings. |
 
 Bugs or feature requests → [open an issue](https://github.com/byte5ai/aiui/issues/new).
