@@ -22,15 +22,15 @@ aiui/
 │   └── skill.md              Agent-facing widget catalog (shipped into
 │                             ~/.claude/skills/aiui/)
 ├── scripts/
-│   └── release.sh            Local sign + notarize + updater feed pipeline
+│   └── release.sh            Stub that refuses to run — releases are CI-only
 ├── assets/                   Brand assets (icon, logo, dmg background)
 └── CHANGELOG.md
 ```
 
 ## Building locally
 
-Prerequisites: Rust (stable), Node.js ≥ 20, Xcode command-line tools,
-[uv](https://docs.astral.sh/uv/).
+Prerequisites: Rust (stable), Node.js ≥ 20, [uv](https://docs.astral.sh/uv/),
+plus Xcode command-line tools on macOS.
 
 ```sh
 cd companion
@@ -40,6 +40,19 @@ npx tauri build --target aarch64-apple-darwin
 
 Output: `companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app`
 
+On Windows, build the NSIS installer the same way CI does — the config
+override skips the updater bundle, which needs the signing key:
+
+```sh
+cd companion
+npm install
+npx tauri build --target x86_64-pc-windows-msvc --bundles nsis \
+  --config src-tauri/tauri.ci.conf.json
+```
+
+A local build like this is fine for development. It is not a release —
+see "Releasing" below.
+
 For the Python side:
 
 ```sh
@@ -47,33 +60,56 @@ cd python
 uv build    # produces dist/aiui_mcp-*.whl + .tar.gz
 ```
 
-## Signing / notarising / releasing
+## Releasing
 
-The release pipeline lives in `scripts/release.sh` and is tuned for the
-byte5 Developer ID. If you fork aiui, copy `.env.release.example` (if
-present) or read the script; the required environment variables are:
+**Releases run exclusively in GitHub Actions.** Not locally, not on the
+maintainer's machine. All signing material lives in Actions secrets
+(`MACOS_*`, `TAURI_SIGNING_PRIVATE_KEY*`, `UV_PUBLISH_TOKEN`) — never in a
+local keychain, never in the repo. `scripts/release.sh` is a stub that
+refuses to run; it exists only to stop anyone from reinventing a local
+build path. If Actions is down, wait for it.
 
-- `APPLE_SIGNING_IDENTITY`, `NOTARY_PROFILE`,
-  `BUILD_KEYCHAIN`, `BUILD_KEYCHAIN_PASS_FILE` — Apple codesign + notary
-- `TAURI_SIGNING_PRIVATE_KEY_PATH` — Ed25519 key for the updater feed
-- `UV_PUBLISH_TOKEN` — PyPI API token (project-scoped to `aiui-mcp`).
-  Without it, `scripts/release.sh` aborts before any work is done — that
-  guard exists because shipping the Tauri side without the matching PyPI
-  bump produces silent slash-command-mismatch on remote hosts.
+Before dispatching, bump the version in `companion/src-tauri/Cargo.toml`,
+`companion/src-tauri/tauri.conf.json`, and `python/pyproject.toml` so all
+three agree — the workflow's first step hard-fails on drift.
 
-A single run of `scripts/release.sh 0.2.3` performs the full pipeline:
+### macOS — `release-macos.yml`
 
-1. Pre-flight checks — `.env.release` loaded, all required env present,
-   versions agree across `Cargo.toml`, `tauri.conf.json`, and
-   `python/pyproject.toml`.
-2. Tauri companion: build, codesign, notarize, staple, DMG, updater
-   bundle + signature, `latest.json`.
-3. Python `aiui-mcp`: `uv build` produces wheel + sdist into
-   `python/dist/`. Done before the dry-run gate so dry runs catch
-   packaging breakage too.
-4. Tag, push, GitHub release.
-5. `uv publish` from `python/` — pushes the wheel + sdist to PyPI so
-   `uvx aiui-mcp` resolves to the matching version on remote hosts.
+Builds on a `macos-14` runner, Developer-ID-signs + notarizes via the App
+Store Connect API key, produces the DMG + signed updater bundle +
+`latest.json`, cuts the GitHub release, and publishes `aiui-mcp` to PyPI.
+
+```sh
+gh workflow run release-macos.yml -f version=X.Y.Z --repo byte5ai/aiui
+
+# validate-first (no PyPI, GitHub pre-release):
+gh workflow run release-macos.yml -f version=X.Y.Z \
+  -f prerelease=true -f publish-pypi=false --repo byte5ai/aiui
+```
+
+PyPI runs last, after the GitHub release succeeded, because PyPI versions
+are permanent. The tag and release steps are idempotent, so a run that
+failed at PyPI can be re-dispatched with the same version to recover.
+
+### Windows — `release-windows.yml`
+
+Run **after** the macOS workflow, against the tag it created. Builds the
+NSIS installer plus the signed updater bundle, attaches all three
+artifacts to the existing release, and patches `latest.json` with the
+`windows-x86_64` entry.
+
+```sh
+gh workflow run release-windows.yml -f tag=vX.Y.Z --repo byte5ai/aiui
+```
+
+The Windows `.exe` ships **unsigned** — no Authenticode certificate, so
+SmartScreen warns on first launch. That is a deliberate v1 decision, not
+an oversight.
+
+Note that this differs from the per-push CI build: CI uses
+`tauri.ci.conf.json` (`createUpdaterArtifacts: false`) and produces the
+`.exe` only. The signed `.nsis.zip` + `.sig` that the updater feed needs
+come from `release-windows.yml` alone.
 
 ## Issues
 
@@ -84,7 +120,7 @@ saves us a round of „which version are you on?".
 For bug reports, please include:
 
 - aiui version (visible in Settings as a chip, e.g. `v0.2.0`)
-- macOS version
+- Your OS and version (macOS, or Windows if you're on a port build)
 - Whether you hit it locally or via a remote host setup
 - What you did / expected / saw
 
