@@ -151,7 +151,17 @@ def _token() -> str:
             "settings window (adds the token automatically). "
             "Download: https://github.com/byte5ai/aiui/releases/latest"
         )
-    return TOKEN_PATH.read_text().strip()
+    tok = TOKEN_PATH.read_text().strip()
+    # Issue #185: a truncated or empty token must fail loudly here rather
+    # than being sent as a bare `Bearer ` that the companion then rejects
+    # with an opaque 401. A well-formed aiui token is 64 hex chars.
+    if len(tok) != 64 or any(c not in "0123456789abcdefABCDEF" for c in tok):
+        raise RuntimeError(
+            f"aiui token at {TOKEN_PATH} is malformed ({len(tok)} chars, expected 64 hex). "
+            "Re-register this remote from the companion's settings window on your Mac "
+            "to write a fresh token."
+        )
+    return tok
 
 
 def _explain_exc(e: BaseException) -> str:

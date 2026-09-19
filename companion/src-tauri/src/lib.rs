@@ -1291,7 +1291,7 @@ pub fn run() {
         Ok(g) => g,
         Err(e) => {
             // Another aiui-GUI is alive and holds the lock. Exit
-            // immediately, traced so the post-mortem in /tmp/aiui-trace.log
+            // immediately, traced so the post-mortem in the trace log
             // explains the silent disappearance.
             logging::trace(&format!(
                 "[aiui] exit (gui-lock-busy): another aiui-GUI holds {} ({e}); \
