@@ -453,6 +453,9 @@ bytes}`, never the value).
   `create` and `substitute` both work identically local and remote — no
   foreign host. The user sees the path and approves by submitting. Errors:
   `{written:false, error}`.
+- A `secret` field MUST carry a `target` — the write-only promise is what
+  the kind means, so a target-less `secret` is rejected (`invalid_spec`)
+  instead of returning the plaintext. Want the value back? Use `password`.
 - A blank field writes nothing: an empty value is refused in both modes
   (`"refusing to write an empty value"`), so a skipped optional field never
   truncates the file and `substitute` never erases its own sentinel.

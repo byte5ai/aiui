@@ -921,6 +921,23 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 format!("Allowed field kinds: {}.", KNOWN_FIELD_KINDS.join(", ")),
             ));
         }
+        // #186: a `secret` field is documented as write-only — "its value is
+        // NEVER returned to you". The stripping, however, keys on the
+        // presence of `target`, not on the kind, so a `secret` without a
+        // `target` sailed through and its plaintext went back in
+        // `result.values`. `target` is a nested object and easy to omit.
+        // Reject the shape here rather than silently downgrading it to
+        // `password`: handing the agent a credential the docs promised it
+        // would never see has to be loud.
+        if fk == "secret" && !f.get("target").map(|t| !t.is_null()).unwrap_or(false) {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+            return Err((
+                format!("form field '{name}' has kind 'secret' but no 'target'"),
+                "A `secret` field is write-only and must carry a `target` (the file its \
+                 value is written to). Use `password` if you want the value returned to you."
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1393,10 +1410,40 @@ mod validate_tests {
     fn accepts_form_with_known_fields() {
         let spec = json!({"kind":"form","fields":[
             {"kind":"text","name":"a"},
-            {"kind":"secret","name":"tok"},
+            // #186: a `secret` needs a `target` — it is write-only by
+            // contract, and this test used to assert the leaking shape valid.
+            {"kind":"secret","name":"tok","target":{"mode":"create","path":"~/.t"}},
             {"kind":"slider","name":"n"}
         ]});
         assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_secret_without_target() {
+        // #186: the docs say a secret's value is NEVER returned. Stripping
+        // keyed on `target`, so this shape leaked the plaintext back to the
+        // agent while looking identical to `password` in the UI.
+        let spec = json!({"kind":"form","fields":[{"kind":"secret","name":"pat"}]});
+        let (detail, hint) = validate_spec(&spec).unwrap_err();
+        assert!(detail.contains("pat"), "names the offending field: {detail}");
+        assert!(detail.contains("secret") && detail.contains("target"), "{detail}");
+        assert!(hint.contains("password"), "points at the right alternative: {hint}");
+
+        // An explicit null target is the same shape.
+        let nulled = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":null}
+        ]});
+        assert!(validate_spec(&nulled).is_err());
+
+        // Inside a tab, too — the loop merges flat fields and tabs[].fields.
+        let tabbed = json!({"kind":"form","tabs":[
+            {"label":"T","fields":[{"kind":"secret","name":"inner"}]}
+        ]});
+        assert!(validate_spec(&tabbed).is_err(), "tabs are covered");
+
+        // `password` is the documented alternative and stays valid bare.
+        let pw = json!({"kind":"form","fields":[{"kind":"password","name":"pw"}]});
+        assert!(validate_spec(&pw).is_ok());
     }
 
     #[test]

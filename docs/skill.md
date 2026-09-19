@@ -644,6 +644,12 @@ user pastes that should land in a file, not your transcript — use a
 `secret` field the value is **write-only**: aiui writes it to the file and
 returns only `{written, target, bytes}`, never the value.
 
+**A `secret` field must carry a `target`.** The write-only promise is what
+a `secret` *is*, and the only place its value can legitimately go is the
+file — so a `secret` without a `target` is rejected with `invalid_spec`
+rather than silently handing you the plaintext. If you want the value back,
+that field is a `password`, not a `secret`.
+
 ```json
 { "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
   "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",

@@ -53,6 +53,9 @@ class _FakeCompanion(ThreadingHTTPServer):
         self.last_render: dict[str, Any] | None = None
         self.hits: set[str] = set()
         self.force_cancel = False
+        # #186: when set, /render answers with the companion's structured
+        # invalid_spec rejection instead of a terminal result.
+        self.force_invalid_spec: dict[str, Any] | None = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -101,6 +104,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/render":
             spec = body.get("spec", {})
             self.server.last_render = {"spec": spec, "async": self.headers.get("x-aiui-async")}
+            if self.server.force_invalid_spec is not None:
+                self._json(422, self.server.force_invalid_spec)
+                return
             if self.server.force_cancel:
                 self._json(200, {"cancelled": True})
                 return
@@ -170,3 +176,35 @@ def test_wrong_token_is_rejected(
     with pytest.raises(RuntimeError) as exc:
         asyncio.run(confirm(title="Proceed?"))
     assert "401" in str(exc.value) or "token" in str(exc.value).lower()
+
+
+
+def test_invalid_spec_422_reaches_the_agent_with_its_reason(companion: Any) -> None:
+    """#186: the companion rejects a bad spec with `{error, detail, hint}`.
+
+    `raise_for_status()` threw that body away, so a bridge-served agent got a
+    bare `HTTPStatusError: 422` and no idea what was wrong with its spec —
+    while a local Rust-bridge agent got the full explanation. The reason must
+    survive the bridge, or the rejection is useless to the remote half of the
+    userbase.
+    """
+    companion.force_invalid_spec = {
+        "error": "invalid_spec",
+        "detail": "form field 'pat' has kind 'secret' but no 'target'",
+        "hint": "A `secret` field is write-only and must carry a `target`.",
+    }
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(form(title="Creds", fields=[{"kind": "secret", "name": "pat"}]))
+    msg = str(exc.value)
+    assert "invalid_spec" in msg
+    assert "'secret' but no 'target'" in msg, f"detail must reach the agent: {msg}"
+    assert "write-only" in msg, f"hint must reach the agent: {msg}"
+
+
+def test_a_422_without_a_body_still_explains_itself(companion: Any) -> None:
+    """A companion too old to send `detail`/`hint` must not degrade into a
+    bare status error either."""
+    companion.force_invalid_spec = {}
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(form(title="x", fields=[]))
+    assert "rejected the dialog spec" in str(exc.value)
