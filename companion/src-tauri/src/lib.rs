@@ -125,6 +125,25 @@ fn write_dialog_targets(
     Ok(out)
 }
 
+/// Trace a startup registration step that failed.
+///
+/// #182: these three call sites used to discard their `StepResult` with
+/// `let _ =`. With the parse-error hard stop in place, a broken host config
+/// turns a silent wipe into a silent no-op — better, but the user still
+/// never learns their config is broken and aiui is simply not registered.
+/// Settings shows step results; the GUI startup path has only the trace.
+fn trace_step(what: &str, step: setup::StepResult) {
+    if !step.ok {
+        logging::trace(&format!(
+            "gui: {what} did not succeed: {}{}",
+            step.message,
+            step.details
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default()
+        ));
+    }
+}
+
 /// Collect every form field that carries a non-null `target`, walking both the
 /// flat `fields` array and any `tabs[].fields`.
 fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -1467,7 +1486,7 @@ pub fn run() {
             // user doesn't use. Idempotent, GUI mode only.
             let bin = setup::app_binary_path();
             if setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
-                let _ = setup::patch_claude_desktop_config(&bin);
+                trace_step("Claude Desktop config registration", setup::patch_claude_desktop_config(&bin));
             }
 
             // Kill any `aiui --mcp-stdio` children left over from an older app
@@ -1489,7 +1508,7 @@ pub fn run() {
             // every session sees aiui without a uv/uvx dependency — but only
             // if Claude Code is set up here (#168).
             if setup::is_claude_code_installed() {
-                let _ = setup::patch_claude_code_config(&bin);
+                trace_step("Claude Code config registration", setup::patch_claude_code_config(&bin));
             }
 
             // Same self-contained registration for OpenAI Codex, if it's set
@@ -1497,7 +1516,7 @@ pub fn run() {
             // pointing at the same bundled --mcp-stdio server — no manual setup,
             // exactly like the Claude hosts.
             if setup::is_codex_installed() {
-                let _ = setup::patch_codex_config(&bin);
+                trace_step("Codex config registration", setup::patch_codex_config(&bin));
             }
 
             // Auto-install the aiui skill into the local Claude Code skill

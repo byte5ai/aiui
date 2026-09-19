@@ -6,6 +6,46 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **An unparsable host config was replaced, not repaired.** Every local
+  writer of `~/.claude.json` and `claude_desktop_config.json` treated a
+  parse error as "empty file" and then wrote a document containing only
+  aiui — taking every other MCP server, every project entry and the OAuth
+  block with it. One trailing comma was enough, and the same hole sat in
+  both remote scripts, where the remove path additionally had no backup at
+  all. All six writers now stop before touching a file they could not
+  parse, and say so. An empty file still parses as `{}`, which is
+  genuinely safe. The remote scripts share one preamble (parse-or-bail,
+  backup, atomic tmp+replace) so they cannot drift apart again, and both
+  writes are atomic — they used to open-truncate-write a file a live
+  Claude Code session may also be writing (#182).
+- **The aiui entry no longer eats its own neighbours.** Registration built
+  a fresh `{command, args}` object and overwrote whatever was there, so an
+  `env` block or any other key on the entry vanished on the next launch.
+  Only those two keys are written now, in all three host configs — the
+  Codex TOML path keeps the user's other keys *and* their comments. The
+  idempotency check compares only those two keys as well, so an entry
+  carrying extras is no longer rewritten, and re-backed-up, on every single
+  launch (#182).
+- **Backups are findable and bounded.** `~/.claude.json` backed up to
+  `~/.claude.bak.<ts>` — a name that looks like a backup of a different
+  file — at second granularity, so two writes in the same second silently
+  overwrote one another, and the pile grew without limit. Backups are now
+  `<file>.bak.<ms>`, capped at five per target, and the path appears in
+  the step result so the user can actually find it (#182).
+- **A failed registration at startup is traced instead of discarded.**
+  Three call sites dropped their result with `let _ =`; with the parse-error
+  stop in place that would have turned a silent wipe into a silent no-op
+  (#182).
+- **`diagnose-session-startup.sh toggle-aiui` no longer restores a stale
+  whole-file copy.** It stashed a copy of `~/.claude.json`, then `mv`'d it
+  back — throwing away everything Claude Code wrote during the measurement
+  window the script itself asks the user to create. It now stashes only the
+  removed entry, re-reads the current file on restore, writes atomically,
+  and warns when a per-project aiui entry would keep aiui loaded for the
+  project being measured (#182).
+
+### Fixed
+
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the
