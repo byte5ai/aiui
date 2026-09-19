@@ -151,6 +151,13 @@ an expected outcome, not a bug to retry around.
   Never style a save button red; never style a delete button green.
 - Offer an escape hatch (`skip_validation: true`) so required-field validation
   never traps the user.
+- **An escape hatch does not commit `target` file writes.** An action with
+  `skip_validation: true` is non-committing: pressing it writes no `target`
+  field to disk, and each such field comes back as
+  `{written: false, error: "action '<value>' does not commit target writes"}`.
+  The built-in submit button always commits. If an action needs both — skip
+  validation *and* write — set `writes_targets: true` on it explicitly.
+  An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
 ## The `list` field — one widget, four modes
@@ -661,6 +668,16 @@ returns only `{written, target, bytes}`, never the value.
   entered value reaches that module over aiui's own channel, never via the
   agent). You cannot target a foreign host; the user sees the resolved path
   and approves it by submitting.
+- **A blank field writes nothing.** An empty value is refused in both modes
+  — `{written: false, error: "refusing to write an empty value"}` — so a
+  skipped optional field can never truncate the user's file, and
+  `substitute` can never erase its own sentinel. Leaving a `target` field
+  blank is a safe no-op that reports itself, which is what makes the
+  "paste a new token only if you want to rotate it" flow legitimate.
+- **Only an affirmative action writes.** The write is committed by the
+  submit button or a plain named action; an action carrying
+  `skip_validation: true` (your Cancel / Save-draft escape hatch) does not
+  write. See *Action buttons* above.
 - **Errors** come back as `{written:false, error}` — no silent success.
 
 Why it exists: it replaces the fragile "guess a shell one-liner to stash a
@@ -710,6 +727,10 @@ aiui.form(
     ],
 )
 ```
+
+Note: `Cancel` and `Save draft` carry `skip_validation: True`, so neither
+commits a `target` file write — only `Create` does. That is the rule, not a
+property of this example.
 
 Response: `{cancelled: false, action: "commit", values: {job: "…",
 scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.

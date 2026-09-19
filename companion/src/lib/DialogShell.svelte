@@ -243,7 +243,14 @@
       }
       let outcomes: Record<string, any> = {};
       try {
-        outcomes = await invoke("write_dialog_targets", { id, values });
+        // Issue #177: hand the pressed action to the writer. The authoritative
+        // decision whether it commits lives in Rust, resolved against the
+        // stored spec — this is a convenience pass-through, not the guard.
+        outcomes = await invoke("write_dialog_targets", {
+          id,
+          values,
+          action: result?.action ?? null,
+        });
       } catch (e) {
         console.error(`[aiui] write_dialog_targets failed for ${id}: ${e}`);
         // Synthesise a failure outcome so the agent is informed instead of

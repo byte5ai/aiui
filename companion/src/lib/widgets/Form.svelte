@@ -146,6 +146,13 @@
     success?: boolean;
     /** If true, field-level required-validation is skipped when this action fires (e.g. "defer"). */
     skip_validation?: boolean;
+    /**
+     * Issue #177: an action with `skip_validation` is an escape hatch and does
+     * NOT commit `target` file writes. Set this to opt such an action back in.
+     * The decision is enforced in the writers (Rust `action_commits_targets`,
+     * Python `_action_commits_targets`) against the stored spec, not here.
+     */
+    writes_targets?: boolean;
   };
 
   type Tab = { label: string; fields: Field[] };
