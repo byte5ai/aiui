@@ -57,6 +57,14 @@ pub const DIALOG_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// Hard cap on concurrently registered dialogs. When exceeded, the oldest
 /// entry is evicted so the map cannot grow without bound even under bursty
 /// load.
+///
+/// This cap — not single-occupancy — is the whole of the concurrency model:
+/// N dialogs may be in flight at once and the companion never answers 409
+/// (see `multiple_dialogs_register_concurrently_no_409` below). Agent-facing
+/// prose in `mcp::aiui_unreachable_result` was written against the old
+/// one-dialog-at-a-time world and had to be rewritten in #202; if the
+/// occupancy model changes again, re-read that message and `docs/skill.md`'s
+/// `evicted` reason before shipping.
 pub const DIALOG_HARD_CAP: usize = 16;
 
 struct PendingEntry {

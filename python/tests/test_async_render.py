@@ -158,9 +158,13 @@ def test_poll_render_gives_up_after_the_retry_budget(
         async with httpx.AsyncClient() as client:
             return await _poll_render(client, "x", None)
 
-    with pytest.raises(httpx.ReadError):
+    # #202: give-up is now bounded by consecutive transport failures and the
+    # error is wrapped in an actionable RuntimeError (not the bare ReadError),
+    # so the agent is told the dialog may still be open on the Mac.
+    with pytest.raises(RuntimeError) as exc_info:
         asyncio.run(run())
-    assert calls["n"] == server.ASYNC_POLL_RETRIES + 1
+    assert "consecutive poll failures" in str(exc_info.value)
+    assert calls["n"] == server.ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
 
 
 def test_poll_render_does_not_retry_404(
