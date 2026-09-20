@@ -170,10 +170,11 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
     // Everything below runs on macOS/Linux ONLY. On Windows
     // `tauri-plugin-updater` hands the NSIS installer to `ShellExecuteW` and
     // then calls `std::process::exit(0)` *inside* the await above, so this
-    // process is already gone. The Windows equivalents of these two steps
-    // (latching the exit authority, sweeping the ssh-NTR children) are wired
-    // to the plugin's `on_before_exit` hook in `lib.rs`, which the plugin
-    // invokes only on that branch (#197).
+    // process is already gone before it can run. The Windows equivalents
+    // (latching the exit authority, sweeping the ssh-NTR children) have no
+    // pre-exit hook on the pinned tauri-plugin-updater to attach to, so they
+    // are a known Windows-only gap (see the updater-plugin comment in
+    // `lib.rs`); #197 lands the macOS/Linux path below.
 
     // Clear the pending-update banner before relaunch — once the new
     // binary is on disk the banner would be stale (version === current

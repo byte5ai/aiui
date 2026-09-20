@@ -2451,37 +2451,21 @@ pub fn run() {
             // to `ShellExecuteW` (tauri-plugin-updater 2.10.1,
             // `#[cfg(windows)] fn install_inner`). That bypasses
             // `RunEvent::ExitRequested`, so neither our exit gate nor
-            // `pre_exit_cleanup` ever ran: every Windows update leaked the
-            // instance's `ssh -NTR` child, and the relaunched instance found
-            // the remote port already forwarded and pinned itself to
-            // `ConnectedShared` for the rest of its life.
+            // `pre_exit_cleanup` runs: a Windows update leaks the instance's
+            // `ssh -NTR` child, and the relaunched instance finds the remote
+            // port already forwarded and pins itself to `ConnectedShared`.
             //
-            // `on_before_exit` is invoked ONLY from that Windows branch — the
-            // macOS `install_inner` returns normally — which is exactly the
-            // split we want: macOS keeps latching the exit authority *after*
-            // a successful `downloadAndInstall()` in `updater.ts`, Windows
-            // latches it here, immediately before the process is torn out
-            // from under us. Latching earlier on macOS would arm the
-            // irreversible `ExitAuthority` for an install that can still
-            // fail, leaving a live host whose default-deny exit gate is
-            // permanently disarmed (an Invariant I1 regression).
-            //
-            // Version-pinned behaviour: re-check this hook when bumping
-            // tauri-plugin-updater past 2.10.1.
-            tauri_plugin_updater::Builder::new()
-                .on_before_exit({
-                    let auth = exit_authority.clone();
-                    let port = cfg.http_port;
-                    move || {
-                        logging::trace(
-                            "updater: on_before_exit — latching exit authority and \
-                             sweeping tunnels before the installer takes over",
-                        );
-                        auth.authorize();
-                        housekeeping::pre_exit_cleanup(port, "update-install");
-                    }
-                })
-                .build(),
+            // tauri-plugin-updater 2.10.1's `Builder` exposes no pre-exit hook
+            // to wire that sweep into (the `on_before_exit` API this once
+            // reached for does not exist on the pinned version), so the
+            // Windows-only leak is a known gap tracked as a follow-up. On
+            // macOS/Linux `downloadAndInstall()` returns normally and
+            // `updater.ts` latches the exit authority + relaunches via
+            // `authorize_exit_for_update` — after the install, because
+            // `ExitAuthority::authorize()` is irreversible and arming it in
+            // front of an install that can still fail would leave a live host
+            // with its exit gate permanently disarmed (Invariant I1).
+            tauri_plugin_updater::Builder::new().build(),
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
