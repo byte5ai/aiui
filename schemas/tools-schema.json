@@ -1,0 +1,251 @@
+{
+  "_comment": "Structural contract shared by aiui's two MCP bridges: the Rust one in companion/src-tauri/src/mcp.rs (tools_list) and the Python one in python/src/aiui_mcp/server.py. Both are asserted against this file (companion/src-tauri/src/mcp.rs::tests and python/tests/test_tool_schema_parity.py), so a tool, argument or default added on one bridge only turns red instead of drifting (#211).",
+  "_scope": "Structure only — tool names, required[], argument names, types and scalar defaults. Descriptions are deliberately NOT captured: they are long agent-facing prose, edited often and on purpose, and pinning them would train people to regenerate this file without reading it.",
+  "_normalisation": [
+    "type: one JSON-Schema type name. Optional[T] (an anyOf with null, as FastMCP emits it) collapses to T; 'integer' is recorded as 'number'.",
+    "default: recorded only when it is a non-null scalar. FastMCP's default: null for an omitted optional argument is treated as 'no default'.",
+    "A default written as an object {\"rust\": …, \"python\": …} is a KNOWN divergence between the bridges; each side's test asserts its own value, so changing it on one bridge only still fails."
+  ],
+  "tools": {
+    "aiui_health": {
+      "required": [],
+      "properties": {}
+    },
+    "ask": {
+      "required": [
+        "options",
+        "question"
+      ],
+      "properties": {
+        "allow_other": {
+          "type": "boolean",
+          "default": {
+            "rust": false,
+            "python": true
+          }
+        },
+        "header": {
+          "type": "string"
+        },
+        "multi_select": {
+          "type": "boolean",
+          "default": false
+        },
+        "options": {
+          "type": "array"
+        },
+        "question": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        }
+      }
+    },
+    "compare": {
+      "required": [
+        "variants"
+      ],
+      "properties": {
+        "cancel_label": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "number"
+        },
+        "description": {
+          "type": "string"
+        },
+        "header": {
+          "type": "string"
+        },
+        "height": {
+          "type": "number"
+        },
+        "session": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "submit_label": {
+          "type": "string"
+        },
+        "sync_scroll": {
+          "type": "boolean",
+          "default": false
+        },
+        "title": {
+          "type": "string"
+        },
+        "variants": {
+          "type": "array"
+        },
+        "width": {
+          "type": "number"
+        }
+      }
+    },
+    "confirm": {
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "cancel_label": {
+          "type": "string"
+        },
+        "confirm_label": {
+          "type": "string"
+        },
+        "destructive": {
+          "type": "boolean",
+          "default": false
+        },
+        "header": {
+          "type": "string"
+        },
+        "image": {
+          "type": "object"
+        },
+        "message": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "form": {
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "actions": {
+          "type": "array"
+        },
+        "cancel_label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "fields": {
+          "type": "array"
+        },
+        "header": {
+          "type": "string"
+        },
+        "height": {
+          "type": "number"
+        },
+        "session": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "submit_label": {
+          "type": "string"
+        },
+        "tabs": {
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        },
+        "width": {
+          "type": "number"
+        }
+      }
+    },
+    "gallery": {
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "actions": {
+          "type": "array"
+        },
+        "cancel_label": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "number"
+        },
+        "comment": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": {
+          "type": "string"
+        },
+        "header": {
+          "type": "string"
+        },
+        "height": {
+          "type": "number"
+        },
+        "items": {
+          "type": "array"
+        },
+        "session": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "submit_label": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "width": {
+          "type": "number"
+        }
+      }
+    },
+    "notify": {
+      "required": [
+        "body",
+        "title"
+      ],
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "sound": {
+          "type": "string"
+        },
+        "subtitle": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "update": {
+      "required": [],
+      "properties": {}
+    },
+    "upload": {
+      "required": [],
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "target_dir": {
+          "type": "string"
+        }
+      }
+    },
+    "version": {
+      "required": [],
+      "properties": {}
+    }
+  }
+}

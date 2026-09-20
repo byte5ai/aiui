@@ -2452,6 +2452,102 @@ mod tests {
         }
     }
 
+    // ---------- upload helpers (#146, covered by #211) ----------
+    //
+    // The Python bridge pins the same contract in
+    // `python/tests/test_upload.py`. This bridge is the one every local
+    // Claude Desktop / Claude Code user runs, and `safe_base_name` is the
+    // only barrier stopping a companion-supplied `x-aiui-filename` from
+    // escaping `target_dir` in `do_upload`.
+
+    #[test]
+    fn safe_base_name_strips_directories() {
+        assert_eq!(safe_base_name("report.pdf").as_deref(), Some("report.pdf"));
+        assert_eq!(
+            safe_base_name("/Users/me/Downloads/report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(safe_base_name("../../etc/passwd").as_deref(), Some("passwd"));
+        assert_eq!(safe_base_name("  spaced.txt  ").as_deref(), Some("spaced.txt"));
+    }
+
+    #[test]
+    fn safe_base_name_rejects_empty_and_dots() {
+        for raw in ["", ".", "..", "/", "   "] {
+            assert_eq!(safe_base_name(raw), None, "{raw:?} must not name a file");
+        }
+    }
+
+    /// `Path::file_name()` is platform-dependent: a backslash is a path
+    /// separator on Windows and an ordinary filename byte everywhere else,
+    /// so the *same* header produces two different names on the two
+    /// platforms aiui ships. Both are safe — neither escapes `target_dir` —
+    /// but the divergence is real and belongs in writing rather than in
+    /// someone's memory.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn safe_base_name_keeps_backslashes_off_windows() {
+        assert_eq!(safe_base_name("..\\win.txt").as_deref(), Some("..\\win.txt"));
+    }
+
+    /// NOTE: compiled but never executed in CI — the Windows leg runs
+    /// `cargo test --lib --no-run` (#141). It documents the divergence and
+    /// starts running the day that is fixed.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn safe_base_name_strips_backslash_directories_on_windows() {
+        assert_eq!(safe_base_name("..\\win.txt").as_deref(), Some("win.txt"));
+    }
+
+    #[test]
+    fn expand_dir_resolves_tilde_and_rejects_relative() {
+        assert_eq!(expand_dir("~/x"), dirs::home_dir().map(|h| h.join("x")));
+        assert_eq!(expand_dir("~"), dirs::home_dir());
+        // Relative paths are a caller error: there is no stable cwd contract
+        // to resolve them against, and guessing one writes the upload
+        // somewhere the agent never named.
+        assert_eq!(expand_dir("rel"), None);
+        assert_eq!(expand_dir("./here"), None);
+        assert_eq!(expand_dir(""), None);
+    }
+
+    /// Absoluteness is platform-dependent too: `"/abs"` is absolute on unix
+    /// and *not* on Windows, so an identical `target_dir` is accepted on one
+    /// shipping platform and rejected on the other.
+    #[cfg(unix)]
+    #[test]
+    fn expand_dir_accepts_a_unix_absolute_path() {
+        assert_eq!(expand_dir("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+    }
+
+    /// NOTE: compiled but never executed in CI — see #141.
+    #[cfg(windows)]
+    #[test]
+    fn expand_dir_accepts_a_windows_absolute_path() {
+        assert_eq!(expand_dir(r"C:\tmp\x"), Some(PathBuf::from(r"C:\tmp\x")));
+        // …and the unix-shaped one is not absolute here.
+        assert_eq!(expand_dir("/abs"), None);
+    }
+
+    #[test]
+    fn pct_decode_bytes_decodes_utf8_escapes() {
+        assert_eq!(String::from_utf8(pct_decode_bytes("%C3%A4")).unwrap(), "ä");
+        assert_eq!(String::from_utf8(pct_decode_bytes("plain.txt")).unwrap(), "plain.txt");
+    }
+
+    #[test]
+    fn pct_decode_bytes_passes_malformed_escapes_through() {
+        // The doc comment's promise: a mangled header degrades to a
+        // slightly-odd name, never a lost upload.
+        for raw in ["a%", "a%4", "%zz", "%"] {
+            assert_eq!(
+                String::from_utf8(pct_decode_bytes(raw)).unwrap(),
+                raw,
+                "{raw:?} must survive literally"
+            );
+        }
+    }
+
     /// The cold-start hint is the one platform-specific sentence left, and it
     /// must follow the *build target* — this binary IS the companion, so the
     /// target is the user's OS. It must never follow
@@ -2481,5 +2577,194 @@ mod tests {
             "context line lost: {text}"
         );
         assert!(!text.contains("local Mac"), "context line claims an OS: {text}");
+    }
+
+    #[test]
+    fn filename_header_survives_the_encode_decode_round_trip() {
+        // The encoder lives in http.rs and is tested there; only the decode
+        // half was unguarded, which is exactly how the two halves drift
+        // apart. Umlaut + space is the case users actually hit.
+        let original = "Prüfung final.md";
+        let encoded = crate::http::pct_encode_filename(original);
+        assert!(encoded.is_ascii(), "header must stay ASCII: {encoded}");
+        let decoded = String::from_utf8(pct_decode_bytes(&encoded)).expect("valid utf-8");
+        assert_eq!(decoded, original);
+        assert_eq!(safe_base_name(&decoded).as_deref(), Some(original));
+    }
+
+    // ---------- result shapes every agent parses ----------
+
+    /// `structuredContent` and `content[0].text` must always be the same
+    /// payload — a client reads one or the other, never both.
+    fn assert_envelope_is_consistent(out: &Value) {
+        let text = out["content"][0]["text"].as_str().expect("text content");
+        let parsed: Value = serde_json::from_str(text).expect("content text is JSON");
+        assert_eq!(parsed, out["structuredContent"], "envelope halves disagree");
+    }
+
+    #[test]
+    fn confirm_result_reports_submit_and_cancel() {
+        let out = format_confirm_result(json!({
+            "id": "d1", "cancelled": false, "result": {"confirmed": true}
+        }));
+        assert_envelope_is_consistent(&out);
+        assert_eq!(out["structuredContent"], json!({"cancelled": false, "confirmed": true}));
+
+        // Cancel carries `result: null` — reading `confirmed` off it must
+        // never be laundered into a "yes".
+        let out = format_confirm_result(json!({"id": "d1", "cancelled": true, "result": null}));
+        assert_envelope_is_consistent(&out);
+        assert_eq!(out["structuredContent"], json!({"cancelled": true, "confirmed": false}));
+    }
+
+    #[test]
+    fn confirm_result_survives_a_non_object_result() {
+        let out = format_confirm_result(json!({"id": "d1", "cancelled": false, "result": "yes"}));
+        assert_envelope_is_consistent(&out);
+        assert_eq!(out["structuredContent"]["confirmed"], json!(false));
+    }
+
+    #[test]
+    fn dialog_result_carries_the_values_and_the_cancelled_flag() {
+        let out = format_dialog_result(json!({
+            "id": "d1", "cancelled": false, "result": {"values": {"name": "Ada"}}
+        }));
+        assert_envelope_is_consistent(&out);
+        assert_eq!(
+            out["structuredContent"],
+            json!({"values": {"name": "Ada"}, "cancelled": false})
+        );
+    }
+
+    #[test]
+    fn dialog_result_of_a_cancel_with_null_result_is_an_object() {
+        // `result: null` is not an object, so the `cancelled` flag has
+        // nowhere to go unless the fallback builds one. An agent parsing
+        // `null["cancelled"]` is the alternative.
+        let out = format_dialog_result(json!({"id": "d1", "cancelled": true, "result": null}));
+        assert_envelope_is_consistent(&out);
+        assert_eq!(out["structuredContent"], json!({"cancelled": true}));
+    }
+
+    #[test]
+    fn dialog_result_of_a_non_object_result_does_not_panic() {
+        for result in [json!("plain text"), json!(["a", "b"]), json!(7)] {
+            let out = format_dialog_result(json!({
+                "id": "d1", "cancelled": false, "result": result
+            }));
+            assert_envelope_is_consistent(&out);
+            assert_eq!(out["structuredContent"], json!({"cancelled": false}));
+        }
+    }
+
+    // ---------- two-bridge schema parity (#211) ----------
+
+    /// The structural contract both bridges are held to. The Python bridge
+    /// asserts against the same file in
+    /// `python/tests/test_tool_schema_parity.py`, so an argument or default
+    /// added on one bridge only turns red instead of drifting — which is how
+    /// `ask.allow_other` ended up with two different defaults unnoticed.
+    const TOOL_SCHEMA_FIXTURE: &str = include_str!("../../../schemas/tools-schema.json");
+
+    /// Mirror of the normalisation documented in `schemas/tools-schema.json`.
+    fn fixture_prop_type(p: &Value) -> String {
+        if let Some(t) = p.get("type").and_then(|v| v.as_str()) {
+            return if t == "integer" { "number".into() } else { t.into() };
+        }
+        if let Some(any) = p.get("anyOf").and_then(|v| v.as_array()) {
+            let mut ts: Vec<String> = any
+                .iter()
+                .filter_map(|x| x.get("type").and_then(|v| v.as_str()))
+                .filter(|t| *t != "null")
+                .map(|t| if t == "integer" { "number".to_string() } else { t.to_string() })
+                .collect();
+            ts.sort();
+            ts.dedup();
+            if ts.len() == 1 {
+                return ts.remove(0);
+            }
+            return ts.join("|");
+        }
+        "any".into()
+    }
+
+    /// A fixture `default` written as an object is a known divergence
+    /// between the bridges; this side asserts its own value, so changing it
+    /// here alone still fails.
+    fn expected_default(entry: &Value) -> Option<Value> {
+        match entry.get("default") {
+            None => None,
+            Some(Value::Object(m)) => Some(
+                m.get("rust")
+                    .cloned()
+                    .expect("a divergence entry names both bridges"),
+            ),
+            Some(v) => Some(v.clone()),
+        }
+    }
+
+    #[test]
+    fn tools_list_matches_the_shared_schema_fixture() {
+        let fixture: Value = serde_json::from_str(TOOL_SCHEMA_FIXTURE).expect("fixture is JSON");
+        let expected = fixture["tools"].as_object().expect("fixture has tools");
+        let listed = tools_list();
+        let listed = listed.as_array().expect("tools_list is an array");
+
+        let mut got: Vec<&str> = listed
+            .iter()
+            .map(|t| t["name"].as_str().expect("every tool is named"))
+            .collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = expected.keys().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "tool set drifted from schemas/tools-schema.json");
+
+        for tool in listed {
+            let name = tool["name"].as_str().unwrap();
+            let want = expected.get(name).unwrap();
+            let schema = &tool["inputSchema"];
+
+            let mut got_req: Vec<&str> = schema
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            got_req.sort_unstable();
+            let mut want_req: Vec<&str> = want["required"]
+                .as_array()
+                .expect("required is a list")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            want_req.sort_unstable();
+            assert_eq!(got_req, want_req, "{name}: required[] drifted");
+
+            let empty = serde_json::Map::new();
+            let got_props = schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .unwrap_or(&empty);
+            let want_props = want["properties"].as_object().expect("properties is a map");
+
+            let mut got_names: Vec<&str> = got_props.keys().map(String::as_str).collect();
+            got_names.sort_unstable();
+            let mut want_names: Vec<&str> = want_props.keys().map(String::as_str).collect();
+            want_names.sort_unstable();
+            assert_eq!(got_names, want_names, "{name}: argument set drifted");
+
+            for (prop, want_prop) in want_props {
+                let got_prop = got_props.get(prop.as_str()).unwrap();
+                assert_eq!(
+                    fixture_prop_type(got_prop),
+                    want_prop["type"].as_str().expect("type is a string"),
+                    "{name}.{prop}: type drifted"
+                );
+                assert_eq!(
+                    got_prop.get("default").cloned(),
+                    expected_default(want_prop),
+                    "{name}.{prop}: default drifted"
+                );
+            }
+        }
     }
 }

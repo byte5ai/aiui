@@ -1003,6 +1003,7 @@ pub(crate) fn is_exe_mtime_stale(baseline: Option<u64>, current: Option<u64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::ssh_ntr_args;
 
     #[cfg(windows)]
     const CURRENT: &str = r"C:\Program Files\aiui\aiui.exe";
@@ -1333,6 +1334,13 @@ mod tests {
         .collect()
     }
 
+    /// `ssh_ntr_args` here is the **production builder** from `tunnel.rs`
+    /// (imported at the top of this module), not a copy. A hand-copied
+    /// duplicate used to live in this file, which made this test inert: an
+    /// `-o` added or reordered in the real spawn kept it green while
+    /// `is_aiui_ssh_ntr_for_port` stopped recognising aiui's own reparented
+    /// tunnels — so orphans piled up and kept the remote's :7777 occupied
+    /// (#211).
     #[test]
     fn ssh_ntr_signature_matches_real_tunnel_args() {
         let a = ssh_ntr_args("dev@devhost", 7777);
