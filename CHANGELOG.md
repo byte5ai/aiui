@@ -19,6 +19,25 @@ All notable changes to this project are documented here.
   runs in the release path before anything becomes visible, and
   `scripts/test-check-updater-feed.sh` exercises it against fixtures on
   every PR so the guard cannot quietly stop guarding (#190).
+- **`rust-toolchain.toml`** pins the compiler aiui is built with. It is a
+  pin, not a floor — `rust-version = "1.77.2"` in `Cargo.toml` stays as the
+  MSRV floor, and the two say different things. Because a
+  `RUSTUP_TOOLCHAIN` in the environment outranks the file's directory
+  override, dropping the file in is not enough on its own: each workflow
+  now asserts `rustc --version` against the pinned channel right after
+  installing the toolchain, so a pin that is not actually in effect fails
+  the job instead of shipping (#192).
+- **`scripts/check-workflow-pins.sh`** refuses a workflow whose `uses:` is
+  not a 40-char commit SHA with a readable `# vX.Y.Z` comment, a
+  `version: latest` uv, or a global `@tauri-apps/cli` install. It runs as
+  its own CI job, and `scripts/test-check-workflow-pins.sh` exercises it
+  against fixtures of every shape that was in the tree before this
+  release (#192).
+- **`.github/dependabot.yml`** covering `github-actions`, `npm`
+  (`/companion`) and `cargo` (`/companion/src-tauri`). Pinning by SHA
+  without an update path only trades a moving-ref risk for a never-updated
+  one; Dependabot rewrites the SHA and its version comment together, so a
+  bump stays a reviewable one-line diff (#192).
 
 ### Changed
 
@@ -283,9 +302,43 @@ All notable changes to this project are documented here.
   produced filename, so the url can't desync from the signed artifact
   (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
   after this fix.
+- **The Windows installer was bundled by a Tauri CLI nobody had pinned.**
+  Both Windows jobs ran `npm ci` and then threw away its result for a
+  global `npm install --global @tauri-apps/cli@^2`, resolved at build time
+  and discarded — not the `2.10.1` that `companion/package-lock.json`
+  locks. So two dispatches of the same tag could bundle with two different
+  bundlers, the `.sig` the updater verifies was produced by whichever one
+  npm happened to pick, and "which bundler built the `.exe` user X is
+  running?" had no answer at all. Both jobs now build with `npx tauri`,
+  which is what the macOS job always did, and a step asserts the CLI
+  version against the lockfile before the build (#192).
+- **The README promised reproducible builds the build could not deliver.**
+  "builds reproducibly" sat in the FAQ beside the true statements about
+  Developer-ID signing and notarization, which lent it credibility it had
+  not earned: `build.rs` stamps wall-clock `chrono::Utc::now()` into every
+  binary, so two builds of one commit are byte-different by construction.
+  That is the worst kind of security documentation — it invites a sceptical
+  user to run a check that cannot succeed. The sentence now says what
+  actually holds (built only in public GitHub Actions, from SHA-pinned
+  actions and a pinned compiler), and a new unit test locks the
+  `build_info` format that `/version` and every trace log expose (#192).
 
 ### Security
 
+- **Every third-party action in every workflow is pinned to a commit
+  SHA.** The macOS release job holds the Developer ID certificate, the
+  App Store Connect notary key, the minisign updater private key and the
+  PyPI publish token in one environment, with `contents: write` on the
+  repo — and it ran `actions/checkout@v4`, `Swatinem/rust-cache@v2`,
+  `astral-sh/setup-uv@v3` and `dtolnay/rust-toolchain@stable`, the last of
+  which is a *branch* ref and so expected to move. One taken-over action
+  repo or one force-moved tag was enough to read those secrets out of the
+  job; with the minisign key an attacker can sign an `aiui.app.tar.gz`
+  that every installed companion accepts from the updater feed, and aiui
+  installs its own updates, so there is no user-visible install step to
+  catch it. The blast radius was every installed companion, not just the
+  next download. Also pinned: the Rust compiler and the uv binary, which
+  used to be downloaded as `version: latest` into the same job (#192).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

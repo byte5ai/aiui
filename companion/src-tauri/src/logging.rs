@@ -148,3 +148,47 @@ fn write_line(msg: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the shape of [`BUILD_INFO`] — #192.
+    ///
+    /// Two readers parse this string by eye and by script: support, via the
+    /// `build_info` field of `/version` (`http.rs`), and every bug report,
+    /// via the first line of the trace file. `build.rs` assembles it from
+    /// three `env!`s, so a change there (a different timestamp format, a
+    /// longer SHA, a dropped segment) compiles fine and only shows up when
+    /// someone is already debugging something else.
+    ///
+    /// This is a *format* lock, not a reproducibility check: it says nothing
+    /// about whether two builds of one commit produce the same bytes. They
+    /// do not — `AIUI_BUILD_TIMESTAMP` is wall-clock — which is exactly why
+    /// the README no longer claims aiui "builds reproducibly".
+    #[test]
+    fn build_info_matches_expected_shape() {
+        let prefix = concat!("aiui v", env!("CARGO_PKG_VERSION"), " (build ");
+        let rest = BUILD_INFO
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("BUILD_INFO {BUILD_INFO:?} does not start with {prefix:?}"));
+        let rest = rest
+            .strip_suffix(')')
+            .unwrap_or_else(|| panic!("BUILD_INFO {BUILD_INFO:?} does not end with ')'"));
+
+        let (timestamp, sha) = rest
+            .split_once(" sha:")
+            .unwrap_or_else(|| panic!("BUILD_INFO {BUILD_INFO:?} has no ' sha:' segment"));
+
+        if let Err(e) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+            panic!("BUILD_INFO timestamp {timestamp:?} is not RFC3339: {e}");
+        }
+
+        // `build.rs` asks git for `--short=12` and falls back to "nogit"
+        // outside a checkout (a release tarball, a vendored build).
+        assert!(
+            sha == "nogit" || (sha.len() == 12 && sha.chars().all(|c| c.is_ascii_hexdigit())),
+            "BUILD_INFO sha segment {sha:?} is neither 12 hex chars nor \"nogit\""
+        );
+    }
+}

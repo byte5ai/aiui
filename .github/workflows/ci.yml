@@ -51,19 +51,32 @@ jobs:
             # *compile and link* on Windows via `--no-run`.
             run_tests: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      # #192: pinned to a `master` commit, with the compiler version passed
+      # explicitly from `rust-toolchain.toml`. `@stable` was a *branch* ref —
+      # expected to move — so CI and the release built with whatever compiler
+      # happened to be stable that morning, recorded nowhere.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-11
         with:
+          toolchain: "1.98.1"
           targets: ${{ matrix.target }}
+          # `--profile minimal` installs no clippy, and a version-named
+          # toolchain is not the runner image's pre-provisioned `stable`.
+          components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Assert the pinned Rust toolchain
+        shell: bash
+        working-directory: companion/src-tauri
+        run: bash ../../scripts/assert-rust-toolchain.sh
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
           key: ${{ matrix.target }}
@@ -102,14 +115,23 @@ jobs:
         working-directory: companion/src-tauri
         run: cargo clippy --release --target ${{ matrix.target }} -- -D warnings
 
+      # #192: the bundler comes from `npm ci` above — the 2.10.1 that
+      # `companion/package-lock.json` locks — not from a global install of
+      # `@tauri-apps/cli@^2` resolved at build time and thrown away. Two runs
+      # of the same commit used to be able to bundle with two different
+      # bundlers, and the `.sig` the updater trusts is produced by whichever
+      # one npm happened to pick.
+      - name: Assert the locked Tauri CLI
+        if: matrix.build_bundle
+        shell: bash
+        working-directory: companion
+        run: bash ../scripts/assert-tauri-cli.sh
+
       # Windows-only: produce a real NSIS installer so we can hand the
       # `.exe` to a tester or run it on a Windows VM. Mac CI stays
       # bundle-less — macOS release bundles are built by release-macos.yml
       # (workflow_dispatch).
-      - name: Install Tauri CLI
-        if: matrix.build_bundle
-        run: npm install --global @tauri-apps/cli@^2
-
+      #
       # `tauri.conf.json` has `createUpdaterArtifacts: true` and a
       # minisign pubkey, so Tauri normally expects `TAURI_SIGNING_PRIVATE_KEY`
       # at build time to produce the signed `.nsis.zip` updater bundle.
@@ -121,11 +143,11 @@ jobs:
       - name: Tauri build (NSIS, no updater bundle)
         if: matrix.build_bundle
         working-directory: companion
-        run: tauri build --target ${{ matrix.target }} --bundles nsis --config src-tauri/tauri.ci.conf.json
+        run: npx tauri build --target ${{ matrix.target }} --bundles nsis --config src-tauri/tauri.ci.conf.json
 
       - name: Upload NSIS installer
         if: matrix.build_bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: aiui-windows-x86_64-nsis
           path: companion/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
@@ -136,7 +158,7 @@ jobs:
     name: skill.md drift guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # docs/skill.md (canonical, embedded in the Rust MCP server) and
       # python/src/aiui_mcp/skill.md (shipped with the Python bridge) must
@@ -164,15 +186,36 @@ jobs:
       - name: Guard the release step order
         run: ./scripts/check-release-ordering.sh
 
+  workflow-pins:
+    name: Workflow pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # #192: the release jobs hold the Developer ID certificate, the notary
+      # key, the minisign updater key and the PyPI token in one environment,
+      # and aiui installs its own updates — so a third-party action resolved
+      # from a mutable ref is a direct path from an upstream takeover to
+      # signed code on every user's machine. Every `uses:` is a commit SHA;
+      # this job is what stops the next edit from floating one again.
+      - name: Check workflow refs are pinned by SHA
+        run: ./scripts/check-workflow-pins.sh
+
+      - name: Self-test the workflow pin guard
+        run: ./scripts/test-check-workflow-pins.sh
+
   mcp:
     name: aiui-mcp (Python)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
-          version: latest
+          # #192: exact, not `latest` — `latest` downloaded whatever uv
+          # shipped that morning into the same job shape that holds
+          # UV_PUBLISH_TOKEN on the release path.
+          version: "0.12.17"
 
       - name: Run unit tests
         working-directory: python
