@@ -808,6 +808,13 @@ struct StatusReport {
     /// non-modal banner in Settings ("Update auf v0.4.X verfügbar —
     /// Installieren"). v0.4.44.
     pending_update: Option<String>,
+    /// True when this binary runs from a location it won't still be at on
+    /// the next launch — a translocated copy off the DMG, `~/Downloads`,
+    /// a temp dir. Host registration is refused in that state (#198),
+    /// because the path we would write as `command` is dead by the time the
+    /// host makes its first tool call. Drives a blocking banner in Settings
+    /// telling the user to move the app and relaunch.
+    ephemeral_install: bool,
 }
 
 const fn current_os() -> &'static str {
@@ -853,6 +860,7 @@ async fn status(
         http_alive,
         os: current_os(),
         pending_update: current_pending_update(pending_update.inner()),
+        ephemeral_install: setup::is_ephemeral_install(),
     })
 }
 
@@ -938,6 +946,47 @@ fn dismiss_welcome(
 fn repair_skill(window: tauri::WebviewWindow) -> Result<setup::StepResult, String> {
     require_privileged_window(&window, "repair_skill")?;
     Ok(skill::install_locally())
+}
+
+/// Re-writes this binary's `aiui` entry into every MCP host installed here.
+/// Bound to the "Repair config" button in the Settings status row, which
+/// only appears when `claude_config_ok` reports false.
+///
+/// #198: the setup closure patches a host only when its `is_*_current`
+/// predicate says otherwise, so before this command there was no in-app way
+/// out of a stale entry the predicate had *already* accepted — the user saw
+/// a red dot and a button that only fixed the skill. Refuses while the app
+/// runs from an ephemeral location: registering a path that disappears is
+/// exactly the state the banner is asking the user to leave.
+#[tauri::command]
+fn repair_claude_config() -> Result<Vec<setup::StepResult>, String> {
+    let bin = setup::app_binary_path();
+    if setup::is_ephemeral_install() {
+        return Ok(vec![setup::StepResult {
+            ok: false,
+            message: "aiui runs from a temporary location — move aiui to Applications and relaunch."
+                .into(),
+            details: Some(bin),
+        }]);
+    }
+    let mut results = Vec::new();
+    if setup::is_claude_desktop_installed() {
+        results.push(setup::patch_claude_desktop_config(&bin));
+    }
+    if setup::is_claude_code_installed() {
+        results.push(setup::patch_claude_code_config(&bin));
+    }
+    if setup::is_codex_installed() {
+        results.push(setup::patch_codex_config(&bin));
+    }
+    if results.is_empty() {
+        results.push(setup::StepResult {
+            ok: true,
+            message: "No MCP host found on this machine — nothing to register.".into(),
+            details: None,
+        });
+    }
+    Ok(results)
 }
 
 /// Open a URL in the user's default browser. Tauri's WebView blocks
@@ -2163,6 +2212,7 @@ pub fn run() {
             resync_remote,
             reinstall_skill,
             repair_skill,
+            repair_claude_config,
             restart_claude_desktop,
             uninstall_all,
             quit_app,
@@ -2190,7 +2240,27 @@ pub fn run() {
             // actually installed here (#168); no phantom config for a host the
             // user doesn't use. Idempotent, GUI mode only.
             let bin = setup::app_binary_path();
-            if setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
+
+            // #198: refuse to register a path that won't exist next launch.
+            // Gatekeeper App Translocation hands a DMG-launched or
+            // ~/Downloads-launched app a
+            // `/private/var/folders/…/AppTranslocation/<uuid>/d/…` path that
+            // is gone when it quits and carries a fresh UUID next time —
+            // writing it into three host configs means every tool call fails
+            // with "no such file", and all three files get rewritten (plus a
+            // fresh `.bak`) on every single launch because the random path
+            // never matches. Substituting the canonical /Applications path
+            // would only swap a broken path for one pointing at nothing;
+            // `ephemeral_install` in the status report raises a banner asking
+            // the user to move the app.
+            let ephemeral = setup::is_ephemeral_install();
+            if ephemeral {
+                logging::trace(&format!(
+                    "gui: refusing host registration — binary sits in an ephemeral location: {bin}"
+                ));
+            }
+
+            if !ephemeral && setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
                 trace_step("Claude Desktop config registration", setup::patch_claude_desktop_config(&bin));
             }
 
@@ -2212,7 +2282,7 @@ pub fn run() {
             // entries from ≤ v0.2.x installs to the native app binary, so
             // every session sees aiui without a uv/uvx dependency — but only
             // if Claude Code is set up here (#168).
-            if setup::is_claude_code_installed() {
+            if !ephemeral && setup::is_claude_code_installed() {
                 trace_step("Claude Code config registration", setup::patch_claude_code_config(&bin));
             }
 
@@ -2220,7 +2290,7 @@ pub fn run() {
             // up here (#168): aiui writes its own ~/.codex/config.toml entry
             // pointing at the same bundled --mcp-stdio server — no manual setup,
             // exactly like the Claude hosts.
-            if setup::is_codex_installed() {
+            if !ephemeral && setup::is_codex_installed() {
                 trace_step("Codex config registration", setup::patch_codex_config(&bin));
             }
 

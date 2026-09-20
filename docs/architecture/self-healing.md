@@ -185,3 +185,43 @@ Implementable in two PRs without breaking the wire format:
   Candidate: 60s, with the client looping until `deadline`.
 - `NSWorkspaceDidWakeNotification` requires Tauri's macOS plugin or a
   small Objective-C bridge — verify which is lighter to maintain.
+
+## Invariants for the setup machinery (#198)
+
+Self-healing only works if the signals it heals on are honest. Five steps in
+the setup/uninstall path reported green for work they had not done, and all
+five reduced to one of these two rules being broken. Both are cheap to hold
+and expensive to rediscover.
+
+**1. A `StepResult` asserts the outcome it verified, never the action it
+attempted.** `ok: true` is a claim about the world after the step, not about
+the step having been reached. Concretely: don't `let _ =` a filesystem
+result and then return `ok: true`; don't word a message from a `changed`
+flag the write path ignores; don't inspect a subprocess's exit status only
+on the branch where it started. A green line over a broken state is the
+worst possible input for a support conversation — the user sees "connected"
+in aiui and a failing MCP server in Claude, and neither side points at the
+cause. A red line the user can act on is strictly better than a green one
+they cannot.
+
+**2. An `is_*_current` predicate must compare exactly what its patcher
+writes — because the predicate is also the repair gate.** The setup closure
+patches a host only when its predicate says the config is stale, so anything
+the predicate accepts can never be healed. `is_claude_config_current`
+stopped at `command` while the patcher wrote `command` *and* `args`: an
+entry missing `--mcp-stdio` read as current forever, and the binary it
+pointed at started the Tauri GUI instead of speaking MCP on stdio. Predicate
+and patcher now share one definition (`aiui_entry_is_current`).
+
+The corollary is the other half of the same rule: compare **only** the keys
+aiui owns, and merge rather than replace. Strict whole-entry equality plus
+wholesale replacement is the mirror-image bug — a user's hand-added `env`
+block gets clobbered and a fresh `.bak.<ts>` dropped on every single launch.
+Compare what we own, preserve what we don't.
+
+A third rule falls out of the two: **never register a path that won't exist
+next launch.** `current_exe()` under Gatekeeper App Translocation is a
+throwaway mount with a fresh UUID per launch; writing it into a host config
+guarantees both a dead `command` and a rewrite loop. The right answer is to
+refuse and tell the user, not to substitute a canonical path the binary is
+not actually at.

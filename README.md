@@ -67,7 +67,11 @@ No Terminal. No Homebrew. No Python. No `uv`.
 
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon).
-2. Drag into `Applications`.
+2. Drag into `Applications`. This step is not optional: launched straight
+   off the mounted DMG or out of `~/Downloads`, macOS runs aiui from a
+   throwaway copy that disappears when you quit it. aiui notices, refuses
+   to register itself with Claude, and shows you a banner saying so —
+   rather than writing a path that is dead by the next tool call.
 3. Launch it once from Finder.
 
 ### Windows (x64)
@@ -244,6 +248,8 @@ Follow [#158](https://github.com/byte5ai/aiui/issues/158) for status.
 | "aiui companion not reachable" in chat | Claude Desktop isn't running, or your machine is asleep. |
 | "Windows protected your PC" when installing | Expected — the installer isn't Authenticode-signed. "More info" → "Run anyway". See [Install](#install). |
 | "token rejected (401)" | An old aiui process is holding the port on the remote. `pkill -f aiui` on the remote, then "Remove" and "Add" that remote again in aiui settings. |
+| "aiui runs from a temporary location" | You launched aiui from the DMG, `~/Downloads`, or a temp folder, so macOS runs it from a copy that won't exist next time. Quit aiui, move `aiui.app` into `Applications`, and launch it from there. |
+| Status dot red although aiui is running | The `aiui` entry in your Claude config is stale or incomplete (e.g. missing the `--mcp-stdio` argument). Click **Repair config** next to the dot, then restart Claude Desktop. |
 
 Bugs or feature requests → [open an issue](https://github.com/byte5ai/aiui/issues/new).
 The "Report issue" button in settings pre-fills version and build SHA.
