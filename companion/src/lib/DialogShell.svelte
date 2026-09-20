@@ -214,6 +214,23 @@
     return out;
   }
 
+  /** Every `secret`-kind field, regardless of whether it carries a `target`
+   *  (issue #186). The write-only contract is a property of the KIND: the
+   *  docs say a secret's value is never returned, but the strip below used
+   *  to key on `target`, so a target-less `secret` went back as plaintext. */
+  function collectSecretFields(spec: any): string[] {
+    const out: string[] = [];
+    const scan = (fields: any) => {
+      if (!Array.isArray(fields)) return;
+      for (const f of fields) {
+        if (f && f.kind === "secret" && typeof f.name === "string") out.push(f.name);
+      }
+    };
+    scan(spec?.fields);
+    if (Array.isArray(spec?.tabs)) for (const t of spec.tabs) scan(t?.fields);
+    return out;
+  }
+
   async function handleSubmit(result: any) {
     if (!current) return;
     clearTtlTimers();
@@ -243,7 +260,14 @@
       }
       let outcomes: Record<string, any> = {};
       try {
-        outcomes = await invoke("write_dialog_targets", { id, values });
+        // Issue #177: hand the pressed action to the writer. The authoritative
+        // decision whether it commits lives in Rust, resolved against the
+        // stored spec — this is a convenience pass-through, not the guard.
+        outcomes = await invoke("write_dialog_targets", {
+          id,
+          values,
+          action: result?.action ?? null,
+        });
       } catch (e) {
         console.error(`[aiui] write_dialog_targets failed for ${id}: ${e}`);
         // Synthesise a failure outcome so the agent is informed instead of
@@ -265,6 +289,31 @@
           fieldValues[t.name] = outcome;
         } else {
           fieldValues[t.name] = { value: fieldValues[t.name], ...outcome };
+        }
+      }
+    }
+
+    // Issue #186: belt and braces for a `secret` that carries no `target` and
+    // was therefore never in `targets`. A current companion rejects that
+    // shape in validate_spec, but an older one in front of a newer bridge
+    // would not — and the value must never reach the agent either way.
+    //
+    // Only for a LOCAL session. With `session_origin` set the plaintext must
+    // still travel to the bridge over the :7777 channel, because the bridge
+    // on the agent's host performs the write and does its own strip. Stripping
+    // here would make it write the stringified outcome object into the user's
+    // credential file and report success.
+    if (!sessionOrigin) {
+      for (const name of collectSecretFields(spec)) {
+        const v = fieldValues[name];
+        const alreadyStripped = v != null && typeof v === "object" && "written" in v;
+        if (!alreadyStripped) {
+          fieldValues[name] = {
+            written: false,
+            target: "",
+            bytes: 0,
+            error: "secret field has no target — value discarded, never returned",
+          };
         }
       }
     }

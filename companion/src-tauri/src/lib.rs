@@ -90,17 +90,21 @@ fn dialog_cancel(
 ///
 /// `target`/mode/path are read authoritatively from the **stored spec** (not
 /// from the frontend) so the destination can't be tampered with after the user
-/// approved it. Returns a per-field outcome map; for a `secret` field the
-/// outcome carries status only, never the value.
+/// approved it — and so is the decision whether the submitted `action` commits
+/// writes at all (issue #177). Returns a per-field outcome map; for a `secret`
+/// field the outcome carries status only, never the value.
 #[tauri::command]
 fn write_dialog_targets(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     values: std::collections::HashMap<String, String>,
+    action: Option<String>,
 ) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
+
+    let commits = action_commits_targets(&req.spec, action.as_deref());
 
     let mut out = std::collections::HashMap::new();
     for field in collect_target_fields(&req.spec) {
@@ -119,8 +123,28 @@ fn write_dialog_targets(
                     continue;
                 }
             };
-        let value = values.get(&name).map(String::as_str).unwrap_or("");
-        out.insert(name, filewrite::write_local(value, &target));
+        // A non-committing action still gets a per-field outcome, so the agent
+        // is told why nothing was written instead of being left guessing.
+        if !commits {
+            let label = action.as_deref().unwrap_or("(submit)");
+            out.insert(
+                name,
+                filewrite::WriteOutcome::invalid(format!(
+                    "action '{label}' does not commit target writes"
+                )),
+            );
+            continue;
+        }
+        // "Field absent from the payload" is not the same as "field submitted
+        // blank": the former means the frontend never sent it, which must not
+        // be laundered into an empty write.
+        match values.get(&name) {
+            Some(value) => out.insert(name, filewrite::write_local(value, &target)),
+            None => out.insert(
+                name,
+                filewrite::WriteOutcome::invalid("no value submitted for this field".into()),
+            ),
+        };
     }
     Ok(out)
 }
@@ -142,6 +166,38 @@ fn trace_step(what: &str, step: setup::StepResult) {
                 .unwrap_or_default()
         ));
     }
+}
+
+/// Issue #177: decide whether the action the user pressed commits `target`
+/// file writes. Resolved from the **stored spec**, never from the frontend.
+///
+/// Rule: the built-in submit (`None`, i.e. `action: null` in the result)
+/// always commits. A named action commits unless it carries
+/// `skip_validation: true` — documented as an escape hatch so required-field
+/// validation never traps the user, and an escape hatch is by definition
+/// non-committing. `writes_targets: true` is the explicit opt-in for the rare
+/// action that needs both. An action **not found** in the spec fails closed.
+///
+/// Deliberately *not* keyed on `destructive` or `primary`: both are styling
+/// and orthogonal to committing — a red "Rollback" may legitimately write, and
+/// a neutral action may be the only affirmative one in the form.
+fn action_commits_targets(spec: &serde_json::Value, action: Option<&str>) -> bool {
+    let Some(name) = action else {
+        return true; // built-in __submit__
+    };
+    let Some(actions) = spec.get("actions").and_then(|v| v.as_array()) else {
+        return false; // named action but no action list — fail closed
+    };
+    let Some(entry) = actions
+        .iter()
+        .find(|a| a.get("value").and_then(|v| v.as_str()) == Some(name))
+    else {
+        return false; // unknown action — fail closed
+    };
+    if entry.get("writes_targets").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    entry.get("skip_validation").and_then(|v| v.as_bool()) != Some(true)
 }
 
 /// Collect every form field that carries a non-null `target`, walking both the
@@ -1347,7 +1403,7 @@ pub fn run() {
         Ok(g) => g,
         Err(e) => {
             // Another aiui-GUI is alive and holds the lock. Exit
-            // immediately, traced so the post-mortem in /tmp/aiui-trace.log
+            // immediately, traced so the post-mortem in the trace log
             // explains the silent disappearance.
             logging::trace(&format!(
                 "[aiui] exit (gui-lock-busy): another aiui-GUI holds {} ({e}); \
@@ -1974,4 +2030,106 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The documented Cancel / Save-draft / Create triple from
+    /// `docs/skill.md`, which is what made issue #177 reachable with a
+    /// copy-pasted example.
+    fn spec_with_documented_actions() -> serde_json::Value {
+        json!({
+            "kind": "form",
+            "fields": [{
+                "kind": "secret",
+                "name": "pat",
+                "label": "GitHub PAT",
+                "target": {"mode": "create", "path": "~/.github_tokens/x", "overwrite": true}
+            }],
+            "actions": [
+                {"label": "Cancel", "value": "cancel", "skip_validation": true},
+                {"label": "Save draft", "value": "draft", "skip_validation": true},
+                {"label": "Create", "value": "commit"}
+            ]
+        })
+    }
+
+    #[test]
+    fn none_action_commits() {
+        // The built-in submit button (`action: null` in the result).
+        assert!(action_commits_targets(&spec_with_documented_actions(), None));
+    }
+
+    #[test]
+    fn skip_validation_action_does_not_commit() {
+        let spec = spec_with_documented_actions();
+        assert!(!action_commits_targets(&spec, Some("cancel")));
+        assert!(!action_commits_targets(&spec, Some("draft")));
+    }
+
+    #[test]
+    fn plain_named_action_commits() {
+        assert!(action_commits_targets(
+            &spec_with_documented_actions(),
+            Some("commit")
+        ));
+    }
+
+    #[test]
+    fn writes_targets_overrides_skip_validation() {
+        let spec = json!({
+            "actions": [
+                {"label": "Save anyway", "value": "force",
+                 "skip_validation": true, "writes_targets": true}
+            ]
+        });
+        assert!(action_commits_targets(&spec, Some("force")));
+    }
+
+    #[test]
+    fn unknown_action_does_not_commit() {
+        // Fail closed: an action the stored spec never declared.
+        let spec = spec_with_documented_actions();
+        assert!(!action_commits_targets(&spec, Some("not-in-spec")));
+    }
+
+    #[test]
+    fn named_action_without_action_list_does_not_commit() {
+        let spec = json!({"kind": "form", "fields": []});
+        assert!(!action_commits_targets(&spec, Some("whatever")));
+        // …while the built-in submit still works on such a spec.
+        assert!(action_commits_targets(&spec, None));
+    }
+
+    #[test]
+    fn collect_target_fields_walks_flat_and_tabs() {
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "plain"},
+                {"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/tmp/a"}},
+                {"kind": "text", "name": "nulled", "target": serde_json::Value::Null}
+            ],
+            "tabs": [
+                {"label": "T1", "fields": [
+                    {"kind": "secret", "name": "b", "target": {"mode": "create", "path": "/tmp/b"}}
+                ]},
+                {"label": "T2", "fields": [{"kind": "text", "name": "c"}]}
+            ]
+        });
+        let names: Vec<String> = collect_target_fields(&spec)
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_empty_when_no_targets() {
+        let spec = json!({"kind": "form", "fields": [{"kind": "text", "name": "x"}]});
+        assert!(collect_target_fields(&spec).is_empty());
+    }
 }
