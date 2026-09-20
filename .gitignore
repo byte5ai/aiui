@@ -7,10 +7,13 @@ companion/src-tauri/gen/schemas/
 companion/node_modules/
 
 # python
+# NOTE: python/uv.lock is TRACKED (#210) — like Cargo.lock and
+# package-lock.json. Refresh it with `uv lock` whenever pyproject.toml
+# dependencies change; CI runs `uv run --locked` and will fail on a stale one.
 __pycache__/
 *.pyc
 .pytest_cache/
-python/uv.lock
+.ruff_cache/
 python/.venv/
 python/dist/
 *.egg-info/

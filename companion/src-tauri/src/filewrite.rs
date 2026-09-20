@@ -418,6 +418,16 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "perm applied");
         }
+        #[cfg(windows)]
+        {
+            // #210: `perm` is deliberately a no-op here — Windows has no mode
+            // bits and the file inherits the directory's ACLs. Assert that
+            // outcome explicitly rather than leaving the Windows behaviour of
+            // the secret-writing path unasserted: supplying `perm` must still
+            // produce a readable file, never a failed write.
+            assert!(path.is_file(), "created even though perm is ignored");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cr3t");
+        }
         let out2 = write_local("other", &target);
         assert!(!out2.written && out2.error.is_some(), "refuses clobber");
         let target_ow = Target { overwrite: true, ..target };

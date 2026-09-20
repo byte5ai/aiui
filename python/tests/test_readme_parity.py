@@ -14,6 +14,7 @@ branch on `sys.platform`, because it runs on the *remote* host — a Linux
 dev box would print Linux instructions for a Windows companion. Neutral
 wording is the only correct answer here.
 """
+
 from __future__ import annotations
 
 import ast

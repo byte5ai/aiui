@@ -5,6 +5,7 @@ by a failed copy, mangled by an editor — must fail loudly here rather than
 being sent as a bare or partial `Bearer` that the companion rejects with an
 opaque 401.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,9 +22,7 @@ def _point_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setattr("aiui_mcp.server.TOKEN_PATH", path)
 
 
-def test_accepts_a_well_formed_token(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_accepts_a_well_formed_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     p = tmp_path / "token"
     p.write_text(GOOD + "\n")  # trailing newline is normal and must be tolerated
     _point_at(monkeypatch, p)

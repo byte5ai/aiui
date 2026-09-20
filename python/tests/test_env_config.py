@@ -11,6 +11,7 @@ someone reaches for while debugging a flaky tunnel.
 The contract: fall back to the default, and *warn* — never swallow the bad
 value silently, because the user has to learn their knob was ignored.
 """
+
 from __future__ import annotations
 
 import logging

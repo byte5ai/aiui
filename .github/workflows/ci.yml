@@ -34,24 +34,26 @@ jobs:
             target: aarch64-apple-darwin
             label: macOS arm64
             build_bundle: false
-            run_tests: true
+            # Tested in the profile the shipped bundle is built from.
+            test_profile: "--release"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows x86_64
             build_bundle: true
-            # #183: Windows executes the test binary again. It used to be
-            # compiled with `--no-run` and thrown away, because the freshly
-            # linked `aiui_lib` test binary crashed at *load* with
-            # STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on the runner (#141,
-            # closed as completed 2026-08-01) — a loader artifact, not a
-            # logic failure. The skip's justification ("aiui ships macOS-only
-            # and the Windows port is WIP") stopped being true at v0.10.1,
-            # and Windows is now the platform where the host-registration
-            # code has the most per-OS branching and the least history. A
-            # matrix entry that never runs a test is a green check that
-            # asserts nothing. If the loader crash returns, reopen #141 with
-            # the failing run linked rather than silently flipping this back.
-            run_tests: true
+            # #210: Windows EXECUTES its tests. It used to compile them with
+            # `--no-run` because the release-profile `aiui_lib` test binary
+            # crashed at *load* with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)
+            # on this runner (#141) — so the platform that uploads the
+            # installer had zero executed assertions, and every
+            # `#[cfg(windows)]` branch was verified by the compiler alone.
+            # The loader crash was a property of that binary's layout, not of
+            # any logic, so the test step drops `--release` here: the debug
+            # test binary links differently and does not trip the loader.
+            # (If it ever returns, the next levers are
+            # `RUSTFLAGS=-C target-feature=+crt-static` and `-C debuginfo=0` —
+            # NOT going back to `--no-run`, which proves nothing the `cargo
+            # check` step below does not already prove.)
+            test_profile: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -87,9 +89,13 @@ jobs:
         working-directory: companion
         run: npm ci
 
-      - name: Svelte type-check
-        working-directory: companion
-        run: npx svelte-check --tsconfig ./tsconfig.json --threshold error
+      # #210: `--threshold error` alone let the warning count grow unnoticed
+      # — 10 today, and nothing said so. The guard fails on any error (as
+      # before) and on any warning ABOVE the recorded baseline, so the number
+      # can only fall. Lower the baseline in the script when it does.
+      - name: Svelte type-check (errors + warning baseline)
+        shell: bash
+        run: ./scripts/check-svelte-warnings.sh
 
       # #206/#208: the frontend's form logic and the settings pane — what the
       # user's answer actually IS, plus the visibility-gated status poll, the
@@ -118,10 +124,9 @@ jobs:
         working-directory: companion/src-tauri
         run: cargo check --release --target ${{ matrix.target }}
 
-      - name: Cargo test (run)
-        if: matrix.run_tests
+      - name: Cargo test
         working-directory: companion/src-tauri
-        run: cargo test --lib --release --target ${{ matrix.target }}
+        run: cargo test --lib ${{ matrix.test_profile }} --target ${{ matrix.target }}
 
       - name: Cargo clippy
         working-directory: companion/src-tauri
@@ -255,8 +260,48 @@ jobs:
         run: ./scripts/test-check-release-preconditions.sh
 
   mcp:
-    name: aiui-mcp (Python)
-    runs-on: ubuntu-latest
+    name: aiui-mcp (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # Every step below is a bash script (the smoke-check pipes `printf` into
+    # `timeout`), so the Windows leg runs Git Bash rather than pwsh — one
+    # script, three runners (#210).
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The declared `requires-python` floor, actually exercised.
+          - os: ubuntu-latest
+            python: "3.10"
+            label: Linux · py3.10
+          # The everyday leg: also the one that lints and builds the wheel,
+          # because both are platform-independent and need running once.
+          - os: ubuntu-latest
+            python: "3.12"
+            label: Linux · py3.12
+            lint: true
+            package: true
+          - os: ubuntu-latest
+            python: "3.14"
+            label: Linux · py3.14
+          # The bottom of `mcp>=1.26.0,<2` — proven rather than assumed. The
+          # weekly `deps-refresh.yml` covers the other end by re-resolving
+          # without the lock, so both edges of the range are watched.
+          - os: ubuntu-latest
+            python: "3.10"
+            label: Linux · py3.10 · lowest-direct
+            resolution: lowest-direct
+          # macOS and Windows run the bridge's own platform branches — above
+          # all `_default_token_path`, which decides where the auth token is
+          # read from and used to be executed on Linux only.
+          - os: macos-14
+            python: "3.12"
+            label: macOS · py3.12
+          - os: windows-latest
+            python: "3.12"
+            label: Windows · py3.12
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -267,15 +312,42 @@ jobs:
           # UV_PUBLISH_TOKEN on the release path.
           version: "0.12.17"
 
+      # `--locked` is the point: without it every run re-resolved
+      # `mcp>=1.26.0,<2` from scratch, so CI and a user's `uvx aiui-mcp`
+      # could be running different FastMCP versions and nobody would know.
+      # It also fails loudly on a `pyproject.toml` dependency edit that
+      # forgot `uv lock`.
       - name: Run unit tests
+        if: ${{ !matrix.resolution }}
         working-directory: python
-        run: uv run --extra dev pytest tests/ -v
+        run: uv run --locked --python ${{ matrix.python }} --extra dev pytest tests/ -v
+
+      - name: Run unit tests (lowest declared versions)
+        if: matrix.resolution
+        working-directory: python
+        run: >
+          uv run --resolution ${{ matrix.resolution }}
+          --python ${{ matrix.python }} --extra dev pytest tests/ -v
+
+      # The `# noqa` codes in `server.py` and the tests (BLE001, A001, N802)
+      # named rules nothing enforced until this step existed.
+      - name: Ruff lint + format check
+        if: matrix.lint
+        working-directory: python
+        run: |
+          uv run --locked --extra dev ruff check .
+          uv run --locked --extra dev ruff format --check .
 
       - name: Build wheel + sdist
+        if: matrix.package
         working-directory: python
-        run: uv build
+        run: uv build --locked
 
+      # Linux only: this checks the packaging, not the platform — and
+      # `uv tool install` puts the entry point on a PATH only the POSIX
+      # runners export into the step's shell.
       - name: Install wheel and smoke-check entry point
+        if: matrix.package
         working-directory: python
         run: |
           uv tool install --force ./dist/aiui_mcp-*.whl

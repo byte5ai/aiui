@@ -9,6 +9,7 @@ Forwarding is generic, so a reason added later needs no bridge change. An agent 
 I6: this must behave identically to the Rust bridge's
 `format_dialog_result`, which has the mirror tests.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -27,9 +28,7 @@ def test_cancel_reason_is_forwarded(reason: str) -> None:
 
 def test_plain_user_cancel_carries_no_reason() -> None:
     """Escape has no reason attached; inventing one is worse than omitting it."""
-    assert _format_result({"id": "d1", "cancelled": True, "result": None}) == {
-        "cancelled": True
-    }
+    assert _format_result({"id": "d1", "cancelled": True, "result": None}) == {"cancelled": True}
 
 
 def test_empty_or_non_string_reason_is_dropped() -> None:
@@ -52,9 +51,7 @@ def test_media_warnings_reach_the_agent() -> None:
     a broken player and the agent with no signal at all. Forwarded on both
     branches — a user may well cancel *because* of the broken player."""
     warnings = ["video not shown — /tmp/clip.mp4: too large: 999 bytes (max 512)"]
-    out = _format_result(
-        {"cancelled": False, "result": {"values": {}}, "media_warnings": warnings}
-    )
+    out = _format_result({"cancelled": False, "result": {"values": {}}, "media_warnings": warnings})
     assert out == {"cancelled": False, "values": {}, "media_warnings": warnings}
 
     out = _format_result({"cancelled": True, "result": None, "media_warnings": warnings})

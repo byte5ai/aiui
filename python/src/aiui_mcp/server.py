@@ -14,6 +14,7 @@ The aiui token is read from `~/.config/aiui/token` — installed once when
 the companion runs on the user's own machine, and scp'd automatically to
 each remote host registered in the companion's settings window.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -86,7 +87,9 @@ def _env_float(name: str, default: float) -> float:
 
 # Spelled out rather than via `logging.getLevelNamesMapping()`, which only
 # exists from 3.11 — this package supports 3.10.
-_LOG_LEVELS = frozenset({"CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET"})
+_LOG_LEVELS = frozenset(
+    {"CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET"}
+)
 
 
 def _env_log_level(default: str = "INFO") -> str:
@@ -477,13 +480,7 @@ def _is_windows_abs_path(s: str) -> bool:
     """
     if s.startswith("\\\\"):
         return True
-    return (
-        len(s) >= 3
-        and s[0].isascii()
-        and s[0].isalpha()
-        and s[1] == ":"
-        and s[2] in "\\/"
-    )
+    return len(s) >= 3 and s[0].isascii() and s[0].isalpha() and s[1] == ":" and s[2] in "\\/"
 
 
 def _looks_like_local_path(s: str) -> bool:
@@ -780,7 +777,11 @@ def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 # non-dict target that still reaches us is simply not a
                 # target (a `secret` carrying one is still stripped by
                 # `_collect_secret_fields`).
-                if isinstance(f, dict) and isinstance(f.get("target"), dict) and isinstance(f.get("name"), str):
+                if (
+                    isinstance(f, dict)
+                    and isinstance(f.get("target"), dict)
+                    and isinstance(f.get("name"), str)
+                ):
                     out.append(f)
 
     scan(spec.get("fields"))
@@ -827,8 +828,10 @@ def _target_path_error(raw_path: str) -> str | None:
     somewhere the user never approved. Same rule `_upload_expand_dir`
     enforces for `upload`'s `target_dir`.
     """
-    if not raw_path or len(raw_path) > 4096 or any(
-        ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path
+    if (
+        not raw_path
+        or len(raw_path) > 4096
+        or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw_path)
     ):
         return "invalid target path"
     # `startswith("/")` in addition to `is_absolute()` so a POSIX-style path
@@ -881,15 +884,19 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     if not isinstance(target, dict):
         # The Python equivalent of Rust's `WriteOutcome::invalid` — no
         # destination to even name.
-        return {"written": False, "target": "", "bytes": 0,
-                "error": "target must be an object with mode/path"}
+        return {
+            "written": False,
+            "target": "",
+            "bytes": 0,
+            "error": "target must be an object with mode/path",
+        }
     raw_path = str(target.get("path", ""))
     why = _target_path_error(raw_path)
     if why:
         return {"written": False, "target": raw_path, "bytes": 0, "error": why}
     try:
         path = _resolve_target_path(Path(raw_path).expanduser())
-    except Exception:  # pragma: no cover - expanduser on an exotic home
+    except Exception:  # noqa: BLE001  # pragma: no cover - expanduser on an exotic home
         path = Path(raw_path)
     display = str(path)
     # Issue #177: an empty credential is never a legitimate write, and
@@ -899,8 +906,12 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     # erase the sentinel, making a retry impossible). Mirrors the identical
     # guard in Rust `filewrite::write_local`.
     if value == "":
-        return {"written": False, "target": display, "bytes": 0,
-                "error": "refusing to write an empty value"}
+        return {
+            "written": False,
+            "target": display,
+            "bytes": 0,
+            "error": "refusing to write an empty value",
+        }
     mode = target.get("mode")
     perm_s = target.get("perm")
     try:
@@ -945,16 +956,24 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     try:
         if mode == "create":
             if path.exists() and not target.get("overwrite"):
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "file exists and overwrite is false (mode: create)"}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "file exists and overwrite is false (mode: create)",
+                }
             data = value.encode("utf-8")
             atomic_write(path, data)
             return {"written": True, "target": display, "bytes": len(data), **mode_out}
         if mode == "substitute":
             placeholder = target.get("placeholder")
             if not placeholder:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "substitute mode requires 'placeholder'"}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "substitute mode requires 'placeholder'",
+                }
             # #199: explicit UTF-8 on BOTH sides. The read used to take the
             # process locale while the write-back was always UTF-8, so on a
             # latin-1 host every non-ASCII byte in the user's file was
@@ -966,10 +985,16 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
             existing = path.read_text(encoding="utf-8")
             count = existing.count(placeholder)
             if count != 1:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": (f"placeholder '{placeholder}' not found in target file"
-                                  if count == 0
-                                  else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": (
+                        f"placeholder '{placeholder}' not found in target file"
+                        if count == 0
+                        else f"placeholder '{placeholder}' found {count}× (must be exactly 1)"
+                    ),
+                }
             updated = existing.replace(placeholder, value, 1)
             data = updated.encode("utf-8")
             atomic_write(path, data)
@@ -979,9 +1004,13 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
         # ValueError covers UnicodeDecodeError (a non-UTF-8 target), which is
         # NOT an OSError and used to escape as a raw traceback.
         return {"written": False, "target": display, "bytes": 0, "error": str(e)}
-    except Exception as e:  # pragma: no cover - backstop, see the docstring
-        return {"written": False, "target": display, "bytes": 0,
-                "error": f"target write failed: {e.__class__.__name__}: {e}"}
+    except Exception as e:  # noqa: BLE001  # pragma: no cover - backstop, see the docstring
+        return {
+            "written": False,
+            "target": display,
+            "bytes": 0,
+            "error": f"target write failed: {e.__class__.__name__}: {e}",
+        }
 
 
 def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
@@ -1034,10 +1063,8 @@ def _annotate_target_paths(spec: dict[str, Any]) -> None:
             if not isinstance(raw, str) or _target_path_error(raw):
                 continue
             try:
-                f["target"]["resolved_path"] = str(
-                    _resolve_target_path(Path(raw).expanduser())
-                )
-            except Exception:  # pragma: no cover - display only, never fatal
+                f["target"]["resolved_path"] = str(_resolve_target_path(Path(raw).expanduser()))
+            except Exception:  # noqa: BLE001  # pragma: no cover - display only, never fatal
                 pass
 
     scan(spec.get("fields"))
@@ -1074,26 +1101,35 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
         v = values.get(name)
         if not commits:
             label = action if action is not None else "(submit)"
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0,
-                       "error": f"action '{label}' does not commit target writes"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": f"action '{label}' does not commit target writes",
+            }
         elif name not in values or v is None:
             # "Absent from the payload" is not "submitted blank": never
             # launder a missing key into an empty write.
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0, "error": "no value submitted for this field"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": "no value submitted for this field",
+            }
         else:
             try:
                 outcome = _write_local_target(str(v), field["target"])
-            except Exception as e:  # pragma: no cover - belt and braces
+            except Exception as e:  # noqa: BLE001  # pragma: no cover - belt and braces
                 # #199: one bad field used to abort the loop mid-way, so the
                 # writes that had already landed were never reported and the
                 # tool call died with a traceback. Every field gets an
                 # outcome; nothing propagates out of the submit path.
-                outcome = {"written": False,
-                           "target": str(field["target"].get("path", "")),
-                           "bytes": 0,
-                           "error": f"target write failed: {e.__class__.__name__}: {e}"}
+                outcome = {
+                    "written": False,
+                    "target": str(field["target"].get("path", "")),
+                    "bytes": 0,
+                    "error": f"target write failed: {e.__class__.__name__}: {e}",
+                }
         if field.get("kind") == "secret":
             values[name] = outcome  # write-only: raw value never returned
         else:
@@ -1171,7 +1207,10 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
             try:
                 os.link(tmp, dest)
             except FileExistsError:
-                return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+                return {
+                    "status": "error",
+                    "error": f"target already exists, not overwriting: {dest}",
+                }
             except OSError as e:
                 # #194: exFAT/FAT32 and many SMB mounts have no hard links, so
                 # an upload to a USB stick or a share failed *after* the bytes
@@ -1337,8 +1376,10 @@ async def _poll_render(
                     ) from e
                 log.warning(
                     "poll %s failed (%s), retry %d/%d",
-                    render_id, _explain_exc(e),
-                    consecutive_failures, ASYNC_POLL_MAX_CONSECUTIVE_FAILURES,
+                    render_id,
+                    _explain_exc(e),
+                    consecutive_failures,
+                    ASYNC_POLL_MAX_CONSECUTIVE_FAILURES,
                 )
                 await asyncio.sleep(ASYNC_POLL_RETRY_BACKOFF_S)
                 continue
@@ -1452,7 +1493,7 @@ async def _post_render(
         if r.status_code == 422:
             try:
                 body = r.json()
-            except Exception:
+            except Exception:  # noqa: BLE001 — a non-JSON 422 body is still a 422
                 body = {}
             detail = body.get("detail") or "the companion rejected the dialog spec"
             hint = body.get("hint")
@@ -1468,7 +1509,7 @@ async def _post_render(
         if r.status_code == 413:
             try:
                 body = r.json()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 body = {}
             detail = body.get("detail") or "the dialog spec is too large"
             hint = body.get("hint")
@@ -1532,7 +1573,9 @@ async def _post_render(
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
-        spec.get("kind"), data.get("cancelled"), dt,
+        spec.get("kind"),
+        data.get("cancelled"),
+        dt,
     )
     return data
 
@@ -2207,7 +2250,7 @@ def teach_prompt() -> str:
     the agent reaches for the right dialog without further prompting."""
     try:
         return (resources.files("aiui_mcp") / "skill.md").read_text()
-    except Exception:
+    except Exception:  # noqa: BLE001 — a missing/unreadable doc must degrade to the link
         return (
             "aiui skill doc not bundled with this install. "
             "See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
@@ -2387,7 +2430,7 @@ async def aiui_health() -> dict[str, Any]:
                 # answer — a 401 body is just `{"error": "unauthorized"}`.
                 out["http_status"] = r.status_code
             return out
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("health check failed: %s", e)
         return {
             "ok": False,

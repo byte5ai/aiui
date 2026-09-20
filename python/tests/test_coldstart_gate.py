@@ -12,6 +12,7 @@ which is exactly when the tunnel may have just come back.
 `aiui_health` is the deliberate exception — it is the diagnostic and must
 answer fast.
 """
+
 from __future__ import annotations
 
 import asyncio

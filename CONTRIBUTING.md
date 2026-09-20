@@ -62,8 +62,24 @@ For the Python side:
 
 ```sh
 cd python
-uv build    # produces dist/aiui_mcp-*.whl + .tar.gz
+uv run --locked --extra dev pytest tests/ -v   # the suite CI runs
+uv run --locked --extra dev ruff check .       # lint (ruff format --check too)
+uv build --locked                              # dist/aiui_mcp-*.whl + .tar.gz
 ```
+
+### `python/uv.lock` is tracked
+
+Like `Cargo.lock` and `companion/package-lock.json`, the Python lock is
+committed and CI resolves nothing on its own: every step runs `--locked`, and
+so does the release. **Whenever you change a dependency in
+`python/pyproject.toml`, run `uv lock` and commit the result in the same
+change** — otherwise CI fails with "the lockfile is not up-to-date".
+
+The lock governs what *we* test; it is not what users get. `pyproject.toml`'s
+ranges stay the published contract, so `uvx aiui-mcp` on a remote host still
+resolves `mcp>=1.26.0,<2` fresh. `deps-refresh.yml` runs weekly against that
+freshly-resolved set, which is how an upstream break surfaces here instead of
+on someone's remote.
 
 ## Releasing
 

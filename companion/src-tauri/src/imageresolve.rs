@@ -1264,6 +1264,26 @@ mod tests {
         );
     }
 
+    /// #210: the drive-letter and UNC arms are `cfg!(windows)`-gated, so they
+    /// are dead code on the macOS leg and were compile-checked only until the
+    /// Windows leg started executing its tests. Losing them turns an absolute
+    /// `C:\…` image path into "not local", which the resolver then leaves for
+    /// the WebView to fetch as if it were a remote URL — a silently broken
+    /// image rather than an error.
+    #[cfg(windows)]
+    #[test]
+    fn looks_like_local_path_windows_absolute_forms() {
+        assert!(looks_like_local_path(r"C:\foo\bar.png"));
+        assert!(looks_like_local_path("D:/bar.png"));
+        assert!(looks_like_local_path(r"\\?\C:\x.png"));
+        assert!(looks_like_local_path(r"\\server\share\x.png"));
+        // The early exits still win over the drive-letter shape.
+        assert!(!looks_like_local_path("data:image/png;base64,AAA"));
+        assert!(!looks_like_local_path("https://a.test/x.png"));
+        // A relative Windows path is no more local than a relative Unix one.
+        assert!(!looks_like_local_path(r"sub\x.png"));
+    }
+
     #[test]
     fn resolve_local_paths_inlines_real_file_and_skips_others() {
         // Write a tiny PNG-ish file. Content doesn't have to be a real

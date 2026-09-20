@@ -6,6 +6,7 @@ bodies exist so the agent can fix the call — `raise_for_status()` would throw
 them away and leave a bare `httpx.HTTPStatusError` with a status code and
 nothing else.
 """
+
 from __future__ import annotations
 
 import asyncio

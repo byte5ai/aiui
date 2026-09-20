@@ -1,6 +1,7 @@
 """Tests for the async-render client path (Step 3): the bridge POSTs, then
 polls `GET /render/{id}` until a terminal result, emitting progress on the way.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -93,9 +94,7 @@ def test_poll_render_reports_progress_each_pending_iteration(
     assert ctx.ticks == [1.0]  # one pending iteration → one progress tick
 
 
-def test_poll_render_raises_on_404(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_poll_render_raises_on_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
@@ -167,9 +166,7 @@ def test_poll_render_gives_up_after_the_retry_budget(
     assert calls["n"] == server.ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
 
 
-def test_poll_render_does_not_retry_404(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_poll_render_does_not_retry_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """A 404 is terminal — the retry is for transport errors only."""
     _setup_token(monkeypatch, tmp_path)
     calls = {"n": 0}
@@ -231,6 +228,7 @@ def test_cancel_render_swallows_old_companion_405(
     _setup_token(monkeypatch, tmp_path)
 
     for status in (404, 405):
+
         async def fake_delete(self: Any, url: str, _s: int = status, **kwargs: Any) -> Any:
             return _FakeResp({}, status=_s)
 
@@ -244,9 +242,7 @@ def test_cancel_render_swallows_old_companion_405(
     asyncio.run(_cancel_render("x"))  # a dead companion is not an error either
 
 
-def test_wait_for_aiui_returns_when_ping_ok(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_wait_for_aiui_returns_when_ping_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:

@@ -15,6 +15,7 @@ and must not be turned into one.
 A dropped connection still has to surface as a RuntimeError — that path is
 how a genuinely unreachable companion is reported.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -102,9 +103,7 @@ def test_windows_install_returns_the_version_delta_before_the_process_exits(
     assert (result["current"], result["available"]) == ("0.10.1", "0.10.2")
 
 
-def test_already_on_latest_is_unchanged(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_already_on_latest_is_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
     _respond_with(
         monkeypatch,
@@ -120,9 +119,7 @@ def test_already_on_latest_is_unchanged(
     assert _call()["note"] == "already on latest"
 
 
-def test_unreachable_companion_still_raises(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_unreachable_companion_still_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_post(self: Any, url: str, **kwargs: Any) -> Any:

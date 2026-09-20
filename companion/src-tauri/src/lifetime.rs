@@ -1032,6 +1032,30 @@ mod tests {
         let _ = is_interactive_session();
     }
 
+    /// #210: the transport address is the one thing the GUI and every
+    /// MCP-stdio child must agree on byte for byte, and on Windows it is a
+    /// different kind of object entirely — a pipe namespace entry, not a file
+    /// under the config dir. Until the Windows CI leg executed its tests both
+    /// arms were checked by the compiler only, so a rename of the pipe would
+    /// have shipped green and left every child unable to connect.
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_is_a_socket_file_under_the_config_dir_on_unix() {
+        let p = socket_path(std::path::Path::new("/tmp/aiui-cfg"));
+        assert_eq!(p, PathBuf::from("/tmp/aiui-cfg/gui.sock"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn socket_path_is_named_pipe_on_windows() {
+        let p = socket_path(std::path::Path::new(r"C:\Users\me\AppData\Roaming\aiui"));
+        assert_eq!(p, PathBuf::from(r"\\.\pipe\aiui-gui"));
+        // The config dir must not leak into the pipe name — a per-install
+        // address would be unreachable for a child that only knows the
+        // constant.
+        assert_eq!(p, socket_path(std::path::Path::new(r"D:\elsewhere")));
+    }
+
     // --- Step-1 verification mini-harness (stabilization-plan §Step 2) ---
     //
     // The decision core is pulled out as pure functions so the two invariants

@@ -18,6 +18,7 @@ contract: a degraded-but-serving companion (200 + `ready: false`) must not
 block an unrelated session's render, and a companion that really is down must
 surface its own `hint` instead of a status code and half a JSON blob.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +33,7 @@ from aiui_mcp.server import _explain_exc, _preflight, aiui_health
 
 
 # ----- _explain_exc unit tests -----
+
 
 def test_explain_exc_returns_class_name_when_str_empty() -> None:
     """The bug-trigger: httpx exceptions with empty str() must still surface."""
@@ -56,6 +58,7 @@ def test_explain_exc_works_for_non_httpx_exceptions() -> None:
 
 
 # ----- aiui_health integration: never returns empty error -----
+
 
 def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """Make the token-file lookup succeed with a dummy bearer."""
@@ -101,6 +104,7 @@ def test_aiui_health_passes_through_message_when_present(
 
 
 # ----- _preflight integration: extended except-chain catches the right classes -----
+
 
 def test_preflight_translates_remote_protocol_error_to_actionable_runtime_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
@@ -164,9 +168,7 @@ class _FakeHealthResp:
         return self._payload
 
 
-def _serve_health(
-    monkeypatch: pytest.MonkeyPatch, resp: _FakeHealthResp
-) -> None:
+def _serve_health(monkeypatch: pytest.MonkeyPatch, resp: _FakeHealthResp) -> None:
     """Answer every GET with `resp`, and short-circuit the wire-compat check
     that `_preflight` runs afterwards so the test isolates the health branch."""
 
@@ -228,9 +230,7 @@ def test_preflight_raises_with_hint_on_webview_unresponsive(
     assert '{"version"' not in msg, "the raw JSON blob must not be the message"
 
 
-def test_preflight_still_fatal_on_401(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_preflight_still_fatal_on_401(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """Token mismatch stays fatal — the 401 branch is untouched by #179."""
     _setup_token(monkeypatch, tmp_path)
     _serve_health(monkeypatch, _FakeHealthResp(401, {"error": "unauthorized"}))
@@ -304,9 +304,7 @@ def test_aiui_health_ok_true_for_degraded_200(
     assert result["reason"] == "too_many_children"
 
 
-def test_aiui_health_reports_non_json_body(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_aiui_health_reports_non_json_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """Dropping `raise_for_status()` must not turn a rogue process on :7777
     into a silent success — a non-JSON body keeps the `{ok: false, error}`
     shape."""

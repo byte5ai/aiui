@@ -647,6 +647,13 @@ mod probe_cmd_tests {
         );
     }
 
+    // #210: the three tests below run the probe through the *local* shell.
+    // The script itself only ever executes on the remote, which is a POSIX
+    // host by construction (it is reached over ssh), and a Windows runner
+    // guarantees neither `sh` nor `curl` nor tilde-expansion against a
+    // drive-lettered `HOME`. Gating them keeps the Windows leg honest — the
+    // two string-shape tests above still assert the shipped command there.
+    #[cfg(unix)]
     #[test]
     fn the_command_is_valid_shell() {
         // Syntax-check with a real shell rather than by eye.
@@ -663,6 +670,7 @@ mod probe_cmd_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_token_exits_with_our_marker() {
         // Run the real command with HOME pointed at an empty dir: no token
@@ -680,6 +688,7 @@ mod probe_cmd_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_empty_token_file_also_exits_with_the_marker() {
         let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));

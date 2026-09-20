@@ -25,6 +25,7 @@ honours `x-aiui-async` so the smoke tests exercise that production path (#202).
 `sync_mode` keeps the legacy synchronous 200 covered, because an old companion
 really does answer that way and the bridge must keep handling it.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -138,7 +139,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"version": "fake", "wire_version": EXPECTED_WIRE_VERSION})
             return
         if self.path.startswith("/render/"):
-            self._do_poll(self.path[len("/render/"):])
+            self._do_poll(self.path[len("/render/") :])
             return
         self._json(404, {"error": "not_found"})
 
@@ -430,7 +431,6 @@ def test_wrong_token_is_rejected(
     with pytest.raises(RuntimeError) as exc:
         asyncio.run(confirm(title="Proceed?"))
     assert "401" in str(exc.value) or "token" in str(exc.value).lower()
-
 
 
 def test_invalid_spec_422_reaches_the_agent_with_its_reason(companion: Any) -> None:

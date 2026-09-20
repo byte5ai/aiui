@@ -4,6 +4,7 @@ Mirror of the Rust `filewrite` tests. The bridge runs ON the agent's host, so
 `target` writes are local file operations here too; secret values are written
 and stripped before the result reaches the agent.
 """
+
 from __future__ import annotations
 
 import os
@@ -24,9 +25,18 @@ from aiui_mcp.server import (
 def test_collect_target_fields_flat_and_tabs() -> None:
     spec = {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/x"}},
-                   {"kind": "text", "name": "b"}],
-        "tabs": [{"label": "T", "fields": [{"kind": "text", "name": "c", "target": {"mode": "create", "path": "/y"}}]}],
+        "fields": [
+            {"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/x"}},
+            {"kind": "text", "name": "b"},
+        ],
+        "tabs": [
+            {
+                "label": "T",
+                "fields": [
+                    {"kind": "text", "name": "c", "target": {"mode": "create", "path": "/y"}}
+                ],
+            }
+        ],
     }
     names = sorted(f["name"] for f in _collect_target_fields(spec))
     assert names == ["a", "c"]
@@ -52,7 +62,9 @@ def test_create_writes_and_refuses_clobber(tmp_path: Path) -> None:
 def test_substitute_replaces_exactly_once(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("token: __PAT__\nother: 1\n")
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"})
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"}
+    )
     assert out["written"], out
     assert path.read_text() == "token: ghp_x\nother: 1\n"
 
@@ -60,9 +72,13 @@ def test_substitute_replaces_exactly_once(tmp_path: Path) -> None:
 def test_substitute_errors_on_zero_or_many(tmp_path: Path) -> None:
     path = tmp_path / "c.txt"
     path.write_text("none here")
-    assert not _write_local_target("v", {"mode": "substitute", "path": str(path), "placeholder": "X"})["written"]
+    assert not _write_local_target(
+        "v", {"mode": "substitute", "path": str(path), "placeholder": "X"}
+    )["written"]
     path.write_text("X and X")
-    assert not _write_local_target("v", {"mode": "substitute", "path": str(path), "placeholder": "X"})["written"]
+    assert not _write_local_target(
+        "v", {"mode": "substitute", "path": str(path), "placeholder": "X"}
+    )["written"]
 
 
 def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
@@ -71,14 +87,21 @@ def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
     spec = {
         "kind": "form",
         "fields": [
-            {"kind": "secret", "name": "pat", "target": {"mode": "create", "path": str(secret_path)}},
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            },
             {"kind": "text", "name": "label", "target": {"mode": "create", "path": str(note_path)}},
             {"kind": "text", "name": "plain"},
         ],
     }
     data = {
         "cancelled": False,
-        "result": {"action": None, "values": {"pat": "ghp_secret", "label": "hello", "plain": "kept"}},
+        "result": {
+            "action": None,
+            "values": {"pat": "ghp_secret", "label": "hello", "plain": "kept"},
+        },
     }
     _apply_target_writes(spec, data)
     values = data["result"]["values"]
@@ -96,8 +119,16 @@ def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
 
 def test_apply_target_writes_noop_on_cancel(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
-    spec = {"kind": "form", "fields": [{"kind": "secret", "name": "pat",
-            "target": {"mode": "create", "path": str(secret_path)}}]}
+    spec = {
+        "kind": "form",
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            }
+        ],
+    }
     data = {"cancelled": True, "result": {}}
     _apply_target_writes(spec, data)
     assert not secret_path.exists(), "no write on cancel"
@@ -111,9 +142,18 @@ def _spec_with_documented_actions(secret_path: Path) -> dict:
     documented pattern that made #177 reachable by copy-paste."""
     return {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "pat",
-                    "target": {"mode": "create", "path": str(secret_path),
-                               "perm": "0600", "overwrite": True}}],
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {
+                    "mode": "create",
+                    "path": str(secret_path),
+                    "perm": "0600",
+                    "overwrite": True,
+                },
+            }
+        ],
         "actions": [
             {"label": "Cancel", "value": "cancel", "skip_validation": True},
             {"label": "Save draft", "value": "draft", "skip_validation": True},
@@ -143,14 +183,17 @@ def test_substitute_refuses_empty_value(tmp_path: Path) -> None:
 
 def test_action_commits_targets_rules() -> None:
     spec = _spec_with_documented_actions(Path("/tmp/x"))
-    assert _action_commits_targets(spec, None) is True          # built-in submit
-    assert _action_commits_targets(spec, "commit") is True      # plain named action
-    assert _action_commits_targets(spec, "cancel") is False     # skip_validation
-    assert _action_commits_targets(spec, "draft") is False      # skip_validation
-    assert _action_commits_targets(spec, "nope") is False       # unknown → fail closed
+    assert _action_commits_targets(spec, None) is True  # built-in submit
+    assert _action_commits_targets(spec, "commit") is True  # plain named action
+    assert _action_commits_targets(spec, "cancel") is False  # skip_validation
+    assert _action_commits_targets(spec, "draft") is False  # skip_validation
+    assert _action_commits_targets(spec, "nope") is False  # unknown → fail closed
     assert _action_commits_targets({"kind": "form"}, "x") is False  # no action list
-    override = {"actions": [{"label": "Force", "value": "f",
-                             "skip_validation": True, "writes_targets": True}]}
+    override = {
+        "actions": [
+            {"label": "Force", "value": "f", "skip_validation": True, "writes_targets": True}
+        ]
+    }
     assert _action_commits_targets(override, "f") is True
 
 
@@ -158,8 +201,7 @@ def test_apply_target_writes_skips_skip_validation_action(tmp_path: Path) -> Non
     secret_path = tmp_path / "tok"
     secret_path.write_text("ghp_existing")
     spec = _spec_with_documented_actions(secret_path)
-    data = {"cancelled": False,
-            "result": {"action": "cancel", "values": {"pat": "ghp_real"}}}
+    data = {"cancelled": False, "result": {"action": "cancel", "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)
     assert secret_path.read_text() == "ghp_existing", "Cancel must not write"
     values = data["result"]["values"]
@@ -171,8 +213,7 @@ def test_apply_target_writes_skips_skip_validation_action(tmp_path: Path) -> Non
 def test_apply_target_writes_commits_on_primary_action(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
     spec = _spec_with_documented_actions(secret_path)
-    data = {"cancelled": False,
-            "result": {"action": "commit", "values": {"pat": "ghp_real"}}}
+    data = {"cancelled": False, "result": {"action": "commit", "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)
     assert secret_path.read_text() == "ghp_real", "happy path must not regress"
     values = data["result"]["values"]
@@ -210,8 +251,7 @@ def test_collect_secret_fields_finds_them_with_and_without_target() -> None:
         "kind": "form",
         "fields": [
             {"kind": "secret", "name": "bare"},
-            {"kind": "secret", "name": "targeted",
-             "target": {"mode": "create", "path": "/x"}},
+            {"kind": "secret", "name": "targeted", "target": {"mode": "create", "path": "/x"}},
             {"kind": "password", "name": "pw"},
             {"kind": "text", "name": "t"},
         ],
@@ -258,8 +298,13 @@ def test_targeted_secret_still_reports_its_write(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
     spec = {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "pat",
-                    "target": {"mode": "create", "path": str(secret_path)}}],
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            }
+        ],
     }
     data = {"cancelled": False, "result": {"action": None, "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)
@@ -304,16 +349,18 @@ def test_substitute_preserves_existing_mode(tmp_path: Path) -> None:
     path = tmp_path / "docker-compose.yml"
     path.write_text("token: __PAT__\n")
     os.chmod(path, 0o644)
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
-                                        "placeholder": "__PAT__"})
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"}
+    )
     assert out["written"], out
     assert (path.stat().st_mode & 0o777) == 0o644, "substitute keeps the file's own mode"
     assert out["mode"] == "0644", "and the outcome says which mode was applied"
 
     # An explicit `perm` still wins.
     path.write_text("token: __PAT__\n")
-    out2 = _write_local_target("ghp_y", {"mode": "substitute", "path": str(path),
-                                         "placeholder": "__PAT__", "perm": "0640"})
+    out2 = _write_local_target(
+        "ghp_y", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__", "perm": "0640"}
+    )
     assert out2["written"], out2
     assert (path.stat().st_mode & 0o777) == 0o640
     assert out2["mode"] == "0640"
@@ -337,8 +384,9 @@ def test_substitute_writes_through_symlink(tmp_path: Path) -> None:
     link = tmp_path / "link.yml"
     real.write_text("token: __PAT__\n")
     link.symlink_to(real)
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(link),
-                                        "placeholder": "__PAT__"})
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(link), "placeholder": "__PAT__"}
+    )
     assert out["written"], out
     assert os.path.islink(link), "the link must survive as a link"
     assert real.read_text() == "token: ghp_x\n", "the real file is the one edited"
@@ -351,8 +399,9 @@ def test_substitute_non_utf8_target_returns_error(tmp_path: Path) -> None:
     path = tmp_path / "app.ini"
     original = "user=André\ntoken=__PAT__\n".encode("latin-1")
     path.write_bytes(original)
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
-                                        "placeholder": "__PAT__"})
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"}
+    )
     assert out["written"] is False
     assert out.get("error"), "a structured error, not an exception"
     assert path.read_bytes() == original, "the file is left byte-identical"
@@ -367,11 +416,12 @@ def test_substitute_preserves_non_ascii_bytes(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(locale, "getpreferredencoding", lambda *a, **k: "latin-1")
     path = tmp_path / "conf"
-    path.write_bytes("user=André\ntoken=__PAT__\n".encode("utf-8"))
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
-                                        "placeholder": "__PAT__"})
+    path.write_bytes("user=André\ntoken=__PAT__\n".encode())
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"}
+    )
     assert out["written"], out
-    assert path.read_bytes() == "user=André\ntoken=ghp_x\n".encode("utf-8")
+    assert path.read_bytes() == "user=André\ntoken=ghp_x\n".encode()
 
 
 def test_write_without_fchmod_does_not_crash(tmp_path: Path, monkeypatch) -> None:
@@ -389,8 +439,12 @@ def test_malformed_target_returns_structured_error() -> None:
     """`"target": "~/.github_tokens/byte5ai"` (a string, not an object) used to
     raise `AttributeError: 'str' object has no attribute 'get'`."""
     out = _write_local_target("v", "not-a-dict")
-    assert out == {"written": False, "target": "", "bytes": 0,
-                   "error": "target must be an object with mode/path"}
+    assert out == {
+        "written": False,
+        "target": "",
+        "bytes": 0,
+        "error": "target must be an object with mode/path",
+    }
 
 
 def test_collect_target_fields_skips_non_dict_target() -> None:
@@ -430,8 +484,7 @@ def test_apply_target_writes_never_raises(tmp_path: Path, monkeypatch) -> None:
             {"kind": "text", "name": "b", "target": {"mode": "create", "path": "relative/key"}},
         ],
     }
-    data = {"cancelled": False,
-            "result": {"action": None, "values": {"a": "one", "b": "two"}}}
+    data = {"cancelled": False, "result": {"action": None, "values": {"a": "one", "b": "two"}}}
     _apply_target_writes(spec, data)
     values = data["result"]["values"]
     assert good.read_text() == "one", "the good field still lands"
@@ -463,15 +516,24 @@ def test_annotate_target_paths_stamps_the_destination(tmp_path: Path) -> None:
             {"kind": "secret", "name": "pat", "target": {"mode": "create", "path": "~/x"}},
             {"kind": "text", "name": "plain"},
         ],
-        "tabs": [{"label": "T", "fields": [
-            {"kind": "text", "name": "b",
-             "target": {"mode": "substitute", "path": str(link), "placeholder": "x"}},
-        ]}],
+        "tabs": [
+            {
+                "label": "T",
+                "fields": [
+                    {
+                        "kind": "text",
+                        "name": "b",
+                        "target": {"mode": "substitute", "path": str(link), "placeholder": "x"},
+                    },
+                ],
+            }
+        ],
     }
     _annotate_target_paths(spec)
     resolved = spec["fields"][0]["target"]["resolved_path"]
     assert not resolved.startswith("~"), resolved
     assert resolved == str(Path("~/x").expanduser())
     assert "target" not in spec["fields"][1], "untargeted field untouched"
-    assert spec["tabs"][0]["fields"][0]["target"]["resolved_path"] == str(real.resolve()), \
+    assert spec["tabs"][0]["fields"][0]["target"]["resolved_path"] == str(real.resolve()), (
         "a symlinked target shows the file that really changes"
+    )

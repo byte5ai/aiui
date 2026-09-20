@@ -24,6 +24,7 @@ A default that diverges between the Rust and the Python bridge passes every
 assertion below (`test_shared_parameter_defaults_agree` would be the place
 for it) and is the remaining class of silent remote-vs-local drift.
 """
+
 from __future__ import annotations
 
 import shutil

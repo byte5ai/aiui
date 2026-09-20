@@ -27,6 +27,31 @@ All notable changes to this project are documented here.
   dialogs and held behaviour `cargo test` cannot reach — two of the four
   defects fixed under #208 lived entirely there, including the one that hit
   every user who ever pressed Uninstall (#208).
+- **`python/uv.lock` is now tracked, and CI resolves nothing on its own.**
+  The Rust and npm locks were committed; the Python one was gitignored, so
+  every CI run and every release re-resolved `mcp>=1.26.0,<2` from scratch
+  and a published wheel could never be rebuilt against the set it was tested
+  with. Tests, the wheel build and the release all run `--locked`, so a
+  dependency edit without `uv lock` fails loudly instead of drifting
+  silently. The ranges in `pyproject.toml` remain the published contract —
+  what a remote's `uvx aiui-mcp` resolves is unchanged (#210).
+- **A weekly `deps-refresh.yml` run resolves without the lock.** The flip
+  side of pinning: users resolve fresh at spawn time, so an upstream `mcp`
+  1.x minor that breaks the bridge would have reached every remote host
+  before it reached a PR. The scheduled job takes the newest versions the
+  ranges allow and runs the suite, and a CI matrix leg resolves
+  `--resolution lowest-direct` so the `>=1.26.0` floor is proven rather than
+  assumed — both edges of the declared range are now watched (#210).
+- **ruff lints the Python bridge in CI.** The source was already written as
+  if it were configured — seven `# noqa` suppressions naming `BLE001`,
+  `A001` and `N802` — but nothing enforced them, so they were decoration.
+  `ruff check` and `ruff format --check` now run on every PR against a rule
+  set that includes exactly those codes (#210).
+- **`scripts/check-svelte-warnings.sh`** — the frontend check ran at
+  `--threshold error`, which said nothing about the 10 warnings on `main`
+  and would have said nothing about the eleventh. Errors still fail the
+  build; warnings now fail it as soon as they exceed the recorded baseline,
+  so the count can only fall (#210).
 - **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
   missing a shipped platform, carries an empty signature or url, points an
   entry at another release's artifact, or advertises the wrong version. It
@@ -173,6 +198,15 @@ All notable changes to this project are documented here.
   DMG drag-and-drop flow is the supported install and the app registers
   itself. CONTRIBUTING's repository-layout tree showed one script where six
   live, which is how this one went unmaintained; it now lists them all (#204).
+- **`aiui-mcp`'s PyPI listing said macOS-only.** The package declared one OS
+  classifier — macOS — and a macOS-only description and keywords, while its
+  commonest home is a Linux SSH remote and aiui itself has shipped on
+  Windows since 0.10.1: anyone filtering PyPI by platform was told the
+  opposite of the main use case. Linux and Windows classifiers are added
+  alongside macOS, the language classifiers now reach 3.14, and the `mcp` CI
+  job runs a `3.10 / 3.12 / 3.14` matrix on all three operating systems, so
+  the declared `requires-python` floor and the bridge's own Windows
+  token-path branch are exercised rather than asserted (#210).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -989,6 +1023,18 @@ All notable changes to this project are documented here.
   asks `origin` via `git ls-remote`, the same way the tag step always has —
   not by deepening the checkout, which would pull the full history onto a
   10×-billed macOS runner for one ref lookup (#209).
+- **Windows CI compiled the tests and never ran a single one.** The
+  `windows-latest` leg stopped at `cargo test --no-run`, so on the platform
+  that also builds and uploads the installer, every `#[cfg(windows)]` branch
+  was verified by the compiler alone: the `\\.\pipe\aiui-gui` transport name,
+  the drive-letter and UNC arms of the image-path check, the `.exe`/`.cmd`
+  extension scan that finds `claude`, the `aiui.exe` leaf the process sweep
+  matches on, and the secret-write path whose `0o600` assertion is
+  Unix-gated. A rename or a dropped arm in any of them would have shipped
+  green and been reported by a user. The leg now executes the suite (in the
+  debug profile — the release-profile test binary is what tripped the
+  #141 loader crash), with new Windows-side cases covering each of those
+  branches (#210).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
