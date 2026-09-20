@@ -33,6 +33,16 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Windows: the diagnostic trace was silently discarded.** `TRACE_PATH`
+  was the hard-coded `/tmp/aiui-trace.log`, which does not exist on
+  Windows, so every `logging::trace()` line was dropped and the failed open
+  was swallowed — the platform with the youngest port shipped with no
+  diagnostics. The trace now resolves per-OS (`%LOCALAPPDATA%\aiui\logs`
+  on Windows, `<config dir>/logs` elsewhere), is opened `0600` with
+  `O_NOFOLLOW` so a planted symlink cannot redirect it, reports a failing
+  open once on stderr instead of never, and names its resolved path in
+  every session header. `/tmp` was also the wrong place on Unix: it is
+  world-readable and shared (#185).
 - **A form's Cancel button could blank the user's credential file.**
   `target` file writes fired on *every* action except the built-in
   `__cancel__`, so a custom `Cancel` or `Save draft` action — the pattern
@@ -82,6 +92,42 @@ All notable changes to this project are documented here.
 
 ### Security
 
+- **Every user file aiui rewrites came back with the wrong permissions.**
+  `atomic_write` created a fresh temp file (umask-masked `0666`) and renamed
+  it over the destination, discarding the destination's own mode. Claude
+  Code creates `~/.claude.json` as `0600` because it holds OAuth data and
+  other MCP servers' `env` blocks; after one aiui config patch it was
+  world-readable, permanently. `~/.ssh/config` got the same treatment on
+  every launch, and under a `002` umask became group-writable — which makes
+  OpenSSH refuse to run at all. The destination's mode is now copied onto
+  the temp handle *before* the rename, so there is no world-readable window
+  either. A symlinked config (a dotfiles-repo setup) is no longer replaced
+  by a regular file: the link is resolved first and written through, and a
+  symlink cycle fails loudly instead of silently swapping the link for a
+  file (#185).
+- **The API token is validated and kept at `0600`.** A malformed token
+  (empty, truncated, not 64 hex chars) is now regenerated instead of being
+  used, `0600` is re-asserted on every launch so a token restored from a
+  backup gets tightened, and the config directory itself is created `0700`.
+  The GUI lock file is created `0600` and repaired if an older install left
+  it `0644`. The Python bridge refuses a malformed token with a clear
+  message instead of sending a bare `Bearer ` (#185).
+- **Token comparison no longer leaks its prefix through timing.** `auth_ok`
+  folds every byte instead of returning at the first mismatch, and an empty
+  configured token now authenticates nobody rather than accepting an empty
+  `Bearer ` (#185).
+- **Windows: another local process could take `127.0.0.1:7777` from us.**
+  `SO_REUSEADDR` means the opposite thing on Windows — it lets an unrelated
+  process bind a socket we are already listening on and answer the bridges
+  in our place. Windows now gets `SO_EXCLUSIVEADDRUSE` instead, which
+  reserves the address; Unix keeps `SO_REUSEADDR` for the TIME_WAIT reason
+  it was added for (#185).
+- **Render specs are no longer written verbatim to the trace file.** A spec
+  carries the user's own content — question text, pre-filled defaults, file
+  paths, `target` destinations — and the trace is what people paste into
+  public bug reports. The trace now records the shape (kind, field and
+  option counts, byte size); `AIUI_TRACE_SPECS=1` restores the full body
+  when it is genuinely needed (#185).
 - **A `secret` field without a `target` handed its plaintext to the agent.**
   Both `skill.md` and the `form` tool description promise a `secret` value
   is "NEVER returned to you", but the stripping keyed on the presence of

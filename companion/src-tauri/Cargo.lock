@@ -39,6 +39,7 @@ dependencies = [
  "fs4",
  "futures",
  "hex",
+ "libc",
  "log",
  "open",
  "rand 0.8.6",
@@ -61,6 +62,7 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

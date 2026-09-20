@@ -265,12 +265,25 @@ pub async fn serve(
     Ok(())
 }
 
-/// Bind a TCP listener with `SO_REUSEADDR` (and `SO_REUSEPORT` on macOS)
-/// set *before* `bind()`, so a fresh aiui can take the port over a
-/// just-exited instance without waiting for the kernel's 30–60s TIME_WAIT
-/// window. Without this, every restart-within-a-minute hits "Address
-/// already in use" — the dominant cause of the user-perceived "aiui
-/// klemmt oft mit Port belegt". Issue #75.
+/// Bind a TCP listener for the local API.
+///
+/// **Unix:** `SO_REUSEADDR` is set *before* `bind()`, so a fresh aiui can
+/// take the port over a just-exited instance without waiting for the
+/// kernel's 30–60s TIME_WAIT window. Without this, every
+/// restart-within-a-minute hits "Address already in use" — the dominant
+/// cause of the user-perceived "aiui klemmt oft mit Port belegt".
+/// Issue #75.
+///
+/// **Windows:** `SO_REUSEADDR` means something else entirely there — it
+/// lets an *unrelated* process bind a socket another process is already
+/// listening on, and the later binder wins new connections. Setting it on
+/// our listener therefore handed any local process the ability to take
+/// `127.0.0.1:7777` away from us and answer the bridges in our place, with
+/// our bind still reporting success. Windows also has no TIME_WAIT problem
+/// for a listening socket, so the flag bought nothing here. We set
+/// `SO_EXCLUSIVEADDRUSE` instead, which is the inverse: it reserves the
+/// address for us and makes any later bind — including one by a process
+/// that sets `SO_REUSEADDR` itself — fail. Issue #185.
 fn bind_with_reuse(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
 
@@ -279,10 +292,38 @@ fn bind_with_reuse(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener>
         SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::STREAM, None)?;
-    // SO_REUSEADDR alone is sufficient on macOS to bind over a port that's
-    // in TIME_WAIT from a previous listener — Linux's stricter semantics
-    // would also need SO_REUSEPORT, but aiui only ships on macOS.
-    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        // SO_REUSEADDR alone is sufficient on macOS to bind over a port
+        // that's in TIME_WAIT from a previous listener.
+        socket.set_reuse_address(true)?;
+    }
+    #[cfg(windows)]
+    {
+        // socket2 0.5 exposes no setter for SO_EXCLUSIVEADDRUSE, so set it
+        // directly. Must precede bind(), like every other socket option here.
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+        let on: i32 = 1;
+        // SAFETY: `socket` owns a live socket for the whole call, so the
+        // handle is valid; `optval`/`optlen` describe the `i32` on the stack
+        // above, which outlives the call. `optval` is typed PCSTR (*const u8)
+        // by the WinSock bindings — the option value is still an i32.
+        let rc = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as SOCKET,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                &on as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -328,12 +369,88 @@ async fn probe(
     .into_response()
 }
 
+/// A redacted, loggable description of a render spec.
+///
+/// Issue #185: the full spec used to be written verbatim to the trace, and
+/// a spec routinely carries the user's own content — the text of a question,
+/// pre-filled form defaults, file paths, `target` destinations. That is the
+/// kind of thing a bug reporter pastes into a public issue without reading.
+/// Log the shape instead: enough to debug a render, nothing to leak.
+///
+/// The full body stays available behind `AIUI_TRACE_SPECS=1` for the rare
+/// case where the shape is not enough.
+fn spec_summary(spec: &serde_json::Value) -> String {
+    if std::env::var("AIUI_TRACE_SPECS").as_deref() == Ok("1") {
+        return format!("spec={spec}");
+    }
+    let kind = spec
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(none)");
+    let count = |key: &str| {
+        spec.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    let tabs = count("tabs");
+    let fields = count("fields")
+        + spec
+            .get("tabs")
+            .and_then(|v| v.as_array())
+            .map(|tabs| {
+                tabs.iter()
+                    .map(|t| {
+                        t.get("fields")
+                            .and_then(|f| f.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+    let bytes = spec.to_string().len();
+    format!(
+        "spec kind={kind} fields={fields} tabs={tabs} options={} items={} actions={} bytes={bytes}",
+        count("options"),
+        count("items"),
+        count("actions")
+    )
+}
+
+/// Compare two byte strings without an early exit.
+///
+/// Issue #185: `==` on `&str` returns as soon as it finds a differing byte,
+/// so the time it takes leaks how long a common prefix the caller guessed.
+/// Any local process may knock on `127.0.0.1:7777`, which makes that a
+/// practical oracle rather than a theoretical one. Folding every byte keeps
+/// the work independent of *where* the first difference is. Lengths are
+/// compared first and deliberately: a length mismatch is not secret, and
+/// leaking it is unavoidable in any fixed-work comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn auth_ok(headers: &HeaderMap, token: &str) -> bool {
+    // Belt and braces: an empty configured token would otherwise make an
+    // empty `Bearer ` header authenticate. `config::AppConfig` already
+    // regenerates a malformed token, but this endpoint must not depend on
+    // that having happened.
+    if token.is_empty() {
+        return false;
+    }
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|v| v == token)
+        .map(|v| constant_time_eq(v.as_bytes(), token.as_bytes()))
         .unwrap_or(false)
 }
 
@@ -1162,7 +1279,7 @@ async fn render(
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response();
         }
     };
-    trace(&format!("render: auth ok, spec={}", req.spec));
+    trace(&format!("render: auth ok, {}", spec_summary(&req.spec)));
 
     // Resolve any http(s):// values in `src` / `thumbnail` fields to
     // `data:` URLs before the spec hits the WebView. The WebView's
@@ -1810,5 +1927,108 @@ mod upload_tests {
             i += 1;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn bearer(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {v}").parse().unwrap());
+        h
+    }
+
+    const TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn accepts_the_exact_token() {
+        assert!(auth_ok(&bearer(TOK), TOK));
+    }
+
+    #[test]
+    fn rejects_wrong_missing_and_malformed_headers() {
+        let mut wrong = TOK.to_string();
+        wrong.pop();
+        wrong.push('0');
+        assert!(!auth_ok(&bearer(&wrong), TOK), "differs in the last byte");
+        assert!(!auth_ok(&bearer("0123"), TOK), "prefix must not pass");
+        assert!(!auth_ok(&HeaderMap::new(), TOK), "no header");
+        let mut h = HeaderMap::new();
+        h.insert("authorization", TOK.parse().unwrap());
+        assert!(!auth_ok(&h, TOK), "missing the Bearer scheme");
+    }
+
+    #[test]
+    fn empty_configured_token_authenticates_nobody() {
+        // Issue #185: an empty token must never turn `Bearer ` into a pass.
+        assert!(!auth_ok(&bearer(""), ""));
+        assert!(!auth_ok(&bearer("anything"), ""));
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(!auth_ok(&h, ""));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"), "length differs");
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+}
+
+#[cfg(test)]
+mod spec_summary_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn summary_omits_user_content() {
+        // Issue #185: nothing the user typed or the agent pre-filled may
+        // reach the trace file.
+        let spec = json!({
+            "kind": "form",
+            "title": "Enter the production database password",
+            "fields": [
+                {"kind": "secret", "name": "pw", "label": "Password",
+                 "default": "hunter2",
+                 "target": {"mode": "create", "path": "/home/alice/.pgpass"}},
+                {"kind": "text", "name": "note", "default": "internal only"}
+            ],
+            "actions": [{"label": "Save", "value": "save"}]
+        });
+        let out = spec_summary(&spec);
+        for leak in ["hunter2", "pgpass", "alice", "production database", "internal only"] {
+            assert!(!out.contains(leak), "{leak:?} leaked into {out:?}");
+        }
+        assert!(out.contains("kind=form"));
+        assert!(out.contains("fields=2"));
+        assert!(out.contains("actions=1"));
+    }
+
+    #[test]
+    fn summary_counts_fields_across_tabs() {
+        let spec = json!({
+            "kind": "form",
+            "fields": [{"kind": "text", "name": "a"}],
+            "tabs": [
+                {"label": "One", "fields": [{"kind": "text", "name": "b"}]},
+                {"label": "Two", "fields": [{"kind": "text", "name": "c"},
+                                            {"kind": "text", "name": "d"}]}
+            ]
+        });
+        let out = spec_summary(&spec);
+        assert!(out.contains("fields=4"), "{out}");
+        assert!(out.contains("tabs=2"), "{out}");
+    }
+
+    #[test]
+    fn summary_handles_a_spec_without_arrays() {
+        let out = spec_summary(&json!({"kind": "confirm", "title": "x"}));
+        assert!(out.contains("kind=confirm"));
+        assert!(out.contains("fields=0"));
     }
 }

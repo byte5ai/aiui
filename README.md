@@ -132,9 +132,18 @@ back in chat — without it, the agent might forget aiui exists.
 ## Privacy
 
 aiui runs purely locally on your own machine. No telemetry, no usage data, no
-content leaves your system. A local auth token lives in `~/.config/aiui/`
-(mode 0600) and is only scp'd to hosts you explicitly register in
-settings.
+content leaves your system. A local auth token lives in the per-user config
+directory and is only scp'd to hosts you explicitly register in settings.
+
+| | Token location | Protection |
+|---|---|---|
+| macOS / Linux | `~/.config/aiui/token` | file mode `0600` in a `0700` directory, re-asserted on every launch |
+| Windows | `%APPDATA%\aiui\token` | the default ACL of your user profile — aiui sets no explicit ACL of its own |
+
+The diagnostic trace lives next to it, in `logs/aiui-trace.log` under the
+same directory (on Windows under `%LOCALAPPDATA%\aiui`). Its resolved path
+is printed in the first line of every log session, so a bug report can name
+it precisely.
 
 ## Slash commands in Claude Desktop App
 

@@ -32,7 +32,9 @@ import pytest
 import aiui_mcp.server as server
 from aiui_mcp.server import EXPECTED_WIRE_VERSION, ask, confirm, form
 
-TOKEN = "smoke-token-for-contract-test"
+# A real aiui token is 64 hex chars; the bridge rejects any other
+# shape (#185), so the fixture has to look like the real thing.
+TOKEN = "ab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1e"
 
 # Canned terminal results per dialog kind, in the companion's wire shape
 # ({cancelled, result}). `_format_result` in the bridge flattens these into the
@@ -171,7 +173,7 @@ def test_wrong_token_is_rejected(
     """Auth is enforced end to end: a bridge holding the wrong token is turned
     away at the companion's 401, surfaced as an actionable tool error."""
     bad = tmp_path / "bad-token"
-    bad.write_text("not-the-token")
+    bad.write_text("badc0ffebadc0ffebadc0ffebadc0ffebadc0ffebadc0ffebadc0ffebadc0ffe")
     monkeypatch.setattr(server, "TOKEN_PATH", bad)
     with pytest.raises(RuntimeError) as exc:
         asyncio.run(confirm(title="Proceed?"))
