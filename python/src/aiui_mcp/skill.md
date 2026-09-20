@@ -384,12 +384,17 @@ Three input formats render correctly:
   file and inlines it as a `data:` URL before the spec leaves your host.
   **The path must exist on the host *you*, the agent, run on** — for an
   SSH-tunneled session that's the remote, not the user's machine. Absolute or
-  `~/`-rooted only; relative paths are not resolved (no stable `cwd`
-  contract on MCP bridges). 10 MB cap.
+  `~`-rooted only; relative paths are not resolved (no stable `cwd`
+  contract on MCP bridges). On a Windows host `C:\…`, `\\?\C:\…`,
+  `\\server\share\…` and `~\…` count as absolute too. `~someuser/…` is
+  not expanded. 10 MB cap.
 - **`http(s)://` URL** — fetched on the user's machine and inlined (5 s
   timeout, 10 MB cap, parallel for grids). Use when the image already
   lives on a reachable server; the user's machine contacts the URL, aiui never phones
-  home.
+  home. **Public destinations only:** a URL resolving to loopback, a
+  private/LAN range, link-local, CGNAT or an IPv6 ULA is refused and
+  renders broken — the user's LAN is not yours to reach. Redirects are
+  not followed, so link to the image itself, not to a redirector.
 - **`data:` URL** (`data:image/png;base64,…`) — the fallback when neither
   path nor URL fits (e.g. bytes generated in-memory). Embed the encoded
   bytes directly in the tool-call `src` — never roundtrip through a shell

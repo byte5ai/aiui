@@ -385,27 +385,65 @@ _LOCAL_PATH_MIME_OVERRIDES = {
 }
 
 
+# Module-level rather than computed per call so a test can monkeypatch it
+# and exercise the Windows branch on a POSIX runner — the same reason the
+# Rust mirror takes the platform as a parameter (#201).
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _is_windows_abs_path(s: str) -> bool:
+    """`C:\\foo`, `D:/bar`, long-path `\\\\?\\C:\\…`, UNC `\\\\server\\share\\…`.
+
+    Mirrors the `cfg!(windows)` branch of `imageresolve::looks_like_local_path`.
+    """
+    if s.startswith("\\\\"):
+        return True
+    return (
+        len(s) >= 3
+        and s[0].isascii()
+        and s[0].isalpha()
+        and s[1] == ":"
+        and s[2] in "\\/"
+    )
+
+
 def _looks_like_local_path(s: str) -> bool:
     """Mirror of `imageresolve::looks_like_local_path` in the Rust bridge.
 
-    Accepts absolute paths and `~/`-rooted paths. Rejects `data:` URLs,
+    Accepts absolute paths and `~`-rooted paths, plus — on a Windows host
+    only — drive-letter, long-path and UNC paths. Rejects `data:` URLs,
     `http(s)://` URLs, relative paths (no stable cwd contract on MCP
     bridges), and anything else.
+
+    The Windows shapes are gated on the host platform on purpose: `C:\\x.png`
+    is not a path on Linux, and accepting it there would push garbage into
+    `_read_path_as_data_url` instead of leaving the value alone.
     """
     if not s:
         return False
     if s.startswith(("data:", "http://", "https://")):
         return False
-    return s.startswith("/") or s.startswith("~")
+    if s.startswith("/") or s.startswith("~"):
+        return True
+    return _IS_WINDOWS and _is_windows_abs_path(s)
 
 
 def _read_path_as_data_url(raw: str) -> str:
     """Read a local file and return it as `data:<mime>;base64,…`.
 
     Raises ValueError on anything that should make the resolver leave
-    the original `src` value alone (missing file, oversize, not a file).
+    the original `src` value alone (missing file, oversize, not a file,
+    an unexpandable `~`).
     """
-    path = Path(raw).expanduser()
+    try:
+        path = Path(raw).expanduser()
+    except RuntimeError as e:
+        # `expanduser()` raises RuntimeError — not OSError — when it cannot
+        # determine a home directory, which is what `~someuser/x.png` and
+        # `~\Pictures\x.png` do on POSIX. Left unmapped it escaped
+        # `_resolve_local_paths`'s handler and failed the whole tool call,
+        # breaking this module's fail-soft contract (#201).
+        raise ValueError(f"cannot expand {raw}: {e}") from e
     if not path.is_file():
         raise ValueError(f"not a file: {path}")
     size = path.stat().st_size
@@ -536,7 +574,9 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
     for p in paths:
         try:
             data = await _read_media_file(p)
-        except (OSError, ValueError, MemoryError) as e:
+        except (OSError, ValueError, MemoryError, RuntimeError) as e:
+            # RuntimeError: `expanduser()` on an unexpandable `~user` /
+            # `~\…` path — fail soft here too (#201).
             log.warning("video skipped (read failed) %s: %s", p, e)
             warnings.append(f"video not shown — {p}: {e}")
             continue
@@ -616,7 +656,9 @@ async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) 
     for p in paths:
         try:
             data = await _read_media_file(p)
-        except (OSError, ValueError, MemoryError) as e:
+        except (OSError, ValueError, MemoryError, RuntimeError) as e:
+            # RuntimeError: `expanduser()` on an unexpandable `~user` /
+            # `~\…` path — fail soft here too (#201).
             log.warning("audio skipped (read failed) %s: %s", p, e)
             warnings.append(f"audio not played — {p}: {e}")
             continue

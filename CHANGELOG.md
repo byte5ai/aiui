@@ -595,6 +595,27 @@ All notable changes to this project are documented here.
   the sweep's own enumeration, re-assert the victim's identity (executable
   leaf plus argv) before signalling, and report `terminated K of N` with K
   being the kills that actually landed (#200).
+- **Windows paths in an image `src` failed silently on both bridges.** The
+  Rust classifier accepted any `~`-prefixed string but the expander only
+  understood `~/`, so `~\Pictures\shot.png` was resolved against the
+  process cwd, missed, and reported only to a log the agent never sees —
+  the agent's call returned success and the user got a broken image. The
+  same gap sent `~\Movies\clip.mp4` past the `/media` upload. The Python
+  bridge's "mirror" of that classifier was missing the drive-letter,
+  long-path and UNC branch entirely, so `C:\Users\me\shot.png` from an
+  agent on Windows was shipped to the companion verbatim and rendered as
+  nothing. Both now agree, and `~alice/x.png` is an explicit "cannot expand
+  ~user paths" instead of a stat failure for a path that was never literal.
+  The classifier and the tilde expander take the platform as a parameter so
+  the Windows branch is covered by tests that actually run — CI compiles
+  but does not execute the unit tests on its Windows leg (#201).
+- **A `~user` path could fail a whole tool call on the Python bridge.**
+  `Path.expanduser()` raises `RuntimeError` — not `OSError` — for
+  `~nosuchuser/x.png` and `~\Pictures\x.png` on a POSIX host, which is the
+  normal deployment for a remote agent. Nothing caught it, so instead of
+  skipping one image the entire `ask` / `confirm` / `form` / `compare` /
+  `gallery` call errored out, against the resolver's own documented
+  fail-soft contract (#201).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
@@ -900,6 +921,40 @@ All notable changes to this project are documented here.
   windows with `core:event:allow-listen`/`allow-unlisten` and nothing else —
   no emit, so agent content cannot forge an event into the Settings window
   (#195).
+- **An image `src` could point the companion at the user's own LAN.** Every
+  `http(s)://` value under a `src` / `thumbnail` key is fetched *from the
+  user's machine*, and nothing looked at where it went — so any holder of
+  the bridge token, i.e. any registered remote dev host, got a blind `GET`
+  primitive with the user's network position: router and IoT admin panels,
+  `169.254.169.254`, anything the remote could not otherwise reach. The
+  resolver now refuses every destination that is not publicly routable
+  (loopback, RFC1918, link-local, CGNAT, benchmarking, documentation, IPv6
+  ULA and link-local, and the IPv4-mapped spellings of all of them), checks
+  the *resolved* address rather than the URL text so `http://2130706433/`
+  and a hostname with a private A record are caught too, pins each vetted
+  address onto the client so a second DNS answer cannot slip past the
+  check, and no longer follows redirects. A refused URL fails soft: it is
+  logged and renders as a broken image (#201).
+- **A rejected spec still probed the network.** `/render` resolved image
+  URLs *before* validating the spec, so a deliberately invalid spec fetched
+  every URL in it and was then rejected with `invalid_spec` — no dialog
+  ever appeared, and the response latency told the caller whether a LAN
+  port was open. Validation now runs first, so a probe costs the prober a
+  real dialog on the user's screen (#201).
+- **A chunked response could grow the companion's memory without limit.**
+  The 10 MB cap was enforced from `Content-Length`, which a chunked
+  response does not carry, and the body was buffered whole before the
+  second check — so any server could hold 5 seconds' worth of RAM per URL,
+  on every render. The body is now streamed and the connection dropped the
+  moment the cap is passed, and at most four fetches run at once instead of
+  one socket per URL (#201).
+- **`SECURITY.md` and `README.md` denied that this fetch existed.** "No
+  outbound calls other than the updater feed" and "no content leaves your
+  system" were both false as written, while `docs/skill.md` documented the
+  URL fetch as a feature. A policy that hides a surface misdirects anyone
+  auditing aiui and makes a good-faith report look like a false positive.
+  Both now name the image fetch and its destination policy, and the render-
+  time image resolver is listed in scope (#201).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

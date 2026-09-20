@@ -1678,6 +1678,24 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     Ok(())
 }
 
+/// Validate a render spec, then resolve its `http(s)://` image sources to
+/// `data:` URLs (the WebView's CSP only permits `data:` for `img-src`, so
+/// without this pass an agent's plain URL renders as a broken image — see
+/// `companion/src-tauri/src/imageresolve.rs` for the failure modes).
+///
+/// The ordering is the point of this helper, not an implementation detail.
+/// Resolving first meant a spec the user would never see — one rejected as
+/// `invalid_spec` — still made the user's machine `GET` every URL in it,
+/// turning `/render` into a network probe that leaves nothing on screen.
+/// Validating first means a probe costs the prober a real dialog (#201).
+async fn validate_then_resolve(
+    spec: &mut serde_json::Value,
+) -> Result<(), (String, String)> {
+    validate_spec(spec)?;
+    crate::imageresolve::resolve_image_srcs(spec).await;
+    Ok(())
+}
+
 /// RAII cleanup for a registered render — closes the cancellation-safety hole
 /// behind the 409-storm + stranded-empty-window pair (2026-05-30 report).
 ///
@@ -2083,20 +2101,13 @@ async fn render(
     };
     trace(&format!("render: auth ok, {}", spec_summary(&req.spec)));
 
-    // Resolve any http(s):// values in `src` / `thumbnail` fields to
-    // `data:` URLs before the spec hits the WebView. The WebView's
-    // CSP only permits `data:` for img-src; without this pass an
-    // agent's plain URL would silently render as a broken image.
-    // See companion/src-tauri/src/imageresolve.rs for failure modes.
-    crate::imageresolve::resolve_image_srcs(&mut req.spec).await;
-
     // Spec validation (v0.4.46, Bug B+): reject anything the frontend
     // can't render *before* creating a window, and tell the agent
     // exactly what to fix. Without this, a bad `kind` opened a window
     // showing the "unknown_kind" placeholder — a confusing surface the
     // user had to dismiss. Now the agent gets `invalid_spec` + detail
     // and can correct the call; nothing is shown to the user.
-    if let Err((detail, hint)) = validate_spec(&req.spec) {
+    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec).await {
         trace(&format!("render: rejected — invalid_spec: {detail}"));
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2383,8 +2394,33 @@ async fn notify(
 
 #[cfg(test)]
 mod validate_tests {
-    use super::validate_spec;
+    use super::{validate_spec, validate_then_resolve};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_spec_is_rejected_before_any_fetch() {
+        // #201: `resolve_image_srcs` used to run first, so a spec that was
+        // then rejected as `invalid_spec` — and therefore never shown to the
+        // user — had already made this machine GET every URL in it. That is
+        // a silent network probe with no dialog on screen.
+        let before = crate::imageresolve::fetch_attempts();
+        let mut spec = json!({
+            "kind": "not-a-real-kind",
+            "image": {"src": "http://93.184.216.34/probe.png"}
+        });
+        let (detail, _hint) = validate_then_resolve(&mut spec).await.unwrap_err();
+        assert!(detail.contains("top-level 'kind'"), "got: {detail}");
+        assert_eq!(
+            crate::imageresolve::fetch_attempts(),
+            before,
+            "an invalid spec reached the network"
+        );
+        // The URL is still there — nothing was resolved.
+        assert_eq!(
+            spec["image"]["src"].as_str(),
+            Some("http://93.184.216.34/probe.png")
+        );
+    }
 
     #[test]
     fn accepts_confirm() {
