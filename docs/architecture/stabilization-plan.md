@@ -52,6 +52,23 @@ establishes an invariant or is out of scope.
 - **I8 — Multi-window:** N concurrent dialogs allowed; **each window carries a
   human-legible session identifier** so the user can tell which session a dialog
   belongs to.
+- **I9 — The child counter moves only for a *successfully connected* client.**
+  A failed `accept()`/`connect()` is never counted, never spawns a reader and
+  never produces a `ChildAttached`/`ChildDetached` pair. Enforced by control
+  flow (the attach path is unreachable without an `Ok`), not by a runtime
+  check. A phantom attach/detach pair arms the grace for a client that never
+  existed, and one failed liveness probe in that window is enough to exit the
+  host while Claude Desktop is on screen — a direct I1 violation. A failing
+  channel backs off (100 ms doubling to a 5 s cap), logs once per backoff step
+  and records `ChannelAcceptFailing`; it never exits the process.
+- **I10 — The auto-resurrect spawn never inherits the caller's standard
+  streams.** The spawning process may be `aiui --mcp-stdio`, whose stdin and
+  stdout *are* the host's JSON-RPC pipes. Every branch of
+  `spawn_gui_detached` goes through `proc_ext::spawn_detached`, which nulls
+  all three streams; the release build additionally has no stdout log target.
+  Inheriting them writes companion log lines into the host's framing stream
+  and holds the pipe's write end open, so the host never observes EOF when
+  the child exits.
 
 ## Step 1 — Host lifetime invariant (decided; highest leverage, lowest risk)
 
