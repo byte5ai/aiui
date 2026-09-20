@@ -54,6 +54,41 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A routine screenshot never opened a dialog.** `/render` was the one
+  body-consuming route without an explicit limit, so axum's 2 MiB default
+  applied. Base64 expands ~1.37×, which put the real ceiling at ~1.5 MB of
+  image bytes — a sixth of the 10 MB the docs promise — and a `confirm`
+  with a 2 MB Retina screenshot died *before* the handler ran: no window,
+  no trace line, and a bare `413` at the agent naming neither the image nor
+  a way out. The route is now capped at 64 MB with the handler's own guard
+  at 48 MB, strictly below it, so what the agent gets is a structured
+  `spec_too_large` carrying the likely cause and the fix. Both bridges
+  surface `detail` + `hint` instead of the status code (#178).
+- **An `ask` without options and a `form` without fields opened dead
+  windows.** Both are optional in the tool signatures, and `options: null`
+  is literally what the Rust bridge emits when the argument is omitted —
+  Svelte renders that exactly like `[]`. The user got a window with the
+  question and nothing but Cancel; the agent got `{cancelled: true}` with
+  no reason. An option carrying only a `description` was worse: it rendered
+  as a blank button and returned `null`. All three are rejected up front
+  now, with a hint pointing at `confirm` where that is the right tool
+  (#178).
+- **A duplicate `value` blanked the dialog or silently dropped a result.**
+  Every collection surface renders through a keyed `{#each}` whose key is
+  agent-supplied data, and only `compare` checked it. Svelte throws on a
+  repeated key in production builds too, and with no `<svelte:boundary>` in
+  the app that throw tore down the whole mount: an empty, always-on-top
+  window the user could not answer and an agent call that hung until the
+  two-hour TTL. Where it did not throw it corrupted quietly — `gallery`
+  builds `out[item.value]`, `list`/`table` resolve rows by `.find(…)`, so
+  two entries collapsed into one and the agent acted on a result that was
+  missing a row it believed it had. Uniqueness is now enforced for
+  `gallery` items, `list` items, `table` rows, `image_grid` images, `tree`
+  nodes (recursively, so cross-branch repeats that cross-link
+  `expanded`/`selected` are caught too), tab `label`s and `form` field
+  `name`s. Triggers were ordinary: two assets sharing a basename, two
+  `config.yaml` rows from different directories, two tabs called "Options"
+  (#178).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

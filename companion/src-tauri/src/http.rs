@@ -224,7 +224,15 @@ pub async fn serve(
 
     let router = Router::new()
         .route("/health", get(health))
-        .route("/render", post(render))
+        // #178: without this layer axum's 2 MiB default applied, so a routine
+        // 2 MB screenshot inlined as base64 died *before* the handler with an
+        // opaque 413 — six times below the 10 MB per-image ceiling the docs
+        // promise. Capped well above the handler's own `RENDER_SPEC_SOFT_CAP`
+        // guard so the 413 the agent sees is ours, structured and actionable.
+        .route(
+            "/render",
+            post(render).layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP)),
+        )
         .route("/render/:id", get(render_poll))
         .route("/notify", post(notify))
         .route("/version", get(version))
@@ -922,6 +930,84 @@ const KNOWN_FIELD_KINDS: &[&str] = &[
     "list", "table", "tree",
 ];
 
+/// Field `kind`s that carry no answer — `Form.svelte`'s `valueFields()`
+/// filters exactly these out of the `values` state map, so they never key
+/// anything and two of them may legitimately share a `name`.
+const DISPLAY_ONLY_FIELD_KINDS: &[&str] = &[
+    "static_text", "markdown", "image", "audio", "mermaid", "wireframe",
+];
+
+/// Hard ceiling enforced by axum (route layer) before `render` runs. Four
+/// images at the documented 10 MB per-image cap, plus room for the rest of
+/// the spec. (#178)
+const RENDER_BODY_HARD_CAP: usize = 64 * 1024 * 1024;
+
+/// Soft ceiling checked *inside* `render`, deliberately below the hard cap so
+/// an oversized spec gets our structured `spec_too_large` 413 — with a hint —
+/// instead of axum's opaque "Failed to buffer the request body". (#178)
+const RENDER_SPEC_SOFT_CAP: usize = 48 * 1024 * 1024;
+
+/// `true` when a `/render` body is past the soft cap and must be refused by
+/// the handler. Split out so the ceiling is unit-testable without a router.
+fn render_body_too_large(body_len: usize) -> bool {
+    body_len > RENDER_SPEC_SOFT_CAP
+}
+
+/// Reject a collection whose agent-supplied keys repeat.
+///
+/// #178: every collection surface renders through a keyed `{#each}` whose key
+/// is agent data. Svelte throws `each_key_duplicate` on a repeat — in prod
+/// builds too — which tears down the whole mount: the user gets an empty,
+/// always-on-top window and the agent's call hangs until the 2 h TTL. Where
+/// it does not throw it corrupts quietly instead: `gallery` builds
+/// `out[item.value]`, `list`/`table` resolve rows by `.find(…)`, so two
+/// entries collapse into one result. Reject before any window exists.
+fn reject_duplicate_keys<'a>(
+    what: &str,
+    key: &str,
+    values: impl Iterator<Item = &'a str>,
+) -> Result<(), (String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    for v in values {
+        if !seen.insert(v) {
+            return Err((
+                format!("{what} has a duplicate '{key}': {v:?}"),
+                format!(
+                    "Each {what}'s '{key}' must be unique — it keys the rendered \
+                     list and the returned result."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The key of one collection entry. `list` items are documented as
+/// `{label, value}` but `Form.svelte` also accepts a bare string (and then
+/// uses it as both), so accept the same two shapes here.
+fn entry_value(v: &serde_json::Value) -> Option<&str> {
+    v.as_str()
+        .or_else(|| v.get("value").and_then(|x| x.as_str()))
+}
+
+/// Flatten a `tree` field's forest into every `value` it contains.
+///
+/// One flat pass covers both failure modes: repeated *siblings* crash
+/// `TreeNode.svelte`'s keyed `{#each}`, while a value repeated across
+/// branches renders fine but cross-links state — `expanded` is a
+/// `Set<string>` and `selected` a `string[]`, both keyed by value, so
+/// toggling one node silently toggles its namesake elsewhere.
+fn collect_tree_values<'a>(items: &'a [serde_json::Value], out: &mut Vec<&'a str>) {
+    for it in items {
+        if let Some(v) = entry_value(it) {
+            out.push(v);
+        }
+        if let Some(children) = it.get("children").and_then(|c| c.as_array()) {
+            collect_tree_values(children, out);
+        }
+    }
+}
+
 /// Validate a dialog spec *before* any window is created (v0.4.46,
 /// Bug B+). On failure returns `(detail, hint)` describing precisely
 /// what's wrong; the caller turns that into a structured `invalid_spec`
@@ -953,34 +1039,28 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 ));
             }
             Some(arr) => {
-                let mut seen = std::collections::HashSet::new();
                 for (i, it) in arr.iter().enumerate() {
-                    let value = it
+                    let has_value = it
                         .get("value")
                         .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty());
-                    match value {
-                        None => {
-                            return Err((
-                                format!("compare variant #{i} is missing a non-empty 'value'"),
-                                "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
-                                    .into(),
-                            ));
-                        }
-                        // Duplicate values collide as the keyed-`{#each}` key and
-                        // as the returned `selected`, making two options
-                        // indistinguishable — reject before render (codex review P2).
-                        Some(v) => {
-                            if !seen.insert(v) {
-                                return Err((
-                                    format!("compare has a duplicate variant 'value': {v:?}"),
-                                    "Each variant's 'value' must be unique — it keys the rendered list and the returned selection."
-                                        .into(),
-                                ));
-                            }
-                        }
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !has_value {
+                        return Err((
+                            format!("compare variant #{i} is missing a non-empty 'value'"),
+                            "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
+                                .into(),
+                        ));
                     }
                 }
+                // Duplicate values collide as the keyed-`{#each}` key and
+                // as the returned `selected`, making two options
+                // indistinguishable — reject before render (codex review P2).
+                reject_duplicate_keys(
+                    "compare variant",
+                    "value",
+                    arr.iter().filter_map(entry_value),
+                )?;
             }
         }
         return Ok(());
@@ -1014,6 +1094,53 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                         ));
                     }
                 }
+                // #178: two items sharing a value collapse in `out[it.value]`,
+                // so one asset's verdict silently overwrites the other's.
+                reject_duplicate_keys(
+                    "gallery item",
+                    "value",
+                    arr.iter().filter_map(entry_value),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    // #178: an `ask` with no options opens a window carrying the question and
+    // nothing but Cancel — the user can't answer and the agent gets a bare
+    // `{cancelled: true}`. `options: null` is literally what the Rust bridge
+    // emits when the argument is omitted, and Svelte renders it like `[]`.
+    if kind == "ask" {
+        match spec.get("options").and_then(|v| v.as_array()) {
+            None => {
+                return Err((
+                    "ask spec is missing the 'options' array".into(),
+                    "Provide options: [{label, value?, description?, thumbnail?}, …] — at least one. For yes/no use confirm."
+                        .into(),
+                ));
+            }
+            Some(arr) if arr.is_empty() => {
+                return Err((
+                    "ask 'options' is empty".into(),
+                    "An ask with no options has nothing to pick — give it at least one, or use confirm for yes/no."
+                        .into(),
+                ));
+            }
+            Some(arr) => {
+                for (i, opt) in arr.iter().enumerate() {
+                    let labelled = ["label", "value"].into_iter().any(|k| {
+                        opt.get(k)
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    });
+                    if !labelled {
+                        return Err((
+                            format!("ask option #{i} has neither a non-empty 'label' nor 'value'"),
+                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A bare 'description' renders as a blank button."
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
         return Ok(());
@@ -1029,7 +1156,29 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     if let Some(fs) = spec.get("fields").and_then(|v| v.as_array()) {
         fields.extend(fs.iter());
     }
-    for f in fields {
+    // #178: `fields` and `tabs` are both optional, so `form(title="x")` used
+    // to open a window with nothing but Submit/Cancel — the agent then got
+    // `{cancelled: true}` with no reason. (`confirm` has no fields by design
+    // and never reaches this guard.)
+    if kind == "form" && fields.is_empty() {
+        return Err((
+            "form spec has no fields (neither 'fields' nor 'tabs[].fields')".into(),
+            "A form with no fields has nothing to answer — use `confirm` for yes/no."
+                .into(),
+        ));
+    }
+    // #178: tab labels key `{#each spec.tabs as t, i (t.label)}` — a repeat
+    // (including two tabs that both omit the label) throws during render and
+    // blanks the whole window.
+    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
+        reject_duplicate_keys(
+            "form tab",
+            "label",
+            tabs.iter()
+                .map(|t| t.get("label").and_then(|v| v.as_str()).unwrap_or("")),
+        )?;
+    }
+    for f in fields.iter().copied() {
         let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if !KNOWN_FIELD_KINDS.contains(&fk) {
             let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
@@ -1055,7 +1204,71 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                     .into(),
             ));
         }
+        // #178: every collection field renders through a keyed `{#each}` over
+        // agent data and resolves its result by that same key.
+        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+        match fk {
+            "list" => {
+                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("list field '{name}' item"),
+                        "value",
+                        items.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "table" => {
+                if let Some(rows) = f.get("rows").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("table field '{name}' row"),
+                        "value",
+                        rows.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "image_grid" => {
+                if let Some(images) = f.get("images").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("image_grid field '{name}' image"),
+                        "value",
+                        images.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "tree" => {
+                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
+                    let mut values = Vec::new();
+                    collect_tree_values(items, &mut values);
+                    reject_duplicate_keys(
+                        &format!("tree field '{name}' node"),
+                        "value",
+                        values.into_iter(),
+                    )?;
+                }
+            }
+            _ => {}
+        }
     }
+    // #178: `Form.svelte` keys its state by `values[f.name]`, so two
+    // answerable fields sharing a name share one slot — one of the two values
+    // is silently missing from the result. Display-only kinds carry no value
+    // (`valueFields()` filters them out) and may repeat a name harmlessly.
+    reject_duplicate_keys(
+        "form field",
+        "name",
+        fields
+            .iter()
+            .copied()
+            .filter(|f| {
+                let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                !DISPLAY_ONLY_FIELD_KINDS.contains(&fk)
+            })
+            .filter_map(|f| {
+                f.get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            }),
+    )?;
     Ok(())
 }
 
@@ -1271,6 +1484,31 @@ async fn render(
     if !auth_ok(&headers, &state.cfg.token) {
         trace("render: auth FAILED");
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+    }
+    // #178: the route layer caps the body at `RENDER_BODY_HARD_CAP`; this
+    // guard sits strictly below it so an oversized spec gets a structured
+    // 413 naming the likely cause (inlined images) instead of axum's opaque
+    // "Failed to buffer the request body" — which never even reaches the
+    // trace log, making the whole thing undiagnosable from a bug report.
+    if render_body_too_large(body.len()) {
+        trace(&format!(
+            "render: rejected — spec_too_large: body_len={} (max {})",
+            body.len(),
+            RENDER_SPEC_SOFT_CAP
+        ));
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "spec_too_large",
+                "detail": format!(
+                    "dialog spec is {} bytes (max {})",
+                    body.len(),
+                    RENDER_SPEC_SOFT_CAP
+                ),
+                "hint": "Inlined images dominate the spec — shrink the image, send fewer at once, or pass an http(s):// src instead of a local path.",
+            })),
+        )
+            .into_response();
     }
     let mut req: RenderRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
@@ -1712,6 +1950,244 @@ mod validate_tests {
             {"label":"T","fields":[{"kind":"warp","name":"w"}]}
         ]});
         assert!(validate_spec(&spec).is_err());
+    }
+
+    // --- #178: duplicate keys in every value-keyed collection -------------
+
+    #[test]
+    fn rejects_gallery_with_duplicate_values() {
+        // Two items sharing a value collapse into one `out[it.value]` entry,
+        // so the agent gets a verdict for one asset and none for the other.
+        let spec = json!({"kind":"gallery","items":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"a","src":"data:image/png;base64,BBBB"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_gallery_with_unique_values() {
+        let spec = json!({"kind":"gallery","items":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"b","src":"data:image/png;base64,BBBB"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_list_field_with_duplicate_item_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"list","name":"files","items":[
+                {"label":"config.yaml (app)","value":"config.yaml"},
+                {"label":"config.yaml (worker)","value":"config.yaml"}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("files"), "names the field: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_list_field_with_duplicate_string_items() {
+        // Form.svelte accepts bare strings as list items (label == value),
+        // so the shorthand shape has to be deduped too.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"list","name":"l","items":["A","A"]}
+        ]});
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_table_field_with_duplicate_row_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"table","name":"stale","columns":[{"key":"c","label":"C"}],"rows":[
+                {"value":"config.yaml","values":{"c":"app"}},
+                {"value":"config.yaml","values":{"c":"worker"}}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_image_grid_with_duplicate_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"image_grid","name":"shots","images":[
+                {"value":"hero","src":"data:image/png;base64,AAAA"},
+                {"value":"hero","src":"data:image/png;base64,BBBB"}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_tree_with_duplicate_sibling_values() {
+        // Sibling duplicates crash TreeNode.svelte's keyed `{#each}`.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"root","label":"root","children":[
+                    {"value":"kid","label":"a"},
+                    {"value":"kid","label":"b"}
+                ]}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_tree_with_value_repeated_across_branches() {
+        // Cross-branch repeats render, but `expanded`/`selected` are keyed by
+        // value — the two nodes toggle each other and the result is ambiguous.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"a","label":"A","children":[{"value":"dup","label":"x"}]},
+                {"value":"b","label":"B","children":[{"value":"dup","label":"y"}]}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_tree_with_unique_values_across_branches() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"a","label":"A","children":[{"value":"a1","label":"x"}]},
+                {"value":"b","label":"B","children":[{"value":"b1","label":"y"}]}
+            ]}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_tab_labels() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"Options","fields":[{"kind":"text","name":"a"}]},
+            {"label":"Options","fields":[{"kind":"text","name":"b"}]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("label"), "got: {}", err.0);
+    }
+
+    // --- #178: dead `ask` / `form` surfaces --------------------------------
+
+    #[test]
+    fn rejects_ask_with_empty_options() {
+        let err = validate_spec(&json!({"kind":"ask","question":"q","options":[]})).unwrap_err();
+        assert!(err.0.contains("empty"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_ask_with_null_options() {
+        // Literally what the Rust bridge emits when `options` is omitted —
+        // Svelte renders `null` like `[]`, i.e. a window with only Cancel.
+        let err = validate_spec(&json!({"kind":"ask","question":"q","options":null})).unwrap_err();
+        assert!(err.0.contains("options"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_ask_option_without_label_or_value() {
+        // Ask.svelte renders `opt.label` and returns `value ?? label`, so a
+        // description-only option is a blank button returning `null`.
+        let spec = json!({"kind":"ask","question":"q","options":[
+            {"label":"Keep","value":"keep"},
+            {"description":"the other one"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("label"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_ask_with_options() {
+        let spec = json!({"kind":"ask","question":"q","options":[
+            {"label":"Keep","value":"keep"},
+            {"label":"Drop"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_form_with_no_fields() {
+        let err = validate_spec(&json!({"kind":"form","title":"x"})).unwrap_err();
+        assert!(err.0.contains("no fields"), "got: {}", err.0);
+        assert!(err.1.contains("confirm"), "points at the alternative: {}", err.1);
+        // Empty containers are the same dead window.
+        assert!(validate_spec(&json!({"kind":"form","fields":[]})).is_err());
+        assert!(validate_spec(&json!({"kind":"form","tabs":[{"label":"T","fields":[]}]})).is_err());
+        // `confirm` legitimately has no fields and must stay valid.
+        assert!(validate_spec(&json!({"kind":"confirm","title":"ok?"})).is_ok());
+    }
+
+    #[test]
+    fn rejects_form_with_duplicate_field_names() {
+        // Form.svelte keys state by `values[f.name]` — the second field's
+        // value silently replaces the first's in the result.
+        let flat = json!({"kind":"form","fields":[
+            {"kind":"text","name":"who"},
+            {"kind":"number","name":"who"}
+        ]});
+        let err = validate_spec(&flat).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("who"), "names the collision: {}", err.0);
+
+        // Same name, one flat and one via a tab.
+        let tabbed = json!({"kind":"form","fields":[{"kind":"text","name":"who"}],
+            "tabs":[{"label":"T","fields":[{"kind":"text","name":"who"}]}]});
+        assert!(validate_spec(&tabbed).is_err());
+    }
+
+    #[test]
+    fn accepts_form_with_unique_field_names_across_tabs() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"A","fields":[{"kind":"text","name":"a"},{"kind":"static_text","text":"hi"}]},
+            {"label":"B","fields":[{"kind":"text","name":"b"},{"kind":"static_text","text":"ho"}]}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_repeated_names_on_display_only_fields() {
+        // `valueFields()` filters these out of the state map, so they key
+        // nothing — the dedup pass must not be over-strict about them.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"static_text","name":"note","text":"one"},
+            {"kind":"static_text","name":"note","text":"two"},
+            {"kind":"text","name":"answer"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod render_body_cap_tests {
+    use super::{render_body_too_large, RENDER_BODY_HARD_CAP, RENDER_SPEC_SOFT_CAP};
+
+    // #178: axum's 2 MiB default killed a routine 2 MB screenshot before the
+    // handler ever ran — a sixth of the 10 MB per-image cap the docs promise,
+    // with an opaque 413 and nothing in the trace log.
+
+    #[test]
+    fn soft_cap_is_strictly_below_the_hard_cap() {
+        // If they were equal (as on /media) axum would reject first and the
+        // structured `spec_too_large` body would be dead code.
+        assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
+    }
+
+    #[test]
+    fn accepts_a_spec_above_the_old_axum_default() {
+        // 3 MB: over axum's 2 MiB default, well under our cap — the exact
+        // shape of a base64-inlined Retina screenshot.
+        assert!(!render_body_too_large(3 * 1024 * 1024));
+        assert!(!render_body_too_large(RENDER_SPEC_SOFT_CAP));
+    }
+
+    #[test]
+    fn rejects_a_spec_past_the_soft_cap() {
+        assert!(render_body_too_large(RENDER_SPEC_SOFT_CAP + 1));
     }
 }
 

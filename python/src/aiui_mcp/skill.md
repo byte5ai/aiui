@@ -76,6 +76,11 @@ Skip the dialog for content the user reads, doesn't answer:
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
+Every dialog must have something to answer: an `ask` needs at least one
+option carrying a `label` (or a `value`), a `form` at least one field.
+An empty one is rejected up front rather than opened as a window the
+user can only cancel.
+
 ## Fire-and-forget: `notify`
 
 `notify` does not open a window and does not wait for the user. Call it,
@@ -135,7 +140,9 @@ notification-permission prompt; a denied permission comes back as
 | ✓ | ✓ | ✓ | Pick-and-order |
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state. Items can carry a
+drag changes, `selected` reflects checkbox state. Each item's `value` must
+be non-empty and unique — it keys the result, and a duplicate is rejected.
+Items can carry a
 `thumbnail` (data: URL or path) — perfect for shotlists, mood boards,
 carousel slides where the visual anchor matters more than the label.
 
@@ -155,7 +162,16 @@ sortable_by_column?: true   # click headers to sort
 
 Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
 order field reflects user-driven sorts so you can preserve their view if
-you reopen the form.
+you reopen the form. Each row's `value` must be non-empty and unique —
+two rows both called `config.yaml` (from different directories, say) are
+rejected; disambiguate with the full path.
+
+**Uniqueness is enforced across every collection**, not just here: `list`
+items, `table` rows, `image_grid` images, `tree` nodes (the whole forest,
+not just siblings), `gallery` items, `compare` variants, plus `form`
+field `name`s and tab `label`s. A repeat keys two things the same, which
+either blanks the dialog or silently collapses two entries into one
+result — so aiui refuses the spec instead of rendering it.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 
@@ -276,7 +292,8 @@ instead of firing `confirm` once per asset.
 Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
 `actions?` (per-item buttons, default Approve / Revise / Skip),
 `comment?` (free-text per item), `columns?`. Each item's `value` must be
-non-empty and unique — it keys the result. `src` follows the standard
+non-empty and unique — it keys the result, and a duplicate is rejected
+(as in every value-keyed collection). `src` follows the standard
 image rules; **videos** (`data:video/` URL, `http(s)://` URL, or a local
 `.mp4`/`.mov`/`.m4v`/`.webm` path) render with native controls. Local
 videos of any size work — the bridge pushes them to aiui's media cache on
@@ -375,6 +392,12 @@ Three input formats render correctly:
 **Pick the simplest one that works:** path if the file's on disk, then URL
 if reachable, `data:` only as last resort.
 
+**Two ceilings, not one:** the 10 MB above is *per image*; the whole spec
+— every inlined image in it, base64-expanded ~1.37× — is capped at 48 MB.
+Past that aiui answers `spec_too_large` and nothing is shown, so for a
+grid or gallery of big assets send fewer at once or pass `http(s)://`
+sources instead of local paths.
+
 Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
 against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
 file on the user's machine won't resolve from a remote agent, or vice versa —
@@ -412,7 +435,9 @@ validation. Native `<input type="datetime-local">`, returns ISO
 Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
 One submit covers all tabs; validation jumps to the first invalid tab
 automatically. Tabs are *display structure*, not a wizard — no per-tab
-confirmation, no per-tab actions, all values land in one response.
+confirmation, no per-tab actions, all values land in one response. Each
+tab needs its own `label` — duplicate labels are rejected, as are two
+fields sharing a `name` across tabs (they'd share one answer slot).
 
 Use when a single dialog naturally falls into 2-4 distinct topical
 groups (e.g. "Identity / Permissions / Notifications" on a user-create

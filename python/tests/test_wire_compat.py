@@ -102,3 +102,47 @@ def test_read_error_is_tolerated_not_fatal(
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     _run_check()  # must not raise — tolerate skew/transient
     assert server._wire_checked is True
+
+
+def test_spec_above_the_old_2mib_body_limit_round_trips(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """#178: a `confirm` carrying a base64-inlined 2 MB screenshot is ~2.7 MB
+    on the wire — over axum's old 2 MiB default, which killed the request
+    before the companion's handler ever ran. The bridge must ship the whole
+    spec and get a terminal result back."""
+    _setup_token(monkeypatch, tmp_path)
+
+    async def noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(server, "_wait_for_aiui", noop)
+    monkeypatch.setattr(server, "_preflight", noop)
+    monkeypatch.setattr(server, "_upload_local_videos", noop)
+    monkeypatch.setattr(server, "_upload_local_audios", noop)
+
+    sent: dict[str, Any] = {}
+
+    class _TerminalResp:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"cancelled": False, "result": {"confirmed": True}}
+
+    async def fake_post(self: Any, url: str, **kwargs: Any) -> Any:
+        sent["json"] = kwargs["json"]
+        return _TerminalResp()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    big_src = "data:image/png;base64," + ("A" * 3_000_000)
+    spec = {"kind": "confirm", "title": "Ship it?", "image": {"src": big_src}}
+    data = asyncio.run(server._post_render(spec))
+
+    assert data["cancelled"] is False
+    # Nothing truncated or dropped on the way out.
+    assert sent["json"]["spec"]["image"]["src"] == big_src
+    assert len(sent["json"]["spec"]["image"]["src"]) > 2 * 1024 * 1024

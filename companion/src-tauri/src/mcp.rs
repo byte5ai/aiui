@@ -1182,6 +1182,24 @@ async fn render_dialog(
         };
         return Err(RenderError::Transport(msg));
     }
+    if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        // #178: the spec exceeded the companion's ceiling — practically
+        // always inlined images. Body shape: { error, detail, hint }, same as
+        // the 422 above. Without this arm the agent saw only "render http
+        // 413", which names neither the image nor a way out.
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        let detail = body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the dialog spec is too large");
+        let hint = body.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+        let msg = if hint.is_empty() {
+            format!("aiui rejected the dialog spec (spec_too_large): {detail}")
+        } else {
+            format!("aiui rejected the dialog spec (spec_too_large): {detail} — {hint}")
+        };
+        return Err(RenderError::Transport(msg));
+    }
     if !resp.status().is_success() {
         return Err(RenderError::Transport(format!(
             "render http {}",

@@ -953,6 +953,21 @@ async def _post_render(
                 f"aiui rejected the dialog spec (invalid_spec): {detail}"
                 + (f" — {hint}" if hint else "")
             )
+        # #178: a spec past the companion's size ceiling — practically always
+        # inlined images. Same `{error, detail, hint}` shape as the 422; the
+        # hint is the whole point ("pass an http(s):// src instead"), so a bare
+        # `HTTPStatusError: 413` would strip the only actionable part.
+        if r.status_code == 413:
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            detail = body.get("detail") or "the dialog spec is too large"
+            hint = body.get("hint")
+            raise RuntimeError(
+                f"aiui rejected the dialog spec (spec_too_large): {detail}"
+                + (f" — {hint}" if hint else "")
+            )
         r.raise_for_status()
         first = r.json()
         if r.status_code == 202:

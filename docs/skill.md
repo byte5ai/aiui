@@ -94,6 +94,11 @@ Skip the dialog for content the user reads, doesn't answer:
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
+Every dialog must have something to answer: an `ask` needs at least one
+option carrying a `label` (or a `value`), a `form` at least one field.
+An empty one is rejected up front rather than opened as a window the
+user can only cancel.
+
 ## Fire-and-forget: `notify`
 
 `notify` is the odd one out: it does not open a window and does not wait
@@ -171,7 +176,9 @@ an expected outcome, not a bug to retry around.
 | ✓ | ✓ | ✓ | Pick-and-order |
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state. Items can carry a
+drag changes, `selected` reflects checkbox state. Each item's `value` must
+be non-empty and unique — it keys the result, and a duplicate is rejected.
+Items can carry a
 `thumbnail` — see [Image sources](#image-sources-src--thumbnail) below
 for the accepted URL formats. Perfect for shotlists, mood boards,
 carousel slides where the visual anchor matters more than the label.
@@ -192,7 +199,16 @@ sortable_by_column?: true   # click headers to sort
 
 Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
 order field reflects user-driven sorts so you can preserve their view if
-you reopen the form.
+you reopen the form. Each row's `value` must be non-empty and unique —
+two rows both called `config.yaml` (from different directories, say) are
+rejected; disambiguate with the full path.
+
+**Uniqueness is enforced across every collection**, not just here: `list`
+items, `table` rows, `image_grid` images, `tree` nodes (the whole forest,
+not just siblings), `gallery` items, `compare` variants, plus `form`
+field `name`s and tab `label`s. A repeat keys two things the same, which
+either blanks the dialog or silently collapses two entries into one
+result — so aiui refuses the spec instead of rendering it.
 
 ## Schematic diagrams: `mermaid`
 
@@ -404,7 +420,8 @@ instead of firing `confirm` once per asset.
 Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
 `actions?` (per-item buttons, default Approve / Revise / Skip),
 `comment?` (free-text field per item), `columns?` (default responsive).
-Each item's `value` must be non-empty and unique — it keys the result.
+Each item's `value` must be non-empty and unique — it keys the result, and
+a duplicate is rejected (as in every value-keyed collection).
 `src` follows the same resolution rules as `image`; **videos** (a
 `data:video/` URL, an `http(s)://` URL, or a local `.mp4`/`.mov`/`.m4v`/
 `.webm` path) render with native `<video controls>`. Local video files of
@@ -567,6 +584,12 @@ In all of them the same three input formats render correctly:
 **Pick the simplest one that works:** path first if the file's on
 disk, then URL if it's reachable, `data:` only as last resort.
 
+**Two ceilings, not one:** the 10 MB above is *per image*; the whole
+spec — every inlined image in it, base64-expanded ~1.37× — is capped at
+48 MB. Past that aiui answers `spec_too_large` and nothing is shown, so
+for a grid or gallery of big assets send fewer at once or pass
+`http(s)://` sources instead of local paths.
+
 What does **not** work — known footguns:
 
 - **Relative paths** (`./foo.png`, `foo.png`, `../assets/x.png`).
@@ -620,7 +643,9 @@ validation. Native `<input type="datetime-local">`, returns ISO
 Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
 One submit covers all tabs; validation jumps to the first invalid tab
 automatically. Tabs are *display structure*, not a wizard — no per-tab
-confirmation, no per-tab actions, all values land in one response.
+confirmation, no per-tab actions, all values land in one response. Each
+tab needs its own `label` — duplicate labels are rejected, as are two
+fields sharing a `name` across tabs (they'd share one answer slot).
 
 Use when a single dialog naturally falls into 2-4 distinct topical
 groups (e.g. "Identity / Permissions / Notifications" on a user-create
