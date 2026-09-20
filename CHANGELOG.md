@@ -27,6 +27,28 @@ All notable changes to this project are documented here.
   runs in the release path before anything becomes visible, and
   `scripts/test-check-updater-feed.sh` exercises it against fixtures on
   every PR so the guard cannot quietly stop guarding (#190).
+- **Tests for the host-registration write path.** The companion rewrites up
+  to three of the user's own config files — `claude_desktop_config.json`,
+  `~/.claude.json`, `~/.codex/config.toml` — unattended on every GUI
+  launch, and deletes entries from all three on uninstall. Those files are
+  not aiui's: they hold every other MCP server the user configured, and
+  `~/.claude.json` holds Claude Code's whole per-project state besides. Not
+  one line of that path was covered, because each function computed its own
+  path from `home()`, so a test would have had to rewrite the developer's
+  real config. Each one is now a thin wrapper over a path-taking core, and
+  the cores are exercised against temp files: fresh-file creation, foreign
+  servers and top-level keys surviving, the `aiui-local` → `aiui` and
+  `uvx aiui-mcp` → native-binary migrations, idempotency (no rewrite and no
+  second `.bak` on an unchanged launch), backup contents, removal touching
+  only aiui, and a malformed Codex config being refused byte-for-byte.
+  Wrapper signatures and their call sites are unchanged, and the bytes
+  written to user configs are identical (#183).
+- **Windows CI runs the Rust test suite.** The `windows-latest` matrix
+  entry compiled the test binary with `--no-run` and threw it away, so no
+  Rust logic had ever executed on the platform aiui most recently started
+  shipping — and the per-OS config paths are exactly where Windows differs.
+  The loader crash that justified the skip (#141) was closed in August; the
+  skip outlived it (#183).
 
 ### Changed
 
@@ -187,6 +209,15 @@ All notable changes to this project are documented here.
   that was hardcoded to `true`. A non-JSON body still yields the old
   `{ok: false, error}` shape, so a stranger on `:7777` cannot pass for a
   healthy companion (#179).
+- **Uninstall left the aiui entry in Claude Desktop's config on Windows.**
+  The remover rebuilt `~/Library/Application Support/Claude/…` inline
+  instead of calling the one function that knows the per-OS path, so on
+  Windows it looked at a file that does not exist there, reported "nothing
+  to do", and left behind an entry whose `command` pointed at a deleted
+  binary — Claude Desktop then failed to start a server on every launch.
+  Patch and remove now resolve the path through the same function, which is
+  the rule a test cannot enforce for you: a test that hands the core its
+  path can never catch a wrapper that builds the wrong one (#183).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
