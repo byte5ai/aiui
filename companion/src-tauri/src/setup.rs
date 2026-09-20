@@ -526,12 +526,19 @@ fn binary_on_path(name: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
+    binary_in_paths(name, &paths)
+}
+
+/// The searchable core of [`binary_on_path`], with the path list passed in
+/// rather than read from the environment — so the Windows extension scan can
+/// be asserted in a test without mutating global env in a parallel runner.
+fn binary_in_paths(name: &str, paths: &std::ffi::OsStr) -> bool {
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
     } else {
         &[""]
     };
-    std::env::split_paths(&paths)
+    std::env::split_paths(paths)
         .any(|dir| exts.iter().any(|ext| dir.join(format!("{name}{ext}")).is_file()))
 }
 
@@ -1885,6 +1892,38 @@ mod tests {
     #[test]
     fn classify_none() {
         assert!(classify_aiui_entry(None).is_none());
+    }
+
+    /// #210: the `.exe`/`.cmd`/`.bat` arm of the `$PATH` scan was verified by
+    /// the compiler only — the Windows CI leg never executed a test. A `claude`
+    /// installed as `claude.cmd` (how npm shims a CLI on Windows) is the normal
+    /// case there, so losing that arm would silently report "Claude Code not
+    /// installed" on every Windows host.
+    #[cfg(windows)]
+    #[test]
+    fn binary_on_path_finds_windows_extensions() {
+        let dir = std::env::temp_dir().join(format!("aiui-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.cmd"), b"@echo off\n").unwrap();
+        let paths = std::env::join_paths([&dir]).unwrap();
+        assert!(binary_in_paths("foo", &paths), "foo.cmd found without its extension");
+        assert!(!binary_in_paths("bar", &paths), "unrelated name not found");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Unix counterpart: only the bare name counts, so a `foo.cmd` lying
+    /// around must not answer for `foo`.
+    #[cfg(unix)]
+    #[test]
+    fn binary_on_path_is_extensionless_on_unix() {
+        let dir = std::env::temp_dir().join(format!("aiui-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.cmd"), b"#!/bin/sh\n").unwrap();
+        let paths = std::env::join_paths([&dir]).unwrap();
+        assert!(!binary_in_paths("foo", &paths));
+        std::fs::write(dir.join("foo"), b"#!/bin/sh\n").unwrap();
+        assert!(binary_in_paths("foo", &paths));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

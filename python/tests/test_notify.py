@@ -6,6 +6,7 @@ notification. Unlike confirm/ask/form/gallery this never goes through
 These mock `httpx.AsyncClient.post` so they run without a live companion,
 mirroring the pattern in test_wire_compat.py / test_health_error_handling.py.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +31,9 @@ class _FakeResp:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise httpx.HTTPStatusError(
-                f"http {self.status_code}", request=None, response=None  # type: ignore[arg-type]
+                f"http {self.status_code}",
+                request=None,
+                response=None,  # type: ignore[arg-type]
             )
 
 
@@ -119,9 +122,7 @@ def test_notify_422_invalid_request_raises_with_detail(
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_post(self: Any, url: str, **kwargs: Any) -> Any:
-        return _FakeResp(
-            422, {"error": "invalid_request", "detail": "title must not be empty"}
-        )
+        return _FakeResp(422, {"error": "invalid_request", "detail": "title must not be empty"})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 

@@ -19,6 +19,7 @@ Tolerant of companion version: assertions that target >=0.5.0 features
 (wire_version, the async `GET /render/{id}` route) degrade gracefully so the
 suite also passes against an older installed release.
 """
+
 from __future__ import annotations
 
 import os
@@ -122,7 +123,11 @@ def test_media_route_exists_and_404s_for_unknown() -> None:
         f"{ENDPOINT}/media/blob/nonexistent-harness-probe.bin",
         timeout=TIMEOUT,
     )
-    if r.status_code == 404 and (r.text or "").strip() == "" and "ServeDir" not in r.headers.get("server", ""):
+    if (
+        r.status_code == 404
+        and (r.text or "").strip() == ""
+        and "ServeDir" not in r.headers.get("server", "")
+    ):
         # Could be a route-miss on an older companion; ServeDir 404s are also
         # empty-body, so we can't distinguish — accept 404 either way as "no
         # such file", and only fail on a hard 5xx.

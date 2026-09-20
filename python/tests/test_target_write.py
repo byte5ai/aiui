@@ -4,9 +4,9 @@ Mirror of the Rust `filewrite` tests. The bridge runs ON the agent's host, so
 `target` writes are local file operations here too; secret values are written
 and stripped before the result reaches the agent.
 """
+
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from aiui_mcp.server import (
@@ -21,9 +21,18 @@ from aiui_mcp.server import (
 def test_collect_target_fields_flat_and_tabs() -> None:
     spec = {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/x"}},
-                   {"kind": "text", "name": "b"}],
-        "tabs": [{"label": "T", "fields": [{"kind": "text", "name": "c", "target": {"mode": "create", "path": "/y"}}]}],
+        "fields": [
+            {"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/x"}},
+            {"kind": "text", "name": "b"},
+        ],
+        "tabs": [
+            {
+                "label": "T",
+                "fields": [
+                    {"kind": "text", "name": "c", "target": {"mode": "create", "path": "/y"}}
+                ],
+            }
+        ],
     }
     names = sorted(f["name"] for f in _collect_target_fields(spec))
     assert names == ["a", "c"]
@@ -49,7 +58,9 @@ def test_create_writes_and_refuses_clobber(tmp_path: Path) -> None:
 def test_substitute_replaces_exactly_once(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("token: __PAT__\nother: 1\n")
-    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"})
+    out = _write_local_target(
+        "ghp_x", {"mode": "substitute", "path": str(path), "placeholder": "__PAT__"}
+    )
     assert out["written"], out
     assert path.read_text() == "token: ghp_x\nother: 1\n"
 
@@ -57,9 +68,13 @@ def test_substitute_replaces_exactly_once(tmp_path: Path) -> None:
 def test_substitute_errors_on_zero_or_many(tmp_path: Path) -> None:
     path = tmp_path / "c.txt"
     path.write_text("none here")
-    assert not _write_local_target("v", {"mode": "substitute", "path": str(path), "placeholder": "X"})["written"]
+    assert not _write_local_target(
+        "v", {"mode": "substitute", "path": str(path), "placeholder": "X"}
+    )["written"]
     path.write_text("X and X")
-    assert not _write_local_target("v", {"mode": "substitute", "path": str(path), "placeholder": "X"})["written"]
+    assert not _write_local_target(
+        "v", {"mode": "substitute", "path": str(path), "placeholder": "X"}
+    )["written"]
 
 
 def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
@@ -68,14 +83,21 @@ def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
     spec = {
         "kind": "form",
         "fields": [
-            {"kind": "secret", "name": "pat", "target": {"mode": "create", "path": str(secret_path)}},
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            },
             {"kind": "text", "name": "label", "target": {"mode": "create", "path": str(note_path)}},
             {"kind": "text", "name": "plain"},
         ],
     }
     data = {
         "cancelled": False,
-        "result": {"action": None, "values": {"pat": "ghp_secret", "label": "hello", "plain": "kept"}},
+        "result": {
+            "action": None,
+            "values": {"pat": "ghp_secret", "label": "hello", "plain": "kept"},
+        },
     }
     _apply_target_writes(spec, data)
     values = data["result"]["values"]
@@ -93,8 +115,16 @@ def test_apply_target_writes_strips_secret(tmp_path: Path) -> None:
 
 def test_apply_target_writes_noop_on_cancel(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
-    spec = {"kind": "form", "fields": [{"kind": "secret", "name": "pat",
-            "target": {"mode": "create", "path": str(secret_path)}}]}
+    spec = {
+        "kind": "form",
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            }
+        ],
+    }
     data = {"cancelled": True, "result": {}}
     _apply_target_writes(spec, data)
     assert not secret_path.exists(), "no write on cancel"
@@ -108,9 +138,18 @@ def _spec_with_documented_actions(secret_path: Path) -> dict:
     documented pattern that made #177 reachable by copy-paste."""
     return {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "pat",
-                    "target": {"mode": "create", "path": str(secret_path),
-                               "perm": "0600", "overwrite": True}}],
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {
+                    "mode": "create",
+                    "path": str(secret_path),
+                    "perm": "0600",
+                    "overwrite": True,
+                },
+            }
+        ],
         "actions": [
             {"label": "Cancel", "value": "cancel", "skip_validation": True},
             {"label": "Save draft", "value": "draft", "skip_validation": True},
@@ -140,14 +179,17 @@ def test_substitute_refuses_empty_value(tmp_path: Path) -> None:
 
 def test_action_commits_targets_rules() -> None:
     spec = _spec_with_documented_actions(Path("/tmp/x"))
-    assert _action_commits_targets(spec, None) is True          # built-in submit
-    assert _action_commits_targets(spec, "commit") is True      # plain named action
-    assert _action_commits_targets(spec, "cancel") is False     # skip_validation
-    assert _action_commits_targets(spec, "draft") is False      # skip_validation
-    assert _action_commits_targets(spec, "nope") is False       # unknown → fail closed
+    assert _action_commits_targets(spec, None) is True  # built-in submit
+    assert _action_commits_targets(spec, "commit") is True  # plain named action
+    assert _action_commits_targets(spec, "cancel") is False  # skip_validation
+    assert _action_commits_targets(spec, "draft") is False  # skip_validation
+    assert _action_commits_targets(spec, "nope") is False  # unknown → fail closed
     assert _action_commits_targets({"kind": "form"}, "x") is False  # no action list
-    override = {"actions": [{"label": "Force", "value": "f",
-                             "skip_validation": True, "writes_targets": True}]}
+    override = {
+        "actions": [
+            {"label": "Force", "value": "f", "skip_validation": True, "writes_targets": True}
+        ]
+    }
     assert _action_commits_targets(override, "f") is True
 
 
@@ -155,8 +197,7 @@ def test_apply_target_writes_skips_skip_validation_action(tmp_path: Path) -> Non
     secret_path = tmp_path / "tok"
     secret_path.write_text("ghp_existing")
     spec = _spec_with_documented_actions(secret_path)
-    data = {"cancelled": False,
-            "result": {"action": "cancel", "values": {"pat": "ghp_real"}}}
+    data = {"cancelled": False, "result": {"action": "cancel", "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)
     assert secret_path.read_text() == "ghp_existing", "Cancel must not write"
     values = data["result"]["values"]
@@ -168,8 +209,7 @@ def test_apply_target_writes_skips_skip_validation_action(tmp_path: Path) -> Non
 def test_apply_target_writes_commits_on_primary_action(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
     spec = _spec_with_documented_actions(secret_path)
-    data = {"cancelled": False,
-            "result": {"action": "commit", "values": {"pat": "ghp_real"}}}
+    data = {"cancelled": False, "result": {"action": "commit", "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)
     assert secret_path.read_text() == "ghp_real", "happy path must not regress"
     values = data["result"]["values"]
@@ -207,8 +247,7 @@ def test_collect_secret_fields_finds_them_with_and_without_target() -> None:
         "kind": "form",
         "fields": [
             {"kind": "secret", "name": "bare"},
-            {"kind": "secret", "name": "targeted",
-             "target": {"mode": "create", "path": "/x"}},
+            {"kind": "secret", "name": "targeted", "target": {"mode": "create", "path": "/x"}},
             {"kind": "password", "name": "pw"},
             {"kind": "text", "name": "t"},
         ],
@@ -255,8 +294,13 @@ def test_targeted_secret_still_reports_its_write(tmp_path: Path) -> None:
     secret_path = tmp_path / "tok"
     spec = {
         "kind": "form",
-        "fields": [{"kind": "secret", "name": "pat",
-                    "target": {"mode": "create", "path": str(secret_path)}}],
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(secret_path)},
+            }
+        ],
     }
     data = {"cancelled": False, "result": {"action": None, "values": {"pat": "ghp_real"}}}
     _apply_target_writes(spec, data)

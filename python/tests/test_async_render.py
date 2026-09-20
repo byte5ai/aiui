@@ -1,6 +1,7 @@
 """Tests for the async-render client path (Step 3): the bridge POSTs, then
 polls `GET /render/{id}` until a terminal result, emitting progress on the way.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -93,9 +94,7 @@ def test_poll_render_reports_progress_each_pending_iteration(
     assert ctx.ticks == [1.0]  # one pending iteration → one progress tick
 
 
-def test_poll_render_raises_on_404(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_poll_render_raises_on_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
@@ -112,9 +111,7 @@ def test_poll_render_raises_on_404(
     assert "lost track" in str(exc_info.value)
 
 
-def test_wait_for_aiui_returns_when_ping_ok(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_wait_for_aiui_returns_when_ping_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:

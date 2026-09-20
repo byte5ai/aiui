@@ -19,6 +19,7 @@ The server binds an ephemeral loopback port (not the fixed 7777, which may be
 taken or need the real app) and points the bridge at it — the contract exercised
 is identical; only the port number differs.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -178,7 +179,6 @@ def test_wrong_token_is_rejected(
     with pytest.raises(RuntimeError) as exc:
         asyncio.run(confirm(title="Proceed?"))
     assert "401" in str(exc.value) or "token" in str(exc.value).lower()
-
 
 
 def test_invalid_spec_422_reaches_the_agent_with_its_reason(companion: Any) -> None:

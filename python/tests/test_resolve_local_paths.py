@@ -7,6 +7,7 @@ bridge, SSH-tunneled remotes through this Python one. Drift between
 them produces silent "works in one setup, broken in the other"
 bugs.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -89,9 +90,7 @@ def test_resolve_local_paths_inlines_real_file_and_skips_others(tmp_path: Path) 
 
     # Local path was rewritten in both places.
     assert spec["fields"][0]["src"].startswith("data:image/png;base64,")
-    assert spec["fields"][3]["items"][0]["thumbnail"].startswith(
-        "data:image/png;base64,"
-    )
+    assert spec["fields"][3]["items"][0]["thumbnail"].startswith("data:image/png;base64,")
     # HTTPS URL is left alone — that's the server-side resolver's job.
     assert spec["fields"][1]["src"] == "https://leave.me/alone.png"
     # Pre-existing data: URL is untouched.
@@ -281,10 +280,7 @@ def test_collect_and_replace_local_audio_mirrors_rust() -> None:
     mapping = {"/Users/me/sample.mp3": "http://127.0.0.1:7777/media/blob/x.mp3"}
     _replace_srcs(spec, mapping)
     assert spec["fields"][0]["src"] == "http://127.0.0.1:7777/media/blob/x.mp3"
-    assert (
-        spec["fields"][3]["items"][0]["thumbnail"]
-        == "http://127.0.0.1:7777/media/blob/x.mp3"
-    )
+    assert spec["fields"][3]["items"][0]["thumbnail"] == "http://127.0.0.1:7777/media/blob/x.mp3"
     # Untouched: https audio and the image.
     assert spec["fields"][1]["src"] == "https://x.test/two.mp3"
     assert spec["fields"][2]["src"] == "/Users/me/pic.png"

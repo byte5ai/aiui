@@ -9,6 +9,7 @@ Forwarding is generic, so a reason added later needs no bridge change. An agent 
 I6: this must behave identically to the Rust bridge's
 `format_dialog_result`, which has the mirror tests.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -27,9 +28,7 @@ def test_cancel_reason_is_forwarded(reason: str) -> None:
 
 def test_plain_user_cancel_carries_no_reason() -> None:
     """Escape has no reason attached; inventing one is worse than omitting it."""
-    assert _format_result({"id": "d1", "cancelled": True, "result": None}) == {
-        "cancelled": True
-    }
+    assert _format_result({"id": "d1", "cancelled": True, "result": None}) == {"cancelled": True}
 
 
 def test_empty_or_non_string_reason_is_dropped() -> None:

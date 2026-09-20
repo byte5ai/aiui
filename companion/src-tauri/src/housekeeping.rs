@@ -690,6 +690,21 @@ mod tests {
         }
     }
 
+    /// #210: the `aiui.exe` leaf is what keeps the Windows sweep from
+    /// signalling a process that merely carries `--mcp-stdio` in its argv.
+    /// Platform-independent by construction (both separators are split on),
+    /// so both shapes are asserted on every leg rather than only where the
+    /// path happens to be native.
+    #[test]
+    fn is_aiui_binary_matches_the_exe_leaf_on_windows() {
+        assert!(is_aiui_binary(r"C:\Program Files\aiui\aiui.exe"));
+        assert!(is_aiui_binary(r"C:\Program Files\aiui\AIUI.EXE"));
+        assert!(!is_aiui_binary(r"C:\x\notaiui.exe"));
+        // The Unix shapes keep working from the same predicate.
+        assert!(is_aiui_binary("/Applications/aiui.app/Contents/MacOS/aiui"));
+        assert!(!is_aiui_binary("/usr/local/bin/aiui-mcp"));
+    }
+
     #[test]
     fn skips_unrelated_processes() {
         let s = vec![

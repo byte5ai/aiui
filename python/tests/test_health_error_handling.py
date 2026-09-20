@@ -13,6 +13,7 @@ fix is `_explain_exc`, which falls back to the exception class name when
 `str(e)` has nothing useful, plus extra `except` branches in `_preflight`
 that translate the protocol-level errors into actionable messages.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +26,7 @@ from aiui_mcp.server import _explain_exc, _preflight, aiui_health
 
 
 # ----- _explain_exc unit tests -----
+
 
 def test_explain_exc_returns_class_name_when_str_empty() -> None:
     """The bug-trigger: httpx exceptions with empty str() must still surface."""
@@ -49,6 +51,7 @@ def test_explain_exc_works_for_non_httpx_exceptions() -> None:
 
 
 # ----- aiui_health integration: never returns empty error -----
+
 
 def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """Make the token-file lookup succeed with a dummy bearer."""
@@ -94,6 +97,7 @@ def test_aiui_health_passes_through_message_when_present(
 
 
 # ----- _preflight integration: extended except-chain catches the right classes -----
+
 
 def test_preflight_translates_remote_protocol_error_to_actionable_runtime_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any

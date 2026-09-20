@@ -14,6 +14,7 @@ The aiui token is read from `~/.config/aiui/token` — installed once when
 the companion runs on the Mac, and scp'd automatically to each remote host
 registered in the companion's settings window.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -256,9 +257,7 @@ async def _preflight() -> None:
                 f"from the companion's settings window to re-sync the token."
             )
         if r.status_code != 200:
-            raise RuntimeError(
-                f"aiui companion /health returned {r.status_code}: {r.text[:200]}"
-            )
+            raise RuntimeError(f"aiui companion /health returned {r.status_code}: {r.text[:200]}")
 
         # Cooperative version floor (Step 2): once per process, confirm the
         # companion speaks a compatible wire version. Reuses this client.
@@ -553,7 +552,11 @@ def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
     def scan(fields: Any) -> None:
         if isinstance(fields, list):
             for f in fields:
-                if isinstance(f, dict) and f.get("target") is not None and isinstance(f.get("name"), str):
+                if (
+                    isinstance(f, dict)
+                    and f.get("target") is not None
+                    and isinstance(f.get("name"), str)
+                ):
                     out.append(f)
 
     scan(spec.get("fields"))
@@ -597,7 +600,7 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     value. Returns `{written, target, bytes, error?}`.
     """
     raw_path = str(target.get("path", ""))
-    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path):
+    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw_path):
         return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
     path = Path(raw_path).expanduser()
     display = str(path)
@@ -608,8 +611,12 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     # erase the sentinel, making a retry impossible). Mirrors the identical
     # guard in Rust `filewrite::write_local`.
     if value == "":
-        return {"written": False, "target": display, "bytes": 0,
-                "error": "refusing to write an empty value"}
+        return {
+            "written": False,
+            "target": display,
+            "bytes": 0,
+            "error": "refusing to write an empty value",
+        }
     mode = target.get("mode")
     perm_s = target.get("perm")
     try:
@@ -635,22 +642,36 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     try:
         if mode == "create":
             if path.exists() and not target.get("overwrite"):
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "file exists and overwrite is false (mode: create)"}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "file exists and overwrite is false (mode: create)",
+                }
             atomic_write(path, value.encode())
             return {"written": True, "target": display, "bytes": len(value.encode())}
         if mode == "substitute":
             placeholder = target.get("placeholder")
             if not placeholder:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "substitute mode requires 'placeholder'"}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "substitute mode requires 'placeholder'",
+                }
             existing = path.read_text()
             count = existing.count(placeholder)
             if count != 1:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": (f"placeholder '{placeholder}' not found in target file"
-                                  if count == 0
-                                  else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": (
+                        f"placeholder '{placeholder}' not found in target file"
+                        if count == 0
+                        else f"placeholder '{placeholder}' found {count}× (must be exactly 1)"
+                    ),
+                }
             updated = existing.replace(placeholder, value, 1)
             atomic_write(path, updated.encode())
             return {"written": True, "target": display, "bytes": len(updated.encode())}
@@ -718,14 +739,21 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
         v = values.get(name)
         if not commits:
             label = action if action is not None else "(submit)"
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0,
-                       "error": f"action '{label}' does not commit target writes"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": f"action '{label}' does not commit target writes",
+            }
         elif name not in values or v is None:
             # "Absent from the payload" is not "submitted blank": never
             # launder a missing key into an empty write.
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0, "error": "no value submitted for this field"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": "no value submitted for this field",
+            }
         else:
             outcome = _write_local_target(str(v), field["target"])
         if field.get("kind") == "secret":
@@ -793,7 +821,10 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
             try:
                 os.link(tmp, dest)
             except FileExistsError:
-                return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+                return {
+                    "status": "error",
+                    "error": f"target already exists, not overwriting: {dest}",
+                }
         finally:
             try:
                 os.unlink(tmp)
@@ -945,7 +976,7 @@ async def _post_render(
         if r.status_code == 422:
             try:
                 body = r.json()
-            except Exception:
+            except Exception:  # noqa: BLE001 — a non-JSON 422 body is still a 422
                 body = {}
             detail = body.get("detail") or "the companion rejected the dialog spec"
             hint = body.get("hint")
@@ -970,7 +1001,9 @@ async def _post_render(
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
-        spec.get("kind"), data.get("cancelled"), dt,
+        spec.get("kind"),
+        data.get("cancelled"),
+        dt,
     )
     return data
 
@@ -1552,7 +1585,7 @@ def teach_prompt() -> str:
     the agent reaches for the right dialog without further prompting."""
     try:
         return (resources.files("aiui_mcp") / "skill.md").read_text()
-    except Exception:
+    except Exception:  # noqa: BLE001 — a missing/unreadable doc must degrade to the link
         return (
             "aiui skill doc not bundled with this install. "
             "See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
@@ -1692,7 +1725,7 @@ async def aiui_health() -> dict[str, Any]:
             r.raise_for_status()
             data = r.json()
             return {"ok": True, **data, "endpoint": ENDPOINT, "server": BUILD_INFO}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — health reports failures, it never raises them
         log.warning("health check failed: %s", e)
         return {
             "ok": False,

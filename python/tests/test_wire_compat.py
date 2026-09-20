@@ -5,6 +5,7 @@ sides carry a `wire_version`; on a hard mismatch the bridge surfaces a
 structured "restart this session" tool error and otherwise tolerates ordinary
 app-version skew. These cover `_check_wire_compat`.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -89,9 +90,7 @@ def test_missing_wire_version_field_is_tolerated(
     assert server._wire_checked is True
 
 
-def test_read_error_is_tolerated_not_fatal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
-) -> None:
+def test_read_error_is_tolerated_not_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """A transient /version read failure must not block rendering."""
     _setup_token(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_wire_checked", False)
