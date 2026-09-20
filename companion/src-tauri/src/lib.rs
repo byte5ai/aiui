@@ -1398,6 +1398,12 @@ pub fn run_mcp_stdio_only() {
     // orphans exist; never touches live siblings.
     let _ = housekeeping::kill_orphaned_mcp_stdio_children();
 
+    // Baseline for the cross-platform half of the stale-binary self-check
+    // (#200). `disk_version_if_stale` above is macOS-only; the exe's mtime
+    // works everywhere and is what catches a Windows NSIS in-place update.
+    // Read once, here, before anything can have replaced the file.
+    let exe_mtime_at_start = housekeeping::current_exe_mtime();
+
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     logging::trace(&format!(
         "mcp-stdio: entering run loop, token_path={}",
@@ -1412,18 +1418,27 @@ pub fn run_mcp_stdio_only() {
         // Periodic stale-binary self-check (v0.4.43, Codex review P1a):
         // every 30 s we re-run disk_version_if_stale. If the on-disk
         // bundle has been replaced (in-app update, manual DMG drop)
-        // since we started, we exit so Claude Desktop respawns us
-        // against the fresh binary. Without this, a child spawned
-        // before the update keeps running its old in-RAM code
-        // indefinitely — the exact failure mode that the 2026-05-23
+        // since we started, we exit so the host respawns us against the
+        // fresh binary. Without this, a child spawned before the update
+        // keeps running its old in-RAM code indefinitely — the exact
+        // failure mode that the 2026-05-23
         // 0.4.40-children-survive-update cascade was driven by.
-        tokio::spawn(async {
+        //
+        // #200: the version check is macOS-only (there is no Info.plist
+        // on Windows), so the tick also compares the exe's mtime against
+        // the baseline taken at start. That is the Windows arm of the
+        // same guarantee: after the GUI-side path sweep became
+        // orphan-gated it no longer force-refreshes a live child, so an
+        // NSIS in-place update has to be noticed here or not at all.
+        // Exiting ourselves is also the only shutdown Claude Code /
+        // Cowork / Codex answer with a respawn.
+        tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if let Some(disk_version) = housekeeping::disk_version_if_stale() {
                     eprintln!(
                         "[aiui] mcp-stdio: periodic self-check: in-memory v{} \
-                         != on-disk v{}; exiting so Claude Desktop respawns \
+                         != on-disk v{}; exiting so the host respawns \
                          the fresh build.",
                         env!("CARGO_PKG_VERSION"),
                         disk_version
@@ -1434,6 +1449,21 @@ pub fn run_mcp_stdio_only() {
                         disk_version,
                         env!("CARGO_PKG_VERSION")
                     ));
+                    std::process::exit(0);
+                }
+                if housekeeping::is_exe_mtime_stale(
+                    exe_mtime_at_start,
+                    housekeeping::current_exe_mtime(),
+                ) {
+                    eprintln!(
+                        "[aiui] mcp-stdio: periodic self-check: the executable \
+                         on disk was replaced since we started; exiting so the \
+                         host respawns the fresh build."
+                    );
+                    logging::trace(
+                        "mcp-stdio: periodic self-check fired — exe mtime \
+                         changed since start; exiting (clean)",
+                    );
                     std::process::exit(0);
                 }
             }
@@ -1645,16 +1675,24 @@ pub fn run() {
                 trace_step("Claude Desktop config registration", setup::patch_claude_desktop_config(&bin));
             }
 
-            // Kill any `aiui --mcp-stdio` children left over from an older app
-            // version. Without this, a user who drops a new aiui.app over an
-            // old one would still have the old MCP-stdio children running
-            // under Claude Desktop — which may lack the auto-resurrect loop
-            // and won't reconnect to the new GUI. SIGTERMing them forces
-            // Claude Desktop to respawn against the freshly patched config.
+            // Reap `aiui --mcp-stdio` children left over from an older app
+            // version at a different path. Without this, a user who drops a
+            // new aiui.app beside an old one would still have the old
+            // MCP-stdio children running — which may lack the auto-resurrect
+            // loop and won't reconnect to the new GUI.
+            //
+            // #200: only *orphaned* children qualify. A path mismatch alone
+            // is not abandonment — the user moving aiui.app out of
+            // ~/Downloads, or running a dev build next to the release, gives
+            // every live child a "stale" path. Claude Desktop respawns one we
+            // kill; Claude Code, Cowork and Codex do not, so an ungated sweep
+            // handed those users `Server disconnected` on their next tool
+            // call. The in-place-update case lives child-side instead (the
+            // 30 s self-check in run_mcp_stdio_only).
             let killed = housekeeping::kill_stale_mcp_stdio_children(&bin);
             if killed > 0 {
                 logging::trace(&format!(
-                    "gui: sent SIGTERM to {killed} stale mcp-stdio child(ren); Claude Desktop will respawn them"
+                    "gui: terminated {killed} orphaned stale-path mcp-stdio child(ren)"
                 ));
             }
 
@@ -1748,12 +1786,18 @@ pub fn run() {
             });
 
             // Startup orphan sweep: any `ssh -NTR <port>:localhost:<port>`
-            // process that's been re-parented to launchd (ppid=1) is a
-            // tunnel from a previously-crashed aiui that exited via
+            // process whose parent is gone is a tunnel from a
+            // previously-crashed or force-quit aiui that exited via
             // `app.exit()` / `process::exit()` and skipped Drop. Left
             // alive, it holds the remote-side port and forces the new
             // GUI into shared-forward mode forever — the v0.4.36 loop
             // root cause. Sweep before binding our own tunnels. v0.4.37.
+            //
+            // "Parent is gone" is `is_orphaned_child`, not `ppid == 1`
+            // (#200): the launchd-reparenting rule the sweep used to
+            // apply is macOS-only, so this was a permanent no-op on
+            // Windows and a force-quit `aiui.exe` wedged the remote's
+            // port across every restart.
             {
                 let port = cfg.http_port;
                 let killed = housekeeping::kill_aiui_ssh_ntr(port, true);

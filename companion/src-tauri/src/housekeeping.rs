@@ -1,40 +1,71 @@
 //! Kill stale `aiui --mcp-stdio` children left over from older app versions.
 //!
-//! Context: Claude Desktop spawns `aiui --mcp-stdio` once and keeps it alive
-//! for the whole Claude Desktop session. If the user updates the aiui binary
-//! while a session is live, those already-spawned children keep running with
-//! the *old* code. Their lifetime-channel logic may be pre-auto-resurrect (≤
-//! v0.2.5) or otherwise incompatible, so the user ends up with a stale MCP
-//! server that refuses to reconnect to the new GUI.
+//! Context: an MCP host (Claude Desktop, Claude Code, Cowork, Codex) spawns
+//! `aiui --mcp-stdio` once and keeps it alive for the whole session. If the
+//! user updates the aiui binary while a session is live, those already-spawned
+//! children keep running with the *old* code. Their lifetime-channel logic may
+//! be pre-auto-resurrect (≤ v0.2.5) or otherwise incompatible, so the user ends
+//! up with a stale MCP server that refuses to reconnect to the new GUI.
 //!
-//! Two complementary mechanisms exist:
+//! # One orphan predicate for all three sweeps (#200)
 //!
-//!  1. **GUI-side sweep** (`kill_stale_mcp_stdio_children`): on every GUI
-//!     startup we scan for `aiui --mcp-stdio` processes whose executable
-//!     path differs from ours and signal them to terminate. This catches the
-//!     case where the *path* changed — useless when the user replaced the
-//!     binary in place.
+//! Three sweeps in this module ask the same question — *"is this process mine
+//! and genuinely abandoned?"* — and all three now answer it with the single
+//! `is_orphaned_child` predicate. That predicate is cross-platform **by
+//! construction**: `ppid == 1` covers macOS/Linux, where the kernel reparents
+//! an orphan to launchd/init; `!snap.contains(ppid)` covers Windows, which does
+//! not reparent — a dead parent's pid simply stops appearing in the snapshot.
+//! Nothing outside `is_orphaned_child` may test `ppid == 1` again.
 //!
-//!  2. **Subprocess-side self-check** (`disk_version_if_stale`, macOS only):
-//!     every `--mcp-stdio` invocation reads `CFBundleShortVersionString` from
-//!     the on-disk `Info.plist` two directories up from `argv[0]` and
-//!     compares it with `CARGO_PKG_VERSION` baked in at compile time. If they
-//!     disagree, the in-memory binary is stale — the bundle on disk was
-//!     replaced after this process loaded — and we exit so Claude Desktop
-//!     respawns us against the fresh binary.
+//! Why the gate is load-bearing: only Claude Desktop respawns an MCP child it
+//! loses. Claude Code, Cowork and Codex do **not** — killing a live child there
+//! is a one-way trip to `Server disconnected` on the user's next tool call.
+//! This was fixed twice before (v0.4.46 Bug A, v0.8.2) for the orphan and
+//! pre-GUI sweeps; #200 closes the third instance in the path-based sweep.
 //!
-//!     On Windows there is no analog of `Info.plist`. The Windows path-based
-//!     sweep (mechanism 1) covers the NSIS-update case because NSIS replaces
-//!     files at the install path while old children continue running from a
-//!     temporary copy under their original PID — sysinfo's `exe()` reports
-//!     the original path, which differs from `current_exe()` for the freshly
-//!     spawned GUI.
+//! # The three process sweeps
 //!
-//! Cross-platform via `sysinfo`: both sweeps enumerate processes with the
+//!  1. **GUI-side path sweep** (`kill_stale_mcp_stdio_children`): on every GUI
+//!     startup we scan for *orphaned* `aiui --mcp-stdio` processes whose
+//!     executable path differs from ours and signal them to terminate. Paths
+//!     are compared canonicalized, and a process whose `exe()` sysinfo could
+//!     not read (so the snapshot fell back to `argv[0]`) is never classified
+//!     stale — we don't kill on evidence we couldn't read.
+//!
+//!  2. **Pre-GUI sweep** (`kill_mcp_stdio_started_before_self`): orphaned
+//!     mcp-stdio children older than this GUI generation.
+//!
+//!  3. **Orphan tunnel sweep** (`kill_aiui_ssh_ntr` with `only_orphans`):
+//!     `ssh -N -T -R <port>:localhost:<port>` children whose aiui parent died
+//!     without firing `kill_on_drop`. Orphan-gated by `is_orphaned_child`
+//!     since #200 — the previous `ppid == Some(1)` literal made this a
+//!     permanent no-op on Windows, where a force-quit `aiui.exe` left the
+//!     tunnel holding the remote's port across every restart.
+//!
+//! # Subprocess-side self-check (the in-place-update path)
+//!
+//! A sweep can only see a path change. When the user replaces the binary *in
+//! place* the path is identical, so the child has to notice by itself and exit
+//! cleanly — the one shutdown every host does honour with a respawn. Two
+//! checks run at `--mcp-stdio` start and then every 30 s (`lib.rs`):
+//!
+//!  * `disk_version_if_stale` (macOS): reads `CFBundleShortVersionString` from
+//!    the on-disk `Info.plist` two directories up from `argv[0]` and compares
+//!    it with the compile-time `CARGO_PKG_VERSION`.
+//!  * `current_exe_mtime` / `is_exe_mtime_stale` (all platforms): records the
+//!    mtime of `current_exe()` at start and exits when it changes. This is the
+//!    Windows analogue of the version check — there is no `Info.plist` there,
+//!    and after #200 orphan-gated the path sweep it is what keeps a Windows
+//!    NSIS in-place update from leaving a live child on pre-update code.
+//!
+//! Cross-platform via `sysinfo`: every sweep enumerates processes with the
 //! same API, no `ps`/`tasklist` shell-out, no /proc assumption.
 //!
 //! Safety: we never kill our own pid. If the current binary path can't be
-//! determined, we skip the path-based sweep entirely.
+//! determined, we skip the path-based sweep entirely. Every kill goes through
+//! `terminate_victim`, which re-asserts the victim's identity (exe leaf + argv)
+//! against the sweep's own snapshot before it signals, so a pid recycled
+//! between "proved it" and "signal it" is refused rather than killed.
 //!
 //! Idempotent: running on a clean system is a no-op.
 
@@ -43,7 +74,7 @@ use fs4::fs_std::FileExt;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use sysinfo::{ProcessRefreshKind, RefreshKind, Signal, System};
+use sysinfo::{ProcessRefreshKind, RefreshKind, Signal, System, UpdateKind};
 
 /// Process-lifetime advisory lock backed by `flock` on Unix (and
 /// `LockFileEx` on Windows via `fs4`). Used to enforce a single live
@@ -140,12 +171,21 @@ struct StaleChild {
 #[derive(Debug, Clone)]
 struct ProcSnap {
     pid: u32,
-    /// Parent PID. On macOS/Linux this is the immediate parent; orphans
-    /// re-parent to launchd/init (pid 1). `None` only when sysinfo can't
-    /// resolve the parent (rare; treat as "unknown, don't act").
+    /// Parent PID, exactly as the OS reports it — never interpreted here.
+    /// `is_orphaned_child` is the only place that decides what a given ppid
+    /// means, because the meaning differs per platform: macOS/Linux reparent
+    /// an orphan to launchd/init, Windows leaves the ppid naming a dead
+    /// process. `None` only when sysinfo can't resolve the parent at all.
     ppid: Option<u32>,
     exe: String,
     args: Vec<String>,
+    /// `false` when sysinfo could not resolve the executable and `exe`
+    /// above is the `argv[0]` fallback — possibly relative, possibly a
+    /// bare command name, in any case *not* a path we may compare
+    /// against `current_exe()`. The path-based stale sweep skips such a
+    /// process rather than killing it on evidence it could not read
+    /// (#200).
+    exe_resolved: bool,
     /// Process start time in seconds since the Unix epoch (whatever
     /// `sysinfo::Process::start_time` returns for the current OS).
     /// Used by the sibling-mcp-stdio sweep to enforce a strict
@@ -154,24 +194,53 @@ struct ProcSnap {
     start_time: u64,
 }
 
-/// Enumerate every running process via `sysinfo` and return a snapshot.
-/// Cross-platform: identical behaviour on macOS, Linux, and Windows.
-fn snapshot_processes() -> Vec<ProcSnap> {
-    let sys = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    );
-    sys.processes()
+/// Exactly the process fields the filters in this module read: `cmd` (for
+/// `has_mcp_stdio_flag` / `is_aiui_ssh_ntr_for_port`) and `exe` (for
+/// `is_aiui_binary` and the path comparison). `ppid` and `start_time` are
+/// core fields sysinfo always refreshes, so they need no opt-in.
+///
+/// Deliberately *not* `ProcessRefreshKind::everything()` (#200): that also
+/// pulls cpu, memory, disk_usage, user, cwd, root and environ for every
+/// process on the machine, which cost hundreds of milliseconds we then spent
+/// widening the window between proving a victim and signalling it.
+fn process_fields() -> ProcessRefreshKind {
+    ProcessRefreshKind::new()
+        .with_cmd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always)
+}
+
+/// Executable path of `p`, plus whether sysinfo actually resolved it.
+/// `false` means the string is the `argv[0]` fallback. Shared by
+/// `snapshot_processes` and `terminate_victim` so the identity re-check
+/// applies the exact same rule the finder did.
+fn resolve_exe(p: &sysinfo::Process) -> (String, bool) {
+    match p.exe() {
+        Some(e) => (e.to_string_lossy().to_string(), true),
+        None => (
+            p.cmd()
+                .first()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            false,
+        ),
+    }
+}
+
+/// Enumerate every running process via `sysinfo` once and return both the
+/// live `System` and a snapshot of it. Cross-platform: identical behaviour
+/// on macOS, Linux, and Windows.
+///
+/// The `System` is returned rather than dropped so the caller can hand it to
+/// `terminate_victim`: killing off the *same* enumeration that proved the
+/// victim is what closes the pid-recycling window (#200).
+fn snapshot_processes() -> (System, Vec<ProcSnap>) {
+    let sys =
+        System::new_with_specifics(RefreshKind::new().with_processes(process_fields()));
+    let snap = sys
+        .processes()
         .iter()
         .map(|(pid, p)| {
-            let exe = p
-                .exe()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| {
-                    p.cmd()
-                        .first()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                });
+            let (exe, exe_resolved) = resolve_exe(p);
             let args = p
                 .cmd()
                 .iter()
@@ -182,10 +251,12 @@ fn snapshot_processes() -> Vec<ProcSnap> {
                 ppid: p.parent().map(|p| p.as_u32()),
                 exe,
                 args,
+                exe_resolved,
                 start_time: p.start_time(),
             }
         })
-        .collect()
+        .collect();
+    (sys, snap)
 }
 
 /// True iff `exe` looks like our aiui binary — last path component is
@@ -206,14 +277,77 @@ fn has_mcp_stdio_flag(args: &[String]) -> bool {
     args.iter().any(|a| a == "--mcp-stdio")
 }
 
-/// Filter: stale (different path) `aiui --mcp-stdio` children, excluding
-/// `own_pid`. Pure function over a snapshot, kept testable.
+/// Lexically normalize an executable path for comparison: unify the two
+/// separators, drop `.` segments, resolve `..`, collapse repeats. Purely
+/// textual — it never touches the filesystem, so it still works for a
+/// process whose binary has since been moved or replaced.
+fn normalize_exe_path(path: &str) -> String {
+    let leading: String = path
+        .chars()
+        .take_while(|c| *c == '/' || *c == '\\')
+        .map(|_| '/')
+        .collect();
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&last) if last != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    format!("{leading}{}", out.join("/"))
+}
+
+/// True iff `a` and `b` name the same executable. Compares canonicalized
+/// paths when both resolve on disk, and falls back to a lexical comparison
+/// otherwise — the binary a running child was started from may already have
+/// been moved away by the update we are reacting to.
+///
+/// #200: the sweep used to compare the two strings raw, so `/Applications/./
+/// aiui.app/…` or any other spelling of the install path classified a live
+/// child as stale.
+fn same_exe_path(a: &str, b: &str) -> bool {
+    if a == b || normalize_exe_path(a) == normalize_exe_path(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Filter: *orphaned* `aiui --mcp-stdio` children running from a different
+/// executable path than ours, excluding `own_pid`. Pure function over a
+/// snapshot, kept testable.
+///
+/// Orphan-gated since #200, mirroring `find_orphaned_mcp_stdio_to_kill` and
+/// `find_pre_gui_mcp_stdio_to_kill`. Without the gate, any GUI start killed
+/// every live `--mcp-stdio` child whose path string differed from ours — the
+/// user moving `aiui.app` out of `~/Downloads`, a dev build beside the
+/// released one, or an update while a session is open. Claude Desktop
+/// respawns such a child; Claude Code, Cowork and Codex do not, so the user
+/// got `Server disconnected` on their next tool call. The in-place-update
+/// case this sweep cannot see is handled child-side — see the module
+/// docstring.
+///
+/// Two further #200 tightenings on the path test itself: paths are compared
+/// canonicalized rather than as raw strings, and a process whose `exe` is the
+/// `argv[0]` fallback (`exe_resolved == false`) is skipped outright — an
+/// unreadable exe is not evidence of staleness.
 fn find_stale(snap: &[ProcSnap], current_exe_path: &str, own_pid: u32) -> Vec<StaleChild> {
     snap.iter()
         .filter(|p| p.pid != own_pid)
         .filter(|p| has_mcp_stdio_flag(&p.args))
+        .filter(|p| p.exe_resolved)
         .filter(|p| is_aiui_binary(&p.exe))
-        .filter(|p| p.exe != current_exe_path)
+        .filter(|p| !same_exe_path(&p.exe, current_exe_path))
+        .filter(|p| is_orphaned_child(snap, p))
         .map(|p| StaleChild {
             pid: p.pid,
             exe: p.exe.clone(),
@@ -235,13 +369,30 @@ fn find_all_children(snap: &[ProcSnap], own_pid: u32) -> Vec<StaleChild> {
         .collect()
 }
 
-/// A process is *orphaned* when its parent is gone — reparented to
-/// launchd/init (`ppid == 1`), parent unknown (`None`), or the ppid no
-/// longer exists in the snapshot. Only orphaned `aiui --mcp-stdio`
-/// children are safe to reap: their MCP client (the Claude.app / Cowork
-/// helper wrapper that spawned them) has died, so they are genuinely
-/// abandoned. A child whose parent is still alive belongs to a *live*
-/// session — and must be spared.
+/// A process is *orphaned* when its parent is gone. **The** orphan
+/// definition for this module: all three sweeps route through it, and no
+/// other code may re-derive one (#200).
+///
+/// Cross-platform by construction — the three arms are not alternatives,
+/// they are the three shapes "parent is gone" takes:
+///
+/// * `None` — sysinfo could not resolve the parent at all.
+/// * `Some(1)` — macOS/Linux: the kernel reparents an orphan to
+///   launchd/init. Windows never produces this.
+/// * `Some(pp)` not in the snapshot — Windows: nothing reparents an orphan,
+///   the recorded ppid keeps naming the dead parent, and a dead pid simply
+///   stops appearing in the enumeration. Also catches the macOS race where
+///   the parent died between fork and our snapshot.
+///
+/// Only orphaned children are safe to reap: their MCP client (the Claude.app
+/// / Cowork helper wrapper that spawned them) has died, so they are genuinely
+/// abandoned. A child whose parent is still alive belongs to a *live* session
+/// — and must be spared, because only Claude Desktop respawns one it loses.
+///
+/// Known limit: on Windows a *recycled* parent pid can make a genuine orphan
+/// look live. Closing that needs a `start_time` ordering check on the
+/// surviving parent, which is a separate change with its own test — not
+/// folded in here.
 fn is_orphaned_child(snap: &[ProcSnap], p: &ProcSnap) -> bool {
     match p.ppid {
         None => true,
@@ -303,24 +454,27 @@ fn find_orphaned_mcp_stdio_to_kill(snap: &[ProcSnap], own_pid: u32) -> Vec<Stale
 /// `kill_all_mcp_stdio_children` is the uninstall-only path for that.
 pub fn kill_orphaned_mcp_stdio_children() -> usize {
     let own_pid = std::process::id();
-    let snap = snapshot_processes();
+    let (sys, snap) = snapshot_processes();
     let victims = find_orphaned_mcp_stdio_to_kill(&snap, own_pid);
 
+    let mut killed = 0usize;
     for victim in &victims {
         trace(&format!(
             "housekeeping: reaping orphaned mcp-stdio pid={} exe={} \
              (parent gone — abandoned leak)",
             victim.pid, victim.exe
         ));
-        terminate_pid(victim.pid);
+        if terminate_victim(&sys, victim.pid, VictimKind::McpStdio) {
+            killed += 1;
+        }
     }
     let n = victims.len();
     if n > 0 {
         trace(&format!(
-            "housekeeping: reaped {n} orphaned mcp-stdio child(ren) on startup"
+            "housekeeping: reaped {killed} of {n} orphaned mcp-stdio child(ren) on startup"
         ));
     }
-    n
+    killed
 }
 
 /// Filter: every *orphaned* `aiui --mcp-stdio` child started strictly
@@ -374,7 +528,7 @@ fn find_pre_gui_mcp_stdio_to_kill(
 /// See `find_pre_gui_mcp_stdio_to_kill` for the rationale.
 pub fn kill_mcp_stdio_started_before_self() -> usize {
     let own_pid = std::process::id();
-    let snap = snapshot_processes();
+    let (sys, snap) = snapshot_processes();
     let own_start_time = snap
         .iter()
         .find(|p| p.pid == own_pid)
@@ -391,57 +545,146 @@ pub fn kill_mcp_stdio_started_before_self() -> usize {
         return 0;
     }
     let victims = find_pre_gui_mcp_stdio_to_kill(&snap, own_pid, own_start_time);
+    let mut killed = 0usize;
     for victim in &victims {
         trace(&format!(
             "housekeeping: killing pre-GUI orphan mcp-stdio pid={} exe={} \
              (older than GUI cutoff={} AND parent gone)",
             victim.pid, victim.exe, own_start_time
         ));
-        terminate_pid(victim.pid);
+        if terminate_victim(&sys, victim.pid, VictimKind::McpStdio) {
+            killed += 1;
+        }
     }
     if !victims.is_empty() {
         trace(&format!(
-            "housekeeping: terminated {} pre-GUI orphan mcp-stdio child(ren) at startup",
+            "housekeeping: terminated {killed} of {} pre-GUI orphan mcp-stdio child(ren) at startup",
             victims.len()
         ));
     }
-    victims.len()
+    killed
 }
 
-/// Cross-platform process termination via sysinfo. Sends SIGTERM on Unix
-/// and the equivalent terminate-by-handle on Windows.
-fn terminate_pid(pid: u32) {
-    let sys = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    );
-    if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
-        let _ = p.kill_with(Signal::Term).unwrap_or_else(|| p.kill());
+/// What a sweep proved about a process before it decided to signal it.
+/// `terminate_victim` re-asserts the matching claim against the live
+/// process right before it signals (#200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VictimKind {
+    /// An `aiui --mcp-stdio` child.
+    McpStdio,
+    /// One of our `ssh -N -T -R <port>:localhost:<port>` tunnel children.
+    SshNtr(u16),
+}
+
+/// Pure re-verification: does the process currently holding a pid still look
+/// like the victim the sweep proved? Kept free of `sysinfo` so it is unit
+/// testable without spawning anything.
+///
+/// "Does the pid still exist" is deliberately *not* the test: pid recycling
+/// means *exists* is not *is the same process*. The argv/exe re-assertion is
+/// the load-bearing part.
+fn victim_identity_matches(kind: VictimKind, exe: &str, args: &[String]) -> bool {
+    match kind {
+        VictimKind::McpStdio => is_aiui_binary(exe) && has_mcp_stdio_flag(args),
+        VictimKind::SshNtr(port) => is_aiui_ssh_ntr_for_port(args, port),
     }
 }
 
-/// Scan for stale `aiui --mcp-stdio` processes and terminate the ones
-/// whose executable path differs from `current_exe_path`. Returns the
-/// number of processes killed.
+/// Terminate one victim out of the enumeration the caller already built, and
+/// report whether the kill actually landed.
+///
+/// Three things this does that the old `terminate_pid` did not (#200):
+///
+/// * It reuses the caller's `System` instead of running a second full
+///   `ProcessRefreshKind::everything()` enumeration *per victim*. Those
+///   hundreds of milliseconds were exactly the window in which a victim could
+///   exit and the OS hand its pid to someone else.
+/// * It re-asserts the victim's identity before signalling, so a pid that no
+///   longer carries the argv/exe the sweep matched on is refused, not killed.
+/// * It returns the outcome instead of dropping it, so callers can log how
+///   many kills landed rather than how many victims they found.
+///
+/// Signal: `SIGTERM` on Unix. On Windows sysinfo supports only `Signal::Kill`,
+/// so `kill_with` returns `None` and the fallback `p.kill()` shells out to
+/// `taskkill.exe /PID <pid> /F` — a hard, ungraceful termination. That
+/// asymmetry is deliberate (there is no graceful equivalent available here),
+/// but it is not "the equivalent terminate-by-handle" the old docstring
+/// claimed.
+fn terminate_victim(sys: &System, pid: u32, expect: VictimKind) -> bool {
+    let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) else {
+        trace(&format!(
+            "housekeeping: pid={pid} no longer in the snapshot — nothing signalled"
+        ));
+        return false;
+    };
+    let (exe, _) = resolve_exe(p);
+    let args: Vec<String> = p
+        .cmd()
+        .iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+    if !victim_identity_matches(expect, &exe, &args) {
+        trace(&format!(
+            "housekeeping: refusing to signal pid={pid} — identity no longer \
+             matches {expect:?} (exe={exe}); pid recycled or process changed"
+        ));
+        return false;
+    }
+    match p.kill_with(Signal::Term) {
+        Some(true) => true,
+        Some(false) => {
+            trace(&format!(
+                "housekeeping: SIGTERM to pid={pid} failed (permission denied \
+                 or already gone)"
+            ));
+            false
+        }
+        None => {
+            // Windows: Signal::Term is unsupported, so this is
+            // `taskkill /PID <pid> /F`.
+            let landed = p.kill();
+            if !landed {
+                trace(&format!(
+                    "housekeeping: hard kill of pid={pid} failed (permission \
+                     denied or already gone)"
+                ));
+            }
+            landed
+        }
+    }
+}
+
+/// Scan for stale `aiui --mcp-stdio` processes and terminate the ones that
+/// are *orphaned* and run from an executable path other than
+/// `current_exe_path`. Returns the number of processes actually killed.
+///
+/// See `find_stale` for why the orphan gate is there (#200) — in short, a
+/// path mismatch alone is not abandonment, and the hosts other than Claude
+/// Desktop do not respawn a child we take down.
 pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
     let own_pid = std::process::id();
-    let snap = snapshot_processes();
+    let (sys, snap) = snapshot_processes();
     let stale = find_stale(&snap, current_exe_path, own_pid);
 
+    let mut killed = 0usize;
     for child in &stale {
         trace(&format!(
-            "housekeeping: killing stale mcp-stdio child pid={} exe={}",
+            "housekeeping: killing stale mcp-stdio child pid={} exe={} \
+             (different path AND parent gone)",
             child.pid, child.exe
         ));
-        terminate_pid(child.pid);
+        if terminate_victim(&sys, child.pid, VictimKind::McpStdio) {
+            killed += 1;
+        }
     }
 
     if !stale.is_empty() {
         trace(&format!(
-            "housekeeping: terminated {} stale mcp-stdio child(ren)",
+            "housekeeping: terminated {killed} of {} stale mcp-stdio child(ren)",
             stale.len()
         ));
     }
-    stale.len()
+    killed
 }
 
 /// Sibling of `kill_stale_mcp_stdio_children` that doesn't filter by
@@ -451,24 +694,27 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
 /// the moment we call `app.exit(0)`.
 pub fn kill_all_mcp_stdio_children() -> usize {
     let own_pid = std::process::id();
-    let snap = snapshot_processes();
+    let (sys, snap) = snapshot_processes();
     let children = find_all_children(&snap, own_pid);
 
+    let mut killed = 0usize;
     for child in &children {
         trace(&format!(
             "housekeeping: killing mcp-stdio child pid={} exe={} (uninstall sweep)",
             child.pid, child.exe
         ));
-        terminate_pid(child.pid);
+        if terminate_victim(&sys, child.pid, VictimKind::McpStdio) {
+            killed += 1;
+        }
     }
 
     if !children.is_empty() {
         trace(&format!(
-            "housekeeping: terminated {} mcp-stdio child(ren) for uninstall",
+            "housekeeping: terminated {killed} of {} mcp-stdio child(ren) for uninstall",
             children.len()
         ));
     }
-    children.len()
+    killed
 }
 
 /// True iff `args` look like a `ssh -N -T -R <port>:localhost:<port> ...`
@@ -498,16 +744,26 @@ fn is_aiui_ssh_ntr_for_port(args: &[String], port: u16) -> bool {
 }
 
 /// Filter: every `ssh -NTR <port>:localhost:<port>` process matching our
-/// tunnel signature. When `only_orphans` is true, restrict to processes
-/// whose ppid is 1 (launchd/init) — the case where an earlier aiui crashed
-/// out of `app.exit()` / `process::exit()` without firing `kill_on_drop`,
-/// leaving the ssh child re-parented to launchd. When false, return all
-/// matching processes (used pre-exit so we sweep our own active tunnels
-/// before the rust-side Drop is skipped). Pure over a snapshot.
+/// tunnel signature. When `only_orphans` is true, restrict to processes whose
+/// parent is gone (`is_orphaned_child`) — the case where an earlier aiui
+/// crashed or was force-quit out of `app.exit()` / `process::exit()` without
+/// firing `kill_on_drop`, leaving the ssh child behind. When false, return all
+/// matching processes (used pre-exit so we sweep our own active tunnels before
+/// the rust-side Drop is skipped). Pure over a snapshot.
+///
+/// #200: this used to test `ppid == Some(1)` directly, which is the
+/// macOS/launchd reparenting rule and therefore *never* true on Windows —
+/// Windows leaves the recorded ppid pointing at the dead parent. The startup
+/// sweep was a permanent no-op there, so a force-quit `aiui.exe` left
+/// `ssh -N -T -R` holding the remote's port, every new tunnel died on
+/// `ExitOnForwardFailure`, and the user sat in a 30 s-backoff `exit code 255`
+/// loop until they killed `ssh.exe` by hand. `is_orphaned_child` covers both
+/// platforms; a live tunnel is still spared because the running GUI parent is
+/// in the same snapshot.
 fn find_aiui_ssh_ntr(snap: &[ProcSnap], port: u16, only_orphans: bool) -> Vec<u32> {
     snap.iter()
         .filter(|p| is_aiui_ssh_ntr_for_port(&p.args, port))
-        .filter(|p| !only_orphans || p.ppid == Some(1))
+        .filter(|p| !only_orphans || is_orphaned_child(snap, p))
         .map(|p| p.pid)
         .collect()
 }
@@ -560,25 +816,29 @@ pub fn exit_cleanup(port: u16, reason: &str, scope: SweepScope) {
 }
 
 /// Sweep ssh-NTR tunnel children — see `find_aiui_ssh_ntr` for the filter.
-/// Returns the number of processes signalled. Logs each kill to the trace
-/// for post-mortem debuggability of the v0.4.36 orphan-tunnel-loop.
+/// Returns the number of kills that actually landed (not the number of
+/// matches found). Logs each kill to the trace for post-mortem
+/// debuggability of the v0.4.36 orphan-tunnel-loop.
 pub fn kill_aiui_ssh_ntr(port: u16, only_orphans: bool) -> usize {
-    let snap = snapshot_processes();
+    let (sys, snap) = snapshot_processes();
     let pids = find_aiui_ssh_ntr(&snap, port, only_orphans);
     let mode = if only_orphans { "orphan" } else { "all" };
+    let mut killed = 0usize;
     for pid in &pids {
         trace(&format!(
             "housekeeping: killing {mode} ssh-NTR tunnel pid={pid}"
         ));
-        terminate_pid(*pid);
+        if terminate_victim(&sys, *pid, VictimKind::SshNtr(port)) {
+            killed += 1;
+        }
     }
     if !pids.is_empty() {
         trace(&format!(
-            "housekeeping: terminated {} {mode} ssh-NTR tunnel(s) on :{port}",
+            "housekeeping: terminated {killed} of {} {mode} ssh-NTR tunnel(s) on :{port}",
             pids.len()
         ));
     }
-    pids.len()
+    killed
 }
 
 /// Pure decision: given our compile-time version string and the version
@@ -645,6 +905,38 @@ pub fn disk_version_if_stale() -> Option<String> {
     None
 }
 
+/// Modification time of our own on-disk executable, in seconds since the
+/// Unix epoch. `None` when `current_exe()` is unresolvable, the file is gone
+/// (an updater may have moved it aside), or the platform reports no mtime.
+///
+/// The cheap, portable analogue of `disk_version_if_stale` (#200): an mcp-stdio
+/// child records this at start and compares it on every periodic tick. It is
+/// what keeps a **Windows** in-place NSIS update from leaving a live child on
+/// pre-update code, now that the GUI-side path sweep is orphan-gated and no
+/// longer force-refreshes a child whose host is still alive. Exiting cleanly
+/// is also the only shutdown Claude Code / Cowork / Codex honour with a
+/// respawn — the GUI killing the child is not.
+pub fn current_exe_mtime() -> Option<u64> {
+    let exe = std::env::current_exe().ok()?;
+    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Pure decision: has the on-disk executable been replaced since `baseline`
+/// was recorded? An unknown value on either side means "we couldn't read it"
+/// → not stale, same conservative rule `is_disk_version_stale` applies to an
+/// empty version string. Better to keep serving than to abort a working
+/// subprocess on a transient stat failure.
+pub(crate) fn is_exe_mtime_stale(baseline: Option<u64>, current: Option<u64>) -> bool {
+    match (baseline, current) {
+        (Some(b), Some(c)) => b != c,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,9 +949,14 @@ mod tests {
     fn snap(pid: u32, exe: &str, args: &[&str]) -> ProcSnap {
         ProcSnap {
             pid,
+            // pid 0 is never in these fixtures, so every process built by
+            // this helper is an orphan under `is_orphaned_child` — which is
+            // what the find_stale tests below rely on now that the sweep is
+            // orphan-gated (#200).
             ppid: Some(0),
             exe: exe.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            exe_resolved: true,
             start_time: 0,
         }
     }
@@ -670,6 +967,7 @@ mod tests {
             ppid: Some(ppid),
             exe: exe.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            exe_resolved: true,
             start_time: 0,
         }
     }
@@ -686,8 +984,22 @@ mod tests {
             ppid: Some(ppid),
             exe: exe.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            exe_resolved: true,
             start_time,
         }
+    }
+
+    /// Like `snap_with_ppid`, but for a process whose `exe()` sysinfo could
+    /// not read — `exe` is then the `argv[0]` fallback, not a real path.
+    fn snap_unresolved_exe(pid: u32, ppid: u32, exe: &str, args: &[&str]) -> ProcSnap {
+        ProcSnap {
+            exe_resolved: false,
+            ..snap_with_ppid(pid, ppid, exe, args)
+        }
+    }
+
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
     }
 
     #[test]
@@ -787,6 +1099,136 @@ mod tests {
         assert!(!is_aiui_binary("/usr/bin/python3"));
     }
 
+    // ---------- find_stale: orphan gate + path handling (#200) ----------
+
+    /// The same install path as `CURRENT`, spelled with a redundant `.`
+    /// segment — what a host that re-derives the path can hand us.
+    #[cfg(windows)]
+    const CURRENT_EQUIVALENT: &str = r"C:\Program Files\.\aiui\aiui.exe";
+    #[cfg(not(windows))]
+    const CURRENT_EQUIVALENT: &str = "/Applications/./aiui.app/Contents/MacOS/aiui";
+
+    #[test]
+    fn stale_sweep_spares_child_with_live_parent() {
+        // The mirror of `pre_gui_kill_spares_bootstrapper_with_live_parent`.
+        // The user moved aiui.app out of ~/Downloads, so a live Claude Code /
+        // Cowork / Codex session's child now runs from a path that differs
+        // from ours. Its wrapper parent (200) is alive → live session →
+        // spared. Killing it would hand the user `Server disconnected` on
+        // their next tool call, and those hosts never respawn.
+        let s = vec![
+            snap_full(100, 1, "/Applications/Claude.app/Contents/MacOS/Claude", &["Claude"], 500),
+            snap_full(200, 100, "/Applications/Claude.app/Contents/Helpers/disclaimer", &["disclaimer"], 999),
+            snap_full(300, 200, "/Users/me/Downloads/aiui.app/Contents/MacOS/aiui", &["aiui", "--mcp-stdio"], 1000),
+        ];
+        assert!(
+            find_stale(&s, CURRENT, 1).is_empty(),
+            "live child at an old path must be spared (#200)"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_reaps_orphaned_old_path_child() {
+        // Same child, parent gone — the leak the sweep exists for. Must
+        // still be reaped, so the orphan gate narrows the sweep rather than
+        // disabling it.
+        let s = vec![snap_full(
+            300,
+            200,
+            "/Users/me/Downloads/aiui.app/Contents/MacOS/aiui",
+            &["aiui", "--mcp-stdio"],
+            1000,
+        )];
+        let stale = find_stale(&s, CURRENT, 1);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].pid, 300);
+    }
+
+    #[test]
+    fn stale_sweep_ignores_unresolved_exe() {
+        // sysinfo could not read this process's exe, so the snapshot fell
+        // back to argv[0] — a bare command name that trivially "differs"
+        // from our install path. Never classify a process stale on evidence
+        // we could not read.
+        let s = vec![snap_unresolved_exe(300, 0, "aiui", &["aiui", "--mcp-stdio"])];
+        assert!(
+            find_stale(&s, CURRENT, 1).is_empty(),
+            "a process with an unresolved exe must never be swept"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_treats_equivalent_paths_as_current() {
+        // Two spellings of the one install path. Raw string equality called
+        // this stale and killed a child of the running build.
+        let s = vec![snap(
+            300,
+            CURRENT_EQUIVALENT,
+            &[CURRENT_EQUIVALENT, "--mcp-stdio"],
+        )];
+        assert!(
+            find_stale(&s, CURRENT, 1).is_empty(),
+            "a differently-spelled path to the current binary is not stale"
+        );
+        assert!(same_exe_path(CURRENT, CURRENT_EQUIVALENT));
+        assert!(!same_exe_path(CURRENT, "/old/path/aiui"));
+    }
+
+    // ---------- victim identity re-check before signalling (#200) ----------
+
+    #[test]
+    fn victim_identity_recheck_rejects_changed_process() {
+        let mcp: Vec<String> = [CURRENT, "--mcp-stdio"].iter().map(|s| s.to_string()).collect();
+        // Unchanged → still our victim.
+        assert!(victim_identity_matches(VictimKind::McpStdio, CURRENT, &mcp));
+
+        // Pid recycled by something that is not aiui.
+        assert!(!victim_identity_matches(
+            VictimKind::McpStdio,
+            "/usr/bin/python3",
+            &mcp
+        ));
+        // Same binary, but no longer an mcp-stdio child — this is the GUI.
+        let gui: Vec<String> = [CURRENT].iter().map(|s| s.to_string()).collect();
+        assert!(!victim_identity_matches(VictimKind::McpStdio, CURRENT, &gui));
+
+        // Tunnel victims re-assert the port-specific argv shape.
+        let tunnel = ssh_ntr_args("dev@devhost", 7777);
+        assert!(victim_identity_matches(
+            VictimKind::SshNtr(7777),
+            "/usr/bin/ssh",
+            &tunnel
+        ));
+        assert!(!victim_identity_matches(
+            VictimKind::SshNtr(8888),
+            "/usr/bin/ssh",
+            &tunnel
+        ));
+        assert!(!victim_identity_matches(
+            VictimKind::SshNtr(7777),
+            "/usr/bin/ssh",
+            &gui
+        ));
+    }
+
+    // ---------- cross-platform stale-binary self-check (#200) ----------
+
+    #[test]
+    fn exe_mtime_check_treats_change_as_stale() {
+        assert!(is_exe_mtime_stale(Some(1_700_000_000), Some(1_700_000_001)));
+        assert!(is_exe_mtime_stale(Some(1_700_000_001), Some(1_700_000_000)));
+    }
+
+    #[test]
+    fn exe_mtime_check_treats_unchanged_and_unknown_as_fresh() {
+        assert!(!is_exe_mtime_stale(Some(1_700_000_000), Some(1_700_000_000)));
+        // Either side unreadable → keep serving, same rule as an empty
+        // on-disk version string.
+        assert!(!is_exe_mtime_stale(None, Some(1_700_000_000)));
+        assert!(!is_exe_mtime_stale(Some(1_700_000_000), None));
+        assert!(!is_exe_mtime_stale(None, None));
+    }
+
     fn ssh_ntr_args(host: &str, port: u16) -> Vec<String> {
         // Mirrors the spawn in tunnel.rs:run_tunnel exactly.
         [
@@ -846,17 +1288,51 @@ mod tests {
 
     #[test]
     fn find_aiui_ssh_ntr_orphans_only_filters_on_ppid() {
+        let a_orphan = ssh_ntr_args("dev@devhost", 7777);
+        let a_live = ssh_ntr_args("customer@macmini", 7777);
         let s = vec![
+            // The live GUI that owns the active tunnel below. #200: it has
+            // to be *in* the snapshot, otherwise its child is — correctly —
+            // an orphan under `is_orphaned_child` and the sweep takes it.
+            snap_with_ppid(76770, 1, CURRENT, &[CURRENT]),
             // Orphan from a crashed earlier aiui — re-parented to pid 1.
-            snap_with_ppid(30295, 1, "/usr/bin/ssh", &ssh_ntr_args("dev@devhost", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
-            // Active tunnel from the current GUI (ppid != 1).
-            snap_with_ppid(40000, 76770, "/usr/bin/ssh", &ssh_ntr_args("customer@macmini", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
+            snap_with_ppid(30295, 1, "/usr/bin/ssh", &strs(&a_orphan)),
+            // Active tunnel from the current GUI (parent 76770 alive).
+            snap_with_ppid(40000, 76770, "/usr/bin/ssh", &strs(&a_live)),
         ];
         let orphans = find_aiui_ssh_ntr(&s, 7777, true);
         assert_eq!(orphans, vec![30295]);
 
         let all = find_aiui_ssh_ntr(&s, 7777, false);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn find_aiui_ssh_ntr_sweeps_orphan_whose_ppid_is_absent() {
+        // The Windows shape (#200): nothing reparents an orphan there, so
+        // the recorded ppid keeps naming the dead aiui.exe and is never 1.
+        // The old `ppid == Some(1)` rule made the startup sweep a permanent
+        // no-op, leaving the tunnel holding the remote's port forever.
+        let a = ssh_ntr_args("dev@devhost", 7777);
+        let s = vec![snap_with_ppid(30295, 4242, r"C:\Windows\System32\OpenSSH\ssh.exe", &strs(&a))];
+        assert_eq!(find_aiui_ssh_ntr(&s, 7777, true), vec![30295]);
+    }
+
+    #[test]
+    fn find_aiui_ssh_ntr_spares_tunnel_with_live_parent() {
+        // Same tunnel, but its aiui parent is alive in the snapshot — this
+        // is a *working* tunnel serving a remote session. Must not be swept.
+        let a = ssh_ntr_args("dev@devhost", 7777);
+        let s = vec![
+            snap_with_ppid(4242, 1, CURRENT, &[CURRENT]),
+            snap_with_ppid(30295, 4242, "/usr/bin/ssh", &strs(&a)),
+        ];
+        assert!(
+            find_aiui_ssh_ntr(&s, 7777, true).is_empty(),
+            "a tunnel whose aiui parent is alive must be spared"
+        );
+        // The pre-exit path (only_orphans = false) still takes it.
+        assert_eq!(find_aiui_ssh_ntr(&s, 7777, false), vec![30295]);
     }
 
     // ---------- find_orphaned_mcp_stdio_to_kill (Bug A, v0.4.46) ----------
@@ -937,6 +1413,7 @@ mod tests {
             ppid: None,
             exe: CURRENT.to_string(),
             args: vec![],
+            exe_resolved: true,
             start_time: 1,
         };
         assert!(is_orphaned_child(&[], &p));
@@ -1116,6 +1593,7 @@ mod tests {
             ppid: Some(1),
             exe: "/usr/bin/ssh".into(),
             args: unrelated,
+            exe_resolved: true,
             start_time: 0,
         }];
         assert!(find_aiui_ssh_ntr(&s, 7777, true).is_empty());
