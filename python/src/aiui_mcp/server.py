@@ -1,4 +1,4 @@
-"""aiui MCP server — renders native macOS dialogs via the aiui companion.
+"""aiui MCP server — renders native desktop dialogs via the aiui companion.
 
 Topology:
 
@@ -8,11 +8,11 @@ Topology:
                                      http://127.0.0.1:7777
                                                │  (local, or via SSH reverse-tunnel)
                                                ▼
-                                       Mac: aiui.app (Tauri companion)
+                                 companion host: aiui (Tauri companion)
 
 The aiui token is read from `~/.config/aiui/token` — installed once when
-the companion runs on the Mac, and scp'd automatically to each remote host
-registered in the companion's settings window.
+the companion runs on the user's own machine, and scp'd automatically to
+each remote host registered in the companion's settings window.
 """
 from __future__ import annotations
 
@@ -206,7 +206,7 @@ UPLOAD_TIMEOUT_S = _env_float("AIUI_UPLOAD_TIMEOUT_S", 900.0)
 UPLOAD_FILE_CAP = 512 * 1024 * 1024  # mirrors the companion's cap
 
 _INSTRUCTIONS = """\
-aiui is connected — you can render native dialogs on the user's Mac \
+aiui is connected — you can render native dialogs on the user's machine \
 instead of asking via chat. Default behaviour for this session:
 
 - Yes/no question (esp. before delete / drop / force-push / deploy) → \
@@ -214,7 +214,7 @@ instead of asking via chat. Default behaviour for this session:
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
   table-row triage, image confirm/grid → call `form`.
-- User wants to hand you a file from their Mac (`/aiui:upload`, \
+- User wants to hand you a file from their machine (`/aiui:upload`, \
   "take this file", "upload …") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
 - Async-completion signal the user doesn't need to answer (tests green, \
@@ -237,7 +237,7 @@ def _token() -> str:
     if not TOKEN_PATH.exists():
         raise RuntimeError(
             f"aiui token not found at {TOKEN_PATH}. "
-            "Install the aiui companion on your Mac and register this remote from its "
+            "Install the aiui companion on your own machine and register this remote from its "
             "settings window (adds the token automatically). "
             "Download: https://github.com/byte5ai/aiui/releases/latest"
         )
@@ -248,7 +248,7 @@ def _token() -> str:
     if len(tok) != 64 or any(c not in "0123456789abcdefABCDEF" for c in tok):
         raise RuntimeError(
             f"aiui token at {TOKEN_PATH} is malformed ({len(tok)} chars, expected 64 hex). "
-            "Re-register this remote from the companion's settings window on your Mac "
+            "Re-register this remote from the companion's settings window on your machine "
             "to write a fresh token."
         )
     return tok
@@ -298,7 +298,8 @@ async def _preflight() -> None:
         except httpx.ConnectError as e:
             raise RuntimeError(
                 f"aiui companion not reachable at {ENDPOINT}. "
-                f"Is Claude Desktop running on your Mac? For remote projects, the "
+                f"Is Claude Desktop running on the machine with the aiui companion? "
+                f"For remote projects, the "
                 f"SSH reverse-tunnel must also be active (companion handles it "
                 f"automatically if this host is registered in its settings). "
                 f"Underlying error: {e}"
@@ -318,9 +319,9 @@ async def _preflight() -> None:
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} accepted the connection but sent no "
                 f"response (ReadError). On a remote this means the SSH reverse-tunnel "
-                f"is up but the Mac-side aiui isn't serving — Claude Desktop may be "
+                f"is up but the companion-side aiui isn't serving — Claude Desktop may be "
                 f"closed, or a stale tunnel is squatting :7777. Open Claude Desktop on "
-                f"the Mac; if it persists, re-register this remote in aiui.app settings. "
+                f"the companion host; if it persists, re-register this remote in aiui.app settings. "
                 f"({_explain_exc(e)})"
             ) from e
         except httpx.RemoteProtocolError as e:
@@ -335,9 +336,9 @@ async def _preflight() -> None:
             # at least sees *something* concrete.
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} reset the connection. "
-                f"The Mac-side mcp-stdio normally auto-resurrects aiui.app on "
+                f"The companion-side mcp-stdio normally auto-resurrects aiui.app on "
                 f"the next call — if this persists, a stale process may hold "
-                f"the port. Verify that Claude Desktop is open on the Mac and, "
+                f"the port. Verify that Claude Desktop is open on the companion host and, "
                 f"on remotes, re-register the host in aiui.app settings to "
                 f"re-sync the token. "
                 f"({_explain_exc(e)})"
@@ -348,7 +349,7 @@ async def _preflight() -> None:
             # exception with an empty message.
             raise RuntimeError(
                 f"aiui companion request to {ENDPOINT} failed: {_explain_exc(e)}. "
-                f"Verify Claude Desktop is open on the Mac; auto-resurrect "
+                f"Verify Claude Desktop is open on the companion host; auto-resurrect "
                 f"normally restores the GUI on the next call. If repeated, "
                 f"check the SSH reverse-tunnel and re-register this remote "
                 f"in aiui.app settings to re-sync the token."
@@ -403,7 +404,7 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
     Raises a structured ``RuntimeError`` (surfaced to the agent as a tool error)
     on a hard wire-version mismatch, telling the user to restart this Claude
     Code session so it respawns ``aiui-mcp`` at a matching version — the
-    cooperative replacement for the Mac externally killing this bridge.
+    cooperative replacement for the companion externally killing this bridge.
 
     Tolerant by design: a companion too old to report ``wire_version`` (field
     absent → treated as v1), or any transient error reading ``/version``, does
@@ -430,7 +431,7 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
         # (e.g. after the user restarts the companion) re-checks cleanly.
         raise RuntimeError(
             f"incompatible aiui versions — this bridge (aiui-mcp {VERSION}) speaks wire "
-            f"v{EXPECTED_WIRE_VERSION}, but the companion on your Mac speaks wire "
+            f"v{EXPECTED_WIRE_VERSION}, but the companion on your machine speaks wire "
             f"v{remote_wire}. Restart this Claude Code session so it respawns aiui-mcp at "
             f"a matching version (or update the side that is behind)."
         )
@@ -541,7 +542,7 @@ def _read_path_as_data_url(raw: str) -> str:
 def _resolve_local_paths(node: Any) -> None:
     """Walk a render spec in place, replacing absolute / `~/` paths in
     `src` / `thumbnail` properties with `data:` URLs. The bridge-side
-    counterpart to the Mac's HTTPS resolver — runs wherever this MCP
+    counterpart to the companion's HTTPS resolver — runs wherever this MCP
     server runs (local or remote), which is by definition the host
     that holds the agent's files.
 
@@ -633,7 +634,7 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
     their `src`/`thumbnail` to the returned loopback playback URL.
 
     Videos are too big to inline as `data:` (the 10 MB cap + base64 bloat),
-    and a remote agent's file isn't readable from the Mac — so the bridge
+    and a remote agent's file isn't readable from the companion host — so the bridge
     streams the bytes over the same :7777 channel the render uses (loopback
     locally, reverse tunnel remotely). Best-effort: a read error, a 413, or
     an old companion without `/media` (404) leaves the path untouched, and
@@ -716,7 +717,7 @@ async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) 
 
     Same reasoning as `_upload_local_videos`: local files are too big (or
     simply unnecessary) to inline as `data:` given the 10 MB cap + base64
-    bloat, and a remote agent's file isn't readable from the Mac — so the
+    bloat, and a remote agent's file isn't readable from the companion host — so the
     bridge streams the bytes over the same :7777 channel the render uses.
     Best-effort: a read error, a 413, or an old companion without `/media`
     (404) leaves the path untouched, and `_resolve_local_paths` then does
@@ -1259,7 +1260,7 @@ async def _wait_for_aiui() -> None:
 async def _cancel_render(render_id: str) -> None:
     """Best-effort `DELETE /render/{id}` (#193) — tell the companion to retract a
     dialog this bridge no longer has a caller for, so it doesn't sit on the
-    user's Mac waiting for an agent that is gone.
+    user's machine waiting for an agent that is gone.
 
     Builds its own client on purpose: the `async with httpx.AsyncClient(...)` in
     `_post_render` may already be unwinding when this runs. Every failure is
@@ -1297,7 +1298,7 @@ async def _poll_render(
 
     On cancellation (#193) the dialog is retracted before the exception
     propagates. The MCP SDK already cancels this task on a `CancelledNotification`,
-    so the task died today but the window on the Mac did not.
+    so the task died today but the window on the user's machine did not.
 
     #202: a transport error on one poll is retried against the SAME id rather
     than ending the call. The dialog is already on the user's screen and stays
@@ -1331,7 +1332,7 @@ async def _poll_render(
                         f"aiui lost contact with the companion while waiting for "
                         f"render {render_id}: {_explain_exc(e)} "
                         f"({consecutive_failures} consecutive poll failures). "
-                        f"The dialog may still be open on the Mac — check it "
+                        f"The dialog may still be open on the user's machine — check it "
                         f"before re-asking."
                     ) from e
                 log.warning(
@@ -1377,7 +1378,7 @@ async def _poll_render(
 
 def _session_origin() -> str:
     """This bridge's host, auto-attached to every render as `session_origin`
-    (Step 4, I8). The Mac can't tell remotes apart at the shared `:7777`, so
+    (Step 4, I8). The companion can't tell remotes apart at the shared `:7777`, so
     the origin must come from the caller side — the user always sees which host
     a dialog came from even when the agent passes no `session` label."""
     try:
@@ -1441,7 +1442,7 @@ async def _post_render(
                 f"aiui companion at {ENDPOINT} failed to register the dialog: "
                 f"{_explain_exc(e)}. No dialog was opened. On a remote this is "
                 f"usually the SSH reverse-tunnel dropping — check aiui "
-                f"Settings → Connections on the Mac, then retry."
+                f"Settings → Connections on the user's machine, then retry."
             ) from e
         # #186/#182: a 422 from the companion carries `{error, detail, hint}`
         # — the whole point of the structured rejection. `raise_for_status`
@@ -1485,13 +1486,13 @@ async def _post_render(
                 f"aiui companion at {ENDPOINT} rejected our token (401) while "
                 f"opening the dialog. The token was rotated mid-session, or "
                 f"another aiui process is listening on this port. Re-register "
-                f"this host from the companion's settings window on the Mac."
+                f"this host from the companion's settings window on the user's machine."
             )
         if r.status_code >= 500:
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} failed to open the dialog "
                 f"(HTTP {r.status_code}): {r.text[:200]}. This is a companion-side "
-                f"fault — retry once; if it persists, restart aiui.app on the Mac."
+                f"fault — retry once; if it persists, restart the aiui companion on the user's machine."
             )
         if r.status_code >= 400:
             raise RuntimeError(
@@ -1505,7 +1506,7 @@ async def _post_render(
                 raise RuntimeError(
                     "aiui accepted the dialog (202) but its response carries no "
                     "`id`, so there is nothing to poll. The dialog may be open on "
-                    "the Mac with no one listening — check it, and report this as "
+                    "the user's machine with no one listening — check it, and report this as "
                     "a companion bug."
                 )
             ttl = first.get("ttl_secs")
@@ -1544,7 +1545,7 @@ def _cancel_defaults(kind: str | None) -> dict[str, Any]:
     `ask` promises `{cancelled, answers}`, `form` promises `{cancelled, values}`
     — and contradicting the Rust bridge, whose `format_confirm_result` always
     emits both keys. An agent following the documented shape and reading
-    `result["confirmed"]` therefore worked on a Mac-local session and raised a
+    `result["confirmed"]` therefore worked on a local session and raised a
     `KeyError` only on a remote: a bridge-dependent bug invisible in local
     testing. `compare` is deliberately absent: `docs/skill.md` documents
     `selected` as *absent* on cancel, and inventing a falsy value there would
@@ -1708,7 +1709,7 @@ async def form(
     - color:       {kind, name, label, default?}  — hex "#RRGGBB"
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
     - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
-    - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the Mac), or a `data:` URL. Use for visual confirmation of agent-generated previews.
+    - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the companion host), or a `data:` URL. Use for visual confirmation of agent-generated previews.
     - annotated_image: {kind, name, src, label?, alt?, mode?, max_height?, required?, default?}  — let the user MARK a spot on an image (logo placement, crop hint, bug location). `src` follows the same rules as `image`. `mode` ∈ {"point" (click one marker, default), "region" (drag a rectangle), "both" (user flips a Point/Region tool)}. `default` may seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized units. Result under `name`: {point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null} — all coordinates normalized 0..1; multiply by `natural` for pixels.
     - audio:       {kind, src, label?}  — read-only native `<audio controls>` player. Use for "listen to this TTS sample / voice memo / generated sound clip before deciding". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner.
     - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders to SVG and DOMPurify-sanitises before display.
@@ -1922,16 +1923,16 @@ async def upload(
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Pull a file FROM the user's Mac INTO this agent session.
+    """Pull a file FROM the user's machine INTO this agent session.
 
-    Calling this opens a native file picker on the user's Mac; the file they
+    Calling this opens a native file picker on the user's machine; the file they
     choose is streamed back over aiui's channel and written to `target_dir` on
     YOUR host (the machine you run on — the remote for an SSH session). This is
     the counterpart to the user having to `scp` a file over: reach for it
     whenever the user says "take this file", "upload …", "here's the
     file/screenshot/PDF", or triggers `/aiui:upload`.
 
-    WHEN TO USE: the user wants to give you a local Mac file. Do NOT ask them
+    WHEN TO USE: the user wants to give you a file from their own machine. Do NOT ask them
     which file — they pick it in the native dialog. Do NOT ask where to put it;
     infer `target_dir` from the conversation (usually your cwd or the active
     project dir) and pass it.
@@ -2134,7 +2135,7 @@ async def notify(
     subtitle: str | None = None,
     sound: str | None = None,
 ) -> dict[str, Any]:
-    """Fire a native macOS notification and return immediately — use this
+    """Fire a native OS notification and return immediately — use this
     for an async-completion signal to a user who isn't watching this
     session ("tests green", "deploy finished", "merge conflicts, need
     you"). Unlike `confirm`/`ask`/`form`/`gallery`, this tool does NOT wait
@@ -2151,9 +2152,9 @@ async def notify(
     input) — `notify` has no way to carry a reply back. Use `confirm`,
     `ask`, or `form` instead.
 
-    Runs against the *user's Mac*, regardless of whether this MCP is local
-    or reached via an SSH reverse-tunnel — same as `update`/`version`,
-    the notification always renders on the Mac side.
+    Runs against the *user's own machine*, regardless of whether this MCP is
+    local or reached via an SSH reverse-tunnel — same as `update`/`version`,
+    the notification always renders on the companion side.
 
     Returns `{ok: bool, error?: str}`. `ok: False` most commonly means the
     user hasn't granted aiui notification permission on macOS yet (the OS
@@ -2249,10 +2250,10 @@ def update() -> str:
     """Instructs the agent to call `update` and report the outcome.
 
     Wired up so Claude Code exposes `/aiui:update` as a slash-command that
-    triggers a silent update check + install on the user's Mac. Works both
+    triggers a silent update check + install on the user's machine. Works both
     locally (MCP talks to aiui on localhost) and remotely (MCP calls reach
-    aiui through the SSH reverse-tunnel — the update runs on the user's Mac,
-    not on the remote host)."""
+    aiui through the SSH reverse-tunnel — the update runs on the user's
+    machine, not on the remote host)."""
     return _UPDATE_PROMPT
 
 
@@ -2297,7 +2298,7 @@ Show the user a quick rundown of their registered aiui remotes — same set \
 the Settings window's "Eingerichtete Remote-Hosts" section shows, but in \
 chat. Call `aiui_health` first to confirm aiui is up; if it isn't, just \
 tell the user that and stop. Otherwise read `remotes.json` from aiui's \
-config directory — `~/.config/aiui/` on macOS and Linux, \
+config directory — `~/.config/aiui/` on Unix, \
 `%APPDATA%\\aiui\\` on Windows (JSON array of host strings) — and present \
 the entries in a compact list. If the file is missing or empty, say "no \
 remotes registered yet — open Settings to add one".
@@ -2326,14 +2327,14 @@ def remotes_prompt() -> str:
 
 
 _UPLOAD_PROMPT = """\
-Call the `upload` tool to let me hand you a file from my Mac. \
+Call the `upload` tool to let me hand you a file from my machine. \
 Use my current working directory as the target unless I say otherwise.
 """
 
 
 @mcp.prompt(name="upload")
 def upload_prompt() -> str:
-    """Hand a file from the Mac to the agent session — opens a native file
+    """Hand a file from your machine to the agent session — opens a native file
     picker and writes the chosen file to the agent host. Surfaces as
     `/aiui:upload` in Claude Code."""
     return _UPLOAD_PROMPT
@@ -2404,7 +2405,7 @@ async def version_tool() -> dict[str, Any]:
     """Report aiui companion version, build info, binary path, and updater endpoint.
 
     Cheap; does not hit the network. Works against both a local companion
-    (on-Mac) and a remote one reached via SSH tunnel.
+    (same host) and a remote one reached via SSH tunnel.
     """
     await _wait_for_aiui()  # cold-start gate, as on every other tool (#203)
     try:
@@ -2428,7 +2429,7 @@ async def version_tool() -> dict[str, Any]:
 
 @mcp.tool(name="update")
 async def update_tool() -> dict[str, Any]:
-    """Check for an aiui update on the user's machine and install it.
+    """Check for an aiui update on the user's machine and install it silently.
 
     Responds BEFORE the companion goes away, so the caller receives
     `{updated, current, available, note}`. Next agent call hits the new
@@ -2438,7 +2439,7 @@ async def update_tool() -> dict[str, Any]:
     refuses to restart out from under a dialog the user is filling in, so
     ask them to finish it and call again.
 
-    Runs the updater against the *user's machine*, regardless of whether the
+    Runs the updater against the *user's own machine*, regardless of whether the
     MCP is local or reached via an SSH reverse-tunnel — because the
     /update HTTP endpoint lives on the aiui companion, not on this process.
     """

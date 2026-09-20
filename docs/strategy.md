@@ -29,7 +29,7 @@ aiui hat zwei Daseinsformen, die sich nicht ablösen, sondern **koexistieren** w
 | Sichtbarkeit von macOS/Claude Desktop | ständig sichtbar, aiui ist Gast | tritt zurück, aiui ist Hauptbild |
 | Versprechen | "Ich frage Dich kurz, dann geht's für Dich weiter wie bisher" | "Für die nächsten Minuten arbeitest Du in einer Oberfläche, die der Agent gestaltet" |
 
-V1 ist heute weitgehend gebaut (drei Tools, zwölf Field-Types). V2 existiert noch nicht.
+V1 ist heute weitgehend gebaut. Wie viele Tools und Field-Types das aktuell sind, steht in [`docs/skill.md`](skill.md) — hier bewusst keine Zahl, weil sie hier jedes Mal veraltet. V2 existiert noch nicht.
 
 ### Warum die Trennung scharf bleiben muss
 
@@ -53,7 +53,7 @@ Gelten unabhängig von V1/V2:
 
 **2. Anti-Slop durch Skill-Doku.** Agenten bauen Slop, wenn das Vokabular zu groß und die Anleitung zu dünn ist. [`docs/skill.md`](skill.md) ist nicht Begleitdoku, sondern aktives Steuerinstrument: jedes neue Widget bekommt einen Eintrag mit klarem When-to-use, einem sauberen Beispiel und einer Anti-Pattern-Spalte. Widgets ohne diesen Eintrag werden nicht gemerged.
 
-**3. aiui ist keine Datei-Transfer-Schicht.** Der Reverse-Tunnel transportiert UI-Specs und Antworten — keine Dateien, keine Inhalte vom Mac auf den Remote-Host. Wer das aufweicht, baut sich eine zweite, parallele Sync-Infrastruktur, die Sicherheits- und Pairing-Annahmen sprengt.
+**3. aiui ist keine Sync-Schicht.** Der Reverse-Tunnel transportiert UI-Specs, Antworten — und genau die Datei-Inhalte, die eine einzelne Nutzer-Aktion freigibt: die Datei, die der User im nativen Picker auswählt (`upload`, #146), oder das Bild/Video, das der Agent zum Rendern schickt. Eine Datei pro bewusster Handlung, in beide Richtungen, über denselben authentifizierten Kanal. Was aiui nicht transportiert, ist Dateiverkehr ohne Nutzer-Akt: kein Verzeichnis-Browsing, kein Hintergrund-Abgleich, keine Ordner-Spiegelung. Wer das aufweicht, baut sich eine zweite, parallele Sync-Infrastruktur, die Sicherheits- und Pairing-Annahmen sprengt.
 
 **4. Keine Übernahme von Aufgaben, die Claude Desktop besser löst.** Wenn ein UI-Element einen Lifecycle-Owner braucht, den nur Claude Desktop selbst sauber besitzt (Session-State, Aufgaben-Pane, Permissions-Flow), gehört das Feature dorthin, nicht in aiui. aiui ergänzt Claude Desktop, dupliziert es nicht.
 
@@ -79,10 +79,17 @@ Was wir nicht bauen, ist genauso strategisch wie was wir bauen.
 
 | Idee | Warum nicht |
 |---|---|
-| `pick_path` (NSOpenPanel) | Macht aiui zur Datei-Transfer-Schicht (Mac-Pfad → Remote-Agent → Inhalt). Bricht Architektur-Prinzip 3. Use-Case-Dichte für die Remote-Topologie zu dünn. |
 | `diff` als eigenes Tool | Marginal. Claude Desktop hat eigenen Diff-Viewer für lokale Sessions. Für Remote-CLI ist ein Window-Diff bestenfalls Komfort, nicht Kategoriefehler-Behebung. Nicht aiui's Job (Prinzip 4). |
 | `progress` mit Live-Updates | Verlangt langlebigen Owner, den der Agent strukturell nicht sauber sein kann. Verstößt gegen Prinzip 1. Verwaiste Progress-Bars sind das wahrscheinliche Resultat. Gehört in Claude Desktop's Aufgaben-Pane. |
 | Multi-Agent-Inbox als V2 | Falsche Einsortierung. Inbox-Aggregation bleibt im Modal-Paradigma — sie ist V1-Erweiterung, nicht V2. V2 ist Paradigma-Bruch, nicht Skalierung. |
+
+### Revidierte Entscheidungen
+
+Eine Absage, die wir zurückgenommen haben, wird hier verbucht statt aus der Tabelle oben gelöscht — die Begründungskette ist der Wert dieser Tabelle, und eine stillschweigend verschwundene Zeile lehrt niemanden etwas.
+
+| Idee | Ursprüngliche Absage | Warum revidiert |
+|---|---|---|
+| `pick_path` (NSOpenPanel) | Macht aiui zur Datei-Transfer-Schicht (Pfad → Remote-Agent → Inhalt). Bricht Architektur-Prinzip 3. Use-Case-Dichte für die Remote-Topologie zu dünn. | Ausgeliefert als `upload` (#146, v0.9.0) — in einer Form, die das Bedenken auflöst: nicht ein Pfad wandert (den der Agent dann frei nachlesen könnte), sondern die Bytes der *einen* Datei, die der User im nativen Picker auswählt. Genau ein Transfer pro Nutzer-Aktion, kein Browsing-Zugriff. Die Use-Case-Dichte war entgegen der Annahme da („nimm diese Datei“ ist der häufigste `scp`-Ersatz). Prinzip 3 ist entsprechend geschärft: verboten bleibt Sync ohne Nutzer-Akt, nicht der einzelne, vom User ausgelöste Transfer. |
 
 ## Prozess-Konsequenzen
 

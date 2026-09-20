@@ -24,10 +24,17 @@ See the main repo for the full install flow and companion download:
 
 ## Tools
 
-- `aiui.confirm` — hard yes/no with optional destructive styling
-- `aiui.ask` — single- or multi-choice with per-option descriptions
-- `aiui.form` — composite window with typed fields and action buttons
-- `aiui.aiui_health` — reachability check
+- `confirm` — hard yes/no with optional destructive styling
+- `ask` — single- or multi-choice with per-option descriptions
+- `form` — composite window with typed fields and action buttons
+- `gallery` — image/video grid the user picks from
+- `compare` — side-by-side diff of two texts or images
+- `upload` — native file picker on the user's machine; the chosen file
+  lands on the agent host
+- `notify` — fire-and-forget OS notification, no dialog, no reply
+- `aiui_health` — reachability check
+- `version` — companion version, build info, binary path, updater endpoint
+- `update` — silent update check + install on the user's machine
 
 ## Environment variables
 
@@ -49,6 +56,12 @@ these must not turn into "the aiui MCP server failed to start".
 ## Prompts
 
 - `/aiui:teach` — briefs the agent on aiui (full widget catalog, design rules, anti-patterns)
+- `/aiui:update` — agent calls the `update` tool and reports the outcome
+- `/aiui:version` — reports the installed aiui version in one line
+- `/aiui:health` — one-line health check of the companion
+- `/aiui:test-dialog` — pops a demo dialog to verify the wiring end to end
+- `/aiui:remotes` — lists the registered aiui remotes in chat
+- `/aiui:upload` — hands a file from the user's machine to the agent session
 
 ## License
 
