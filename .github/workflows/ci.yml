@@ -59,7 +59,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
@@ -341,7 +341,9 @@ jobs:
       - name: Build wheel + sdist
         if: matrix.package
         working-directory: python
-        run: uv build --locked
+        # `uv build` packages the source; it takes no `--locked` (that flag is
+        # for the resolving commands — run/sync/lock — which the steps above use).
+        run: uv build
 
       # Linux only: this checks the packaging, not the platform — and
       # `uv tool install` puts the entry point on a PATH only the POSIX
