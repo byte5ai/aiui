@@ -21,6 +21,12 @@ All notable changes to this project are documented here.
   longer drift from what the companion actually measures. Additive on the
   wire: both bridges parse the body generically, so no `WIRE_VERSION` bump,
   and an un-patched bridge simply sees one fewer fatal preflight (#179).
+- **A frontend test runner for the companion.** `vitest` + jsdom +
+  `@testing-library/svelte`, an `npm test` script and a CI step beside the
+  existing `svelte-check`. The settings pane is the only UI surface outside
+  dialogs and held behaviour `cargo test` cannot reach — two of the four
+  defects fixed under #208 lived entirely there, including the one that hit
+  every user who ever pressed Uninstall (#208).
 - **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
   missing a shipped platform, carries an empty signature or url, points an
   entry at another release's artifact, or advertises the wrong version. It
@@ -874,6 +880,58 @@ All notable changes to this project are documented here.
   cannot drift either. The red banner also no longer resets the count to
   exactly 2:00 when it fires, and the yellow banner no longer reads "About
   15:00 min left" (#207).
+- **The Settings window kept polling after you closed it.** Closing the
+  setup window hides it rather than destroying it — the process has to keep
+  serving HTTP and the lifetime socket — so the Svelte component stayed
+  mounted and its 2 s status poll ran for the life of the app. Each tick
+  cost an authenticated HTTP round-trip *and* a child process (`pgrep` on
+  macOS, `tasklist` on Windows, the latter 100–300 ms of CPU): roughly
+  43,000 spawns over an idle day, for a window nobody was looking at, and
+  the exact opposite of the "no background polling" principle this repo
+  writes down in `docs/architecture/self-healing.md`. The poll is now gated
+  on visibility — `visibilitychange`, window blur/focus, and an explicit
+  `setup:visibility` event from Rust, because a hidden WKWebView can keep
+  reporting itself visible — and the two expensive probes sit behind a 15 s
+  cache, so even a window left open spawns at most four processes a minute.
+  Deliberately *not* fixed by destroying the window on close: that would
+  unmount the component and break Invariant I2 (#208).
+- **The health banner blamed a port conflict for four different failures.**
+  It rendered whenever the self-probe said "not alive" and then claimed,
+  unconditionally, that another process was holding port 7777 and offered
+  an `lsof` command to hunt it. The probe returns false for a missing token
+  file, a 500 ms timeout, a client-build failure or a non-aiui response —
+  only the last of those is a squatter. The deterministic case was
+  Uninstall: it deletes the token file, so the next tick reported the
+  server dead *while it was still listening*, and the user dismissed the
+  done-modal into a red port-conflict warning plus a re-armed first-run
+  wizard, both false. The probe now reports *why*, the hint names the
+  actual cause (new `http_error.hint.token` / `http_error.hint.unreachable`
+  strings in both catalogues), the banner waits for three consecutive
+  failures so one slow probe during wake-from-sleep can't flash it, and
+  neither it nor the welcome wizard appears after an uninstall. The trigger
+  is unchanged — `http_alive` stays the source of truth for *whether* to
+  show the banner, which is the lesson of #77 (#208).
+- **"Remove" on a remote host fired on the first click.** That one click
+  stops the tunnel, strips the `RemoteForward` from `~/.ssh/config` and, if
+  the host answers, deletes the auth token, the `aiui` MCP entry and the
+  skill directory *on that host* — with no undo and no path back short of a
+  full re-setup. The button sat flush against the ⟳ resync icon in a 520 px
+  window. It is now two-step, the same shape as the local uninstall
+  confirm, with a spacer between the two. aiui was failing the rule it
+  ships to agents in `docs/skill.md`: destructive or hard-to-undo actions
+  get confirmed, even when loose approval was already given (#208).
+- **The welcome wizard's "Copy demo prompt" button could do nothing, twice,
+  and say nothing.** It was the only route to the demo prompt — the text is
+  rendered nowhere else — and it used `navigator.clipboard`, which needs a
+  secure context WKWebView does not always grant. Its catch block set a
+  flag and stopped: no message, no log line, no alternative, so a first-run
+  user on step 3 clicked, saw nothing, clicked again, and was out of moves.
+  The copy now goes through a Rust command first (which has no
+  secure-context requirement), falls back to the Web API, and if both fail
+  shows the prompt inline in a read-only textarea with a failure line in
+  the log. Deliberately not `document.execCommand("copy")`: the defect is
+  that a failed copy left the user with no access to the prompt at all
+  (#208).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

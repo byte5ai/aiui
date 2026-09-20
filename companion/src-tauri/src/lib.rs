@@ -38,6 +38,12 @@ use tauri_plugin_notification::NotificationExt;
 /// unreachable (#179).
 pub const SETUP_WINDOW_LABEL: &str = "setup";
 
+/// Broadcast whenever the setup window is hidden (`false`) or surfaced again
+/// (`true`). Settings gates its status poll on it — the window is hidden, not
+/// destroyed (Invariant I2), so the frontend has no lifecycle hook of its own
+/// to hang that on. Issue #208.
+pub const SETUP_VISIBILITY_EVENT: &str = "setup:visibility";
+
 /// Text of the "an update is available" system notification (#188).
 ///
 /// English only: there is no i18n layer in the Rust half (the `en`/`de`
@@ -717,6 +723,11 @@ async fn surface_for_dialog(
     if let Some(win) = win {
         let _ = win.show();
         let _ = win.set_focus();
+        // #208: if that was the setup window, it may have been hidden with
+        // its status poll stopped — same signal as the Dock-click path.
+        if win.label() == SETUP_WINDOW_LABEL {
+            let _ = app.emit(SETUP_VISIBILITY_EVENT, true);
+        }
     }
     Ok(())
 }
@@ -849,6 +860,15 @@ struct StatusReport {
     /// requests — that's how v0.4.8 ended up showing a permanent red
     /// banner on a perfectly healthy server. Issue #77.
     http_alive: bool,
+    /// Why `http_alive` is what it is — `ProbeOutcome::as_str`. #208: a
+    /// bare `false` was indistinguishable between "you just uninstalled
+    /// and the token is gone" and "another process owns the port", and
+    /// Settings claimed the latter for all of them.
+    http_probe_reason: &'static str,
+    /// The i18n key Settings renders as the banner's hint line, picked by
+    /// `health_hint_key` from the probe reason, `http_error` and the OS.
+    /// Computed here rather than in Svelte so the mapping is unit-tested.
+    http_hint_key: String,
     /// Lower-case OS identifier — `"macos"`, `"windows"`, `"linux"`, or
     /// `"other"`. Lets the Svelte side render OS-specific copy (e.g. the
     /// uninstall instructions: drag to Trash vs. Apps & Features) without
@@ -883,17 +903,36 @@ const fn current_os() -> &'static str {
 #[tauri::command]
 async fn status(
     window: tauri::WebviewWindow,
+    // `force: true` bypasses the expensive-probe cache. The frontend passes
+    // it for user-triggered refreshes only; the 2 s poll leaves it unset,
+    // which is what keeps an open Settings window off `pgrep`/`tasklist`
+    // more than four times a minute (#208).
+    force: Option<bool>,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
     pending_update: tauri::State<'_, Arc<PendingUpdate>>,
     lock_err: tauri::State<'_, Arc<LockError>>,
+    expensive: tauri::State<'_, Arc<ExpensiveStatusCache>>,
 ) -> Result<StatusReport, String> {
     // #195: this discloses the token path, the HTTP port and every registered
     // SSH alias — reconnaissance for anything that got script into a dialog.
     require_privileged_window(&window, "status")?;
     let bin = setup::app_binary_path();
-    let http_alive = probe_http_self(&cfg).await;
+    // #208: the HTTP round-trip and the `pgrep`/`tasklist` spawn are behind
+    // a 15 s TTL. The rest — config flags, skill stat, remotes, tunnels —
+    // is cheap enough to answer on every poll and is what the user actually
+    // watches change while they click around in Settings.
+    let cfg_for_probe = cfg.inner().clone();
+    let expensive = expensive
+        .sample(force.unwrap_or(false), || async move {
+            ExpensiveStatus {
+                probe: probe_http_self(&cfg_for_probe).await,
+                claude_desktop_running: setup::is_claude_desktop_running(),
+            }
+        })
+        .await;
+    let http_error = http_err.lock().ok().and_then(|s| s.clone());
     Ok(StatusReport {
         app_binary_path: bin.clone(),
         token_path: cfg.token_path.display().to_string(),
@@ -901,14 +940,20 @@ async fn status(
         claude_config_ok: setup::is_claude_config_current(&bin),
         claude_code_config_ok: setup::is_claude_code_config_current(&bin),
         skill_installed: skill::is_installed_locally(),
-        claude_desktop_running: setup::is_claude_desktop_running(),
+        claude_desktop_running: expensive.claude_desktop_running,
         remotes: setup::load_remotes(),
         tunnels: tm.snapshot().await,
         build_info: logging::BUILD_INFO,
         welcome_pending: is_first_run(&cfg),
-        http_error: http_err.lock().ok().and_then(|s| s.clone()),
+        http_alive: expensive.probe.is_alive(),
+        http_probe_reason: expensive.probe.as_str(),
+        http_hint_key: health_hint_key(
+            expensive.probe.as_str(),
+            http_error.is_some(),
+            current_os(),
+        ),
+        http_error,
         lock_error: lock_err.0.lock().ok().and_then(|s| s.clone()),
-        http_alive,
         os: current_os(),
         pending_update: current_pending_update(pending_update.inner()),
         ephemeral_install: setup::is_ephemeral_install(),
@@ -936,20 +981,92 @@ fn current_pending_update(state: &PendingUpdate) -> Option<String> {
     slot.clone()
 }
 
+/// Why the HTTP self-probe said what it said.
+///
+/// #208: the probe used to return a bare `bool`, and Settings turned every
+/// `false` into one sentence — "something else is holding port 7777, check
+/// `lsof`". Four unrelated conditions collapse into that `false`, and only
+/// one of them is a port conflict. The deterministic case is Uninstall:
+/// `uninstall_all` deletes the token file, the next probe can't read it, and
+/// the user is told to hunt a squatter that does not exist while aiui's own
+/// server is still listening. The outcome travels to the frontend so the
+/// hint can name the actual failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// `/probe` answered with our marker — the server on the port is us.
+    Alive,
+    /// The token file is missing or unreadable, so the probe never ran.
+    /// Says nothing at all about the port.
+    TokenUnreadable,
+    /// Nobody answered within the 500 ms budget (or the connection failed).
+    Unreachable,
+    /// Something answered, but it isn't aiui — this *is* the squatter case.
+    WrongService,
+    /// `reqwest` refused to build a client. Local fault, not the port's.
+    ClientBuildFailed,
+}
+
+impl ProbeOutcome {
+    /// Stable, lower-snake wire name for `StatusReport.http_probe_reason`.
+    /// Consumed by `health_hint_key` and shown in no UI directly.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProbeOutcome::Alive => "alive",
+            ProbeOutcome::TokenUnreadable => "token_unreadable",
+            ProbeOutcome::Unreachable => "unreachable",
+            ProbeOutcome::WrongService => "wrong_service",
+            ProbeOutcome::ClientBuildFailed => "client_build_failed",
+        }
+    }
+
+    pub(crate) fn is_alive(self) -> bool {
+        matches!(self, ProbeOutcome::Alive)
+    }
+}
+
+/// Which i18n key the health banner's hint line should render (#208).
+///
+/// Pure so the mapping — the part that was wrong — is testable without a
+/// window, a port or a token file.
+///
+/// `bind_failed` is `http_error.is_some()`: the HTTP server recorded an
+/// actual bind/serve failure at startup. That, and a live non-aiui service
+/// on the port, are the only two states where "something else is holding
+/// the port" is a true statement; everything else gets a hint that matches
+/// what actually happened.
+pub(crate) fn health_hint_key(reason: &str, bind_failed: bool, os: &str) -> String {
+    let squatter = format!("settings.http_error.hint.{os}");
+    if bind_failed {
+        return squatter;
+    }
+    match reason {
+        "wrong_service" => squatter,
+        "token_unreadable" => "settings.http_error.hint.token".to_string(),
+        "unreachable" | "client_build_failed" => {
+            "settings.http_error.hint.unreachable".to_string()
+        }
+        // `alive` (banner not shown) and anything a future probe adds:
+        // the OS hint is the historical default, so an unmapped reason
+        // degrades to today's behaviour rather than to an empty line.
+        _ => squatter,
+    }
+}
+
 /// Authenticated HTTP self-probe to verify our own HTTP server is
 /// actually serving aiui. A naked TCP connect would lie positive when an
 /// SSH-session squatter or any other process happens to hold the port in
 /// LISTEN — the kernel answers SYN regardless of who's behind it. Issue
 /// #77 (revised in v0.4.10): we hit `/probe` with our bearer token and
 /// verify the response carries the aiui marker. Anything else (squatter
-/// without our token, non-aiui content, timeout) reads as "down".
+/// without our token, non-aiui content, timeout) reads as "down" — but
+/// since #208 it reads as a *specific* kind of down, see `ProbeOutcome`.
 ///
 /// 500 ms timeout to cover token-read + HTTP round-trip + JSON parse
 /// over loopback; this stays well under the Settings refresh interval.
-async fn probe_http_self(cfg: &config::AppConfig) -> bool {
+async fn probe_http_self(cfg: &config::AppConfig) -> ProbeOutcome {
     let token = match std::fs::read_to_string(&cfg.token_path) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::TokenUnreadable,
     };
     let url = format!("http://127.0.0.1:{}/probe", cfg.http_port);
     let client = match reqwest::Client::builder()
@@ -957,19 +1074,100 @@ async fn probe_http_self(cfg: &config::AppConfig) -> bool {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::ClientBuildFailed,
     };
     let resp = match client.get(&url).bearer_auth(&token).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return false,
+        // A 401/403/5xx means *something* is answering on the port and it
+        // isn't behaving like our server — that is the squatter shape. A
+        // transport error (refused, timed out) is nobody answering.
+        Ok(_) => return ProbeOutcome::WrongService,
+        Err(_) => return ProbeOutcome::Unreachable,
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::WrongService,
     };
-    body.get("aiui")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    if body.get("aiui").and_then(|v| v.as_bool()).unwrap_or(false) {
+        ProbeOutcome::Alive
+    } else {
+        ProbeOutcome::WrongService
+    }
+}
+
+/// The half of `status` that costs real resources: the authenticated HTTP
+/// round-trip (token read + `reqwest` client + request) and the Claude
+/// Desktop liveness check, which spawns `pgrep` on macOS and `tasklist` on
+/// Windows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpensiveStatus {
+    pub(crate) probe: ProbeOutcome,
+    pub(crate) claude_desktop_running: bool,
+}
+
+/// TTL for [`ExpensiveStatusCache`]. Settings refreshes every 2 s while it is
+/// visible, which is the right cadence for config flags and tunnel state but
+/// absurd for a child-process spawn. 15 s keeps the window feeling live while
+/// capping the process spawns at four a minute.
+pub(crate) const EXPENSIVE_STATUS_TTL: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Memoises [`ExpensiveStatus`] for [`EXPENSIVE_STATUS_TTL`] (#208).
+///
+/// Not a general-purpose cache: it exists because the Settings poll is the
+/// only caller and it asks far more often than the answer changes.
+pub(crate) struct ExpensiveStatusCache {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, ExpensiveStatus)>>,
+}
+
+impl ExpensiveStatusCache {
+    pub(crate) fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fresh(&self) -> Option<ExpensiveStatus> {
+        let guard = self.slot.lock().ok()?;
+        let (at, value) = guard.as_ref()?;
+        (at.elapsed() < self.ttl).then_some(*value)
+    }
+
+    /// Returns the cached sample, or runs `compute` and caches its result.
+    ///
+    /// `force` bypasses the TTL. Settings passes it for refreshes the *user*
+    /// triggered — reopening the window, restarting Claude Desktop, adding a
+    /// remote — where a 15 s-stale answer would read as the button not having
+    /// worked. The 2 s poll never forces.
+    ///
+    /// The lock is never held across the `await` — it is a `std::sync::Mutex`
+    /// and the future has to stay `Send` for a Tauri command. Two concurrent
+    /// misses may therefore both compute; that costs one extra probe and is
+    /// cheaper than the async mutex it would take to prevent.
+    pub(crate) async fn sample<F, Fut>(&self, force: bool, compute: F) -> ExpensiveStatus
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ExpensiveStatus>,
+    {
+        if !force {
+            if let Some(hit) = self.fresh() {
+                return hit;
+            }
+        }
+        let value = compute().await;
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some((std::time::Instant::now(), value));
+        }
+        value
+    }
+}
+
+impl Default for ExpensiveStatusCache {
+    fn default() -> Self {
+        Self::new(EXPENSIVE_STATUS_TTL)
+    }
 }
 
 /// Marks the welcome banner as dismissed so it doesn't reappear on the
@@ -1074,6 +1272,26 @@ fn open_url(url: String) -> Result<(), String> {
     }
     open::that(&url).map_err(|e| format!("open {url}: {e}"))?;
     Ok(())
+}
+
+/// Put `text` on the system clipboard from the Rust side (#208).
+///
+/// The welcome wizard's "copy demo prompt" button used `navigator.clipboard`,
+/// which needs a secure context and is not reliably available in WKWebView —
+/// and its failure path did nothing at all, leaving a first-run user clicking
+/// a button that never responds with no other route to the prompt. Rust-side
+/// clipboard access has no secure-context requirement.
+///
+/// No capability grant is added for this: the frontend calls *this* command,
+/// not the plugin's JS API, and app commands are not gated by capabilities.
+/// Granting `clipboard-manager:allow-write-text` would hand clipboard access
+/// to the dialog window too, which renders agent-supplied content.
+#[tauri::command]
+fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("clipboard write failed: {e}"))
 }
 
 /// Quit aiui after Uninstall has cleaned up configs/tokens/skill, killing
@@ -1712,6 +1930,10 @@ fn show_settings_window(app: &tauri::AppHandle) {
         let _ = win.show();
         let _ = win.set_focus();
         let _ = win.unminimize();
+        // #208: the component is still mounted from the last time the window
+        // was open, with its poll stopped. Tell it it's back on screen so it
+        // refreshes once immediately and resumes ticking.
+        let _ = app.emit(SETUP_VISIBILITY_EVENT, true);
         return;
     }
     if let Err(e) = build_setup_window(app) {
@@ -2267,6 +2489,10 @@ pub fn run() {
         // directly from Rust (http.rs `/notify`), no capability grant needed
         // since it's never invoked from the WebView side.
         .plugin(tauri_plugin_notification::init())
+        // Backs the `copy_to_clipboard` command (#208). Registered for its
+        // Rust API only — no capability is granted, so the WebView cannot
+        // reach the plugin's own commands.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(cfg.clone())
         .manage(dialog_state.clone())
         .manage(ui_acks.clone())
@@ -2276,6 +2502,11 @@ pub fn run() {
         .manage(http_error.clone())
         .manage(lock_error.clone())
         .manage(pending_update.clone())
+        // #208: memoises the two expensive halves of `status` (the
+        // authenticated HTTP self-probe and the `pgrep`/`tasklist` spawn)
+        // so an open Settings window polling every 2 s doesn't spawn a
+        // child process 30 times a minute.
+        .manage(Arc::new(ExpensiveStatusCache::default()))
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
@@ -2301,6 +2532,7 @@ pub fn run() {
             quit_app,
             authorize_exit_for_update,
             dismiss_welcome,
+            copy_to_clipboard,
             open_url
         ])
         .setup(move |app| {
@@ -2755,6 +2987,15 @@ pub fn run() {
                 // both proxies) is removed.
                 api.prevent_close();
                 let _ = window.hide();
+                // #208: because the window is hidden and never destroyed, the
+                // Svelte component stays mounted and its `onDestroy` never
+                // runs — that is how a 2 s status poll survived for the life
+                // of the process, spawning `pgrep`/`tasklist` ~43k times a
+                // day for a UI nobody was looking at. `visibilitychange`
+                // alone is not trustworthy here (a hidden WKWebView can keep
+                // reporting `visibilityState: "visible"`), so Rust tells the
+                // frontend plainly when the window went away.
+                let _ = app.emit(SETUP_VISIBILITY_EVENT, false);
                 #[cfg(target_os = "macos")]
                 {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -3178,6 +3419,212 @@ mod window_permission_tests {
         assert!(!dialog_command_allowed(SAMPLE_DIALOG_LABEL, ""));
         assert!(!dialog_command_allowed("", SAMPLE_DIALOG_LABEL));
         assert!(!dialog_command_allowed("", ""));
+    }
+}
+
+/// #208 — the settings pane told four different failures the same story,
+/// and polled for them forever. These cover the Rust half: what the probe
+/// actually reports, which hint that maps to, and the TTL that keeps an
+/// open window off `pgrep`/`tasklist`.
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cfg_with(token_path: std::path::PathBuf, port: u16) -> config::AppConfig {
+        config::AppConfig {
+            token: "a".repeat(64),
+            config_dir: token_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default(),
+            token_path,
+            http_port: port,
+        }
+    }
+
+    /// A directory under the OS temp dir that nothing else is using, and a
+    /// path inside it that does not exist. No `tempfile` dependency in this
+    /// crate, so this is the shape the other tests use too.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-208-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A port nobody is listening on: bind one, learn its number, drop it.
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        l.local_addr().expect("local addr").port()
+    }
+
+    #[tokio::test]
+    async fn probe_outcome_is_token_unreadable_when_token_file_missing() {
+        // The deterministic #208 scenario: `uninstall_all` removes the token
+        // file, and the very next poll's probe bails on the read. That is
+        // *not* evidence about the port, and it used to be reported as such.
+        let dir = scratch("no-token");
+        let cfg = cfg_with(dir.join("token"), free_port());
+        assert_eq!(
+            probe_http_self(&cfg).await,
+            ProbeOutcome::TokenUnreadable,
+            "a missing token says nothing about who owns the port"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn probe_outcome_is_unreachable_when_nothing_listens() {
+        let dir = scratch("nothing-listens");
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "a".repeat(64)).expect("write token");
+        let cfg = cfg_with(token_path, free_port());
+        let started = std::time::Instant::now();
+        assert_eq!(probe_http_self(&cfg).await, ProbeOutcome::Unreachable);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the probe must stay inside its own timeout budget"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_hint_key_only_claims_port_conflict_on_bind_failure() {
+        // The banner's hint claimed a port squatter unconditionally. It may
+        // only say that when the HTTP server actually failed to bind, or
+        // when something that isn't aiui answered on the port.
+        assert_eq!(
+            health_hint_key("unreachable", true, "macos"),
+            "settings.http_error.hint.macos"
+        );
+        assert_eq!(
+            health_hint_key("wrong_service", false, "macos"),
+            "settings.http_error.hint.macos"
+        );
+        assert_eq!(
+            health_hint_key("wrong_service", false, "windows"),
+            "settings.http_error.hint.windows"
+        );
+        for reason in ["token_unreadable", "unreachable", "client_build_failed"] {
+            assert_ne!(
+                health_hint_key(reason, false, "macos"),
+                "settings.http_error.hint.macos",
+                "{reason} is not evidence of a port conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn health_hint_key_names_the_missing_token() {
+        assert_eq!(
+            health_hint_key("token_unreadable", false, "macos"),
+            "settings.http_error.hint.token"
+        );
+        assert_eq!(
+            health_hint_key("unreachable", false, "linux"),
+            "settings.http_error.hint.unreachable"
+        );
+        assert_eq!(
+            health_hint_key("client_build_failed", false, "linux"),
+            "settings.http_error.hint.unreachable"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_reason_degrades_to_the_os_hint() {
+        // Whatever a future probe outcome is called, the banner must still
+        // render a sentence rather than an empty line.
+        assert_eq!(
+            health_hint_key("something_new", false, "other"),
+            "settings.http_error.hint.other"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reuses_cached_expensive_probes_within_ttl() {
+        // The poll ticks every 2 s; the probe and the `pgrep`/`tasklist`
+        // spawn behind it must not.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::new(std::time::Duration::from_secs(15));
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: true,
+                }
+            }
+        };
+        for _ in 0..8 {
+            assert!(cache.sample(false, compute).await.probe.is_alive());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "eight polls, one probe");
+    }
+
+    #[tokio::test]
+    async fn an_expired_ttl_takes_a_fresh_sample() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::new(std::time::Duration::from_millis(20));
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: false,
+                }
+            }
+        };
+        cache.sample(false, compute).await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        cache.sample(false, compute).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_user_triggered_refresh_bypasses_the_cache() {
+        // Clicking "Restart Claude Desktop" and then being told for another
+        // 15 s that it isn't running reads as the button not having worked.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::default();
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: true,
+                }
+            }
+        };
+        cache.sample(false, compute).await;
+        cache.sample(true, compute).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn probe_reasons_are_distinct_wire_names() {
+        let all = [
+            ProbeOutcome::Alive,
+            ProbeOutcome::TokenUnreadable,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::WrongService,
+            ProbeOutcome::ClientBuildFailed,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|o| o.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len());
+        assert!(ProbeOutcome::Alive.is_alive());
+        assert_eq!(all.iter().filter(|o| o.is_alive()).count(), 1);
     }
 }
 
