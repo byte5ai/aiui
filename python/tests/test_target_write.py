@@ -11,6 +11,7 @@ from pathlib import Path
 
 from aiui_mcp.server import (
     _action_commits_targets,
+    _collect_secret_fields,
     _apply_target_writes,
     _collect_target_fields,
     _write_local_target,
@@ -196,3 +197,94 @@ def test_apply_target_writes_blank_value_leaves_file_intact(tmp_path: Path) -> N
     _apply_target_writes(spec, data)
     assert secret_path.read_text() == "ghp_existing"
     assert data["result"]["values"]["pat"]["written"] is False
+
+
+# --- issue #186: a `secret` is write-only by KIND, with or without a target
+
+
+def test_collect_secret_fields_finds_them_with_and_without_target() -> None:
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "secret", "name": "bare"},
+            {"kind": "secret", "name": "targeted",
+             "target": {"mode": "create", "path": "/x"}},
+            {"kind": "password", "name": "pw"},
+            {"kind": "text", "name": "t"},
+        ],
+        "tabs": [{"label": "T", "fields": [{"kind": "secret", "name": "in_tab"}]}],
+    }
+    assert sorted(_collect_secret_fields(spec)) == ["bare", "in_tab", "targeted"]
+
+
+def test_target_less_secret_is_never_returned_to_the_agent(tmp_path: Path) -> None:
+    """The #186 headline. An older companion does not reject this shape, so a
+    newer bridge in front of one must not hand the plaintext back."""
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "secret", "name": "pat", "label": "GitHub PAT"},
+            {"kind": "text", "name": "note"},
+        ],
+    }
+    data = {
+        "cancelled": False,
+        "result": {"action": None, "values": {"pat": "ghp_live_secret", "note": "kept"}},
+    }
+    _apply_target_writes(spec, data)
+    values = data["result"]["values"]
+    assert "ghp_live_secret" not in str(values), "the plaintext must not survive"
+    assert values["pat"]["written"] is False
+    assert "no target" in values["pat"]["error"]
+    assert values["note"] == "kept", "non-secret fields are untouched"
+
+
+def test_target_less_secret_inside_a_tab_is_stripped(tmp_path: Path) -> None:
+    spec = {
+        "kind": "form",
+        "tabs": [{"label": "Creds", "fields": [{"kind": "secret", "name": "pat"}]}],
+    }
+    data = {"cancelled": False, "result": {"action": None, "values": {"pat": "ghp_x"}}}
+    _apply_target_writes(spec, data)
+    assert "ghp_x" not in str(data["result"]["values"])
+
+
+def test_targeted_secret_still_reports_its_write(tmp_path: Path) -> None:
+    """The happy path must not regress: a real write still wins over the
+    fallback marker."""
+    secret_path = tmp_path / "tok"
+    spec = {
+        "kind": "form",
+        "fields": [{"kind": "secret", "name": "pat",
+                    "target": {"mode": "create", "path": str(secret_path)}}],
+    }
+    data = {"cancelled": False, "result": {"action": None, "values": {"pat": "ghp_real"}}}
+    _apply_target_writes(spec, data)
+    assert secret_path.read_text() == "ghp_real"
+    assert data["result"]["values"]["pat"]["written"] is True
+    assert "no target" not in str(data["result"]["values"]["pat"])
+
+
+def test_password_field_is_still_returned(tmp_path: Path) -> None:
+    """`password` is the documented alternative for "I want the value back" —
+    it must keep working, or agents have nowhere to go."""
+    spec = {"kind": "form", "fields": [{"kind": "password", "name": "pw"}]}
+    data = {"cancelled": False, "result": {"action": None, "values": {"pw": "hunter2"}}}
+    _apply_target_writes(spec, data)
+    assert data["result"]["values"]["pw"] == "hunter2"
+
+
+def test_cancelled_dialog_with_a_bare_secret_is_still_a_noop(tmp_path: Path) -> None:
+    spec = {"kind": "form", "fields": [{"kind": "secret", "name": "pat"}]}
+    data = {"cancelled": True, "result": {}}
+    _apply_target_writes(spec, data)
+    assert data == {"cancelled": True, "result": {}}, "cancel carries no values"
+
+
+def test_absent_secret_value_is_not_invented(tmp_path: Path) -> None:
+    """A secret the user never filled in has no key in `values`; the strip
+    must not create one."""
+    spec = {"kind": "form", "fields": [{"kind": "secret", "name": "pat"}]}
+    data = {"cancelled": False, "result": {"action": None, "values": {}}}
+    _apply_target_writes(spec, data)
+    assert "pat" not in data["result"]["values"]

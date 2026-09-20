@@ -80,6 +80,29 @@ All notable changes to this project are documented here.
   (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
   after this fix.
 
+### Security
+
+- **A `secret` field without a `target` handed its plaintext to the agent.**
+  Both `skill.md` and the `form` tool description promise a `secret` value
+  is "NEVER returned to you", but the stripping keyed on the presence of
+  `target`, not on the field kind — and `target` is a nested object that is
+  easy to omit. A `secret` without one sailed through validation (there was
+  even a unit test asserting that shape valid), looked identical to a
+  `password` in the UI, and its value went back in `result.values` and thus
+  into the transcript. Three layers now close it: the companion rejects the
+  shape with `invalid_spec`, and both the frontend and the Python bridge
+  strip on the kind rather than on the target, so an older companion in
+  front of a newer bridge cannot leak either. A target-less `secret` is
+  rejected rather than silently downgraded to `password`: handing over a
+  credential the docs promised would never be returned has to be loud
+  (#186).
+
+- **The Python bridge discarded the reason for a rejected spec.**
+  `raise_for_status()` threw away the companion's `{error, detail, hint}`
+  body, so a remote agent got a bare `HTTPStatusError: 422` while a local
+  Rust-bridge agent got the explanation. The reason now survives the bridge
+  (#186).
+
 ## [0.10.1] — 2026-08-31
 
 ### Added
