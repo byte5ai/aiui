@@ -160,6 +160,34 @@ an expected outcome, not a bug to retry around.
   An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
+## What the dialog enforces before it submits
+
+The constraints you declare are checked in the dialog, not just decoration
+on the widget — an affirmative action only fires once they all hold:
+
+- `required` — a blank field, a whitespace-only text, an unset end of a
+  `date_range`, or an empty `table` / `image_grid` / `annotated_image`
+  selection blocks the submit.
+- `min` / `max` on `number` and `slider` — a value outside the interval
+  blocks the submit, including one typed straight into the box (native
+  `min`/`max` only constrain the stepper arrows).
+- Pressing the action anyway is never a silent no-op: the dialog switches
+  to the offending tab, shows a footer message and marks the fields.
+  `skip_validation: true` is the documented way past all of it.
+
+Two things are normalised before the user ever sees them, so what comes
+back is what was on screen:
+
+- A `select` without a `default` resolves to its **first option** — it no
+  longer returns `""`, a value you never offered.
+- A `default` the native control cannot represent is normalised or
+  cleared rather than round-tripped: `date` / `datetime` must be ISO
+  (`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`), `color` must be `#rrggbb`, and a
+  `number` / `slider` default outside `[min, max]` is clamped into it.
+
+None of this replaces validating the returned values on your side — it is
+a UI guard, not a security control.
+
 ## The `list` field — one widget, four modes
 
 | `selectable` | `multi_select` | `sortable` | Mode |
@@ -300,8 +328,9 @@ Spec:
     *and* a region (both are returned).
 - `default` — optionally seed `{point?: {x, y}, region?: {x, y, w, h}}` in
   normalized units to pre-place a marker the user then nudges.
-- `required` — the submit action stays disabled until the user has marked
-  the annotation the mode calls for.
+- `required` — pressing an affirmative action before the user has marked
+  the annotation the mode calls for highlights the field and shows what is
+  missing instead of submitting.
 
 **Result** (under the field `name`):
 
@@ -618,8 +647,9 @@ validation. Native `<input type="datetime-local">`, returns ISO
 ## Tabs — long forms without scroll fatigue
 
 Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
-One submit covers all tabs; validation jumps to the first invalid tab
-automatically. Tabs are *display structure*, not a wizard — no per-tab
+One submit covers all tabs; pressing it with something invalid switches to
+the first invalid tab, names it in a footer message and marks the offending
+fields — it never submits silently. Tabs are *display structure*, not a wizard — no per-tab
 confirmation, no per-tab actions, all values land in one response.
 
 Use when a single dialog naturally falls into 2-4 distinct topical

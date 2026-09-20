@@ -54,6 +54,28 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **`form` validation was decorative — `required`, `min` and `max` are now
+  enforced before the answer leaves the dialog.** A required `date_range`
+  counted as filled in while empty (the value is an object, and
+  `String({from,to})` is a non-empty string), `"   "` satisfied a required
+  text, and a `number` bounded 1–10 happily returned 9999 because native
+  `min`/`max` only constrain the stepper arrows. A `date`, `datetime`,
+  `color` or `slider` default the native control cannot represent rendered
+  blank, black or clamped while the original string was what the agent got
+  back on submit — it is now normalised or cleared instead, so the returned
+  value is the one the user saw. A `select` without a `default` returned
+  `""`, a value the agent never offered, and now resolves to its first
+  option — which is what the dropdown already displayed (#206).
+- **A form could not tell the user what was missing, or where.** The submit
+  button was disabled whenever validation failed, and a disabled button
+  fires no click — so the "jumps to the first invalid tab" the skill
+  promises was unreachable, and a required field on tab 3 left the user
+  staring at a dead button on tab 1 with a `*` they could not see.
+  Meanwhile `destructive` buttons stayed enabled and swallowed the click
+  silently. Affirmative actions are now always clickable: pressing one with
+  something invalid switches to the offending tab, names it in a footer
+  message, and marks the fields with a red border and `aria-invalid`
+  (#206).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
