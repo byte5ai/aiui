@@ -39,17 +39,19 @@ jobs:
             target: x86_64-pc-windows-msvc
             label: Windows x86_64
             build_bundle: true
-            # Compile+link the tests but do NOT execute them on Windows.
-            # The freshly-linked `aiui_lib` test binary crashes at *load*
-            # with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on the GH
-            # windows-latest runner — a loader artifact of the large test
-            # binary, not a logic failure (build, clippy and the NSIS bundle
-            # all pass; identical dependency graph to the green macOS/main
-            # build; no Windows FFI added). aiui ships macOS-only and the
-            # Windows port is WIP; the Windows unit-test-binary loader crash (#141)
-            # is tracked separately. We still validate that all code + tests
-            # *compile and link* on Windows via `--no-run`.
-            run_tests: false
+            # #183: Windows executes the test binary again. It used to be
+            # compiled with `--no-run` and thrown away, because the freshly
+            # linked `aiui_lib` test binary crashed at *load* with
+            # STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on the runner (#141,
+            # closed as completed 2026-08-01) — a loader artifact, not a
+            # logic failure. The skip's justification ("aiui ships macOS-only
+            # and the Windows port is WIP") stopped being true at v0.10.1,
+            # and Windows is now the platform where the host-registration
+            # code has the most per-OS branching and the least history. A
+            # matrix entry that never runs a test is a green check that
+            # asserts nothing. If the loader crash returns, reopen #141 with
+            # the failing run linked rather than silently flipping this back.
+            run_tests: true
     steps:
       - uses: actions/checkout@v4
 
@@ -88,15 +90,6 @@ jobs:
         if: matrix.run_tests
         working-directory: companion/src-tauri
         run: cargo test --lib --release --target ${{ matrix.target }}
-
-      # Windows: compile + link the test binary (real coverage that the code
-      # and tests build on Windows) but skip execution — the test binary
-      # crashes at load on the runner (see matrix comment; tracked under the
-      # Windows-port WIP). `--no-run` stops before that loader crash.
-      - name: Cargo test (compile only)
-        if: ${{ !matrix.run_tests }}
-        working-directory: companion/src-tauri
-        run: cargo test --lib --release --target ${{ matrix.target }} --no-run
 
       - name: Cargo clippy
         working-directory: companion/src-tauri
