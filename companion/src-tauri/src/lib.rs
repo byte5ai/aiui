@@ -2314,4 +2314,129 @@ mod tests {
         let spec = json!({"kind": "form", "fields": [{"kind": "text", "name": "x"}]});
         assert!(collect_target_fields(&spec).is_empty());
     }
+
+    fn target_names(spec: &serde_json::Value) -> Vec<String> {
+        collect_target_fields(spec)
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn collect_target_fields_walks_flat_fields() {
+        // The whole write-target contract of `write_dialog_targets`: what
+        // this returns is exactly what lands on disk. Everything it misses
+        // is a file the user expected and never got, on a dialog that
+        // reported success (#211).
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "plain"},
+                {"kind": "secret", "name": "pat",
+                 "target": {"mode": "create", "path": "~/.github_tokens/x"}}
+            ]
+        });
+        assert_eq!(target_names(&spec), vec!["pat".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_walks_tab_fields() {
+        // A tabbed form has no flat `fields` at all. A refactor that stops
+        // descending into `tabs[]` writes nothing for the whole dialog.
+        let spec = json!({
+            "kind": "form",
+            "tabs": [
+                {"label": "Creds", "fields": [
+                    {"kind": "secret", "name": "pat",
+                     "target": {"mode": "create", "path": "/tmp/pat"}}
+                ]},
+                {"label": "Notes", "fields": [
+                    {"kind": "text", "name": "note"},
+                    {"kind": "text", "name": "env",
+                     "target": {"mode": "append", "path": "/tmp/env"}}
+                ]}
+            ]
+        });
+        assert_eq!(target_names(&spec), vec!["pat".to_string(), "env".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_skips_null_and_absent_targets() {
+        // `"target": null` is a deliberate opt-out, not a target. Relaxing
+        // the `!t.is_null()` test to a plain `.is_some()` would feed `null`
+        // into `serde_json::from_value::<filewrite::Target>` and turn every
+        // such field into a "bad target spec" outcome.
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "no_key"},
+                {"kind": "text", "name": "nulled", "target": serde_json::Value::Null}
+            ],
+            "tabs": [
+                {"label": "T", "fields": [
+                    {"kind": "text", "name": "nulled_in_tab", "target": serde_json::Value::Null}
+                ]}
+            ]
+        });
+        assert!(collect_target_fields(&spec).is_empty());
+    }
+
+    #[test]
+    fn collect_target_fields_keeps_duplicate_names() {
+        // Both are returned; the caller's `HashMap` then keeps the last
+        // outcome per name. That last-write-wins is a deliberate, visible
+        // choice here rather than something this function quietly decides.
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "dup", "target": {"mode": "create", "path": "/tmp/a"}}
+            ],
+            "tabs": [
+                {"label": "T", "fields": [
+                    {"kind": "text", "name": "dup", "target": {"mode": "create", "path": "/tmp/b"}}
+                ]}
+            ]
+        });
+        let fields = collect_target_fields(&spec);
+        assert_eq!(fields.len(), 2, "both survive collection: {fields:?}");
+        assert_eq!(target_names(&spec), vec!["dup".to_string(), "dup".to_string()]);
+        assert_eq!(fields[0]["target"]["path"], json!("/tmp/a"));
+        assert_eq!(fields[1]["target"]["path"], json!("/tmp/b"));
+    }
+
+    #[test]
+    fn is_dialog_window_label_rejects_setup_label() {
+        // Every dialog-window teardown path (Dock demote, teardown stamp,
+        // close handling) hangs off this one predicate: a window label IS a
+        // dialog id, except for the single setup window.
+        assert!(!is_dialog_window_label(SETUP_WINDOW_LABEL));
+        assert!(is_dialog_window_label("d-4f3a91"));
+        assert!(is_dialog_window_label("setup-2"), "prefix is not enough");
+        assert!(is_dialog_window_label(""));
+    }
+
+    #[test]
+    fn current_os_names_this_platform() {
+        // Reported to the agent in `/status` and used by the bridge to
+        // decide platform-specific hints, so "other" would be a silent
+        // downgrade on a platform we actually ship.
+        #[cfg(target_os = "macos")]
+        assert_eq!(current_os(), "macos");
+        #[cfg(target_os = "windows")]
+        assert_eq!(current_os(), "windows");
+        #[cfg(target_os = "linux")]
+        assert_eq!(current_os(), "linux");
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        assert_eq!(current_os(), "other");
+    }
+
+    #[test]
+    fn uninstall_hint_names_this_platforms_removal_path() {
+        let hint = uninstall_app_removal_hint();
+        assert!(!hint.is_empty());
+        #[cfg(target_os = "macos")]
+        assert!(hint.contains("/Applications/aiui.app"), "{hint}");
+        #[cfg(target_os = "windows")]
+        assert!(hint.contains("Apps & Features"), "{hint}");
+    }
 }

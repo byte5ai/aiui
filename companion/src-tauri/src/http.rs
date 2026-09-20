@@ -539,7 +539,10 @@ const UPLOAD_FILENAME_HEADER: &str = "x-aiui-filename";
 /// Percent-encode a filename for transport in an ASCII HTTP header. Encodes
 /// every byte that isn't an RFC-3986 unreserved char, so UTF-8 names, spaces,
 /// and control bytes all survive the round-trip and the header stays valid.
-fn pct_encode_filename(s: &str) -> String {
+///
+/// `pub(crate)` so `mcp::pct_decode_bytes` — the other half of that round
+/// trip — can be tested against the real encoder instead of a re-typed one.
+pub(crate) fn pct_encode_filename(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

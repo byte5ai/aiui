@@ -648,6 +648,7 @@ pub fn disk_version_if_stale() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::ssh_ntr_args;
 
     #[cfg(windows)]
     const CURRENT: &str = r"C:\Program Files\aiui\aiui.exe";
@@ -787,32 +788,13 @@ mod tests {
         assert!(!is_aiui_binary("/usr/bin/python3"));
     }
 
-    fn ssh_ntr_args(host: &str, port: u16) -> Vec<String> {
-        // Mirrors the spawn in tunnel.rs:run_tunnel exactly.
-        [
-            "ssh",
-            "-N",
-            "-T",
-            "-R",
-            &format!("{port}:localhost:{port}"),
-            "-o",
-            "ServerAliveInterval=30",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "--",
-            host,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
+    /// `ssh_ntr_args` here is the **production builder** from `tunnel.rs`
+    /// (imported at the top of this module), not a copy. A hand-copied
+    /// duplicate used to live in this file, which made this test inert: an
+    /// `-o` added or reordered in the real spawn kept it green while
+    /// `is_aiui_ssh_ntr_for_port` stopped recognising aiui's own reparented
+    /// tunnels — so orphans piled up and kept the remote's :7777 occupied
+    /// (#211).
     #[test]
     fn ssh_ntr_signature_matches_real_tunnel_args() {
         let a = ssh_ntr_args("dev@devhost", 7777);

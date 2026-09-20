@@ -19,6 +19,27 @@ All notable changes to this project are documented here.
   runs in the release path before anything becomes visible, and
   `scripts/test-check-updater-feed.sh` exercises it against fixtures on
   every PR so the guard cannot quietly stop guarding (#190).
+- **`schemas/tools-schema.json`** — one structural contract (tool names,
+  required arguments, argument names, types, scalar defaults) that both MCP
+  bridges are now asserted against, the Rust one in `mcp.rs`, the Python one
+  in `python/tests/test_tool_schema_parity.py`. The two tool surfaces were
+  hand-maintained twice with nothing comparing them, and had already drifted:
+  `ask`'s `allow_other` defaults to `false` on one bridge and `true` on the
+  other. That divergence is recorded in the fixture rather than papered over,
+  and changing a default on one bridge only now fails there. Descriptions are
+  deliberately not captured — they are prose, edited on purpose (#211).
+- **Tests for the companion's untested pure logic.** `collect_target_fields`
+  decides which form fields get written to disk, and nothing pinned that it
+  walks `tabs[]` as well as `fields`, or that `"target": null` stays an
+  opt-out — a refactor could have made a form report success while writing
+  nothing. `TunnelManager::ensure`'s host-alias guard is the only validation
+  on aliases read from a hand-edited `remotes.json`, and nothing asserted it
+  was still wired up. The upload path's `safe_base_name`, `expand_dir` and
+  `pct_decode_bytes` now match the Python bridge's coverage, including a
+  round trip against the real encoder and the platform divergences of
+  `Path::file_name` and absoluteness. Also `is_dialog_window_label`,
+  `current_os`, `uninstall_app_removal_hint`, and the confirm/dialog result
+  shapes every agent parses (#211).
 
 ### Changed
 
@@ -51,6 +72,14 @@ All notable changes to this project are documented here.
   agent-facing path guidance no longer says "the user's Mac" — an agent
   reading that could reasonably assume POSIX paths on a Windows user's
   machine.
+- **The `ssh -NTR` argv is built once and shared.** `tunnel::ssh_ntr_args`
+  is now the single source for both the tunnel spawn and the orphan reaper's
+  signature test, which until now asserted against a hand-copied duplicate of
+  those flags. Adding or reordering one `-o` on the real spawn kept that test
+  green while `is_aiui_ssh_ntr_for_port` could stop recognising aiui's own
+  reparented tunnels — invisible locally, surfacing days later as leaked
+  `ssh` processes and an occupied `:7777` on the remote. The argv on the wire
+  is byte-identical; this is a pure refactor (#211).
 
 ### Fixed
 
