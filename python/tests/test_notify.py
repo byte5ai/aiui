@@ -38,6 +38,10 @@ def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57")
     monkeypatch.setattr(server, "TOKEN_PATH", token_file)
+    # `notify` runs the cold-start gate since #203; these tests mock only
+    # `post`, so zero the budget rather than let the gate poll a real
+    # `/ping` for 30 s. The gate itself is covered in test_coldstart_gate.py.
+    monkeypatch.setattr(server, "COLDSTART_WAIT_S", 0.0)
 
 
 def test_notify_success_posts_expected_body_and_returns_ok(

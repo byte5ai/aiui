@@ -268,6 +268,11 @@ async fn dispatch(
         "tools/call" => tools_call(params, cfg, http, tx).await,
         "prompts/list" => Ok(json!({ "prompts": prompts_list() })),
         "prompts/get" => prompts_get(params),
+        // MCP requires a prompt empty result for `ping`; a sender may treat a
+        // failed ping as a stale connection and terminate the session — which
+        // surfaces as the "Server disconnected" symptom. Unlike
+        // `server/discover`, this must NEVER fall through to -32601.
+        "ping" => Ok(json!({})),
         _ => Err(RpcError {
             code: -32601,
             message: format!("method not found: {method}"),
@@ -291,8 +296,8 @@ fn tools_list() -> Value {
                     "message": { "type": "string", "description": "One sentence stating the concrete consequence." },
                     "header": { "type": "string", "description": "Short chip above the title (≤ 14 chars)." },
                     "destructive": { "type": "boolean", "default": false, "description": "Red confirm button — for deletions/rollbacks only." },
-                    "confirm_label": { "type": "string" },
-                    "cancel_label": { "type": "string" },
+                    "confirm_label": { "type": "string", "description": "Overrides the affirmative button label. Defaults to the companion's localized affirmative label — resolved from the user's locale, so don't name it in chat unless you set it yourself." },
+                    "cancel_label": { "type": "string", "description": "Overrides the negative button label. Defaults to the companion's localized negative label — resolved from the user's locale, so don't name it in chat unless you set it yourself." },
                     "image": {
                         "type": "object",
                         "description": "Optional image shown between header and title for visual sign-off.",
@@ -780,12 +785,7 @@ async fn tools_call(
             http,
             cfg,
             "/notify",
-            json!({
-                "title": args.get("title"),
-                "body": args.get("body"),
-                "subtitle": args.get("subtitle"),
-                "sound": args.get("sound")
-            }),
+            compact_object(&args, &["title", "body", "subtitle", "sound"]),
         )
         .await
         .map(value_to_tool_text),
@@ -1333,6 +1333,25 @@ async fn post_empty(
         .map_err(|e| format!("parse {path}: {e}"))
 }
 
+/// Build a JSON object from the named keys of `args`, skipping keys that are
+/// absent or null, so an omitted optional is never posted as an explicit
+/// `null` (#203).
+///
+/// `#[serde(default)]` on the receiving struct fires only for an *absent*
+/// key, never for a `null` — so `notify(title="…")` with no `body` used to
+/// send `"body": null` and die in axum's `Json` extractor with a 422 whose
+/// body is a plain-text serde dump, never reaching the companion's own
+/// structured `invalid_request` path.
+fn compact_object(args: &Value, keys: &[&str]) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        if let Some(v) = args.get(*key).filter(|v| !v.is_null()) {
+            out.insert((*key).to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 /// POST with a JSON body, returning the parsed response. Backs `notify`
 /// (#17) — unlike `render_dialog`, there is no async-poll dance here: the
 /// companion's `/notify` handler is itself fire-and-forget and answers
@@ -1357,7 +1376,7 @@ async fn post_json(
         .map_err(|e| format!("POST {path}: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let detail = resp.text().await.unwrap_or_default();
+        let detail = error_detail(&resp.text().await.unwrap_or_default());
         return Err(if detail.is_empty() {
             format!("{path} http {status}")
         } else {
@@ -1367,6 +1386,20 @@ async fn post_json(
     resp.json::<Value>()
         .await
         .map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Pull the companion's own `detail` out of a structured error body, falling
+/// back to the raw text (#203). The companion answers a bad `/notify` with
+/// `{"error":"invalid_request","detail":"title must not be empty"}`; string-
+/// concatenating that whole object handed the agent JSON punctuation instead
+/// of the sentence written for it. Mirrors the Python bridge's handling.
+fn error_detail(raw: &str) -> String {
+    let parsed: Option<Value> = serde_json::from_str(raw).ok();
+    let detail = parsed
+        .as_ref()
+        .and_then(|v| v.get("detail"))
+        .and_then(|d| d.as_str());
+    detail.unwrap_or(raw).to_string()
 }
 
 // MCP tool-result shape: { content: [...], structuredContent?: ..., isError? }
@@ -1610,5 +1643,88 @@ mod tests {
         .expect("initialize must succeed");
         assert_eq!(res["protocolVersion"], "2025-06-18");
         assert!(!res["instructions"].as_str().unwrap_or("").is_empty());
+    }
+
+    /// #203: MCP's ping utility requires an empty result, and a sender may
+    /// treat a failed ping as a stale connection and tear the session down —
+    /// which is how a missing arm here presents: "Server disconnected", not
+    /// "method not found". Exactly one named arm; the catch-all stays strict
+    /// (see `server_discover_probe_gets_method_not_found`).
+    #[tokio::test]
+    async fn ping_returns_empty_result() {
+        let (tx, _rx) = mpsc::channel(1);
+        let res = dispatch(
+            "ping",
+            json!({}),
+            &test_cfg(),
+            &reqwest::Client::new(),
+            &tx,
+        )
+        .await
+        .expect("ping must be answered, not rejected");
+        assert_eq!(res, json!({}));
+    }
+
+    /// #203: the Python bridge defaulted `allow_other` to `true` while this
+    /// one defaults it to `false`, so identical agent code showed a free-text
+    /// box on a remote host and not locally. `false` is the settled value;
+    /// pin the advertised schema so the two cannot drift apart again.
+    #[test]
+    fn ask_schema_defaults_allow_other_to_false() {
+        let tools = tools_list();
+        let ask = tools
+            .as_array()
+            .expect("tools_list is an array")
+            .iter()
+            .find(|t| t["name"] == "ask")
+            .expect("ask tool is advertised");
+        assert_eq!(
+            ask["inputSchema"]["properties"]["allow_other"]["default"],
+            json!(false)
+        );
+    }
+
+    /// #203: an absent optional must not be posted as an explicit `null` —
+    /// `#[serde(default)]` on `NotifyRequest` covers an absent key only, so a
+    /// `null` body died in axum's extractor with a serde dump.
+    #[test]
+    fn notify_body_omits_absent_optionals() {
+        let body = compact_object(
+            &json!({"title": "x", "body": "y"}),
+            &["title", "body", "subtitle", "sound"],
+        );
+        assert_eq!(body, json!({"title": "x", "body": "y"}));
+        assert!(body.get("subtitle").is_none(), "absent key must not appear");
+        assert!(body.get("sound").is_none(), "absent key must not appear");
+    }
+
+    /// An explicit `null` in the args is as good as absent — the agent meant
+    /// "not given" either way.
+    #[test]
+    fn notify_body_drops_explicit_nulls() {
+        let body = compact_object(
+            &json!({"title": "x", "body": "y", "subtitle": null, "sound": null}),
+            &["title", "body", "subtitle", "sound"],
+        );
+        assert_eq!(body, json!({"title": "x", "body": "y"}));
+    }
+
+    /// #203: the companion answers a bad `/notify` with a structured
+    /// `{"error","detail"}`; the agent should get the sentence, not the JSON.
+    #[test]
+    fn error_detail_prefers_the_structured_message() {
+        assert_eq!(
+            error_detail(r#"{"error":"invalid_request","detail":"title must not be empty"}"#),
+            "title must not be empty"
+        );
+    }
+
+    /// Anything that isn't a `{detail: str}` object passes through verbatim —
+    /// a plain-text body from a proxy or an older companion must not vanish.
+    #[test]
+    fn error_detail_falls_back_to_the_raw_body() {
+        assert_eq!(error_detail("plain text failure"), "plain text failure");
+        assert_eq!(error_detail(r#"{"error":"nope"}"#), r#"{"error":"nope"}"#);
+        assert_eq!(error_detail(""), "");
     }
 }
