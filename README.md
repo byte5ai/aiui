@@ -160,6 +160,15 @@ locally, the standalone Python package `aiui-mcp` is still on PyPI and
 gets used via `uvx aiui-mcp`. aiui registers that automatically when you
 add the remote in settings.
 
+A registered remote needs `curl` 7.55 or newer, which every distribution
+shipped since 2017 has. aiui uses it to check, over ssh, whether the port
+it wants is already forwarded back to itself. Older `curl` cannot read a
+request header from stdin, and aiui will not pass your API token on a
+command line where every other user on that host could read it out of the
+process list. On a remote without a usable `curl`, the check is reported
+as inconclusive and the tunnel simply retries — nothing breaks, aiui just
+takes longer to notice a stale forward.
+
 **How much memory does it use?** The companion idles around 30–50 MB.
 The underlying WebKit view loads only while a dialog is on screen.
 

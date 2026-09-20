@@ -4,6 +4,50 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **The API token was readable from the remote host's process list.** The
+  shared-forward probe interpolated the token into
+  `curl -H "Authorization: Bearer $T"`, so the remote shell expanded it
+  before exec and the live token sat in curl's `argv` — visible in `ps` to
+  every user on that machine, once per poll (every 30 s in shared-forward
+  mode). Anyone who read it could render dialogs on the user's desktop
+  through the tunnel. The header now reaches curl over stdin, so the token
+  never becomes an argument of any process. Deliberately not via a pipe
+  from `printf` (external where it is not a builtin, which just moves the
+  leak) nor through the environment (`/proc/<pid>/environ` is readable by
+  the same users as `cmdline`) (#187).
+
+### Fixed
+
+- **A hung probe could park a tunnel task forever.** `ConnectTimeout=5`
+  bounds the TCP connect only; authentication, a wedged remote shell or a
+  stalled curl were unbounded after that, and the probe is awaited inside
+  the poll loop. It now has a 15 s overall cap, is killed on drop rather
+  than orphaned, and races against cancellation at both call sites — a
+  remote removed while a probe was in flight used to wait for it (#187).
+- **The probe called outcomes that prove nothing.** A missing token on the
+  remote, a curl that timed out, a remote without curl, an ssh killed by a
+  signal: all four were reported as "the forward is gone", which in
+  shared-forward mode means a retry storm against a port that is still
+  occupied. Each is now inconclusive, which costs one extra poll. The
+  missing-token case gets its own exit code so it cannot be confused with
+  a real answer — matching what the function's own docstring always
+  claimed (#187).
+- **Every tunnel failure surfaced as "ssh exit code 255".** ssh explains
+  itself on stderr, and stderr went to `/dev/null`. It is now captured
+  into a bounded ring and the last lines are appended to the status, so
+  Settings shows e.g. `ssh exit code 255 — remote port forwarding failed
+  for listen port 7777` instead of the least informative thing ssh can
+  say (#187).
+- **The reconnect backoff never reset.** It only doubled, so a link that
+  connected, worked for hours and then dropped inherited whatever the last
+  startup stumble had left behind — a flapping connection degraded into a
+  permanent 30 s hole during which every remote dialog fails. A link that
+  survived past 30 s now starts over at 1 s, and the sleep carries ±20 %
+  jitter so several tunnels that drop together do not retry in lockstep
+  (#187).
+
 ### Fixed
 
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
