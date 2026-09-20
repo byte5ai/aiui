@@ -145,34 +145,44 @@ const SHARED_FORWARD_POLL_SECS: u64 = 30;
 /// there at remote-registration time). If the file is missing on the
 /// remote, the probe is treated as inconclusive — we don't have enough
 /// to decide.
-async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
+/// The shell command the probe runs on the remote.
+///
+/// #187: the token is fed to curl over STDIN, not as an argument. It used
+/// to be interpolated into `-H "Authorization: Bearer $T"`, which the
+/// remote shell expanded before exec — so the live API token sat in curl's
+/// argv, visible in `ps` to every user on that host, once per poll (every
+/// 30 s in shared-forward mode). Whoever read it could render dialogs on
+/// the user's desktop through the tunnel. `curl -H @-` reads headers from
+/// stdin, so the secret never becomes an argv element of any process.
+///
+/// The heredoc delimiter is deliberately UNQUOTED so the remote shell
+/// expands `$T`. Not `printf … | curl -H @-`: where printf is an external
+/// binary rather than a builtin, that just moves the token into *its* argv.
+/// Not the environment either — `/proc/<pid>/environ` is readable by the
+/// same set of users as `cmdline`.
+///
+/// `-f` makes curl fail on 4xx/5xx (so a 401 reads as not-shared) and
+/// `-m 3` caps its time. The missing-token case gets its own exit code so
+/// the classifier can tell it apart from a real answer.
+///
+/// A function rather than an inline `format!` so the tests exercise the
+/// string that actually ships. A malformed heredoc would break the probe
+/// on every remote at once, and Rust's line continuations make the layout
+/// easy to get wrong — a test against a re-typed copy would stay green
+/// through exactly that mistake.
+fn probe_command(port: u16) -> String {
     let url = format!("http://localhost:{port}/probe");
-    // #187: the token is fed to curl over STDIN, not as an argument.
-    //
-    // It used to be interpolated into `-H "Authorization: Bearer $T"`, which
-    // the remote shell expanded before exec — so the live API token sat in
-    // curl's argv, visible in `ps` to every user on that host, once per poll
-    // (every 30 s in shared-forward mode). Whoever read it could render
-    // dialogs on the user's desktop through the tunnel. `curl -H @-` reads
-    // headers from stdin instead, so the secret never becomes an argv
-    // element of any process.
-    //
-    // The heredoc delimiter is deliberately UNQUOTED so the remote shell
-    // expands `$T`. Not `printf … | curl -H @-`: where printf is an external
-    // binary rather than a builtin, that just moves the token into *its*
-    // argv. Not the environment either — `/proc/<pid>/environ` is readable
-    // by the same set of users as `cmdline`.
-    //
-    // `-f` makes curl fail on 4xx/5xx (so a 401 reads as not-shared) and
-    // `-m 3` caps its time. The missing-token case gets its own exit code so
-    // the classifier can tell it apart from a real answer.
-    let cmd = format!(
+    format!(
         "T=$(cat ~/.config/aiui/token 2>/dev/null); \
          [ -n \"$T\" ] || exit {NO_TOKEN_EXIT}; \
          curl -sS -f -m 3 -H @- {url} <<AIUI_HDR\n\
          Authorization: Bearer $T\n\
          AIUI_HDR\n"
-    );
+    )
+}
+
+async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
+    let cmd = probe_command(port);
     let fut = no_window_tokio(
         Command::new("ssh")
             .args([
@@ -600,18 +610,9 @@ async fn shared_forward_poll_loop(
 mod probe_cmd_tests {
     use super::*;
 
-    /// The exact string handed to the remote shell. Kept as a helper so the
-    /// tests below check what really ships, not a re-typed copy.
-    fn probe_cmd(port: u16) -> String {
-        let url = format!("http://localhost:{port}/probe");
-        format!(
-            "T=$(cat ~/.config/aiui/token 2>/dev/null); \
-             [ -n \"$T\" ] || exit {NO_TOKEN_EXIT}; \
-             curl -sS -f -m 3 -H @- {url} <<AIUI_HDR\n\
-             Authorization: Bearer $T\n\
-             AIUI_HDR\n"
-        )
-    }
+    /// The production builder, so these tests check the string that really
+    /// ships rather than a re-typed copy that could drift away from it.
+    use super::probe_command as probe_cmd;
 
     #[test]
     fn the_token_is_never_an_argument() {
