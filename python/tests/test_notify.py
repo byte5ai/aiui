@@ -36,7 +36,7 @@ class _FakeResp:
 
 def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     token_file = tmp_path / "token"
-    token_file.write_text("dummy-token-for-tests")
+    token_file.write_text("de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57")
     monkeypatch.setattr(server, "TOKEN_PATH", token_file)
 
 
@@ -66,7 +66,7 @@ def test_notify_success_posts_expected_body_and_returns_ok(
         "subtitle": "CI",
         "sound": "default",
     }
-    assert seen["headers"]["Authorization"] == "Bearer dummy-token-for-tests"
+    assert seen["headers"]["Authorization"] == "Bearer " + "de1e7e57" * 8
 
 
 def test_notify_omits_optional_fields_as_none(

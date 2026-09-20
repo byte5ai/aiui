@@ -3,7 +3,8 @@ use serde_json::{Map, Value};
 use crate::fsutil::atomic_write;
 use crate::proc_ext::no_window;
 use std::fs;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,36 +41,166 @@ fn claude_desktop_config_path() -> PathBuf {
     }
 }
 
-fn backup(path: &PathBuf) -> std::io::Result<()> {
+/// Copy `path` aside before we rewrite it. Returns the backup's path so the
+/// caller can name it in `StepResult.details` — a backup the user cannot find
+/// is not a backup (#182).
+///
+/// The suffix is **appended** rather than replacing the extension, so
+/// `~/.claude.json` yields `~/.claude.json.bak.<ts>` and not the misleading
+/// `~/.claude.bak.<ts>`, which looked like a backup of a different file and
+/// did not match what the remote script already produced. Milliseconds,
+/// because two writes in the same second used to silently overwrite each
+/// other's backup.
+fn backup(path: &PathBuf) -> std::io::Result<Option<PathBuf>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
-    let bak = path.with_extension(format!("bak.{ts}"));
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".bak.{ts}"));
+    let bak = path.with_file_name(name);
     fs::copy(path, &bak)?;
-    Ok(())
+    prune_backups(path);
+    Ok(Some(bak))
+}
+
+/// Render a backup path for `StepResult.details`, so the user can actually
+/// find the copy we made before rewriting their file (#182).
+fn backup_detail(bak: Option<PathBuf>) -> Option<String> {
+    bak.map(|p| format!("Backup: {}", p.display()))
+}
+
+/// Keep at most [`MAX_BACKUPS`] `<file>.bak.*` siblings per target.
+///
+/// These are full copies of credential-bearing configs (`~/.claude.json`
+/// carries OAuth data and other servers' `env` blocks), and one was dropped
+/// on every GUI launch that changed anything — an unbounded pile nobody
+/// ever looked at. Also matches the legacy `<stem>.bak.*` shape for one
+/// release, so strays written by older builds get swept too.
+fn prune_backups(path: &Path) {
+    const MAX_BACKUPS: usize = 5;
+    let Some(dir) = path.parent() else { return };
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+    let new_prefix = format!("{file_name}.bak.");
+    let legacy_prefix = format!("{stem}.bak.");
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| {
+                    n.starts_with(&new_prefix)
+                        || (!stem.is_empty() && n.starts_with(&legacy_prefix))
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if found.len() <= MAX_BACKUPS {
+        return;
+    }
+    // Sort by mtime, oldest first; fall back to the name (which carries the
+    // timestamp) when mtime is unavailable.
+    found.sort_by_key(|p| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    let excess = found.len() - MAX_BACKUPS;
+    for old in found.into_iter().take(excess) {
+        let _ = fs::remove_file(old);
+    }
+}
+
+/// Set `command`/`args` on the `aiui` entry **without discarding the rest**.
+///
+/// #182: the old code built a fresh `{command, args}` object and overwrote
+/// whatever was there, so an `env` block, a `disabled` flag or any other key
+/// the user (or a future Claude Code version) added to the aiui entry
+/// vanished on the next launch. Only the two keys we actually own are
+/// touched. The `uvx` → native-binary migration still works, because it
+/// overwrites those same two values.
+fn upsert_aiui_entry(servers: &mut Map<String, Value>, app_binary_path: &str) {
+    let mut entry = servers
+        .get("aiui")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    entry.insert("command".into(), Value::String(app_binary_path.to_string()));
+    entry.insert(
+        "args".into(),
+        Value::Array(vec![Value::String("--mcp-stdio".into())]),
+    );
+    servers.insert("aiui".into(), Value::Object(entry));
+}
+
+/// Is the stored entry already pointing at this binary with our args?
+///
+/// #182: compares **only** the two keys we own. The old
+/// `existing_entry == Some(&entry)` compared whole objects, so an entry
+/// carrying any extra key could never compare equal — meaning a rewrite,
+/// and a fresh `.bak`, on every single launch.
+fn aiui_entry_is_current(entry: Option<&Value>, app_binary_path: &str) -> bool {
+    let Some(obj) = entry.and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let command_ok = obj.get("command").and_then(|v| v.as_str()) == Some(app_binary_path);
+    let args_ok = obj
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len() == 1 && a[0].as_str() == Some("--mcp-stdio"))
+        .unwrap_or(false);
+    command_ok && args_ok
+}
+
+/// Read a JSON host config.
+///
+/// `Ok(None)` = the file is absent. An **empty** file parses as an empty
+/// object, which is genuinely safe. A parse error is an `Err` and never an
+/// empty object (#182): treating unparsable content as `{}` meant the next
+/// write replaced the user's entire file — every MCP server they had
+/// configured, every project entry, the OAuth block — with a document
+/// containing only aiui. A trailing comma was enough.
+fn read_json_config(path: &PathBuf) -> Result<Option<Value>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if raw.trim().is_empty() {
+        return Ok(Some(Value::Object(Map::new())));
+    }
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
     let path = claude_desktop_config_path();
 
-    let existing: Value = if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(s) if s.trim().is_empty() => Value::Object(Map::new()),
-            Ok(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Map::new())),
-            Err(e) => {
-                return StepResult {
-                    ok: false,
-                    message: "Konnte claude_desktop_config.json nicht lesen".into(),
-                    details: Some(e.to_string()),
-                }
+    // #182: a parse error must never be laundered into an empty object —
+    // that replaced the user's whole config with one containing only aiui.
+    let existing: Value = match read_json_config(&path) {
+        Ok(Some(v)) => v,
+        Ok(None) => Value::Object(Map::new()),
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: format!(
+                    "{} is not valid JSON — left untouched",
+                    path.display()
+                ),
+                details: Some(e),
             }
         }
-    } else {
-        Value::Object(Map::new())
     };
 
     let mut root = existing.as_object().cloned().unwrap_or_default();
@@ -78,10 +209,6 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
-    let entry = serde_json::json!({
-        "command": app_binary_path,
-        "args": ["--mcp-stdio"]
-    });
     // Migration: ≤ v0.4.5 wrote the entry under the key `aiui-local`. That
     // mismatched `~/.claude.json`'s `aiui` key, breaking slash commands like
     // `/aiui:test-dialog` in Claude Desktop (would have needed
@@ -90,16 +217,19 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
     let had_legacy = servers.contains_key("aiui-local");
     servers.remove("aiui-local");
     let was_present = servers.contains_key("aiui");
-    servers.insert("aiui".into(), entry);
+    upsert_aiui_entry(&mut servers, app_binary_path);
     root.insert("mcpServers".into(), Value::Object(servers));
 
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "Backup fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "Backup fehlgeschlagen".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
 
     let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
     match atomic_write(&path, pretty.as_bytes()) {
@@ -112,7 +242,10 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
                 }
                 (false, false) => "aiui zu Claude Desktop Config hinzugefügt.".into(),
             },
-            details: Some(format!("Datei: {}", path.display())),
+            details: Some(match backup_detail(bak) {
+                Some(b) => format!("Datei: {} — {b}", path.display()),
+                None => format!("Datei: {}", path.display()),
+            }),
         },
         Err(e) => StepResult {
             ok: false,
@@ -431,23 +564,36 @@ fn codex_toml_upsert(
         None => DocumentMut::new(),
     };
 
-    // Build the aiui entry as an explicit table so it serializes as
-    // `[mcp_servers.aiui]` (the conventional, readable form) rather than dotted
-    // keys (`mcp_servers.aiui.command = …`).
-    let mut aiui = Table::new();
-    aiui["command"] = value(app_binary_path);
     let mut args = Array::new();
     args.push("--mcp-stdio");
-    aiui["args"] = value(args);
 
     // Ensure a `[mcp_servers]` parent table exists — implicit, so we never emit
-    // an empty `[mcp_servers]` header — then set (or replace) `aiui` under it.
+    // an empty `[mcp_servers]` header.
     if doc.get("mcp_servers").and_then(|i| i.as_table()).is_none() {
         let mut parent = Table::new();
         parent.set_implicit(true);
         doc.insert("mcp_servers", Item::Table(parent));
     }
-    doc["mcp_servers"]["aiui"] = Item::Table(aiui);
+
+    // #182: if an `[mcp_servers.aiui]` table is already there, set only the
+    // two keys we own so the user's other keys — and toml_edit's decor, i.e.
+    // their comments and spacing — survive. Build a fresh table only when
+    // there is none.
+    let has_table = doc["mcp_servers"]
+        .get("aiui")
+        .map(|i| i.is_table())
+        .unwrap_or(false);
+    if has_table {
+        doc["mcp_servers"]["aiui"]["command"] = value(app_binary_path);
+        doc["mcp_servers"]["aiui"]["args"] = value(args);
+    } else {
+        // Explicit table so it serializes as `[mcp_servers.aiui]` (the
+        // conventional, readable form) rather than dotted keys.
+        let mut aiui = Table::new();
+        aiui["command"] = value(app_binary_path);
+        aiui["args"] = value(args);
+        doc["mcp_servers"]["aiui"] = Item::Table(aiui);
+    }
 
     Ok(doc.to_string())
 }
@@ -491,13 +637,16 @@ pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
         };
     }
     let was_new = existing.is_none();
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "~/.codex/config.toml backup failed".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.codex/config.toml backup failed".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     match atomic_write(&path, new_toml.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
@@ -506,7 +655,10 @@ pub fn patch_codex_config(app_binary_path: &str) -> StepResult {
             } else {
                 "Updated aiui entry in ~/.codex/config.toml".into()
             },
-            details: Some(format!("Datei: {}", path.display())),
+            details: Some(match backup_detail(bak) {
+                Some(b) => format!("Datei: {} — {b}", path.display()),
+                None => format!("Datei: {}", path.display()),
+            }),
         },
         Err(e) => StepResult {
             ok: false,
@@ -552,13 +704,16 @@ pub fn remove_codex_config() -> StepResult {
     if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
         servers.remove("aiui");
     }
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "~/.codex/config.toml backup failed".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.codex/config.toml backup failed".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     match atomic_write(&path, doc.to_string().as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
@@ -567,7 +722,7 @@ pub fn remove_codex_config() -> StepResult {
             } else {
                 "aiui was not registered in ~/.codex/config.toml".into()
             },
-            details: None,
+            details: backup_detail(bak),
         },
         Err(e) => StepResult {
             ok: false,
@@ -672,20 +827,17 @@ pub fn is_claude_desktop_running() -> bool {
 /// Auto-migrates legacy `uvx aiui-mcp` entries from ≤ v0.2.x installs.
 pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
     let path = home().join(".claude.json");
-    let existing: Value = if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(s) if s.trim().is_empty() => Value::Object(Map::new()),
-            Ok(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Map::new())),
-            Err(e) => {
-                return StepResult {
-                    ok: false,
-                    message: "Could not read ~/.claude.json".into(),
-                    details: Some(e.to_string()),
-                }
+    // #182: see patch_claude_desktop_config — unparsable is a hard stop.
+    let existing: Value = match read_json_config(&path) {
+        Ok(Some(v)) => v,
+        Ok(None) => Value::Object(Map::new()),
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.claude.json is not valid JSON — left untouched".into(),
+                details: Some(e),
             }
         }
-    } else {
-        Value::Object(Map::new())
     };
 
     let mut root = existing.as_object().cloned().unwrap_or_default();
@@ -694,15 +846,12 @@ pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
-    let entry = serde_json::json!({
-        "command": app_binary_path,
-        "args": ["--mcp-stdio"]
-    });
-
     let existing_entry = servers.get("aiui");
     let previous_kind = classify_aiui_entry(existing_entry);
     let was_present = existing_entry.is_some();
-    let already_correct = existing_entry == Some(&entry);
+    // #182: compare only the keys we own, so an entry carrying an `env`
+    // block isn't rewritten (and re-backed-up) on every launch.
+    let already_correct = aiui_entry_is_current(existing_entry, app_binary_path);
     if already_correct {
         return StepResult {
             ok: true,
@@ -710,16 +859,19 @@ pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
             details: None,
         };
     }
-    servers.insert("aiui".into(), entry);
+    upsert_aiui_entry(&mut servers, app_binary_path);
     root.insert("mcpServers".into(), Value::Object(servers));
 
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "~/.claude.json backup failed".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.claude.json backup failed".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     let pretty = serde_json::to_string_pretty(&Value::Object(root)).unwrap();
     match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => {
@@ -735,7 +887,7 @@ pub fn patch_claude_code_config(app_binary_path: &str) -> StepResult {
             StepResult {
                 ok: true,
                 message: msg,
-                details: None,
+                details: backup_detail(bak),
             }
         }
         Err(e) => StepResult {
@@ -779,25 +931,43 @@ pub fn remove_claude_code_config() -> StepResult {
             details: None,
         };
     }
-    let Ok(s) = fs::read_to_string(&path) else {
-        return StepResult {
-            ok: true,
-            message: "~/.claude.json unreadable, skipping".into(),
-            details: None,
-        };
+    // #182: on an unparsable file, stop before touching it and tell the user
+    // to remove the entry by hand. `ok: true` on purpose — a full uninstall
+    // must not turn red over a file aiui did not break. Mirrors
+    // remove_codex_config.
+    let mut v: Value = match read_json_config(&path) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return StepResult {
+                ok: true,
+                message: "~/.claude.json does not exist".into(),
+                details: None,
+            }
+        }
+        Err(e) => {
+            return StepResult {
+                ok: true,
+                message: "~/.claude.json is not valid JSON — left untouched; \
+                          remove the `aiui` entry under `mcpServers` by hand"
+                    .into(),
+                details: Some(e),
+            }
+        }
     };
-    let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::Object(Map::new()));
     let had = v.pointer("/mcpServers/aiui").is_some();
     if let Some(servers) = v.get_mut("mcpServers").and_then(|x| x.as_object_mut()) {
         servers.remove("aiui");
     }
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "~/.claude.json backup failed".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "~/.claude.json backup failed".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     let pretty = serde_json::to_string_pretty(&v).unwrap();
     match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => StepResult {
@@ -807,7 +977,7 @@ pub fn remove_claude_code_config() -> StepResult {
             } else {
                 "aiui was not registered in ~/.claude.json".into()
             },
-            details: None,
+            details: backup_detail(bak),
         },
         Err(e) => StepResult {
             ok: false,
@@ -830,17 +1000,27 @@ pub fn remove_claude_desktop_config() -> StepResult {
             details: None,
         };
     }
-    let s = match fs::read_to_string(&path) {
-        Ok(s) => s,
+    // #182: see remove_claude_code_config — never rewrite a file we could
+    // not parse.
+    let mut v: Value = match read_json_config(&path) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return StepResult {
+                ok: true,
+                message: "claude_desktop_config.json existiert nicht, nichts zu tun.".into(),
+                details: None,
+            }
+        }
         Err(e) => {
             return StepResult {
-                ok: false,
-                message: "Konnte claude_desktop_config.json nicht lesen".into(),
-                details: Some(e.to_string()),
+                ok: true,
+                message: "claude_desktop_config.json is not valid JSON — left untouched; \
+                          remove the `aiui` entry under `mcpServers` by hand"
+                    .into(),
+                details: Some(e),
             }
         }
     };
-    let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::Object(Map::new()));
     // Remove both the current `aiui` key and the legacy `aiui-local` key so
     // Uninstall always leaves a clean state regardless of which version
     // wrote the entry.
@@ -850,13 +1030,16 @@ pub fn remove_claude_desktop_config() -> StepResult {
         servers.remove("aiui");
         servers.remove("aiui-local");
     }
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "Backup fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "Backup fehlgeschlagen".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     let pretty = serde_json::to_string_pretty(&v).unwrap();
     match atomic_write(&path, pretty.as_bytes()) {
         Ok(_) => StepResult {
@@ -866,7 +1049,7 @@ pub fn remove_claude_desktop_config() -> StepResult {
             } else {
                 "aiui war bereits nicht eingetragen.".into()
             },
-            details: None,
+            details: backup_detail(bak),
         },
         Err(e) => StepResult {
             ok: false,
@@ -945,13 +1128,16 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
         .join("\n");
     let out = if out.ends_with('\n') { out } else { format!("{out}\n") };
 
-    if let Err(e) = backup(&path) {
-        return StepResult {
-            ok: false,
-            message: "Backup fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        };
-    }
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "Backup fehlgeschlagen".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
     match atomic_write(&path, out.as_bytes()) {
         Ok(_) => StepResult {
             ok: true,
@@ -960,7 +1146,7 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
             } else {
                 format!("Host '{host_alias}' hatte keine aiui-Einträge.")
             },
-            details: None,
+            details: backup_detail(bak),
         },
         Err(e) => StepResult {
             ok: false,
@@ -999,14 +1185,23 @@ pub fn patch_claude_code_config_remote(
     uvx_path: Option<&str>,
     pinned_version: &str,
 ) -> (StepResult, Option<RemoteConfigPatch>) {
-    // If we know the absolute uvx path from the reachability probe, use
-    // it. Otherwise fall back to the bare "uvx" name (which depends on
-    // Claude-Code's process PATH being right at spawn time — fragile,
-    // but the only option if the probe didn't find an absolute path).
-    // JSON-escape via serde so paths with unusual characters don't break
-    // the Python script's string literal.
+    // If we know the absolute uvx path from the reachability probe, use it.
+    // JSON-escape via serde so paths with unusual characters don't break the
+    // Python script's string literal.
+    //
+    // #184: when we DON'T know one, `None` no longer means "write the bare
+    // name". The bare `uvx` depends on Claude Code's process PATH at spawn
+    // time — fragile enough that the probe exists to avoid it — so
+    // overwriting a working absolute path with it is a downgrade. The script
+    // below keeps an existing resolvable command in that case and rewrites
+    // only `args`, so the version pin is still enforced. The bare name is
+    // written only when there is no usable entry at all, which is the same
+    // position a fresh host without a successful probe was always in.
     let uvx_command_lit = serde_json::to_string(uvx_path.unwrap_or("uvx"))
         .unwrap_or_else(|_| "\"uvx\"".to_string());
+    // Whether the literal above is a discovered absolute path or the
+    // fallback. Drives the keep-what-works branch in the script.
+    let command_is_known = if uvx_path.is_some() { "True" } else { "False" };
     // Pin to the exact aiui-mcp version that matches the local
     // companion. Without the pin, uvx silently caches whichever version
     // happened to be installed first on the remote — that's how a v0.3.1
@@ -1018,29 +1213,33 @@ pub fn patch_claude_code_config_remote(
     let pkg_spec = format!("aiui-mcp=={pinned_version}");
     let pkg_spec_lit = serde_json::to_string(&pkg_spec)
         .unwrap_or_else(|_| format!("\"{pkg_spec}\""));
-    let script = format!(r#"
-import json, pathlib, shutil, time
-p = pathlib.Path.home() / ".claude.json"
-data = {{}}
-if p.exists():
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
-        data = {{}}
+    let script = format!(r#"{REMOTE_JSON_PREAMBLE}
 servers = data.get("mcpServers") or {{}}
 existing = servers.get("aiui") or {{}}
-expected = {{"command": {uvx_command_lit}, "args": [{pkg_spec_lit}]}}
-if (existing.get("command") == expected["command"]
-        and existing.get("args") == expected["args"]):
+current_cmd = existing.get("command") if isinstance(existing, dict) else None
+
+# #184: decide the command BEFORE comparing, so "we know of no path" never
+# downgrades a working one. When the companion discovered an absolute path
+# it wins. Otherwise keep whatever is already there if it looks resolvable
+# (absolute and ending in /uvx) — the version pin in `args` is enforced
+# either way. Only a host with no usable entry gets the bare name.
+want_cmd = {uvx_command_lit}
+if not {command_is_known}:
+    if isinstance(current_cmd, str) and current_cmd.startswith("/") \
+            and current_cmd.rstrip("/").endswith("/uvx"):
+        want_cmd = current_cmd
+
+if (current_cmd == want_cmd and existing.get("args") == [{pkg_spec_lit}]):
     print("ok:current")
     raise SystemExit(0)
-ts = int(time.time())
-if p.exists():
-    shutil.copy(p, p.with_suffix(f".json.bak.{{ts}}"))
-servers["aiui"] = expected
+backup()
+# Keep any foreign keys on the entry (env, disabled, …) — set only ours.
+entry = dict(existing) if isinstance(existing, dict) else {{}}
+entry["command"] = want_cmd
+entry["args"] = [{pkg_spec_lit}]
+servers["aiui"] = entry
 data["mcpServers"] = servers
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(data, indent=2))
+save(data)
 print("ok:patched")
 "#);
     let script = script.as_str();
@@ -1064,6 +1263,16 @@ print("ok:patched")
                     details: None,
                 }
             }
+            "err:malformed" => StepResult {
+                ok: false,
+                message: format!(
+                    "~/.claude.json on {host_alias} is not valid JSON — left untouched"
+                ),
+                details: Some(
+                    "Fix the file on that host (or remove it) and register the remote again."
+                        .into(),
+                ),
+            },
             other => StepResult {
                 ok: false,
                 message: format!("Patching ~/.claude.json on {host_alias} did not confirm 'ok'"),
@@ -1424,24 +1633,81 @@ fn run_remote_python(
     on_success(&stdout)
 }
 
-pub fn remove_claude_code_config_remote(host_alias: &str) -> StepResult {
-    let script = r#"
-import json, pathlib
+/// Parse-or-bail + timestamped backup + atomic write, shared verbatim by both
+/// remote `~/.claude.json` scripts (#182).
+///
+/// Factored out because the drift between them is exactly how the remove path
+/// ended up with no backup at all while the patch path had one. Both used to
+/// swallow a parse error into `data = {}` and then `p.write_text(...)` — an
+/// open-truncate-write over a file a live Claude Code session may also be
+/// writing, which replaced the user's entire remote config with one
+/// containing only aiui.
+///
+/// Defines: `p` (the config path), `data` (parsed, or a bail-out), plus
+/// `backup()` and `save(data)`.
+const REMOTE_JSON_PREAMBLE: &str = r#"
+import json, os, pathlib, shutil, time
 p = pathlib.Path.home() / ".claude.json"
-if not p.exists():
-    print("ok")
-else:
+data = {}
+if p.exists():
     try:
         data = json.loads(p.read_text())
     except Exception:
-        data = {}
-    servers = data.get("mcpServers") or {}
-    servers.pop("aiui", None)
-    data["mcpServers"] = servers
-    p.write_text(json.dumps(data, indent=2))
-    print("ok")
+        # Never launder an unparsable config into an empty dict: the next
+        # write would replace every MCP server, project entry and the OAuth
+        # block with a document containing only aiui.
+        print("err:malformed")
+        raise SystemExit(2)
+    if not isinstance(data, dict):
+        print("err:malformed")
+        raise SystemExit(2)
+
+def backup():
+    if p.exists():
+        ts = int(time.time() * 1000)
+        shutil.copy(p, p.with_name(p.name + f".bak.{ts}"))
+        baks = sorted(p.parent.glob(p.name + ".bak.*"), key=lambda f: f.stat().st_mtime)
+        for old in baks[:-5]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+def save(data):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".aiui-tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, p)
 "#;
+
+pub fn remove_claude_code_config_remote(host_alias: &str) -> StepResult {
+    let script = format!(r#"{REMOTE_JSON_PREAMBLE}
+if not p.exists():
+    print("ok")
+else:
+    servers = data.get("mcpServers") or {{}}
+    if "aiui" in servers:
+        backup()
+        servers.pop("aiui", None)
+        data["mcpServers"] = servers
+        save(data)
+    print("ok")
+"#);
+    let script = script.as_str();
     run_remote_python(host_alias, script, "Removing aiui from ~/.claude.json", |stdout| {
+        if stdout.trim() == "err:malformed" {
+            // ok:true on purpose — a full uninstall must not turn red over a
+            // file aiui did not break.
+            return StepResult {
+                ok: true,
+                message: format!(
+                    "~/.claude.json on {host_alias} is not valid JSON — left untouched"
+                ),
+                details: Some(
+                    "Remove the `aiui` entry under `mcpServers` on that host by hand.".into(),
+                ),
+            };
+        }
         let confirmed = stdout.trim() == "ok";
         StepResult {
             ok: confirmed,
@@ -1562,6 +1828,53 @@ pub fn load_remotes() -> Vec<String> {
 pub fn save_remotes(list: &[String]) -> std::io::Result<()> {
     let p = remotes_path();
     let json = serde_json::to_string_pretty(list).unwrap();
+    atomic_write(&p, json.as_bytes())
+}
+
+/// Where the absolute `uvx` path discovered for each remote is remembered
+/// (#184).
+///
+/// A **sidecar** rather than a second field in `remotes.json`, deliberately.
+/// Widening `remotes.json` from `["host"]` to `[{alias, uvx_path}]` would be
+/// read fine by a new build and silently as an empty list by an older one —
+/// `load_remotes` ends in `unwrap_or_default()`, so a downgrade would wipe
+/// the user's registered hosts. An extra file costs one `read_to_string`;
+/// an older build simply ignores it and is back to today's behaviour.
+fn remote_uvx_path() -> PathBuf {
+    home().join(".config").join("aiui").join("remote-uvx.json")
+}
+
+/// The absolute `uvx` path discovered for `host_alias`, if we know one.
+///
+/// #184: `add_remote` probes the remote for an absolute path precisely
+/// because the bare name depends on Claude Code's PATH at spawn time. That
+/// discovery was then thrown away, so the two resync paths — one of which
+/// runs on every launch — passed `None` and rewrote the pinned absolute
+/// path back down to `"uvx"`, reporting success while breaking the host.
+pub fn load_remote_uvx(host_alias: &str) -> Option<String> {
+    let raw = fs::read_to_string(remote_uvx_path()).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&raw).ok()?;
+    map.get(host_alias).cloned()
+}
+
+/// Remember (or forget, with `None`) the uvx path for one host. Malformed
+/// or absent sidecar content starts from empty rather than failing — this
+/// is a cache, not state we cannot rebuild.
+pub fn save_remote_uvx(host_alias: &str, uvx_path: Option<&str>) -> std::io::Result<()> {
+    let p = remote_uvx_path();
+    let mut map: HashMap<String, String> = fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match uvx_path {
+        Some(path) => {
+            map.insert(host_alias.to_string(), path.to_string());
+        }
+        None => {
+            map.remove(host_alias);
+        }
+    }
+    let json = serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".into());
     atomic_write(&p, json.as_bytes())
 }
 
@@ -1686,6 +1999,173 @@ mod tests {
     }
 
     const AIUI_BIN: &str = "/Applications/aiui.app/Contents/MacOS/aiui";
+
+    // ─── #184: the discovered uvx path survives a restart ───────────────
+
+    #[test]
+    fn remote_uvx_sidecar_round_trips() {
+        // The store is a sidecar rather than a second field in
+        // remotes.json: widening that file would make an older build read
+        // it as an empty list and silently drop the user's hosts.
+        let dir = std::env::temp_dir().join(format!("aiui-uvx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-uvx.json");
+
+        // Written by hand here, because the real accessors resolve against
+        // the user's home; this asserts the shape they read and write.
+        let mut map = HashMap::new();
+        map.insert("macmini".to_string(), "/opt/homebrew/bin/uvx".to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap()).unwrap();
+
+        let read: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read.get("macmini").unwrap(), "/opt/homebrew/bin/uvx");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_or_broken_sidecar_is_not_fatal() {
+        // It is a cache, not state we cannot rebuild: a corrupt file must
+        // degrade to "no path known", which now means "keep what works".
+        assert!(load_remote_uvx("no-such-host-at-all").is_none());
+        let broken: Result<HashMap<String, String>, _> = serde_json::from_str("{not json");
+        assert!(broken.is_err(), "and such content parses as an error, not a map");
+    }
+
+    // ─── #182: never destroy a user config we could not parse ───────────
+
+    #[test]
+    fn read_json_config_distinguishes_absent_empty_and_broken() {
+        let dir = std::env::temp_dir().join(format!("aiui-rjc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("nope.json");
+        assert!(matches!(read_json_config(&missing), Ok(None)), "absent");
+
+        let empty = dir.join("empty.json");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(
+            read_json_config(&empty).unwrap(),
+            Some(Value::Object(Map::new())),
+            "an empty file is genuinely safe to treat as {{}}"
+        );
+
+        // The failure that used to wipe the file: one trailing comma.
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, r#"{"mcpServers": {"other": {"command": "x"},}}"#).unwrap();
+        assert!(
+            read_json_config(&broken).is_err(),
+            "unparsable must be an error, never an empty object"
+        );
+
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{"a": 1}"#).unwrap();
+        assert!(read_json_config(&good).unwrap().is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_keeps_foreign_keys_on_the_aiui_entry() {
+        // #182: an `env` block (or anything else) on the aiui entry used to
+        // be discarded on every launch.
+        let mut servers: Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "aiui": {
+                "command": "/old/path/aiui",
+                "args": ["--mcp-stdio"],
+                "env": {"AIUI_DEBUG": "1"},
+                "disabled": false
+            },
+            "other": {"command": "keep-me"}
+        }))
+        .unwrap();
+        upsert_aiui_entry(&mut servers, "/Applications/aiui.app/Contents/MacOS/aiui");
+        let aiui = servers["aiui"].as_object().unwrap();
+        assert_eq!(
+            aiui["command"].as_str().unwrap(),
+            "/Applications/aiui.app/Contents/MacOS/aiui",
+            "the migration must still be able to overwrite command"
+        );
+        assert_eq!(aiui["env"]["AIUI_DEBUG"], "1", "foreign key survives");
+        assert_eq!(aiui["disabled"], false, "foreign key survives");
+        assert_eq!(servers["other"]["command"], "keep-me", "other servers untouched");
+    }
+
+    #[test]
+    fn upsert_creates_the_entry_when_absent() {
+        let mut servers: Map<String, Value> = Map::new();
+        upsert_aiui_entry(&mut servers, "/bin/aiui");
+        assert_eq!(servers["aiui"]["command"], "/bin/aiui");
+        assert_eq!(servers["aiui"]["args"][0], "--mcp-stdio");
+    }
+
+    #[test]
+    fn entry_is_current_compares_only_owned_keys() {
+        // #182: whole-object equality meant an entry with an `env` block was
+        // rewritten — and re-backed-up — on every single launch.
+        let with_env = serde_json::json!({
+            "command": "/bin/aiui", "args": ["--mcp-stdio"], "env": {"X": "1"}
+        });
+        assert!(
+            aiui_entry_is_current(Some(&with_env), "/bin/aiui"),
+            "extra keys must not force a rewrite"
+        );
+        let stale = serde_json::json!({"command": "/old/aiui", "args": ["--mcp-stdio"]});
+        assert!(!aiui_entry_is_current(Some(&stale), "/bin/aiui"), "stale path");
+        let legacy = serde_json::json!({"command": "uvx", "args": ["aiui-mcp"]});
+        assert!(!aiui_entry_is_current(Some(&legacy), "/bin/aiui"), "legacy uvx");
+        assert!(!aiui_entry_is_current(None, "/bin/aiui"), "absent");
+    }
+
+    #[test]
+    fn backup_appends_and_prunes() {
+        // #182: `~/.claude.json` must back up to `~/.claude.json.bak.<ts>`,
+        // not the misleading `~/.claude.bak.<ts>`, and the pile is bounded.
+        let dir = std::env::temp_dir().join(format!("aiui-bak-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(".claude.json");
+        std::fs::write(&target, "{}").unwrap();
+
+        let first = backup(&target).unwrap().expect("a backup was made");
+        let name = first.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(".claude.json.bak."),
+            "backup name appends to the full file name: {name}"
+        );
+
+        for i in 0..9 {
+            std::fs::write(&target, format!("{{\"n\": {i}}}")).unwrap();
+            backup(&target).unwrap();
+        }
+        let baks = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().unwrap().contains(".bak."))
+            .count();
+        assert!(baks <= 5, "backups are pruned to at most 5, found {baks}");
+
+        // An absent file yields no backup and no error.
+        assert!(backup(&dir.join("nope")).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_upsert_preserves_foreign_keys_on_the_aiui_table() {
+        let existing = r#"
+[mcp_servers.aiui]
+command = "/old/aiui"
+args = ["--mcp-stdio"]
+# the user's own note
+startup_timeout_ms = 30000
+"#;
+        let out = codex_toml_upsert(Some(existing), "/new/aiui").unwrap();
+        assert!(out.contains("/new/aiui"), "command updated");
+        assert!(
+            out.contains("startup_timeout_ms = 30000"),
+            "foreign key survives: {out}"
+        );
+        assert!(out.contains("# the user's own note"), "comment survives: {out}");
+    }
 
     #[test]
     fn codex_upsert_fresh_document() {
