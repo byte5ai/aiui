@@ -22,6 +22,11 @@ aiui/
 │   └── skill.md              Agent-facing widget catalog (shipped into
 │                             ~/.claude/skills/aiui/)
 ├── scripts/
+│   ├── check-release-ordering.sh   Guards the order of the release steps
+│   ├── check-skill-drift.sh        Keeps both skill.md copies in sync
+│   ├── check-updater-feed.sh       Validates a release's latest.json
+│   ├── diagnose-session-startup.sh Session-startup troubleshooting dump
+│   ├── test-check-updater-feed.sh  Fixtures for the feed guard
 │   └── release.sh            Stub that refuses to run — releases are CI-only
 ├── assets/                   Brand assets (icon, logo, dmg background)
 └── CHANGELOG.md

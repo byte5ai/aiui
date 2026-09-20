@@ -112,7 +112,7 @@ normal message:
 
 That's the whole idea. The agent picks the right kind of dialog —
 yes/no, pick-from-options, or a multi-field form — opens it on your
-Mac, you click, it carries on with your answer.
+machine, you click, it carries on with your answer.
 
 The first time you do this in a fresh project, run `/aiui:teach` once.
 That briefs the agent on *when* to reach for aiui versus just typing
@@ -155,13 +155,20 @@ it precisely.
 | `/aiui:teach` | Briefs the agent on aiui — loads the full widget catalog and design rules into the session. Run once per project. |
 | `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
+| `/aiui:health` | One-line health check: WebView responsive, no dialog backlog, no child-process flood. |
+| `/aiui:test-dialog` | Pops a tiny demo dialog so you can verify aiui is wired up end to end. |
+| `/aiui:remotes` | Lists your registered remote hosts in chat — the same set the settings window shows. |
+| `/aiui:upload` | Hands a file from your machine to the agent session: a native file picker opens, the file you choose lands on the agent's host. |
 
 ## FAQ
 
-**Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
-Developer-ID signed and notarized. It never phones home. The auth token
-stays under `~/.config/aiui/` on your machine and is only copied to
-hosts you explicitly register in settings.
+**Is it safe?** aiui is open source (MIT) and builds reproducibly. The
+macOS build is Apple Developer-ID signed and notarized; the Windows
+installer carries no Authenticode signature yet (see
+[Install](#install)), but its updater artifacts are signature-verified.
+It never phones home. The auth token stays on your own machine —
+`~/.config/aiui/` on macOS, `%APPDATA%\aiui\` on Windows — and is only
+copied to hosts you explicitly register in settings.
 
 **Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships
 inside the aiui.app bundle as native Rust code — drag-and-drop install

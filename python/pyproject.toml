@@ -1,19 +1,20 @@
 [project]
 name = "aiui-mcp"
 version = "0.10.1"
-description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
+description = "MCP server for aiui — native desktop dialogs from any Claude Code session, local or remote."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "byte5 GmbH", email = "cwendler@byte5.de" },
 ]
-keywords = ["mcp", "claude", "ui", "dialog", "macos", "tauri"]
+keywords = ["mcp", "claude", "ui", "dialog", "macos", "windows", "tauri"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

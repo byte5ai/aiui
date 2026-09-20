@@ -36,7 +36,7 @@ const SKILL_MD: &str = include_str!("../../../docs/skill.md");
 /// what shifts the agent's default away from chat-first replies on the
 /// kind of prompts aiui is meant to handle.
 const INSTRUCTIONS: &str = "\
-aiui is connected — you can render native dialogs on the user's Mac \
+aiui is connected — you can render native dialogs on the user's machine \
 instead of asking via chat. Default behaviour for this session:
 
 - Yes/no question (esp. before delete / drop / force-push / deploy) → \
@@ -44,7 +44,7 @@ instead of asking via chat. Default behaviour for this session:
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
   table-row triage, image confirm/grid → call `form`.
-- User wants to hand you a file from their Mac (`/aiui:upload`, \
+- User wants to hand you a file from their machine (`/aiui:upload`, \
   \"take this file\", \"upload …\") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
 - Async-completion signal the user doesn't need to answer (tests green, \
@@ -103,7 +103,7 @@ window opened and returned, or the underlying error if it didn't.
 ";
 
 const UPLOAD_PROMPT: &str = "\
-Call the `upload` tool to let me hand you a file from my Mac. \
+Call the `upload` tool to let me hand you a file from my machine. \
 Use my current working directory as the target unless I say otherwise.
 ";
 
@@ -336,7 +336,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. A `secret` therefore REQUIRES a `target` — without one the render is rejected with `invalid_spec` rather than handing you the plaintext; if you want the value back, that field is a `password`, not a `secret`. Non-secret fields with a `target` are written AND returned. **Only an affirmative action commits the write:** the submit button or a plain named action. An action carrying `skip_validation:true` (your Cancel / Save-draft escape hatch) writes nothing and returns `{written:false, error}` per field — set `writes_targets:true` on it if it really must write. A blank field also writes nothing (`refusing to write an empty value`), in both modes, so a skipped optional field never truncates the user's file and `substitute` never erases its own sentinel. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. A `secret` therefore REQUIRES a `target` — without one the render is rejected with `invalid_spec` rather than handing you the plaintext; if you want the value back, that field is a `password`, not a `secret`. Non-secret fields with a `target` are written AND returned. **Only an affirmative action commits the write:** the submit button or a plain named action. An action carrying `skip_validation:true` (your Cancel / Save-draft escape hatch) writes nothing and returns `{written:false, error}` per field — set `writes_targets:true` on it if it really must write. A blank field also writes nothing (`refusing to write an empty value`), in both modes, so a skipped optional field never truncates the user's file and `substitute` never erases its own sentinel. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — the companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -421,7 +421,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "upload",
-            "description": "Pull a file FROM the user's Mac INTO this agent session. Calling this opens a native file picker on the user's Mac; the file they choose is streamed back over aiui's channel and written to `target_dir` on YOUR host (the machine you run on — the remote for an SSH session). This is the counterpart to the user having to `scp` a file over: reach for it whenever the user says \"take this file\", \"upload …\", \"here's the file/screenshot/PDF\", or triggers `/aiui:upload`. **`target_dir` is optional and you should almost always pass it:** set it to the directory the file belongs in given the conversation — usually your current working directory or the active project dir. Do NOT ask the user where to put it or which file to pick; just call the tool and let them choose the file in the native dialog. If you have no context at all, omit `target_dir` (defaults to your process's cwd) or ask in one short sentence. The filename comes from the user's selection — the file lands at `target_dir/<filename>`, a deterministic path, no temp/staging dir. **Existing files are never overwritten:** if `target_dir/<filename>` already exists the call returns an error rather than clobbering — pick a different `target_dir` or move the old file first. Returns `{status: \"ok\", path, filename, bytes}` on success, or `{status: \"error\", error}` on any failure — user cancelled the picker, file unreadable, file too large (512 MB cap), or target directory missing/not writable. Report the result briefly; on `ok` mention the path the file landed at. **This tool blocks until the user picks a file or dismisses the picker. Response can take a while — do not assume aiui is broken; the user is choosing a file. Progress notifications fire every ~10 s while waiting.**",
+            "description": "Pull a file FROM the user's machine INTO this agent session. Calling this opens a native file picker on the user's machine; the file they choose is streamed back over aiui's channel and written to `target_dir` on YOUR host (the machine you run on — the remote for an SSH session). This is the counterpart to the user having to `scp` a file over: reach for it whenever the user says \"take this file\", \"upload …\", \"here's the file/screenshot/PDF\", or triggers `/aiui:upload`. **`target_dir` is optional and you should almost always pass it:** set it to the directory the file belongs in given the conversation — usually your current working directory or the active project dir. Do NOT ask the user where to put it or which file to pick; just call the tool and let them choose the file in the native dialog. If you have no context at all, omit `target_dir` (defaults to your process's cwd) or ask in one short sentence. The filename comes from the user's selection — the file lands at `target_dir/<filename>`, a deterministic path, no temp/staging dir. **Existing files are never overwritten:** if `target_dir/<filename>` already exists the call returns an error rather than clobbering — pick a different `target_dir` or move the old file first. Returns `{status: \"ok\", path, filename, bytes}` on success, or `{status: \"error\", error}` on any failure — user cancelled the picker, file unreadable, file too large (512 MB cap), or target directory missing/not writable. Report the result briefly; on `ok` mention the path the file landed at. **This tool blocks until the user picks a file or dismisses the picker. Response can take a while — do not assume aiui is broken; the user is choosing a file. Progress notifications fire every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -471,7 +471,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "notify",
-            "description": "Fire a native macOS notification and return immediately — use this for an async-completion signal to a user who isn't watching this session (\"tests green\", \"deploy finished\", \"merge conflicts, need you\"). Unlike confirm/ask/form/gallery, this tool does NOT wait for the user: it hands the notification to the OS and returns {ok: true} right away, with no dialog, no window, no response to parse. Use it instead of a chat message when the point is exactly that the user doesn't have to be looking at this session to notice. For anything that needs an answer (yes/no, a choice, input), use confirm/ask/form — notify has no way to carry a reply back. `title` is required and short (≤ ~40 chars, notification banners truncate); `body` carries the detail. `subtitle` is optional extra context (folded into the body on platforms without a distinct subtitle slot). `sound` is an optional OS sound name (e.g. \"default\"); omit for a silent notification.",
+            "description": "Fire a native OS notification and return immediately — use this for an async-completion signal to a user who isn't watching this session (\"tests green\", \"deploy finished\", \"merge conflicts, need you\"). Unlike confirm/ask/form/gallery, this tool does NOT wait for the user: it hands the notification to the OS and returns {ok: true} right away, with no dialog, no window, no response to parse. Use it instead of a chat message when the point is exactly that the user doesn't have to be looking at this session to notice. For anything that needs an answer (yes/no, a choice, input), use confirm/ask/form — notify has no way to carry a reply back. `title` is required and short (≤ ~40 chars, notification banners truncate); `body` carries the detail. `subtitle` is optional extra context (folded into the body on platforms without a distinct subtitle slot). `sound` is an optional OS sound name (e.g. \"default\"); omit for a silent notification.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title", "body"],
@@ -554,6 +554,20 @@ async fn wait_for_aiui(http: &reqwest::Client, cfg: &AppConfig) -> bool {
     }
 }
 
+/// How to tell the user to launch the companion by hand, per platform
+/// (#204). Resolved at *compile* time, not from the runtime environment:
+/// this binary is the companion, so the build target IS the user's OS.
+/// `lifetime::is_interactive_session()` answers a different question —
+/// local vs. SSH — and says nothing about which OS we are on; conflating
+/// the two is what made the cold-start path tell Windows users to open
+/// `/Applications`.
+#[cfg(target_os = "macos")]
+const OPEN_HINT: &str = "ask them to open aiui from /Applications";
+#[cfg(target_os = "windows")]
+const OPEN_HINT: &str = "ask them to open aiui from the Start menu";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const OPEN_HINT: &str = "ask them to start the aiui companion";
+
 /// Tool-call response signaling that the local aiui companion didn't
 /// answer `/ping` within `COLDSTART_WAIT`. Differentiates the realistic
 /// causes so the calling agent can choose between "retry once" and
@@ -565,9 +579,9 @@ async fn wait_for_aiui(http: &reqwest::Client, cfg: &AppConfig) -> bool {
 fn aiui_unreachable_result() -> Value {
     let local = crate::lifetime::is_interactive_session();
     let context_line = if local {
-        "You are running on the user's local Mac (no SSH session detected)."
+        "You are running on the user's own machine (no SSH session detected)."
     } else {
-        "You are running on a remote dev host. aiui reaches the user's Mac \
+        "You are running on a remote dev host. aiui reaches the user's machine \
          via an SSH-reverse-tunnel on port 7777."
     };
     let text = format!(
@@ -583,19 +597,20 @@ fn aiui_unreachable_result() -> Value {
          2. **Stale dialog window from an earlier session.** A previous \
             agent's dialog timed out or was orphaned and is still pinning \
             the companion. Tell the user: \"please close any leftover aiui \
-            dialog windows on your Mac and try again.\"\n\
+            dialog windows on your machine and try again.\"\n\
          3. **A parallel Claude session is using aiui right now.** Two \
-            agents on the same Mac share one companion; only one dialog at \
+            agents on the same machine share one companion; only one dialog at \
             a time. Either retry shortly or tell the user the other session \
             is currently holding the dialog.\n\
          4. **aiui is genuinely not running** (cold-start path). If you are \
-            on the user's Mac, ask them to open aiui from /Applications. If \
-            on a remote host, the SSH-reverse-tunnel may be down — point \
-            them to aiui Settings → Connections.\n\
+            on the user's own machine, {open_hint}. If on a remote host, \
+            the SSH-reverse-tunnel may be down — point them to aiui \
+            Settings → Connections.\n\
          \n\
          Do not relay this entire message to the user verbatim — pick the \
          likely cause and phrase it plainly.",
-        COLDSTART_WAIT.as_secs()
+        COLDSTART_WAIT.as_secs(),
+        open_hint = OPEN_HINT
     );
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -1258,7 +1273,7 @@ fn aiui_busy_result(pending_count: u64, oldest_age_secs: u64) -> Value {
             call. Do not retry rapidly.\n\
          2. **A stale dialog window from an earlier session** that the \
             user never answered. Tell the user: \"please answer or close \
-            the leftover aiui dialog on your Mac, then I'll retry.\" The \
+            the leftover aiui dialog on your machine, then I'll retry.\" The \
             companion will sweep it automatically after 5 minutes.\n\
          3. **A parallel Claude session is currently using aiui.** Either \
             wait briefly and retry, or tell the user the other session \
@@ -1464,7 +1479,7 @@ fn prompts_list() -> Value {
         },
         {
             "name": "upload",
-            "description": "Hand a file from your Mac to the agent session — opens a native file picker and writes the chosen file to the agent host.",
+            "description": "Hand a file from your machine to the agent session — opens a native file picker and writes the chosen file to the agent host.",
             "arguments": []
         }
     ])
@@ -1610,5 +1625,83 @@ mod tests {
         .expect("initialize must succeed");
         assert_eq!(res["protocolVersion"], "2025-06-18");
         assert!(!res["instructions"].as_str().unwrap_or("").is_empty());
+    }
+
+    /// Every string the agent actually receives — the session `instructions`,
+    /// the prompt bodies, both list responses and the two diagnostic blocks.
+    /// Internal `///`/`//` comments are deliberately absent: they never reach
+    /// a model.
+    fn agent_facing_texts() -> Vec<(&'static str, String)> {
+        vec![
+            ("INSTRUCTIONS", INSTRUCTIONS.to_string()),
+            ("UPLOAD_PROMPT", UPLOAD_PROMPT.to_string()),
+            ("UPDATE_PROMPT", UPDATE_PROMPT.to_string()),
+            ("VERSION_PROMPT", VERSION_PROMPT.to_string()),
+            ("HEALTH_PROMPT", HEALTH_PROMPT.to_string()),
+            ("TEST_DIALOG_PROMPT", TEST_DIALOG_PROMPT.to_string()),
+            ("REMOTES_PROMPT", REMOTES_PROMPT.to_string()),
+            ("tools_list", tools_list().to_string()),
+            ("prompts_list", prompts_list().to_string()),
+            (
+                "aiui_unreachable_result",
+                aiui_unreachable_result().to_string(),
+            ),
+            ("aiui_busy_result", aiui_busy_result(1, 42).to_string()),
+        ]
+    }
+
+    /// #204: aiui shipped on Windows in v0.10.1, but the strings injected into
+    /// the agent's context still described a Mac-only product — so an agent
+    /// told a Windows user to "open aiui from /Applications", with the model's
+    /// authority behind it. Agent-facing text must name no platform; the one
+    /// place a concrete instruction is unavoidable is `OPEN_HINT`, which is
+    /// chosen at compile time (see `unreachable_hint_matches_target_os`).
+    #[test]
+    fn agent_facing_text_is_platform_neutral() {
+        for (label, text) in agent_facing_texts() {
+            for needle in ["Mac", "macOS"] {
+                assert!(
+                    !text.contains(needle),
+                    "{label} still says {needle:?} to the agent"
+                );
+            }
+            // `/Applications` survives only inside the macOS `OPEN_HINT`.
+            #[cfg(not(target_os = "macos"))]
+            assert!(
+                !text.contains("/Applications"),
+                "{label} points a non-macOS user at /Applications"
+            );
+        }
+    }
+
+    /// The cold-start hint is the one platform-specific sentence left, and it
+    /// must follow the *build target* — this binary IS the companion, so the
+    /// target is the user's OS. It must never follow
+    /// `is_interactive_session()`, which only answers local-vs-SSH: that
+    /// conflation is the bug.
+    #[test]
+    fn unreachable_hint_matches_target_os() {
+        let text = aiui_unreachable_result()["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(text.contains("/Applications"), "macOS build: {text}");
+            assert!(!text.contains("Start menu"), "macOS build: {text}");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(text.contains("Start menu"), "Windows build: {text}");
+            assert!(!text.contains("/Applications"), "Windows build: {text}");
+        }
+
+        // The context line reports local vs. SSH and claims no OS either way.
+        assert!(
+            text.contains("machine") || text.contains("remote dev host"),
+            "context line lost: {text}"
+        );
+        assert!(!text.contains("local Mac"), "context line claims an OS: {text}");
     }
 }

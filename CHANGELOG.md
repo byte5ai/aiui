@@ -22,6 +22,14 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- **`scripts/install-mac.sh` is gone.** It defaulted to a v0.1.0 zip, stripped
+  `com.apple.quarantine` off a build it called unsigned — the app has been
+  Developer-ID signed and notarized for many versions, so the only effect was
+  discarding a Gatekeeper check — and printed a four-step manual setup that
+  hand-wrote the `aiui-local` config key the app now deletes on launch. The
+  DMG drag-and-drop flow is the supported install and the app registers
+  itself. CONTRIBUTING's repository-layout tree showed one script where six
+  live, which is how this one went unmaintained; it now lists them all (#204).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -54,6 +62,50 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **The agent was told to send Windows users to `/Applications`.** aiui has
+  shipped on Windows since v0.10.1, but the strings injected into the
+  model's context still described a Mac-only product — worst of all the
+  cold-start guidance, which first asserted "you are running on the user's
+  local Mac" (derived from an SSH check that never looks at the OS) and
+  then named a directory Windows does not have. The agent relayed a step
+  the user could not perform, with the model's authority behind it. Every
+  agent-facing string in the Rust bridge and the Python bridge now names no
+  platform; the one place a concrete instruction is unavoidable picks it at
+  *compile* time, so the macOS build says `/Applications` and the Windows
+  build says the Start menu. Two unit tests hold the line, and a
+  `python/tests/test_readme_parity.py` walks `server.py`'s AST so no new
+  string can reintroduce it (#204).
+- **The PyPI landing page documented 4 of 10 tools and 1 of 7 prompts.**
+  `python/README.md` is the package `readme`, so it is what someone
+  evaluating the remote path reads on pypi.org — and it listed the three
+  original dialogs under an `aiui.` prefix no MCP client uses, implying
+  `gallery`/`compare`/`upload`/`notify` were companion-only when parity is
+  the whole point of the bridge. Both lists are now complete and are
+  asserted against the live `FastMCP` instance, so the README cannot fall
+  behind the tool surface again. The package description no longer says
+  "macOS dialogs" and the Windows classifier is set (#204).
+- **The README stated a token path and a signing guarantee that do not hold
+  on Windows.** The FAQ named `~/.config/aiui/` as *the* token location and
+  called aiui "Apple Developer-ID signed and notarized" without qualifying
+  it, contradicting the install section's own account of the unsigned
+  Windows installer. Both are now scoped per platform. The slash-command
+  table listed 3 of the 7 prompts the companion registers — `/aiui:upload`
+  among the missing ones, although the session instructions tell agents to
+  advertise it — and now lists all seven. The bug-report template asks for
+  OS *and* version with both platforms offered, instead of a macOS-only
+  field that left every Windows report without one (#204).
+- **`docs/strategy.md` forbade a tool that shipped a year ago.**
+  Architecture Principle 3 ("keine Dateien, keine Inhalte vom Mac auf den
+  Remote-Host") and the `pick_path` row in the "Was wir explizit nicht
+  bauen" table describe precisely what `upload` (#146, v0.9.0) does — and
+  CONTRIBUTING measures every feature proposal against that document, so it
+  would have been cited to block an extension of a tool that already ships.
+  Principle 3 now states the boundary that actually holds: one file per
+  deliberate user action, no sync without a user act. The `pick_path` row
+  moved into a new "Revidierte Entscheidungen" section rather than being
+  deleted — the reasoning trail is what makes that table worth keeping. The
+  hard tool/field-type counts are replaced by a pointer to `docs/skill.md`
+  so they cannot drift again (#204).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
