@@ -7,17 +7,20 @@ import { invoke } from "@tauri-apps/api/core";
  * Checks the configured endpoint for a new version.
  *
  * Two modes:
- *  • `silent: true` (auto-triggers from App.svelte: post-render event,
- *    window-focus, mount). No prompts, no surfaced UI. If an update is
- *    available AND the dialog window is idle (no pending render), the
- *    update is downloaded and installed transparently followed by a
- *    relaunch. The next agent tool call hits the new version. If the
- *    dialog window is busy with a live form/confirm/ask, the install
- *    is deferred until the next safe moment (catches the
- *    2026-05-06 mid-dialog-popup case AND fixes the v0.4.39
- *    too-silent regression where auto-updates simply never shipped).
+ *  • `silent: true` (auto-triggered on mount and window-focus from
+ *    `setup.ts` and `dialog.ts`). No prompts, no surfaced UI, and — since
+ *    v0.4.44 — **no install**: it records the available version via
+ *    `set_pending_update` and returns. The settings banner and the system
+ *    notification from the headless Rust check are what tell the user.
  *  • `silent: false` (manual button in Settings): full UX —
- *    error/no-update messages and the install prompt.
+ *    error/no-update messages, then `downloadAndInstall` + relaunch.
+ *
+ * #188: this comment used to describe a transparent install-and-relaunch in
+ * silent mode, naming `App.svelte` (deleted in the multi-window refactor)
+ * as the trigger. That behaviour was removed deliberately — it restarted
+ * the app under the user with no indication anything had happened — so the
+ * text was describing a mechanism that no longer existed, in the one file a
+ * contributor would check first.
  *
  * UX note: use `message()` (single OK button) for pure-info outcomes, and
  * `ask()` (Yes/No) only when the user actually has a decision to make.

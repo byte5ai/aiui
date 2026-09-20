@@ -92,9 +92,12 @@ Desktop App is open. No dock icon, no menu-bar clutter, no lingering
 daemons. aiui tools are available in **every** Claude Desktop App session
 immediately; no per-project config needed.
 
-Updates install themselves in the background. If you want to force a
-check, use `/aiui:update` in Claude Desktop App, or open aiui's settings
-window.
+aiui checks for updates every 6 hours in the background and tells you when
+one is available — a system notification, and a banner in its settings
+window. Installing is one click on that banner, or `/aiui:update` in Claude
+Desktop App. Nothing installs itself without you: aiui restarts to apply an
+update, and doing that underneath a dialog you are filling in would be
+worse than waiting.
 
 ## Quickstart
 
