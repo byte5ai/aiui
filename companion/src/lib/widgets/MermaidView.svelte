@@ -22,6 +22,20 @@
   // in `<text>`/`<tspan>` — which the svg profile does allow. The
   // sanitiser stays strict; see ../mermaid-config.ts for why widening it
   // would be the wrong trade.
+  //
+  // Issue #212 asked whether the Mermaid `classDef` CSS-injection
+  // advisories apply to this path. Verdict: **they did**, and not by the
+  // route the advisory text suggests. `securityLevel: "strict"` covers node
+  // labels, not `classDef`, and Mermaid does not put a `classDef`'s
+  // declarations into the theme stylesheet the sanitiser already drops — it
+  // writes them verbatim into an inline `style` attribute on the styled
+  // node. That attribute is allowed by the svg profile, and DOMPurify does
+  // not read the CSS inside it, so an agent-supplied
+  // `position:fixed;width:100vw;…;opacity:.02` arrived in the DOM as an
+  // invisible sheet over the Confirm button. The fix is `style` in
+  // `FORBID_ATTR`, alongside the already-forbidden style element;
+  // `mermaid-config.test.ts` puts both payloads through the real renderer
+  // so a later Mermaid bump cannot reopen this quietly.
 
   import mermaid from "mermaid";
   import { MERMAID_INIT_CONFIG, sanitizeMermaidSvg } from "../mermaid-config";

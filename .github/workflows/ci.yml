@@ -72,9 +72,36 @@ jobs:
         working-directory: companion
         run: npm ci
 
+      # #212: the advisory count against the pinned lockfile could only grow
+      # between releases, because nothing looked at it. This is the gate —
+      # a new *high* advisory turns the PR red; moderates are reported by
+      # dependabot's weekly PRs (.github/dependabot.yml) instead of blocking
+      # unrelated work.
+      #
+      # `--omit=optional` is the appdmg exemption, and it is deliberate.
+      # `appdmg` is an optionalDependency used by exactly one step,
+      # release-macos.yml's DMG build, and its `image-size` advisories are
+      # denial-of-service parsers fed exactly one input: our own
+      # src-tauri/dmg/background.png. No attacker input, no exposure — and
+      # npm's proposed "fix" is a downgrade to appdmg@0.1.0, which does not
+      # build the DMG. Omitting the optional tree is preferred over a
+      # hand-maintained ignore list that would also hide a future advisory
+      # in something that ships.
+      - name: npm audit (production + dev, optional deps exempt)
+        working-directory: companion
+        run: npm audit --audit-level=high --omit=optional
+
       - name: Svelte type-check
         working-directory: companion
         run: npx svelte-check --tsconfig ./tsconfig.json --threshold error
+
+      # Renders hostile Mermaid sources through the real renderer and the
+      # real sanitiser (#212). This is what stops a dependency bump from
+      # quietly reopening the classDef CSS-injection path, or from emptying
+      # the diagrams out the way #189 did.
+      - name: Frontend unit tests
+        working-directory: companion
+        run: npm test
 
       - name: Vite build
         working-directory: companion
