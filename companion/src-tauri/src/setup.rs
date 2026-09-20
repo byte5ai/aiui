@@ -577,18 +577,20 @@ pub fn remove_codex_config() -> StepResult {
     }
 }
 
-/// The substring `pgrep -f` matches to find a running Claude Desktop on
-/// macOS: the bundle's executable path, which is the same wherever the app
-/// is installed (#180).
+/// The substring that identifies a running Claude Desktop on macOS: the
+/// bundle's executable path, which is the same wherever the app is
+/// installed (#180). Private so it cannot drift from the matcher below.
 #[cfg(target_os = "macos")]
 const CLAUDE_DESKTOP_PROC_MATCH: &str = "Claude.app/Contents/MacOS/Claude";
 
-/// Would `pgrep -f CLAUDE_DESKTOP_PROC_MATCH` match this command line?
+/// Is this `pgrep -af` line a running Claude Desktop?
 ///
-/// Pure so the matching rule can be unit-tested over fixtures without a
-/// running Claude Desktop — the same treatment `is_aiui_ssh_ntr_for_port`
-/// gets in `housekeeping.rs`. The two properties that matter: it finds the
-/// app wherever it is installed, and it never matches the `claude` CLI.
+/// The authority for the liveness probe, not a description of it: the
+/// `pgrep` pattern is a cheap pre-filter and this decides. Pure, so the
+/// rule can be unit-tested over fixtures without a running Claude Desktop —
+/// the same treatment `is_aiui_ssh_ntr_for_port` gets in `housekeeping.rs`.
+/// The two properties that matter: it finds the app wherever it is
+/// installed, and it never matches the `claude` CLI.
 #[cfg(target_os = "macos")]
 pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
     cmdline.contains(CLAUDE_DESKTOP_PROC_MATCH)
@@ -601,8 +603,9 @@ pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
 ///
 /// Pure read-only. Per-OS process probe:
 ///
-/// - macOS: `pgrep -f /Applications/Claude.app/` matches against the full
-///   command line, which catches helper processes too (still a true positive).
+/// - macOS: `pgrep -af Claude.app` pre-filters, then
+///   [`is_claude_desktop_proc`] decides — the bundle executable, at any
+///   install location, never the `claude` CLI.
 /// - Windows: `tasklist /FI "IMAGENAME eq Claude.exe" /NH` lists running
 ///   processes by image name; non-empty stdout means at least one match.
 ///
@@ -615,16 +618,19 @@ pub fn is_claude_desktop_running() -> bool {
         // old `-f /Applications/Claude.app/` missed an install in
         // `~/Applications` (which `is_claude_desktop_installed` already
         // supports via the config dir), so the app looked permanently dead
-        // to its own liveness probe. Matching
-        // `Claude.app/Contents/MacOS/Claude` is location-independent and
-        // still cannot match the `claude` CLI binary, so a Claude Code
-        // session is never mistaken for Claude Desktop.
+        // to its own liveness probe — and the exit gate inverted.
+        //
+        // `pgrep -af Claude.app` is only the cheap pre-filter; the decision
+        // is `is_claude_desktop_proc`, so the matching rule lives in one
+        // unit-tested place rather than inside an argv string.
         let out = std::process::Command::new("pgrep")
-            .args(["-f", CLAUDE_DESKTOP_PROC_MATCH])
+            .args(["-af", "Claude.app"])
             .output();
         match out {
-            Ok(o) => o.status.success() && !o.stdout.is_empty(),
-            Err(_) => false,
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(is_claude_desktop_proc),
+            _ => false,
         }
     }
     #[cfg(target_os = "windows")]
@@ -1590,6 +1596,10 @@ mod tests {
         ));
         assert!(is_claude_desktop_proc(
             "/Users/ada/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        // The real input shape: `pgrep -af` prefixes the pid.
+        assert!(is_claude_desktop_proc(
+            "4711 /Applications/Claude.app/Contents/MacOS/Claude"
         ));
         assert!(
             is_claude_desktop_proc(
