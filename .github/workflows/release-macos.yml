@@ -88,6 +88,19 @@ jobs:
             echo "Tag ${TAG} already exists — bump the version or delete the tag first."
             exit 1
           fi
+          # #191: a run that publishes no bridge must not be able to produce
+          # a directly-promotable full release. The companion pins
+          # `aiui-mcp==${VERSION}`, so without the PyPI artifact every
+          # remote's tool calls fail. Skipping the publish is legitimate for
+          # a validate-first pre-release; combining it with a full release
+          # is not.
+          if [ "${{ inputs.publish-pypi }}" != "true" ] \
+             && [ "${{ inputs.prerelease }}" != "true" ]; then
+            echo "publish-pypi=false requires prerelease=true: a full release"
+            echo "without the aiui-mcp ${VERSION} artifact would pin every"
+            echo "remote to a version that does not exist."
+            exit 1
+          fi
 
       - uses: actions/setup-node@v4
         with:
@@ -253,6 +266,55 @@ jobs:
           uv build
           ls dist/aiui_mcp-${VERSION}-*.whl dist/aiui_mcp-${VERSION}.tar.gz
 
+      # #191: PyPI BEFORE the release, not after.
+      #
+      # The companion pins the bridge to its own version
+      # (`aiui-mcp==<version>`) in every remote's ~/.claude.json. Publishing
+      # the app first therefore ships a pin that cannot resolve: on every
+      # remote host, `uvx` fails and EVERY aiui tool call returns nothing —
+      # for as long as the gap lasts, which is forever if the PyPI step
+      # fails and nobody re-runs it.
+      #
+      # The old ordering was justified by PyPI versions being permanent. The
+      # priority is backwards: a published bridge with no matching app is
+      # inert (nothing resolves it — the pin only ever names the version the
+      # companion was compiled as), while an app with no matching bridge is
+      # a dead feature on every remote the user owns.
+      - name: Publish aiui-mcp to PyPI
+        if: ${{ inputs.publish-pypi }}
+        working-directory: python
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+        # --check-url keeps a same-version recovery re-run working: already
+        # uploaded files are skipped instead of failing the run. Without it
+        # the reorder would trade one broken recovery path for another.
+        run: uv publish --check-url https://pypi.org/simple/aiui-mcp/
+
+      # The index is not instantly consistent, so "upload returned 0" is not
+      # yet "a remote can resolve it". Poll until it can.
+      #
+      # A plain HTTPS index check, deliberately not `uvx aiui-mcp==$VERSION
+      # --help`: the package has no --help handler, so the flag is ignored,
+      # the MCP server starts, and it blocks on stdin forever — the trap
+      # documented in setup.rs.
+      - name: Wait for aiui-mcp to be resolvable
+        if: ${{ inputs.publish-pypi }}
+        run: |
+          set -euo pipefail
+          URL="https://pypi.org/pypi/aiui-mcp/${VERSION}/json"
+          for i in $(seq 1 10); do
+            CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || echo 000)"
+            if [ "$CODE" = "200" ]; then
+              echo "aiui-mcp ${VERSION} is resolvable on PyPI (attempt $i)"
+              exit 0
+            fi
+            echo "attempt $i: PyPI returned $CODE for ${VERSION}, retrying in 6s"
+            sleep 6
+          done
+          echo "aiui-mcp ${VERSION} never appeared on PyPI — refusing to cut a"
+          echo "release whose remote pin cannot resolve."
+          exit 1
+
       - name: Tag + GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -308,18 +370,6 @@ jobs:
               --draft \
               $PRERELEASE_FLAG
           fi
-
-      # PyPI LAST, after the GitHub release succeeded — PyPI versions are
-      # permanent. If this step fails, the Tauri side is already shipped;
-      # recovery is re-running with the same version and publish-pypi only
-      # after fixing the token (uv publish is idempotent-safe: re-uploading
-      # an existing version fails loudly instead of overwriting).
-      - name: Publish aiui-mcp to PyPI
-        if: ${{ inputs.publish-pypi }}
-        working-directory: python
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
-        run: uv publish
 
       # #190: the release is a DRAFT until the Windows half lands, so the
       # second workflow is no longer something a human has to remember —
