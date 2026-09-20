@@ -90,6 +90,23 @@ All notable changes to this project are documented here.
   `select`, a worked example and an anti-pattern — including the two
   behaviours an agent otherwise gets wrong: omitting `default_expanded`
   expands *every* node, and `required` is not enforced for `tree` (#205).
+- **`scripts/check-release-preconditions.sh`** — the gate a release has to
+  pass before anything is signed. It asserts that all four version-carrying
+  manifests agree (`Cargo.toml`, `tauri.conf.json`, `pyproject.toml` and now
+  `companion/package.json`, which nothing checked and which had drifted six
+  minor versions), that `CHANGELOG.md` has a section for that version, and —
+  in dispatch mode — that the version matches the dispatched one and its tag
+  is not already on the remote. CI runs the no-argument mode on every PR, so
+  drift surfaces in the bump PR instead of twenty signed minutes into a
+  release run; `scripts/test-check-release-preconditions.sh` exercises it
+  against fixture trees (#209).
+- **The release run now runs the tests.** `release-macos.yml` executes the
+  drift guards, `pytest` and `cargo test --lib` before the Developer ID
+  certificate is imported, and refuses outright to run from any ref but
+  `main`. It previously accepted an arbitrary branch and asserted nothing
+  beyond three version strings, so a commit whose CI was red — or that never
+  had one — could be signed, notarized, released and pushed to PyPI with
+  nothing in the pipeline noticing (#209).
 
 ### Changed
 
@@ -932,6 +949,46 @@ All notable changes to this project are documented here.
   the log. Deliberately not `document.execCommand("copy")`: the defect is
   that a failed copy left the user with no access to the prompt at all
   (#208).
+- **`companion/package.json` is back in step at `0.10.1`.** It had sat at
+  `0.4.5` — six minor versions of drift — because the version gate only ever
+  looked at the other three manifests. Inert at runtime (nothing reads it),
+  but it is the version an npm consumer or a supply-chain scanner sees. It
+  is now one entry in the guard's manifest list rather than a fourth
+  hand-written `grep`, so a fifth place is a one-line change (#209).
+- **The documented bump list names all four manifests plus the CHANGELOG.**
+  CONTRIBUTING's "Releasing" section repeated the same three-file blind spot
+  that let `package.json` drift, and said nothing about the CHANGELOG
+  section the gate now requires (#209).
+- **Four CHANGELOG sections no longer read as releases that shipped.**
+  `0.9.0`, `0.8.3`, `0.4.46` and `0.4.32` carried dates and version headings
+  but have no tag, no release page and no PyPI version — a user who read
+  "v0.9.0 added the upload tool" could neither find nor install it. Each now
+  says which release its content actually first reached users in (#209).
+
+### Fixed
+
+- **A re-dispatched release shipped the previous run's artifacts.** The only
+  place assets were uploaded was inside the `else` of the "does the release
+  already exist" check, so the recovery path CONTRIBUTING documents —
+  re-dispatch the same version — rebuilt, re-signed and re-notarized the
+  DMG, zip, updater bundle and `latest.json`, discarded all four, and
+  reported success. A release left with a partial asset set by a failed
+  upload could never be completed by a re-run, and a packaging fix without a
+  version bump kept the broken artifacts while the log said the build
+  succeeded. Creation and upload are now separate steps, with the upload
+  unconditional and `--clobber`ing. The macOS run merges its
+  `darwin-aarch64` entry into the published `latest.json` instead of
+  replacing it, so a re-dispatch after the Windows run cannot silently drop
+  the `windows-x86_64` entry and send every shipped Windows client's update
+  check into `TargetsNotFound` (#209).
+- **The "tag already exists" pre-flight could never fire.** It probed with
+  `git rev-parse "$TAG"` against an `actions/checkout@v4` that fetches depth
+  1 and no tags, so the ref was never present locally and the guard always
+  passed. Dispatching an already-released version therefore cost a full
+  signed build before the tag step quietly reused the tag. The probe now
+  asks `origin` via `git ls-remote`, the same way the tag step always has —
+  not by deepening the checkout, which would pull the full history onto a
+  10×-billed macOS runner for one ref lookup (#209).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
@@ -1428,7 +1485,12 @@ All notable changes to this project are documented here.
   timestamped `.bak`) on every launch when the entry is already correct —
   the same idempotent short-circuit the Claude paths already had (#170).
 
-## [0.9.0] — 2026-08-02
+## [0.9.0] — never released; folded into v0.10.0 (2026-08-23)
+
+_No `v0.9.0` tag exists and none ever will. The entries below describe work
+that landed on `main` around 2026-08-02 and first reached users in
+`v0.10.0`. Kept under their original heading so links and cross-references
+still resolve — but there is nothing here to download or `pip install`._
 
 ### Added
 
@@ -1552,7 +1614,10 @@ All notable changes to this project are documented here.
   intentional divergences); it runs as the lightweight `skill-drift` job in
   CI so the two copies can't silently diverge again.
 
-## [0.8.3] — 2026-07-29
+## [0.8.3] — never released; folded into v0.10.0 (2026-08-23)
+
+_No `v0.8.3` tag exists. This work landed on `main` around 2026-07-29 and
+first reached users in `v0.10.0`._
 
 ### Added
 
@@ -1637,7 +1702,10 @@ here.)
   bootstrapper has a live parent → spared. Regression tests cover both
   the bootstrapper-spared case and the orphan-reaped case.
 
-## [0.4.46] — 2026-05-29
+## [0.4.46] — never released; folded into v0.5.0 (2026-05-30)
+
+_No `v0.4.46` tag exists. This work landed on `main` on 2026-05-29 and
+first reached users in `v0.5.0` the next day._
 
 Dialog-lifecycle hardening. Two field-reported regressions from the
 lifecycle work of the last days, both root-caused from a Cowork session's
@@ -2238,7 +2306,10 @@ identified the gaps. Five interlocking fixes:
   pid-mismatch, sha-mismatch, legacy responses without pid/sha,
   `aiui: false`, invalid JSON. All 58 lib tests green.
 
-## [0.4.32] — 2026-05-04
+## [0.4.32] — never released; folded into v0.4.33 (2026-05-04)
+
+_No `v0.4.32` tag exists — the tags jump `v0.4.31` → `v0.4.33`. This work
+first reached users in `v0.4.33` the same day._
 
 ### Added
 

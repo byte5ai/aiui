@@ -65,6 +65,18 @@ jobs:
       VERSION: ${{ inputs.version }}
       TAG: v${{ inputs.version }}
     steps:
+      # #209: `workflow_dispatch` lets the operator pick any ref, and this
+      # workflow hands out a byte5 GmbH Developer ID signature, an Apple
+      # notarization ticket and a permanent PyPI version. Nothing else in
+      # the pipeline ever looked at which ref that was, so a feature branch
+      # or a stale commit could be signed and published. First step of all,
+      # before even the checkout: it costs nothing and needs nothing.
+      - name: Guard — releases are cut from main only
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF_NAME" = "main" ] \
+            || { echo "dispatched from ${GITHUB_REF_NAME}; releases are cut from main only"; exit 1; }
+
       # #192: every `uses:` below is pinned to a full commit SHA. This job
       # holds the Developer ID certificate, the notary key, the minisign
       # updater private key and the PyPI token at once, and aiui installs
@@ -73,27 +85,24 @@ jobs:
       # `scripts/check-workflow-pins.sh` fails CI if a pin floats again.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # Four places must agree on the version BEFORE we spend build
+      # Four manifests must agree on the version BEFORE we spend build
       # minutes: Cargo.toml (build), tauri.conf.json (Info.plist),
       # pyproject.toml (PyPI artifact → what `uvx aiui-mcp` resolves on
-      # remote hosts), and the dispatched version (tag/release). Drift
-      # between them produced #82 (updater confusion) and the
-      # v0.4.2/v0.4.21 Tauri-vs-PyPI split on 2026-04-28.
+      # remote hosts), package.json (npm metadata), plus the dispatched
+      # version (tag/release) and a CHANGELOG section for it. Drift
+      # produced #82 (updater confusion) and the v0.4.2/v0.4.21
+      # Tauri-vs-PyPI split on 2026-04-28.
+      #
+      # The check itself lives in scripts/check-release-preconditions.sh so
+      # that CI can run it on every PR (job `release-preconditions`) — drift
+      # is then caught in the bump PR rather than at dispatch time — and so
+      # the tag probe asks ORIGIN. The inline `git rev-parse "$TAG"` it
+      # replaces could never fire: actions/checkout@v4 fetches depth 1 and
+      # no tags, so the ref was never present locally (#209).
       - name: Check version sync
         run: |
           set -euo pipefail
-          grep -q "^version = \"${VERSION}\"" companion/src-tauri/Cargo.toml \
-            || { echo "Cargo.toml does not match ${VERSION}"; exit 1; }
-          CONF="$(python3 -c 'import json;print(json.load(open("companion/src-tauri/tauri.conf.json"))["version"])')"
-          [ "$CONF" = "$VERSION" ] \
-            || { echo "tauri.conf.json is ${CONF}, expected ${VERSION}"; exit 1; }
-          PYV="$(grep -E '^version = ' python/pyproject.toml | awk -F'"' '{print $2}')"
-          [ "$PYV" = "$VERSION" ] \
-            || { echo "pyproject.toml is ${PYV}, expected ${VERSION}"; exit 1; }
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists — bump the version or delete the tag first."
-            exit 1
-          fi
+          ./scripts/check-release-preconditions.sh "$VERSION"
           # #191: a run that publishes no bridge must not be able to produce
           # a directly-promotable full release. The companion pins
           # `aiui-mcp==${VERSION}`, so without the PyPI artifact every
@@ -136,6 +145,31 @@ jobs:
           # Exact, not `latest`: this job publishes to PyPI with
           # UV_PUBLISH_TOKEN, so the uv binary is part of the trusted set.
           version: "0.12.17"
+
+      # #209: the release path used to run no tests at all — not cargo test,
+      # not pytest, not the drift guards. A commit whose CI was red (or that
+      # never had one) could be built, signed, notarized, released and
+      # pushed to PyPI with nothing noticing. These are the same checks
+      # ci.yml runs; they cost seconds on a runner that is about to spend
+      # twenty minutes on a signed build, and they sit BEFORE the keychain
+      # import on purpose, so a red test never reaches the signing material.
+      - name: Pre-release checks (drift guards)
+        run: |
+          set -euo pipefail
+          ./scripts/check-skill-drift.sh
+          ./scripts/test-check-updater-feed.sh
+          ./scripts/check-release-ordering.sh
+          ./scripts/test-check-release-preconditions.sh
+
+      # test_integration_live.py is opt-in (AIUI_LIVE=1) and skips itself
+      # otherwise, so the default selection needs no exclusion here.
+      - name: Pre-release checks (Python)
+        working-directory: python
+        run: uv run --extra dev pytest tests/ -q
+
+      - name: Pre-release checks (Rust)
+        working-directory: companion/src-tauri
+        run: cargo test --lib --release --target aarch64-apple-darwin
 
       # Ephemeral keychain + Developer ID import — from the macos-sign.yml
       # template. The keychain password is generated per run and never a
@@ -369,9 +403,34 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           # Idempotent: skip creation if the release already exists so a
-          # recovery re-run proceeds to the PyPI step instead of failing here.
+          # recovery re-run proceeds instead of failing here.
+          #
+          # #209: creation and upload are SEPARATE. They used to be one
+          # `gh release create` with the four assets as arguments, which
+          # meant a re-dispatch rebuilt, re-signed and re-notarized
+          # everything and then discarded all of it — a green run whose log
+          # says "built" while the release keeps the previous run's (or a
+          # half-uploaded) asset set. That is the documented recovery path
+          # in CONTRIBUTING, so it was the common case, not the exotic one.
           if gh release view "$TAG" --repo byte5ai/aiui >/dev/null 2>&1; then
-            echo "release $TAG already exists — skipping create; PyPI step still runs"
+            echo "release $TAG already exists — reusing it; assets are re-uploaded below"
+            # A re-dispatch must NOT un-ship the other platform.
+            # release-windows.yml merges its `windows-x86_64` entry into the
+            # latest.json this workflow uploaded, so clobbering that file
+            # with the freshly built darwin-only feed would send every
+            # shipped Windows client's update check into TargetsNotFound —
+            # silently, with no error anywhere. So: pull the published feed
+            # and splice today's darwin-aarch64 entry INTO it rather than
+            # replacing the document. Same tag, same version, so a windows
+            # entry carried over still points at this release's installer.
+            rm -rf published && mkdir -p published
+            if gh release download "$TAG" --repo byte5ai/aiui \
+                 --pattern latest.json --dir published >/dev/null 2>&1; then
+              python3 -c 'import json,sys; pub=json.load(open(sys.argv[1])); fresh=json.load(open(sys.argv[2])); plat=dict(pub.get("platforms",{})); plat.update(fresh.get("platforms",{})); fresh["platforms"]=plat; json.dump(fresh,open(sys.argv[2],"w"),indent=2); print("latest.json platforms after merge: "+", ".join(sorted(plat)))' \
+                published/latest.json latest.json
+            else
+              echo "no latest.json on $TAG yet — uploading the freshly built feed as is"
+            fi
           else
             # DRAFT on purpose (#190). `releases/latest/download/latest.json`
             # is what every installed aiui polls, and a draft is not served
@@ -384,16 +443,27 @@ jobs:
             # every Windows client's update check went into the error path
             # until a human remembered to dispatch the second workflow.
             gh release create "$TAG" \
-              "aiui-${VERSION}-arm64.dmg" \
-              "aiui-${VERSION}-arm64.zip" \
-              "aiui-${VERSION}-updater-arm64.tar.gz" \
-              "latest.json" \
               --repo byte5ai/aiui \
               --title "aiui ${TAG}" \
               --notes-file notes.md \
               --draft \
               $PRERELEASE_FLAG
           fi
+
+          # Unconditional, outside the branch above: what this run actually
+          # built is what the release carries. `--clobber` so a partial
+          # asset set from a failed run is completed rather than being
+          # unrepairable, and deliberately NOT `gh release delete` +
+          # recreate — that discards download counts, breaks links already
+          # handed out, and drops the Windows assets release-windows.yml
+          # attached.
+          gh release upload "$TAG" \
+            "aiui-${VERSION}-arm64.dmg" \
+            "aiui-${VERSION}-arm64.zip" \
+            "aiui-${VERSION}-updater-arm64.tar.gz" \
+            "latest.json" \
+            --repo byte5ai/aiui \
+            --clobber
 
       # #190: the release is a DRAFT until the Windows half lands, so the
       # second workflow is no longer something a human has to remember —

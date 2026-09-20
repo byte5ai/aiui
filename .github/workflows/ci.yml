@@ -231,6 +231,29 @@ jobs:
       - name: Self-test the workflow pin guard
         run: ./scripts/test-check-workflow-pins.sh
 
+  release-preconditions:
+    name: release preconditions
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned like every other `uses:` so the workflow-pin guard above
+      # stays green (#192).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # #209: the four version-carrying manifests (Cargo.toml,
+      # tauri.conf.json, pyproject.toml, package.json) must agree, and
+      # CHANGELOG.md must have a section for the version they carry. The
+      # same script gates the release dispatch; running it here, in
+      # no-argument mode, means drift is caught in the bump PR rather than
+      # twenty signed minutes into a release run. `companion/package.json`
+      # had drifted six minor versions (0.4.5 against 0.10.1) precisely
+      # because nothing on either path looked at it.
+      - name: Check the release preconditions
+        run: ./scripts/check-release-preconditions.sh
+
+      # A guard that silently stopped guarding would be worse than none.
+      - name: Self-test the release-preconditions guard
+        run: ./scripts/test-check-release-preconditions.sh
+
   mcp:
     name: aiui-mcp (Python)
     runs-on: ubuntu-latest

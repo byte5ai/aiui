@@ -74,9 +74,30 @@ local keychain, never in the repo. `scripts/release.sh` is a stub that
 refuses to run; it exists only to stop anyone from reinventing a local
 build path. If Actions is down, wait for it.
 
-Before dispatching, bump the version in `companion/src-tauri/Cargo.toml`,
-`companion/src-tauri/tauri.conf.json`, and `python/pyproject.toml` so all
-three agree — the workflow's first step hard-fails on drift.
+Before dispatching, the bump PR has to do all of this:
+
+- bump the version in all **four** manifests —
+  `companion/src-tauri/Cargo.toml`, `companion/src-tauri/tauri.conf.json`,
+  `python/pyproject.toml` and `companion/package.json`;
+- rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] — <date>`, so
+  the version being released has a section.
+
+`scripts/check-release-preconditions.sh` is what enforces it, and it runs
+twice: in CI on every PR (no argument — the four manifests must agree with
+each other and with a CHANGELOG section), and as the release workflow's
+first step after checkout (`… X.Y.Z` — the manifests must additionally equal
+the dispatched version, and `vX.Y.Z` must not already be on the remote).
+Run it locally before opening the bump PR:
+
+```sh
+scripts/check-release-preconditions.sh          # the tree agrees with itself
+scripts/check-release-preconditions.sh 0.11.0   # …and with what you'll dispatch
+```
+
+Releases are cut **from `main` only** — the workflow's very first step
+refuses any other ref — and the run executes the drift guards, `pytest` and
+`cargo test --lib` *before* the Developer ID certificate is imported, so a
+red test never reaches the signing keychain.
 
 ### macOS — `release-macos.yml`
 
@@ -95,7 +116,12 @@ gh workflow run release-macos.yml -f version=X.Y.Z \
 
 PyPI runs last, after the GitHub release succeeded, because PyPI versions
 are permanent. The tag and release steps are idempotent, so a run that
-failed at PyPI can be re-dispatched with the same version to recover.
+failed at PyPI can be re-dispatched with the same version to recover — and
+since #209 that re-run also **re-uploads** what it just built
+(`gh release upload --clobber`), instead of building it and throwing it
+away. Its `latest.json` is merged into the published feed rather than
+replacing it, so re-dispatching macOS after the Windows run does not drop
+the `windows-x86_64` entry.
 
 **The release stays a draft until the Windows run completes.** A draft is
 not served by `releases/latest/download/latest.json`, which is what every
