@@ -90,6 +90,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
 | Mark *where* on an image (point / region) | `form` with `annotated_image` |
+| Pick from a nested structure (file subtree, config namespaces, org chart) | `form` with a `tree` field |
 | Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
@@ -193,6 +194,78 @@ sortable_by_column?: true   # click headers to sort
 Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
 order field reflects user-driven sorts so you can preserve their view if
 you reopen the form.
+
+## Hierarchical picker: `tree`
+
+When the options carry real parent/child structure the user needs to
+*see* — a file subtree, config namespaces, the packages of a monorepo,
+an org chart — hand them a `tree`. Flat set where ordering matters →
+`list`. Flat one-of-N → `select`. Structure the user has to navigate →
+`tree`.
+
+```
+{
+  "kind": "tree",
+  "name": "<result key>",
+  "label": "<optional>",
+  "items": [{label, value, description?, children?: [...]}],
+  "multi_select": true,        # checkbox per node; default is single-pick
+  "default_selected": [values],
+  "default_expanded": [values]
+}
+```
+
+Result: `{selected: [values]}` — that is the whole shape. Expand/collapse
+is the user's *view*, not an answer: it is stripped at submit, so never
+plan on reading it back.
+
+Three behaviours to get right before you send one:
+
+- **Omitting `default_expanded` expands every node.** On a deep or wide
+  tree that hands the user a wall of rows. Pass the handful of values you
+  want open — usually the roots — and let them drill down.
+- **`required` is not enforced for `tree`** (same as `list`). The user can
+  submit with nothing picked, so handle an empty `selected` rather than
+  assuming a selection. Seed `default_selected` when a sensible
+  preselection exists.
+- **Parents and children are independently selectable.** Picking a parent
+  does *not* pick its children. If you mean "the whole subtree", say so
+  in the label or list the children explicitly.
+
+```
+{
+  "kind": "tree",
+  "name": "namespaces",
+  "label": "Which config namespaces should migrate?",
+  "multi_select": true,
+  "default_expanded": ["app", "app/auth"],
+  "default_selected": ["app/auth/tokens"],
+  "items": [
+    {
+      "label": "app",
+      "value": "app",
+      "children": [
+        {
+          "label": "auth",
+          "value": "app/auth",
+          "children": [
+            {"label": "tokens", "value": "app/auth/tokens", "description": "12 keys"},
+            {"label": "sessions", "value": "app/auth/sessions", "description": "3 keys"}
+          ]
+        },
+        {"label": "cache", "value": "app/cache", "description": "7 keys"}
+      ]
+    },
+    {"label": "legacy", "value": "legacy", "description": "deprecated, 41 keys"}
+  ]
+}
+```
+
+Anti-pattern: faking the hierarchy with indented labels in a `select` or
+a `list` (`"  └ tokens"`) — the indentation is a picture the user cannot
+collapse, and the values come back flat with the structure lost. The
+mirror anti-pattern is reaching for `tree` on a flat set because it looks
+fancier; a two-level-deep `tree` of five leaves is a worse `list`.
 
 ## Schematic diagrams: `mermaid`
 

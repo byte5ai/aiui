@@ -19,6 +19,16 @@ All notable changes to this project are documented here.
   runs in the release path before anything becomes visible, and
   `scripts/test-check-updater-feed.sh` exercises it against fixtures on
   every PR so the guard cannot quietly stop guarding (#190).
+- **The `tree` field is finally documented.** The hierarchical picker has
+  shipped, validated and rendered for releases, and the README sells
+  "hierarchical pickers" as what `AskUserQuestion` can't do — but neither
+  `skill.md` copy mentioned it, so an agent reading its catalog had no
+  reason to believe it existed and fell back to a flat `select` or indented
+  labels. Both copies gain a `tree` section with the spec, the
+  `{selected: [values]}` result shape, when to reach for it over `list` or
+  `select`, a worked example and an anti-pattern — including the two
+  behaviours an agent otherwise gets wrong: omitting `default_expanded`
+  expands *every* node, and `required` is not enforced for `tree` (#205).
 
 ### Changed
 
@@ -51,6 +61,19 @@ All notable changes to this project are documented here.
   agent-facing path guidance no longer says "the user's Mac" — an agent
   reading that could reasonably assume POSIX paths on a Windows user's
   machine.
+- **The skill-drift guard now checks the contract, not just the headers.**
+  It compared backtick-quoted tokens found in Markdown headers — 23 of
+  them — which is why `tree` could go undocumented in *both* copies while
+  CI reported success: a symmetrically missing section is invisible to a
+  symmetric comparison. `scripts/check-skill-drift.sh` keeps that section
+  check unchanged and adds two source-derived ones: every kind in
+  `KNOWN_FIELD_KINDS` (parsed out of `http.rs`, not restated in the
+  script) must appear as a backticked token in both copies, and the
+  `tools_list()` name set in `mcp.rs` must equal the `@mcp.tool()` set in
+  `server.py`, with every dialog tool documented in both copies. Four
+  plain input kinds and the three non-dialog tools are allowlisted, each
+  with a reason. `python/tests/test_skill_contract.py` breaks one fixture
+  at a time and asserts the guard fails and names the break (#205).
 
 ### Fixed
 

@@ -142,8 +142,15 @@ jobs:
       # python/src/aiui_mcp/skill.md (shipped with the Python bridge) must
       # document the same field/tool surface — both bridges expose the same
       # MCP tools. The two copies are deliberately tailored per bridge, so
-      # this is a field/tool-section check, not a byte diff. See the script
-      # header for how to allowlist a deliberate divergence.
+      # this is never a byte diff. Three assertions (#205): matching
+      # field/tool *sections* (backticked header tokens), every kind in
+      # `KNOWN_FIELD_KINDS` (parsed out of http.rs) documented as a
+      # backticked token in both copies, and tool-name parity between
+      # `tools_list()` in mcp.rs and the `@mcp.tool()` set in server.py.
+      # The section check alone stayed green while `tree` shipped
+      # undocumented in both copies. See the script header for how to
+      # allowlist a deliberate divergence; the guard's own negative tests
+      # live in python/tests/test_skill_contract.py (job `mcp`).
       - name: Check skill.md copies are in sync
         run: ./scripts/check-skill-drift.sh
 
