@@ -1,6 +1,7 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
   import { renderMarkdown } from "../markdown";
+  import { handleContentClick } from "../external-link";
   import TreeNode from "./TreeNode.svelte";
   import MermaidView from "./MermaidView.svelte";
   import WireframeView from "./WireframeView.svelte";
@@ -607,7 +608,13 @@
       {#if f.kind === "static_text"}
         <div class="static-text {f.tone ?? 'info'}">{f.text}</div>
       {:else if f.kind === "markdown"}
-        <div class="markdown-field">
+        <!-- #189: links inside agent-supplied markdown open in the user's
+             browser, never by navigating this window away. Delegated, because
+             the content is {@html} and its anchors have no Svelte lifecycle.
+             Not interactive itself — the handler only acts on a real <a>. -->
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="markdown-field" onclick={handleContentClick}>
           <!-- eslint-disable-next-line svelte/no-at-html-tags -->
           {@html renderMarkdown(f.text)}
         </div>

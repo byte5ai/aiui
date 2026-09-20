@@ -29,6 +29,38 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 pub const SETUP_WINDOW_LABEL: &str = "setup";
 pub const DIALOG_WINDOW_LABEL: &str = "dialog";
 
+/// May the WebView navigate to this URL?
+///
+/// #189: a `markdown` or `compare` field renders agent-supplied text, and a
+/// plain `[text](https://…)` link survives sanitisation — as it should, the
+/// user is meant to be able to follow it. But clicking it navigated the
+/// **dialog window itself** away from `dialog.html`. The Svelte app is gone,
+/// the dialog's `/render` is left hanging until its TTL, and the user is
+/// looking at a web page in a frameless window with no way back. A
+/// compromised remote host could aim that anywhere.
+///
+/// So: only our own app origins may be navigated to. Everything else is
+/// refused here and opened in the user's real browser by the frontend (via
+/// the existing `open_url` command).
+///
+/// The host check is not optional. `|u| u.scheme() == "tauri"` looks like the
+/// obvious one-liner and breaks two shipped configurations: WebView2 serves
+/// the Windows app from `http://tauri.localhost` (v0.10.1 onward), and
+/// `npm run tauri:dev` loads `http://localhost:5173` per `tauri.conf.json`.
+///
+/// Pure, so the matrix is unit-testable without a window.
+pub(crate) fn is_allowed_app_navigation(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        // macOS / Linux production.
+        "tauri" => true,
+        // Windows production (`useHttpsScheme` unset → http) and the dev server.
+        "http" => matches!(url.host_str(), Some("tauri.localhost") | Some("localhost")),
+        // Windows production with `useHttpsScheme: true`.
+        "https" => url.host_str() == Some("tauri.localhost"),
+        _ => false,
+    }
+}
+
 /// Timestamp of the most recent dialog-window teardown (X-close, submit/cancel
 /// close, or programmatic destroy). The macOS `RunEvent::Reopen` handler reads
 /// it to suppress the settings window when a Reopen fires merely as a
@@ -1024,6 +1056,10 @@ pub(crate) fn build_setup_window(
         SETUP_WINDOW_LABEL,
         WebviewUrl::App("setup.html".into()),
     )
+    // #189: the window may never leave our own app origin, and a
+    // `target="_blank"` that survives sanitisation may not open a popup.
+    .on_navigation(is_allowed_app_navigation)
+    .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
     .title("aiui")
     .inner_size(520.0, 480.0)
     .min_inner_size(520.0, 380.0)
@@ -1103,6 +1139,10 @@ pub(crate) fn build_dialog_window(
     };
     let id_for_lift = id.to_string();
     WebviewWindowBuilder::new(app, id, WebviewUrl::App("dialog.html".into()))
+        // #189: see is_allowed_app_navigation. This is the window that
+        // renders agent-supplied markdown, so it is the one that matters.
+        .on_navigation(is_allowed_app_navigation)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         // Session identity (I8) in the native title bar. Set here in Rust —
         // the frontend `setTitle` is blocked without a `core:window:set-title`
         // capability, so the Rust builder is the reliable place.
@@ -1913,4 +1953,53 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    fn url(s: &str) -> tauri::Url {
+        s.parse().expect("test url parses")
+    }
+
+    #[test]
+    fn app_origins_may_be_navigated_to() {
+        // Every shipped configuration must keep working — this predicate
+        // gates the window's own startup navigation too, so a wrong `false`
+        // here means a blank window rather than a blocked link.
+        assert!(is_allowed_app_navigation(&url("tauri://localhost/dialog.html")));
+        assert!(
+            is_allowed_app_navigation(&url("http://tauri.localhost/dialog.html")),
+            "Windows/WebView2 production, shipped in v0.10.1"
+        );
+        assert!(
+            is_allowed_app_navigation(&url("https://tauri.localhost/dialog.html")),
+            "Windows with useHttpsScheme"
+        );
+        assert!(
+            is_allowed_app_navigation(&url("http://localhost:5173/dialog.html")),
+            "npm run tauri:dev, per tauri.conf.json build.devUrl"
+        );
+    }
+
+    #[test]
+    fn agent_supplied_links_may_not_navigate_the_window() {
+        // #189: the defect itself. A `[text](https://…)` in a markdown field
+        // navigated the dialog away from dialog.html — the Svelte app gone,
+        // the /render left hanging until its TTL, no way back for the user.
+        assert!(!is_allowed_app_navigation(&url("https://example.com/")));
+        assert!(!is_allowed_app_navigation(&url("http://example.com/")));
+        assert!(!is_allowed_app_navigation(&url("http://127.0.0.1:7777/probe")));
+        assert!(!is_allowed_app_navigation(&url("file:///etc/passwd")));
+        assert!(!is_allowed_app_navigation(&url("data:text/html,<h1>x</h1>")));
+    }
+
+    #[test]
+    fn a_lookalike_host_is_not_our_origin() {
+        // Why the host check is not optional, in both directions.
+        assert!(!is_allowed_app_navigation(&url("http://tauri.localhost.evil.com/")));
+        assert!(!is_allowed_app_navigation(&url("https://localhost/")));
+        assert!(!is_allowed_app_navigation(&url("http://notlocalhost/")));
+    }
 }

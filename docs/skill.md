@@ -573,9 +573,12 @@ What does **not** work — known footguns:
   follows the same CSP — the URL has to resolve to `data:` somehow.
   The resolver only walks `src` / `thumbnail` properties, not the
   bodies of markdown blocks.
-- **Linking out** with `<a href="https://...">` from `markdown` —
-  works as a click target, but opens in the user's default browser
-  (we explicitly intercept it). It's not an image-rendering question.
+- **Linking out** with `[text](https://…)` or `<a href="https://…">` from
+  `markdown` (and from a `compare` variant's `content`) — works as a click
+  target. It opens in the user's default browser; the dialog window itself
+  never navigates, so the dialog stays open and still returns a result.
+  Only `http(s)` links open; anything else is ignored. It's not an
+  image-rendering question.
 
 If you tried a path or URL and the user reports a broken image, ask
 them once whether anything appeared at all — a missing file, a CSP

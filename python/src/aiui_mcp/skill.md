@@ -374,8 +374,10 @@ file on the user's machine won't resolve from a remote agent, or vice versa —
 the bridge that reads it is on the agent's host; use `http(s)://` or inline
 `data:`); **bare URLs in `markdown` field text** (`![alt](url)` follows the
 same CSP — the resolver only walks `src` / `thumbnail`, not markdown
-bodies); **`<a href="https://…">` links** work as a click target but open
-in the user's default browser, not an image-rendering path. A missing file,
+bodies); **`https://…` links** in `markdown` and in a `compare` variant's
+`content` work as a click target and open in the user's default browser —
+the dialog window never navigates, so the dialog stays open and still
+returns a result. Only `http(s)` opens; anything else is ignored. A missing file,
 a CSP block, and a 404 all look identical to the user — if they report a
 broken image, ask once whether anything appeared at all.
 
