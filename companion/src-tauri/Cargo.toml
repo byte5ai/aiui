@@ -84,3 +84,18 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # after Codex review (PR #131 follow-up) flagged the probe/remove/bind
 # race in lifetime::gui_serve.
 fs4 = { version = "0.12", features = ["sync"] }
+
+# Unix-only: `O_NOFOLLOW` when opening the trace log, so a symlink planted
+# at the log path fails the open instead of being appended through (#185).
+# Already in the dependency tree transitively; declared here so the flag is
+# available without relying on someone else's re-export.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows-only: SO_EXCLUSIVEADDRUSE on the API listener, which socket2 0.5
+# exposes no setter for. Without it `SO_REUSEADDR` (whose Windows semantics
+# are the opposite of the Unix ones) let any local process bind over our
+# listener and answer the bridges in our place (#185).
+[target.'cfg(windows)'.dependencies]
+# 0.59, not 0.52: SO_EXCLUSIVEADDRUSE is only defined from 0.59 on.
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }

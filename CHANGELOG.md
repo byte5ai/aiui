@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
+  missing a shipped platform, carries an empty signature or url, points an
+  entry at another release's artifact, or advertises the wrong version. It
+  runs in the release path before anything becomes visible, and
+  `scripts/test-check-updater-feed.sh` exercises it against fixtures on
+  every PR so the guard cannot quietly stop guarding (#190).
+
+### Changed
+
+- **`skip_validation: true` actions no longer commit `target` file
+  writes.** They are escape hatches, and an escape hatch that writes a
+  credential to disk is a trap. The new `writes_targets: true` action flag
+  opts one back in. An action value the spec never declared is refused
+  (fail closed). Agent-facing: documented in both `skill.md` copies and in
+  the `form` tool description of both bridges. Nothing that previously
+  failed now succeeds; some writes that previously fired silently now
+  refuse with a reason (#177).
+- **Documentation updated for a two-platform product.** README, both
+  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
+  doc still described aiui as macOS-only. The README gained per-platform
+  install instructions including the expected SmartScreen warning, and
+  agent-facing path guidance no longer says "the user's Mac" — an agent
+  reading that could reasonably assume POSIX paths on a Windows user's
+  machine.
+
 ### Fixed
 
 - **An unparsable host config was replaced, not repaired.** Every local
@@ -43,9 +70,52 @@ All notable changes to this project are documented here.
   removed entry, re-reads the current file on restore, writes atomically,
   and warns when a per-project aiui entry would keep aiui loaded for the
   project being measured (#182).
+- **Windows: the diagnostic trace was silently discarded.** `TRACE_PATH`
+  was the hard-coded `/tmp/aiui-trace.log`, which does not exist on
+  Windows, so every `logging::trace()` line was dropped and the failed open
+  was swallowed — the platform with the youngest port shipped with no
+  diagnostics. The trace now resolves per-OS (`%LOCALAPPDATA%\aiui\logs`
+  on Windows, `<config dir>/logs` elsewhere), is opened `0600` with
+  `O_NOFOLLOW` so a planted symlink cannot redirect it, reports a failing
+  open once on stderr instead of never, and names its resolved path in
+  every session header. `/tmp` was also the wrong place on Unix: it is
+  world-readable and shared (#185).
+- **A form's Cancel button could blank the user's credential file.**
+  `target` file writes fired on *every* action except the built-in
+  `__cancel__`, so a custom `Cancel` or `Save draft` action — the pattern
+  `skill.md` itself recommends — committed the write with whatever was in
+  the field. For an untouched `secret` that is the empty string, so
+  `mode: "create"` with `overwrite: true` replaced the file with zero
+  bytes, and `mode: "substitute"` erased its own placeholder so even a
+  retry failed. The agent was told `{written: true, bytes: 0}`. Two guards
+  now close it, in both writers (native app and Python bridge): an action
+  carrying `skip_validation: true` no longer commits target writes, and an
+  empty value is refused before the filesystem is touched. A field missing
+  from the payload is reported as such instead of being laundered into a
+  blank write (#177).
+- **A release published a macOS-only update feed, breaking every Windows
+  client's update check.** `releases/latest/download/latest.json` is what
+  every installed aiui polls, and `release-macos.yml` published one
+  carrying only `darwin-aarch64` — the `windows-x86_64` entry was added
+  later by a second, manually dispatched workflow. In between, a Windows
+  update check did not report "up to date"; it failed
+  (`tauri-plugin-updater` raises `TargetsNotFound` for a missing target),
+  and if the second dispatch was forgotten it failed permanently. That is
+  what shipped in v0.10.1.
 
-### Fixed
+  The release is now created as a **draft**, which
+  `releases/latest/download/…` does not serve, so clients keep resolving
+  the previous complete feed until both platforms are in. The Windows
+  workflow is dispatched automatically, validates the assembled feed, and
+  only then publishes the release. A Windows failure therefore holds back
+  the whole release rather than shipping half of one — the correct
+  coupling for a two-platform product.
 
+  Deliberately **not** fixed by carrying the previous release's Windows
+  entry forward: that feed would advertise the new version while pointing
+  at the old installer, which verifies and installs cleanly and leaves the
+  client on the old version — a silent reinstall loop, with `/update`
+  reporting success for a version the machine never reached (#190).
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the
@@ -57,15 +127,64 @@ All notable changes to this project are documented here.
   (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
   after this fix.
 
-### Changed
+### Security
 
-- **Documentation updated for a two-platform product.** README, both
-  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
-  doc still described aiui as macOS-only. The README gained per-platform
-  install instructions including the expected SmartScreen warning, and
-  agent-facing path guidance no longer says "the user's Mac" — an agent
-  reading that could reasonably assume POSIX paths on a Windows user's
-  machine.
+- **Every user file aiui rewrites came back with the wrong permissions.**
+  `atomic_write` created a fresh temp file (umask-masked `0666`) and renamed
+  it over the destination, discarding the destination's own mode. Claude
+  Code creates `~/.claude.json` as `0600` because it holds OAuth data and
+  other MCP servers' `env` blocks; after one aiui config patch it was
+  world-readable, permanently. `~/.ssh/config` got the same treatment on
+  every launch, and under a `002` umask became group-writable — which makes
+  OpenSSH refuse to run at all. The destination's mode is now copied onto
+  the temp handle *before* the rename, so there is no world-readable window
+  either. A symlinked config (a dotfiles-repo setup) is no longer replaced
+  by a regular file: the link is resolved first and written through, and a
+  symlink cycle fails loudly instead of silently swapping the link for a
+  file (#185).
+- **The API token is validated and kept at `0600`.** A malformed token
+  (empty, truncated, not 64 hex chars) is now regenerated instead of being
+  used, `0600` is re-asserted on every launch so a token restored from a
+  backup gets tightened, and the config directory itself is created `0700`.
+  The GUI lock file is created `0600` and repaired if an older install left
+  it `0644`. The Python bridge refuses a malformed token with a clear
+  message instead of sending a bare `Bearer ` (#185).
+- **Token comparison no longer leaks its prefix through timing.** `auth_ok`
+  folds every byte instead of returning at the first mismatch, and an empty
+  configured token now authenticates nobody rather than accepting an empty
+  `Bearer ` (#185).
+- **Windows: another local process could take `127.0.0.1:7777` from us.**
+  `SO_REUSEADDR` means the opposite thing on Windows — it lets an unrelated
+  process bind a socket we are already listening on and answer the bridges
+  in our place. Windows now gets `SO_EXCLUSIVEADDRUSE` instead, which
+  reserves the address; Unix keeps `SO_REUSEADDR` for the TIME_WAIT reason
+  it was added for (#185).
+- **Render specs are no longer written verbatim to the trace file.** A spec
+  carries the user's own content — question text, pre-filled defaults, file
+  paths, `target` destinations — and the trace is what people paste into
+  public bug reports. The trace now records the shape (kind, field and
+  option counts, byte size); `AIUI_TRACE_SPECS=1` restores the full body
+  when it is genuinely needed (#185).
+- **A `secret` field without a `target` handed its plaintext to the agent.**
+  Both `skill.md` and the `form` tool description promise a `secret` value
+  is "NEVER returned to you", but the stripping keyed on the presence of
+  `target`, not on the field kind — and `target` is a nested object that is
+  easy to omit. A `secret` without one sailed through validation (there was
+  even a unit test asserting that shape valid), looked identical to a
+  `password` in the UI, and its value went back in `result.values` and thus
+  into the transcript. Three layers now close it: the companion rejects the
+  shape with `invalid_spec`, and both the frontend and the Python bridge
+  strip on the kind rather than on the target, so an older companion in
+  front of a newer bridge cannot leak either. A target-less `secret` is
+  rejected rather than silently downgraded to `password`: handing over a
+  credential the docs promised would never be returned has to be loud
+  (#186).
+
+- **The Python bridge discarded the reason for a rejected spec.**
+  `raise_for_status()` threw away the companion's `{error, detail, hint}`
+  body, so a remote agent got a bare `HTTPStatusError: 422` while a local
+  Rust-bridge agent got the explanation. The reason now survives the bridge
+  (#186).
 
 ## [0.10.1] — 2026-08-31
 

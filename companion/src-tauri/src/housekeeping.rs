@@ -84,13 +84,30 @@ impl ProcessLock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        // Issue #185: the lock file must not be world-readable/writable.
+        // `mode()` applies only on creation, so an install that already
+        // carries a 0644 lock is repaired right after a successful acquire.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
         file.try_lock_exclusive()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&path) {
+                if md.permissions().mode() & 0o177 != 0 {
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
         Ok(Self { file, path })
     }
 
