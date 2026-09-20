@@ -36,6 +36,45 @@ def test_looks_like_local_path_classifies_correctly() -> None:
     assert not _looks_like_local_path("")
 
 
+# The Windows shapes the Rust classifier accepts under `cfg!(windows)` —
+# kept entry-for-entry in step with `looks_like_local_path_classifies_correctly`
+# in `companion/src-tauri/src/imageresolve.rs` (#201).
+_WINDOWS_PATHS = [
+    r"C:\Users\me\x.png",
+    "D:/renders/x.png",
+    r"\\?\C:\Users\me\x.png",
+    r"\\srv\share\x.png",
+]
+
+
+def test_looks_like_local_path_accepts_windows_paths_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiui_mcp import server
+
+    monkeypatch.setattr(server, "_IS_WINDOWS", True)
+    for p in _WINDOWS_PATHS:
+        assert server._looks_like_local_path(p), p
+    # Platform-independent shapes keep classifying the same way.
+    assert server._looks_like_local_path(r"~\Pictures\x.png")
+    assert server._looks_like_local_path("/Users/me/x.png")
+    assert not server._looks_like_local_path("relative.png")
+    assert not server._looks_like_local_path("https://a.test/x.png")
+
+
+def test_looks_like_local_path_rejects_windows_paths_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiui_mcp import server
+
+    monkeypatch.setattr(server, "_IS_WINDOWS", False)
+    for p in _WINDOWS_PATHS:
+        # `C:\x.png` is not a path on Linux — accepting it would push
+        # garbage into the file reader instead of leaving the value alone.
+        assert not server._looks_like_local_path(p), p
+    assert server._looks_like_local_path("/Users/me/x.png")
+
+
 def test_read_path_as_data_url_uses_extension_mime(tmp_path: Path) -> None:
     f = tmp_path / "tiny.png"
     f.write_bytes(b"\x89PNG\r\n\x1a\nfake bytes")
@@ -103,6 +142,29 @@ def test_resolve_local_paths_fails_soft_on_missing_file() -> None:
     spec = {"src": original}
     _resolve_local_paths(spec)  # should not raise
     assert spec["src"] == original
+
+
+def test_resolve_local_paths_fails_soft_on_tilde_user_path() -> None:
+    """`~user/…` and `~\\…` make `Path.expanduser()` raise RuntimeError on a
+    POSIX host — not OSError. Unmapped it escaped the resolver's handler and
+    failed the whole `ask`/`form`/… tool call (#201). The contract is
+    fail-soft: keep the original value, raise nothing.
+    """
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "image", "src": "~nosuchuser42/x.png"},
+            {"kind": "image", "src": "~\\Pictures\\x.png"},
+        ],
+    }
+    _resolve_local_paths(spec)  # must not raise
+    assert spec["fields"][0]["src"] == "~nosuchuser42/x.png"
+    assert spec["fields"][1]["src"] == "~\\Pictures\\x.png"
+
+
+def test_read_path_as_data_url_maps_unexpandable_tilde_to_value_error() -> None:
+    with pytest.raises(ValueError, match="cannot expand"):
+        _read_path_as_data_url("~nosuchuser42/x.png")
 
 
 def test_resolve_local_paths_ignores_non_src_keys() -> None:

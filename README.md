@@ -134,9 +134,16 @@ back in chat — without it, the agent might forget aiui exists.
 
 ## Privacy
 
-aiui runs purely locally on your own machine. No telemetry, no usage data, no
-content leaves your system. A local auth token lives in the per-user config
-directory and is only scp'd to hosts you explicitly register in settings.
+aiui runs purely locally on your own machine. No telemetry, no usage data: no
+dialog content and no answer you give ever leaves your system. A local auth
+token lives in the per-user config directory and is only scp'd to hosts you
+explicitly register in settings.
+
+The one outbound request aiui makes on a spec's behalf is a `GET` for an
+`http(s)://` image `src`, fetched on your machine so the dialog can show it —
+publicly routable destinations only, never your LAN (see
+[SECURITY.md](SECURITY.md)). Beyond that and the GitHub-hosted updater feed,
+aiui does not phone anywhere.
 
 | | Token location | Protection |
 |---|---|---|

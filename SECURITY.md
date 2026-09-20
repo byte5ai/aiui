@@ -31,7 +31,8 @@ for high-severity issues.
 In scope:
 
 - `aiui.app` (Tauri companion) — signing/notarization, HTTP endpoint,
-  tunnel manager, lifetime socket, auto-updater trust chain
+  tunnel manager, lifetime socket, auto-updater trust chain,
+  render-time image resolver (the `http(s)://` `src` fetch)
 - `aiui-mcp` Python package — token handling, preflight, render call path
 - Release pipeline signing and notarisation
 
@@ -47,5 +48,10 @@ Out of scope (report upstream instead):
   notarised by Apple.
 - Updater artifacts are signed with an Ed25519 key and verified on the
   client before installation.
-- No telemetry, no outbound calls other than the GitHub-hosted updater
-  feed.
+- No telemetry and no analytics. aiui makes exactly two kinds of
+  outbound request: the GitHub-hosted updater feed, and a `GET` for any
+  `http(s)://` image URL a dialog spec asks it to render — publicly
+  routable destinations only; loopback, private, link-local, CGNAT and
+  ULA targets are refused before a socket is opened, resolved addresses
+  are pinned so a second DNS answer cannot slip past that check, and
+  redirects are not followed. Nothing else leaves your machine.
