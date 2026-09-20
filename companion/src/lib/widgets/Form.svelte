@@ -146,6 +146,13 @@
     success?: boolean;
     /** If true, field-level required-validation is skipped when this action fires (e.g. "defer"). */
     skip_validation?: boolean;
+    /**
+     * Issue #177: an action with `skip_validation` is an escape hatch and does
+     * NOT commit `target` file writes. Set this to opt such an action back in.
+     * The decision is enforced in the writers (Rust `action_commits_targets`,
+     * Python `_action_commits_targets`) against the stored spec, not here.
+     */
+    writes_targets?: boolean;
   };
 
   type Tab = { label: string; fields: Field[] };
@@ -930,6 +937,17 @@
                 >mode: {f.target.mode}{f.target.perm ? `, ${f.target.perm}` : ""}{f.target.overwrite
                   ? ", overwrite"
                   : ""}</span>
+            </p>
+          {:else if f.kind === "secret"}
+            <!-- Issue #186: the write-only promise belongs to the KIND, not to
+                 the presence of a `target`. This note used to render only for
+                 target-carrying fields, so a target-less `secret` looked and
+                 behaved exactly like `password` while the docs told the user
+                 it was write-only. A current companion rejects that shape in
+                 validate_spec; this is the layer the user actually sees. -->
+            <p class="write-target">
+              <span class="wt-icon" aria-hidden="true">↳</span>
+              Wird nicht an den Agent zurückgegeben und nirgends gespeichert.
             </p>
           {/if}
         </div>
