@@ -11,6 +11,7 @@ lives in `mcp.rs`'s test module. Structure only — names, required[],
 argument names, types and scalar defaults — never the descriptions, which are
 prose that changes on purpose.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -101,11 +102,12 @@ def test_argument_defaults_match_the_shared_fixture() -> None:
             )
 
 
-def test_the_known_allow_other_divergence_is_recorded_not_averaged() -> None:
-    # The fixture pins reality rather than papering over it: the two bridges
-    # really do disagree here, and that disagreement is tracked as its own
-    # finding. Aligning them is a deliberate two-bridge edit — this test is
-    # the thing that makes it one.
+def test_allow_other_default_is_aligned_across_bridges() -> None:
+    # #211 first recorded `ask.allow_other` as a two-bridge divergence
+    # (rust=false, python=true); #203 aligned them on false — "false is the
+    # settled value". The fixture now records a single default rather than a
+    # `{rust, python}` split, and `test_argument_defaults_match_the_shared_
+    # fixture` holds each bridge to it, so a future one-sided regression fails
+    # loudly there.
     entry = _fixture()["ask"]["properties"]["allow_other"]["default"]
-    assert isinstance(entry, dict) and set(entry) == {"rust", "python"}, entry
-    assert entry["rust"] != entry["python"], "aligned? then record a single default"
+    assert entry is False, f"expected the aligned scalar default, got {entry!r}"

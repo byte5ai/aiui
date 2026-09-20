@@ -19,10 +19,7 @@
       "properties": {
         "allow_other": {
           "type": "boolean",
-          "default": {
-            "rust": false,
-            "python": true
-          }
+          "default": false
         },
         "header": {
           "type": "string"

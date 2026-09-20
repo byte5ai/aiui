@@ -249,8 +249,6 @@ All notable changes to this project are documented here.
   still there afterwards, so neither the injection path nor the #189
   blank-diagram regression can come back with a version bump (#212).
 
-### Changed
-
 - **Build-chain dependencies updated out of their advisory ranges.** `vite`
   8.0.9 → 8.3.0 clears its own advisory and, with it, the transitive
   `postcss` and `nanoid` ones. `svelte-i18n` stays on its current major:
@@ -1057,8 +1055,6 @@ All notable changes to this project are documented here.
   but have no tag, no release page and no PyPI version — a user who read
   "v0.9.0 added the upload tool" could neither find nor install it. Each now
   says which release its content actually first reached users in (#209).
-
-### Fixed
 
 - **A re-dispatched release shipped the previous run's artifacts.** The only
   place assets were uploaded was inside the `else` of the "does the release
