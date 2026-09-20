@@ -13,6 +13,14 @@ All notable changes to this project are documented here.
   English-only: there is no i18n layer in the Rust half, and adding one for
   a single string is not the right trade; the localised banner remains the
   richer surface (#188).
+- **`reason` and `hint` on the `/health` response.** When `ready` is false the
+  body now names the cause — `webview_unresponsive`, `dialog_registry_full` or
+  `too_many_children`, in that fixed precedence — and carries a
+  human-readable one-liner with the live numbers in it. Agents relay the hint
+  rather than inferring a cause from a status code, and the guidance can no
+  longer drift from what the companion actually measures. Additive on the
+  wire: both bridges parse the body generically, so no `WIRE_VERSION` bump,
+  and an un-patched bridge simply sees one fewer fatal preflight (#179).
 - **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
   missing a shipped platform, carries an empty signature or url, points an
   entry at another release's artifact, or advertises the wrong version. It
@@ -134,6 +142,51 @@ All notable changes to this project are documented here.
   `ChannelAcceptFailing` lifecycle event past five consecutive failures.
   Neither loop can exit the process — the three legitimate exit causes are
   unchanged (#181).
+- **`/health`'s WebView probe could not fail.** A user whose dialog window
+  was open but frozen — "the dialog opened but nothing happens", the single
+  most common stuck report — got `webview.responsive: true` every time, with
+  a fabricated `rtt_ms: 0` and no ping ever sent. The probe looked the window
+  up by the fixed label `"dialog"`, which the multi-window rewrite had
+  already retired: every dialog window's label is its dialog id now, so the
+  lookup always missed and the probe always took its "nothing to ping"
+  branch. Worse, the frontend had no `ui:ping` listener at all, so the ack
+  registry was unreachable in production and repairing only the label would
+  have turned a cosmetic lie into a permanent 503 for as long as any dialog
+  was on screen. Both halves are fixed together: the probe now resolves the
+  newest live dialog via `DialogState::newest_id()` (deterministic, unlike
+  picking an arbitrary entry out of the window `HashMap`), `DialogShell`
+  answers `ui:ping` with `ui_pong` and unlistens on destroy, the Tauri
+  capability scope was widened so per-id dialog windows may actually use the
+  ACL-gated event API, and the round-trip budget went from 100 ms — inside
+  the window where a freshly mounted WebView is still doing layout — to
+  750 ms. With no dialog open, `rtt_ms` is now `null` rather than a `0` that
+  reads like a real measurement (#179).
+- **A full dialog registry took rendering down for every session sharing the
+  companion.** `/health` answered 503 the moment 16 dialogs were pending, and
+  the Python bridge preflights `/health` before every render and every
+  upload, treating any non-200 as fatal. With a 2 h dialog TTL and parallel
+  sessions on one companion, 16 unanswered dialogs is an ordinary state — so
+  a session with nothing pending of its own died with
+  `RuntimeError("aiui companion /health returned 503: {\"version\":…")`,
+  even though `/render` would have recovered on its own by sweeping expired
+  entries and evicting the oldest. 503 is now reserved for
+  `webview_unresponsive`, the one state that genuinely cannot serve;
+  degraded-but-serving states answer 200 with `ready: false` plus a reason.
+  The `32`-children threshold is now a named `CHILD_SOFT_CAP` (#179).
+- **Both diagnostic paths discarded the diagnosis.** `aiui_health` — the tool
+  whose job is to tell a cold companion apart from a rogue process holding
+  the port — called `raise_for_status()` and returned
+  `{"ok": false, "error": "Server error '503 Service Unavailable'"}`, throwing
+  away `pending`, `oldest_age_secs` and `lifecycle_phase`, the whole point of
+  a composite response; the Rust bridge collapsed the same body to
+  `"/health http 503 Service Unavailable"`. Both now parse and return the
+  body on any status (`ok` reports whether the companion answered 200,
+  `ready` whether it is healthy), and both `/aiui:health` prompts were
+  rewritten to relay the companion's `hint` instead of guessing a cause —
+  they used to instruct the agent to blame "WebView frozen" from a field
+  that was hardcoded to `true`. A non-JSON body still yields the old
+  `{ok: false, error}` shape, so a stranger on `:7777` cannot pass for a
+  healthy companion (#179).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

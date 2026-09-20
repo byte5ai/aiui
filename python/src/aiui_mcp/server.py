@@ -178,6 +178,22 @@ def _explain_exc(e: BaseException) -> str:
     return msg if msg else type(e).__name__
 
 
+def _health_body(r: Any) -> dict[str, Any] | None:
+    """Parse a ``/health`` response body, on any status code.
+
+    ``None`` when the body is not a JSON object — which is itself diagnostic:
+    something that isn't the companion is answering on this port. Callers must
+    read the body even on a non-2xx, because since #179 it carries the
+    ``reason``/``hint`` that explain the status instead of the caller having to
+    guess from the number.
+    """
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 — any parse failure means "no usable body"
+        return None
+    return body if isinstance(body, dict) else None
+
+
 async def _preflight() -> None:
     """Quick sanity check before every render call: the service on :7777 must
     accept our bearer token. Guards against stale local aiui instances that
@@ -255,9 +271,35 @@ async def _preflight() -> None:
                 f"token. Run `pkill -f '^aiui$'` on this host, then re-register it "
                 f"from the companion's settings window to re-sync the token."
             )
+        body = _health_body(r)
+
         if r.status_code != 200:
+            # Only a genuinely unserviceable companion reaches here: since
+            # #179 the companion answers 503 for `webview_unresponsive` alone.
+            # Relay its `hint` verbatim — the old `r.text[:200]` handed the
+            # user a status code and half a JSON blob.
+            hint = (body.get("hint") or body.get("reason")) if body else None
             raise RuntimeError(
-                f"aiui companion /health returned {r.status_code}: {r.text[:200]}"
+                f"aiui companion at {ENDPOINT} is not serving "
+                f"(HTTP {r.status_code}): {hint or r.text[:200]}"
+            )
+
+        if body is None:
+            raise RuntimeError(
+                f"aiui companion /health returned a 200 with an unparseable body: "
+                f"{r.text[:200]}. Another process may be holding {ENDPOINT}."
+            )
+
+        # Degraded-but-serving (`dialog_registry_full`, `too_many_children`)
+        # comes back as 200 + `ready: false`. It must NOT block this session:
+        # /render sweeps expired dialogs and evicts the oldest on its own, so
+        # one session's backlog used to take rendering down for every other
+        # session sharing the companion (#179).
+        if body.get("ready") is False:
+            log.warning(
+                "aiui companion degraded but serving (reason=%s): %s",
+                body.get("reason") or "unknown",
+                body.get("hint") or "",
             )
 
         # Cooperative version floor (Step 2): once per process, confirm the
@@ -1623,9 +1665,13 @@ _HEALTH_PROMPT = """\
 Run the `aiui_health` tool and report the result in one short sentence:
 
 - If `ready: true`, say "aiui ready (v{version})".
-- If `ready: false`, point at the most likely cause based on the response \
-  body (WebView frozen, dialog backlog, too many children) and suggest the \
-  one-step fix ("open Settings, click Check for updates" or "restart aiui").
+- If `ready: false`, read `reason` and `hint` from the response body and \
+  relay the `hint` — it already names the cause and the one-step fix, with \
+  the live numbers filled in. Don't guess a cause the body doesn't state. \
+  Only if `hint` is absent, fall back to "restart aiui".
+- `ready: false` with `reason: "dialog_registry_full"` or \
+  `"too_many_children"` is degraded, not down: say so, because dialogs \
+  still render.
 
 Don't dump the raw JSON unless the user asked for it.
 """
@@ -1697,6 +1743,13 @@ async def aiui_health() -> dict[str, Any]:
     Use this first if dialogs hang or fail — it distinguishes a cold companion
     (user needs to launch Claude Desktop, or the SSH tunnel is down) from a
     rogue local process holding the port with the wrong token.
+
+    The companion's body is returned on *any* status: a 503 carries the
+    ``reason``, ``hint``, ``pending``, ``oldest_age_secs`` and
+    ``lifecycle_phase`` that are the whole point of the composite response, and
+    `raise_for_status()` used to throw exactly that diagnosis away (#179).
+    ``ok`` reports whether the companion answered 200, so a degraded-but-serving
+    companion comes back as ``ok: true`` with ``ready: false``.
     """
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
@@ -1704,9 +1757,28 @@ async def aiui_health() -> dict[str, Any]:
                 f"{ENDPOINT}/health",
                 headers={"Authorization": f"Bearer {_token()}"},
             )
-            r.raise_for_status()
-            data = r.json()
-            return {"ok": True, **data, "endpoint": ENDPOINT, "server": BUILD_INFO}
+            data = _health_body(r)
+            if data is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"/health answered HTTP {r.status_code} with a non-JSON body: "
+                        f"{r.text[:200]}"
+                    ),
+                    "endpoint": ENDPOINT,
+                    "server": BUILD_INFO,
+                }
+            out: dict[str, Any] = {
+                "ok": r.status_code == 200,
+                **data,
+                "endpoint": ENDPOINT,
+                "server": BUILD_INFO,
+            }
+            if r.status_code != 200:
+                # Keep the status legible now that it is no longer the whole
+                # answer — a 401 body is just `{"error": "unauthorized"}`.
+                out["http_status"] = r.status_code
+            return out
     except Exception as e:
         log.warning("health check failed: %s", e)
         return {

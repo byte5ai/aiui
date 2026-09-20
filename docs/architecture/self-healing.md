@@ -67,8 +67,13 @@ dialog to show.
 
 `/health` is a question, not a maintained state. On request:
 
-- Synchronous mini-roundtrip to the frontend (`invoke("ui_ping")`,
-  100 ms timeout).
+- Synchronous mini-roundtrip to the frontend: the backend emits a `ui:ping`
+  **event** to the newest open dialog window (its Tauri label is that
+  dialog's id — `DialogState::newest_id()`), and the Svelte side answers by
+  invoking the `ui_pong` **command**, which fulfils the ack registry.
+  750 ms timeout. With no dialog window open there is nothing to be
+  unresponsive about: `responsive: true`, `rtt_ms: null` — never a
+  fabricated `0`.
 - Read live counters from the dialog registry (orphan count, oldest age).
 - Read mcp-stdio child count from the lifetime tracker.
 
@@ -76,6 +81,31 @@ Returned status is `ready` only if all three are sane. "Health green while
 app is dead" becomes structurally impossible.
 
 No background task maintains this. If nobody calls `/health`, nothing runs.
+
+#### `reason`, `hint`, and the 200-vs-503 rule
+
+When `ready` is false the body names the cause, so no caller has to guess it
+from a status code. `reason` is one of `webview_unresponsive`,
+`dialog_registry_full`, `too_many_children`, evaluated in exactly that
+precedence so a multiply-degraded companion reports deterministically;
+`hint` is the same cause as one human-readable line, with the live numbers
+filled in. Both bridges relay the `hint` rather than inventing a diagnosis.
+
+The status code splits "cannot serve" from "degraded but serving":
+
+| `reason` | status | why |
+| --- | --- | --- |
+| `webview_unresponsive` | **503** | a frozen WebView cannot show a dialog |
+| `dialog_registry_full` | **200** | `register_dialog()` sweeps and evicts the oldest — the next render still works, it just costs someone their oldest dialog |
+| `too_many_children` | **200** | rendering is unaffected; this is a leak signal |
+
+This matters because the Python bridge preflights `/health` before every
+render and every upload, and treats a non-200 as fatal. 503-ing a full
+registry meant one session's 16 unanswered dialogs took `/render` down for
+every *other* session sharing the companion (#179).
+
+Both fields are additive; bridges parse the body generically, so no
+`WIRE_VERSION` bump.
 
 ### 4. Opportunistic registry sweep
 
@@ -130,7 +160,7 @@ week does no update polling — which is fine, because nobody is using it.
 ## What this adds
 
 - `dialog_received(id)` Tauri command + per-render ack wait.
-- `ui_ping` Tauri command for `/health`'s live probe.
+- `ui:ping` event + `ui_pong` Tauri command for `/health`'s live probe.
 - `WebviewWindowBuilder`-based recreate path on the main thread.
 - TTL field + opportunistic sweep in `dialog::DialogState`.
 - Socket-disconnect listener + sweep-on-attach in the lifetime tracker.

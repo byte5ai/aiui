@@ -81,9 +81,13 @@ const HEALTH_PROMPT: &str = "\
 Run the `aiui_health` tool and report the result in one short sentence:
 
 - If `ready: true`, say \"aiui ready (v{version})\".
-- If `ready: false`, point at the most likely cause based on the response \
-  body (WebView frozen, dialog backlog, too many children) and suggest the \
-  one-step fix (\"open Settings, click Check for updates\" or \"restart aiui\").
+- If `ready: false`, read `reason` and `hint` from the response body and \
+  relay the `hint` — it already names the cause and the one-step fix, with \
+  the live numbers filled in. Don't guess a cause the body doesn't state. \
+  Only if `hint` is absent, fall back to \"restart aiui\".
+- `ready: false` with `reason: \"dialog_registry_full\"` or \
+  `\"too_many_children\"` is degraded, not down: say so, because dialogs \
+  still render.
 
 Don't dump the raw JSON unless the user asked for it.
 ";
@@ -790,7 +794,11 @@ async fn tools_call(
         .await
         .map(value_to_tool_text),
 
-        "aiui_health" => get_json(http, cfg, "/health").await.map(value_to_tool_text),
+        // Health is the one endpoint whose non-2xx body must survive: a 503
+        // carries the `reason`/`hint` the agent is supposed to relay (#179).
+        "aiui_health" => get_json_allow_status(http, cfg, "/health")
+            .await
+            .map(value_to_tool_text),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
         "update" => post_empty(http, cfg, "/update")
             .await
@@ -1328,6 +1336,40 @@ async fn get_json(
     resp.json::<Value>()
         .await
         .map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Like [`get_json`], but returns the parsed body on *any* status instead of
+/// collapsing a non-2xx into a bare status line.
+///
+/// Only `/health` uses this, deliberately: its body *is* the diagnosis
+/// (`reason`, `hint`, `pending`, `oldest_age_secs`, `lifecycle_phase`), and
+/// throwing it away to report `"/health http 503 Service Unavailable"` is the
+/// bug #179 fixes — `aiui_health` promises to tell a cold companion apart from
+/// a rogue process holding the port. `/render`, `/version` and `/update` keep
+/// the strict [`get_json`], where a non-2xx genuinely is a failed call.
+async fn get_json_allow_status(
+    http: &reqwest::Client,
+    cfg: &AppConfig,
+    path: &str,
+) -> Result<Value, String> {
+    let token = load_token(cfg)?;
+    let url = format!("{}{}", base_url(cfg), path);
+    let resp = http
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("GET {path}: {e}"))?;
+    let status = resp.status();
+    match resp.json::<Value>().await {
+        Ok(v) => Ok(v),
+        // No JSON to relay — fall back to the status line, which is all we
+        // have and still beats an empty error.
+        Err(e) if !status.is_success() => {
+            Err(format!("{path} http {status} (unparseable body: {e})"))
+        }
+        Err(e) => Err(format!("parse {path}: {e}")),
+    }
 }
 
 async fn post_empty(

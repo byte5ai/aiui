@@ -288,6 +288,13 @@ pub fn socket_path(config_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Soft cap on concurrently-attached MCP-stdio children. Crossing it makes
+/// `/health` report `ready: false` with `reason: "too_many_children"` — a
+/// "something is leaking sessions" signal, not a refusal: rendering keeps
+/// working, which is why that state stays a 200 (#179). Previously an
+/// unnamed `32` literal inline in `http.rs`.
+pub const CHILD_SOFT_CAP: usize = 32;
+
 /// Live counter of currently-attached MCP-stdio children. Owned by the Tauri
 /// app via `manage()` and read by `/health` to surface child count in the
 /// composite-health response.
