@@ -1,0 +1,18 @@
+# The Rust compiler aiui is built with — #192.
+#
+# This is a PIN, not a floor. `companion/src-tauri/Cargo.toml` keeps
+# `rust-version = "1.77.2"` as the MSRV floor; the two are different
+# things and both stay. The floor says what a consumer may compile with,
+# this file says what CI and the release actually used.
+#
+# Why it exists: every release workflow used to install `stable`, a
+# moving target resolved at dispatch time, so the compiler that produced
+# a signed, notarized, auto-installed binary was never recorded anywhere.
+#
+# Bumping it is a deliberate, reviewable one-line change. Note that this
+# file alone is NOT self-enforcing in CI: rustup lets `RUSTUP_TOOLCHAIN`
+# in the environment outrank a directory override, so each workflow
+# asserts `rustc --version` against this channel right after installing
+# the toolchain.
+[toolchain]
+channel = "1.98.1"

@@ -158,10 +158,12 @@ it precisely.
 
 ## FAQ
 
-**Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
-Developer-ID signed and notarized. It never phones home. The auth token
-stays under `~/.config/aiui/` on your machine and is only copied to
-hosts you explicitly register in settings.
+**Is it safe?** aiui is open source (MIT), Apple Developer-ID signed and
+notarized, and built only in public GitHub Actions — never on a
+maintainer's machine — from third-party actions pinned to commit SHAs and
+a Rust compiler pinned in `rust-toolchain.toml`. It never phones home.
+The auth token stays under `~/.config/aiui/` on your machine and is only
+copied to hosts you explicitly register in settings.
 
 **Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships
 inside the aiui.app bundle as native Rust code — drag-and-drop install

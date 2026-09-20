@@ -1,0 +1,32 @@
+# Keeps the SHA pins from #192 maintained rather than frozen.
+#
+# Pinning every `uses:` to a commit SHA removes the "an upstream tag
+# moved under us" risk and replaces it with "nobody ever updates these
+# again" — which is the same risk on a longer fuse. Dependabot rewrites
+# the SHA *and* the trailing `# vX.Y.Z` comment, so a bump stays a
+# reviewable one-line diff.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+
+  - package-ecosystem: npm
+    directory: /companion
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+
+  - package-ecosystem: cargo
+    directory: /companion/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore

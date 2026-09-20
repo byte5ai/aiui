@@ -65,7 +65,13 @@ jobs:
       VERSION: ${{ inputs.version }}
       TAG: v${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      # #192: every `uses:` below is pinned to a full commit SHA. This job
+      # holds the Developer ID certificate, the notary key, the minisign
+      # updater private key and the PyPI token at once, and aiui installs
+      # its own updates — so a step resolved from a mutable ref turns one
+      # upstream retag into signed, notarized code on every user's machine.
+      # `scripts/check-workflow-pins.sh` fails CI if a pin floats again.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Four places must agree on the version BEFORE we spend build
       # minutes: Cargo.toml (build), tauri.conf.json (Info.plist),
@@ -102,24 +108,34 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The compiler that builds the signed binary is recorded in
+      # `rust-toolchain.toml`, not resolved from the moving `stable` branch.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-11
         with:
+          toolchain: "1.98.1"
           targets: aarch64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Assert the pinned Rust toolchain
+        shell: bash
+        working-directory: companion/src-tauri
+        run: bash ../../scripts/assert-rust-toolchain.sh
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
           key: release-aarch64-apple-darwin
 
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
-          version: latest
+          # Exact, not `latest`: this job publishes to PyPI with
+          # UV_PUBLISH_TOKEN, so the uv binary is part of the trusted set.
+          version: "0.12.17"
 
       # Ephemeral keychain + Developer ID import — from the macos-sign.yml
       # template. The keychain password is generated per run and never a
@@ -153,6 +169,14 @@ jobs:
       - name: Build frontend
         working-directory: companion
         run: npm ci && npm run build
+
+      # #192: this job's `npx tauri` produces both the signed .app and the
+      # minisign-signed updater bundle, so which CLI ran is part of the
+      # release record. Assert it is the one package-lock.json locks.
+      - name: Assert the locked Tauri CLI
+        shell: bash
+        working-directory: companion
+        run: bash ../scripts/assert-tauri-cli.sh
 
       # APPLE_SIGNING_IDENTITY is picked up by the Tauri bundler (signs the
       # .app during build); TAURI_SIGNING_PRIVATE_KEY produces the signed

@@ -35,6 +35,13 @@ In scope:
 - `aiui-mcp` Python package — token handling, preflight, render call path
 - Release pipeline signing and notarisation
 
+The release workflows pin every third-party action to a full commit SHA
+and the Rust compiler to the channel in `rust-toolchain.toml`, so a moved
+upstream tag cannot reach the job that holds the Developer ID
+certificate, the notary key and the minisign updater key
+(`scripts/check-workflow-pins.sh` enforces this on every pull request).
+A floating ref that slips past that guard is in scope — please report it.
+
 Out of scope (report upstream instead):
 
 - Vulnerabilities in Tauri, Rust std, WebKit, FastMCP, or uv
