@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 use crate::fsutil::atomic_write;
 use crate::proc_ext::no_window;
 use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1153,14 +1154,23 @@ pub fn patch_claude_code_config_remote(
     uvx_path: Option<&str>,
     pinned_version: &str,
 ) -> (StepResult, Option<RemoteConfigPatch>) {
-    // If we know the absolute uvx path from the reachability probe, use
-    // it. Otherwise fall back to the bare "uvx" name (which depends on
-    // Claude-Code's process PATH being right at spawn time — fragile,
-    // but the only option if the probe didn't find an absolute path).
-    // JSON-escape via serde so paths with unusual characters don't break
-    // the Python script's string literal.
+    // If we know the absolute uvx path from the reachability probe, use it.
+    // JSON-escape via serde so paths with unusual characters don't break the
+    // Python script's string literal.
+    //
+    // #184: when we DON'T know one, `None` no longer means "write the bare
+    // name". The bare `uvx` depends on Claude Code's process PATH at spawn
+    // time — fragile enough that the probe exists to avoid it — so
+    // overwriting a working absolute path with it is a downgrade. The script
+    // below keeps an existing resolvable command in that case and rewrites
+    // only `args`, so the version pin is still enforced. The bare name is
+    // written only when there is no usable entry at all, which is the same
+    // position a fresh host without a successful probe was always in.
     let uvx_command_lit = serde_json::to_string(uvx_path.unwrap_or("uvx"))
         .unwrap_or_else(|_| "\"uvx\"".to_string());
+    // Whether the literal above is a discovered absolute path or the
+    // fallback. Drives the keep-what-works branch in the script.
+    let command_is_known = if uvx_path.is_some() { "True" } else { "False" };
     // Pin to the exact aiui-mcp version that matches the local
     // companion. Without the pin, uvx silently caches whichever version
     // happened to be installed first on the remote — that's how a v0.3.1
@@ -1175,14 +1185,26 @@ pub fn patch_claude_code_config_remote(
     let script = format!(r#"{REMOTE_JSON_PREAMBLE}
 servers = data.get("mcpServers") or {{}}
 existing = servers.get("aiui") or {{}}
-if (existing.get("command") == {uvx_command_lit}
-        and existing.get("args") == [{pkg_spec_lit}]):
+current_cmd = existing.get("command") if isinstance(existing, dict) else None
+
+# #184: decide the command BEFORE comparing, so "we know of no path" never
+# downgrades a working one. When the companion discovered an absolute path
+# it wins. Otherwise keep whatever is already there if it looks resolvable
+# (absolute and ending in /uvx) — the version pin in `args` is enforced
+# either way. Only a host with no usable entry gets the bare name.
+want_cmd = {uvx_command_lit}
+if not {command_is_known}:
+    if isinstance(current_cmd, str) and current_cmd.startswith("/") \
+            and current_cmd.rstrip("/").endswith("/uvx"):
+        want_cmd = current_cmd
+
+if (current_cmd == want_cmd and existing.get("args") == [{pkg_spec_lit}]):
     print("ok:current")
     raise SystemExit(0)
 backup()
 # Keep any foreign keys on the entry (env, disabled, …) — set only ours.
 entry = dict(existing) if isinstance(existing, dict) else {{}}
-entry["command"] = {uvx_command_lit}
+entry["command"] = want_cmd
 entry["args"] = [{pkg_spec_lit}]
 servers["aiui"] = entry
 data["mcpServers"] = servers
@@ -1778,6 +1800,53 @@ pub fn save_remotes(list: &[String]) -> std::io::Result<()> {
     atomic_write(&p, json.as_bytes())
 }
 
+/// Where the absolute `uvx` path discovered for each remote is remembered
+/// (#184).
+///
+/// A **sidecar** rather than a second field in `remotes.json`, deliberately.
+/// Widening `remotes.json` from `["host"]` to `[{alias, uvx_path}]` would be
+/// read fine by a new build and silently as an empty list by an older one —
+/// `load_remotes` ends in `unwrap_or_default()`, so a downgrade would wipe
+/// the user's registered hosts. An extra file costs one `read_to_string`;
+/// an older build simply ignores it and is back to today's behaviour.
+fn remote_uvx_path() -> PathBuf {
+    home().join(".config").join("aiui").join("remote-uvx.json")
+}
+
+/// The absolute `uvx` path discovered for `host_alias`, if we know one.
+///
+/// #184: `add_remote` probes the remote for an absolute path precisely
+/// because the bare name depends on Claude Code's PATH at spawn time. That
+/// discovery was then thrown away, so the two resync paths — one of which
+/// runs on every launch — passed `None` and rewrote the pinned absolute
+/// path back down to `"uvx"`, reporting success while breaking the host.
+pub fn load_remote_uvx(host_alias: &str) -> Option<String> {
+    let raw = fs::read_to_string(remote_uvx_path()).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&raw).ok()?;
+    map.get(host_alias).cloned()
+}
+
+/// Remember (or forget, with `None`) the uvx path for one host. Malformed
+/// or absent sidecar content starts from empty rather than failing — this
+/// is a cache, not state we cannot rebuild.
+pub fn save_remote_uvx(host_alias: &str, uvx_path: Option<&str>) -> std::io::Result<()> {
+    let p = remote_uvx_path();
+    let mut map: HashMap<String, String> = fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match uvx_path {
+        Some(path) => {
+            map.insert(host_alias.to_string(), path.to_string());
+        }
+        None => {
+            map.remove(host_alias);
+        }
+    }
+    let json = serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".into());
+    atomic_write(&p, json.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,6 +1930,38 @@ mod tests {
     }
 
     const AIUI_BIN: &str = "/Applications/aiui.app/Contents/MacOS/aiui";
+
+    // ─── #184: the discovered uvx path survives a restart ───────────────
+
+    #[test]
+    fn remote_uvx_sidecar_round_trips() {
+        // The store is a sidecar rather than a second field in
+        // remotes.json: widening that file would make an older build read
+        // it as an empty list and silently drop the user's hosts.
+        let dir = std::env::temp_dir().join(format!("aiui-uvx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-uvx.json");
+
+        // Written by hand here, because the real accessors resolve against
+        // the user's home; this asserts the shape they read and write.
+        let mut map = HashMap::new();
+        map.insert("macmini".to_string(), "/opt/homebrew/bin/uvx".to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap()).unwrap();
+
+        let read: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read.get("macmini").unwrap(), "/opt/homebrew/bin/uvx");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_or_broken_sidecar_is_not_fatal() {
+        // It is a cache, not state we cannot rebuild: a corrupt file must
+        // degrade to "no path known", which now means "keep what works".
+        assert!(load_remote_uvx("no-such-host-at-all").is_none());
+        let broken: Result<HashMap<String, String>, _> = serde_json::from_str("{not json");
+        assert!(broken.is_err(), "and such content parses as an error, not a map");
+    }
 
     // ─── #182: never destroy a user config we could not parse ───────────
 

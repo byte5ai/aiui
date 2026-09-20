@@ -6,6 +6,39 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A working remote broke on the next launch, and aiui reported success.**
+  `add_remote` probes the remote for an **absolute** `uvx` path and pins it
+  — the bare name depends on Claude Code's PATH at spawn time, which is
+  exactly what fails on the hosts the probe's fallback list exists for. That
+  discovery was then thrown away. The startup resync (every remote, every
+  launch) and the Settings "Resync" button both passed no path, so the
+  script rewrote the pinned absolute path back down to `"uvx"` and logged a
+  green result. The next Claude Code session on that host could not find
+  `uvx`, and every aiui tool call failed with "command not found".
+
+  A one-way downgrade, not a flip-flop: once the bare name was written,
+  later resyncs saw it as current and left it. The absolute-path discovery
+  had effectively been dead code since 0.4.29, when the auto-resync was
+  added.
+
+  The discovered path is now remembered per host and passed by both resync
+  paths. Two further guards: "no path known" no longer means "write the
+  bare name" but "keep an existing resolvable command and re-pin only the
+  version", which protects hosts upgrading from ≤ 0.10.1; and the Resync
+  button self-heals a host with no remembered path by re-probing, which
+  also gives that button the pre-flight check it never had (#184).
+
+### Changed
+
+- **New file `~/.config/aiui/remote-uvx.json`** holds the `uvx` path per
+  registered remote. Deliberately a sidecar rather than a second field in
+  `remotes.json`: widening that file would make an older build parse it as
+  an empty list and silently drop the user's registered hosts on a
+  downgrade. An older build ignores the sidecar and behaves exactly as it
+  does today. Removed with the host, and on uninstall (#184).
+
+### Fixed
+
 - **An unparsable host config was replaced, not repaired.** Every local
   writer of `~/.claude.json` and `claude_desktop_config.json` treated a
   parse error as "empty file" and then wrote a document containing only
