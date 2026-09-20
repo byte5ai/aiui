@@ -596,12 +596,12 @@ fn tools_list() -> Value {
         },
         {
             "name": "upload",
-            "description": "Pull a file FROM the user's Mac INTO this agent session. Calling this opens a native file picker on the user's Mac; the file they choose is streamed back over aiui's channel and written to `target_dir` on YOUR host (the machine you run on — the remote for an SSH session). This is the counterpart to the user having to `scp` a file over: reach for it whenever the user says \"take this file\", \"upload …\", \"here's the file/screenshot/PDF\", or triggers `/aiui:upload`. **`target_dir` is optional and you should almost always pass it:** set it to the directory the file belongs in given the conversation — usually your current working directory or the active project dir. Do NOT ask the user where to put it or which file to pick; just call the tool and let them choose the file in the native dialog. If you have no context at all, omit `target_dir` (defaults to your process's cwd) or ask in one short sentence. The filename comes from the user's selection — the file lands at `target_dir/<filename>`, a deterministic path, no temp/staging dir. **Existing files are never overwritten:** if `target_dir/<filename>` already exists the call returns an error rather than clobbering — pick a different `target_dir` or move the old file first. Returns `{status: \"ok\", path, filename, bytes}` on success, or `{status: \"error\", error}` on any failure — user cancelled the picker, file unreadable, file too large (512 MB cap), or target directory missing/not writable. Report the result briefly; on `ok` mention the path the file landed at. **This tool blocks until the user picks a file or dismisses the picker. Response can take a while — do not assume aiui is broken; the user is choosing a file. Progress notifications fire every ~10 s while waiting.**",
+            "description": "Pull a file FROM the user's Mac INTO this agent session. Calling this opens a native file picker on the user's Mac; the file they choose is streamed back over aiui's channel and written to `target_dir` on YOUR host (the machine you run on — the remote for an SSH session). This is the counterpart to the user having to `scp` a file over: reach for it whenever the user says \"take this file\", \"upload …\", \"here's the file/screenshot/PDF\", or triggers `/aiui:upload`. **`target_dir` is optional and you should almost always pass it:** set it to the directory the file belongs in given the conversation — usually your current working directory or the active project dir. Do NOT ask the user where to put it or which file to pick; just call the tool and let them choose the file in the native dialog. If you have no context at all, omit `target_dir` (defaults to your process's cwd) or ask in one short sentence. The filename comes from the user's selection — the file lands at `target_dir/<filename>`, a deterministic path, no temp/staging dir. **Existing files are never overwritten:** if `target_dir/<filename>` already exists the call returns an error rather than clobbering — pick a different `target_dir` or move the old file first. Returns `{status: \"ok\", path, filename, bytes}` on success, or `{status: \"error\", error}` on any failure — user cancelled the picker, file unreadable, file too large (512 MB cap), or target directory missing/not writable. Report the result briefly; on `ok` mention the path the file landed at. **This tool blocks until the user picks a file or dismisses the picker. Response can take a while — do not assume aiui is broken; the user is choosing a file. Progress notifications fire every ~10 s while waiting.** The picker may take a moment to come forward. Only one picker can be open at a time: a concurrent `upload` returns an error saying another upload is already waiting — let that one finish, then retry. An unanswered picker eventually times out with an error rather than hanging forever.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target_dir": { "type": "string", "description": "Absolute or `~/`-rooted directory ON YOUR HOST where the picked file is written as `<target_dir>/<filename>`. Optional; defaults to your process's current working directory. Relative paths are rejected (no stable cwd contract). The directory must already exist and be writable." },
-                    "session": { "type": "string", "description": "Optional short human label for the session this upload belongs to (project/task name), shown in aiui's window chrome." }
+                    "session": { "type": "string", "description": "Optional short human label for the session this upload belongs to (project/task name), shown in the file picker's title bar so the user can tell which agent asked for a file." }
                 }
             }
         },
@@ -1048,6 +1048,24 @@ async fn upload_media(
     } else {
         std::path::PathBuf::from(path)
     };
+    // Stat first, read second (#194). `tokio::fs::read` on a 3–4 GB screen
+    // recording — an entirely ordinary thing to put in a `gallery` item —
+    // materialised the whole file in a `Vec<u8>` before anything checked it
+    // against the companion's 512 MB ceiling, and an allocation failure there
+    // is an OOM kill of the `aiui --mcp-stdio` child, which the MCP host
+    // reports as the thoroughly unhelpful "Server disconnected". Same shape
+    // as `imageresolve::read_path_as_data_url`.
+    let len = tokio::fs::metadata(&expanded)
+        .await
+        .map_err(|e| format!("read {}: {e}", expanded.display()))?
+        .len();
+    if len > crate::media::MEDIA_FILE_CAP {
+        return Err(format!(
+            "{} is {len} bytes, over the {} byte media cap",
+            expanded.display(),
+            crate::media::MEDIA_FILE_CAP
+        ));
+    }
     let bytes = tokio::fs::read(&expanded)
         .await
         .map_err(|e| format!("read {}: {e}", expanded.display()))?;
@@ -1173,9 +1191,18 @@ async fn do_upload(args: &Value, cfg: &AppConfig, http: &reqwest::Client) -> Val
         Err(e) => return upload_error(e),
     };
     let url = format!("{}/upload", base_url(cfg));
+    // #194: the optional `{session}` body titles the picker, so a user facing
+    // several agents can tell which one is asking. Additive — an older
+    // companion has no body extractor and ignores it.
+    let session = args
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let resp = match http
         .post(&url)
         .bearer_auth(&token)
+        .json(&json!({ "session": session }))
         .timeout(UPLOAD_TIMEOUT)
         .send()
         .await
@@ -1187,6 +1214,22 @@ async fn do_upload(args: &Value, cfg: &AppConfig, http: &reqwest::Client) -> Val
     match resp.status() {
         reqwest::StatusCode::NO_CONTENT => {
             return upload_error("upload cancelled — no file was selected");
+        }
+        reqwest::StatusCode::CONFLICT => {
+            // #194: the companion serialises the native picker. Say so in
+            // words the agent can act on, instead of a bare status code.
+            return upload_error(
+                "another upload is already waiting for the user — one file picker \
+                 at a time. Wait for that one to be answered, then retry.",
+            );
+        }
+        reqwest::StatusCode::GATEWAY_TIMEOUT => {
+            // #194: the companion's own bound (600 s) fires before this
+            // bridge's 900 s, so this is the diagnosis that wins the race.
+            return upload_error(
+                "the file picker was never answered — it timed out on the user's \
+                 machine. Ask the user whether the picker appeared, then retry.",
+            );
         }
         reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
             let detail = resp.text().await.unwrap_or_default();
@@ -1282,6 +1325,13 @@ async fn render_dialog(
     // `resolve_local_paths` so the image inliner never tries to base64 a
     // video. Upload failures are non-fatal — the path is simply left as-is
     // (the WebView shows a broken player rather than the call blowing up).
+    //
+    // #194: a failure here used to reach the trace log and nowhere else. The
+    // user got a broken player and the agent got no signal at all, so it
+    // cheerfully asked about a clip that was never shown. Collected and
+    // returned as `media_warnings` instead — still non-fatal, just no longer
+    // silent.
+    let mut media_warnings: Vec<String> = Vec::new();
     let videos = crate::imageresolve::collect_local_video_paths(&spec);
     if !videos.is_empty() {
         let mut map = std::collections::HashMap::new();
@@ -1291,7 +1341,10 @@ async fn render_dialog(
                 Ok(media_url) => {
                     map.insert(path, media_url);
                 }
-                Err(e) => trace(&format!("render_dialog: media upload failed for {path}: {e}")),
+                Err(e) => {
+                    trace(&format!("render_dialog: media upload failed for {path}: {e}"));
+                    media_warnings.push(format!("video not shown — {path}: {e}"));
+                }
             }
         }
         crate::imageresolve::replace_srcs(&mut spec, &map);
@@ -1309,7 +1362,10 @@ async fn render_dialog(
                 Ok(media_url) => {
                     map.insert(path, media_url);
                 }
-                Err(e) => trace(&format!("render_dialog: media upload failed for {path}: {e}")),
+                Err(e) => {
+                    trace(&format!("render_dialog: media upload failed for {path}: {e}"));
+                    media_warnings.push(format!("audio not played — {path}: {e}"));
+                }
             }
         }
         crate::imageresolve::replace_srcs(&mut spec, &map);
@@ -1403,7 +1459,7 @@ async fn render_dialog(
         .map_err(|e| RenderError::Transport(format!("parse /render: {e}")))?;
     if !accepted {
         // Synchronous companion (old): `first` is already the terminal result.
-        return Ok(first);
+        return Ok(attach_media_warnings(first, media_warnings));
     }
     // Async companion: poll `GET /render/{id}` until terminal. Each GET is
     // bounded (40 s > the server's ~25 s poll window) so the server always
@@ -1449,7 +1505,32 @@ async fn render_dialog(
         if pv.get("pending").and_then(|v| v.as_bool()) == Some(true) {
             continue;
         }
-        return Ok(pv);
+        return Ok(attach_media_warnings(pv, media_warnings));
+    }
+}
+
+/// Fold the render's non-fatal media failures into the render value so the
+/// result formatters can hand them to the agent (#194). A no-op when nothing
+/// failed — the key only appears when there is something to say.
+fn attach_media_warnings(mut render: Value, warnings: Vec<String>) -> Value {
+    if warnings.is_empty() {
+        return render;
+    }
+    if let Some(obj) = render.as_object_mut() {
+        obj.insert("media_warnings".into(), json!(warnings));
+    }
+    render
+}
+
+/// Copy `media_warnings` from the render value onto the tool payload. Shared
+/// by both formatters so `confirm` (which builds its own narrow payload)
+/// reports a dropped clip the same way `form`/`gallery` do.
+fn carry_media_warnings(render: &Value, payload: &mut Value) {
+    let Some(warnings) = render.get("media_warnings") else {
+        return;
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("media_warnings".into(), warnings.clone());
     }
 }
 
@@ -1640,7 +1721,8 @@ fn format_confirm_result(render: Value) -> Value {
         .and_then(|r| r.get("confirmed"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let payload = json!({ "cancelled": cancelled, "confirmed": confirmed });
+    let mut payload = json!({ "cancelled": cancelled, "confirmed": confirmed });
+    carry_media_warnings(&render, &mut payload);
     value_to_tool_text(payload)
 }
 
@@ -1673,6 +1755,10 @@ fn format_dialog_result(render: Value) -> Value {
             }
         }
     }
+    // #194: a clip the bridge could not push to the media cache was shown as
+    // a broken player with no word to the agent. Non-fatal, but no longer
+    // silent.
+    carry_media_warnings(&render, &mut payload);
     value_to_tool_text(payload)
 }
 
@@ -1806,6 +1892,80 @@ mod tests {
         assert_eq!(out["cancelled"], json!(false));
         assert_eq!(out["values"]["name"], json!("Ada"));
         assert!(out.get("reason").is_none(), "not a cancel: {out}");
+    }
+
+    #[test]
+    fn a_dropped_clip_is_reported_to_the_agent() {
+        // #194: `upload_media` failures used to reach the trace log only —
+        // the user saw a broken player and the agent believed the clip was
+        // shown. Both formatters must carry the warning through.
+        let render = json!({
+            "id": "d1",
+            "cancelled": false,
+            "result": {"values": {"note": "ok"}},
+            "media_warnings": ["video not shown — ~/clip.mp4: too large"]
+        });
+        let out = tool_payload(format_dialog_result(render.clone()));
+        assert_eq!(out["media_warnings"][0], json!("video not shown — ~/clip.mp4: too large"));
+        assert_eq!(out["values"]["note"], json!("ok"), "the render result is unchanged");
+
+        let confirm = json!({
+            "id": "d2",
+            "cancelled": false,
+            "result": {"confirmed": true},
+            "media_warnings": ["audio not played — ~/vm.mp3: read failed"]
+        });
+        let out = tool_payload(format_confirm_result(confirm));
+        assert_eq!(out["confirmed"], json!(true));
+        assert_eq!(out["media_warnings"][0], json!("audio not played — ~/vm.mp3: read failed"));
+    }
+
+    #[test]
+    fn a_clean_render_carries_no_media_warnings_key() {
+        // An always-present empty array trains agents to ignore the key.
+        let render = json!({"id": "d1", "cancelled": false, "result": {}});
+        let out = tool_payload(format_dialog_result(render));
+        assert!(out.get("media_warnings").is_none(), "no warnings invented: {out}");
+        assert_eq!(
+            attach_media_warnings(json!({"id": "d1"}), vec![]),
+            json!({"id": "d1"}),
+            "nothing to say → nothing added"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_media_rejects_oversize_before_reading() {
+        // #194: the old code read the file into a Vec<u8> first and only then
+        // discovered the companion's 512 MB ceiling — on a 3–4 GB screen
+        // recording that is an OOM kill of the mcp-stdio child, surfaced to
+        // the user as "Server disconnected". A sparse file proves the check
+        // happens on the metadata, not on the bytes: reading this would take
+        // half a gigabyte of RAM, and the test would not finish quietly.
+        let path = std::env::temp_dir().join(format!("aiui-oversize-{}.mp4", std::process::id()));
+        let f = std::fs::File::create(&path).expect("create sparse file");
+        let size = crate::media::MEDIA_FILE_CAP + 1;
+        f.set_len(size).expect("grow sparsely");
+        drop(f);
+
+        let err = upload_media(
+            &reqwest::Client::new(),
+            &test_cfg(),
+            "test-token",
+            path.to_str().unwrap(),
+            "mp4",
+        )
+        .await
+        .expect_err("an oversize clip must not be uploaded");
+
+        assert!(err.contains(&size.to_string()), "names the file size: {err}");
+        assert!(
+            err.contains(&crate::media::MEDIA_FILE_CAP.to_string()),
+            "names the cap: {err}"
+        );
+        // Nothing was sent: a POST would have failed against the port-0
+        // config and said so instead.
+        assert!(!err.contains("POST /media"), "no request attempted: {err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn test_cfg() -> Arc<AppConfig> {
