@@ -2,6 +2,7 @@
   import { _ } from "svelte-i18n";
   import { renderMarkdown } from "../markdown";
   import { handleContentClick } from "../external-link";
+  import { onActivate } from "../a11y";
 
   type Variant = {
     value: string; // stable id returned as `selected`
@@ -51,13 +52,6 @@
     const sel = window.getSelection?.();
     if (sel && sel.toString().length > 0) return;
     selected = value;
-  }
-
-  function onKey(e: KeyboardEvent, value: string) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      selected = value;
-    }
   }
 
   const cols = $derived(
@@ -118,7 +112,7 @@
           tabindex="0"
           aria-pressed={selected === v.value}
           onclick={(e) => pick(e, v.value)}
-          onkeydown={(e) => onKey(e, v.value)}
+          onkeydown={(e) => onActivate(e, () => (selected = v.value))}
         >
           <div class="compare-head">
             <span class="compare-radio" aria-hidden="true"></span>

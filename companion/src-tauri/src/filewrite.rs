@@ -93,7 +93,11 @@ pub fn is_sane_target_path(p: &str) -> bool {
     !p.is_empty() && p.len() <= 4096 && p.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
+/// Resolve a leading `~/` against this machine's home. Public since #207:
+/// `resolve_dialog_targets` shows the user the destination the write will
+/// actually use, and re-implementing `~` expansion in TypeScript would let
+/// the two drift.
+pub fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);

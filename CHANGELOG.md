@@ -54,6 +54,48 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **`list` and `table` fields could not be answered without a mouse.** A
+  selectable list row took focus and painted a focus ring but had no key
+  handler, so Enter did nothing; a table row carried neither `role` nor
+  `tabindex`, so it could not be focused at all; and a sortable list was
+  drag-and-drop only, leaving a keyboard user with no way to answer except
+  cancelling. Two of the eight advertised field kinds, unusable for
+  keyboard-only and switch-control users, failing silently. Selection is
+  now Enter/Space, reordering is Alt+↑/↓ (announced through an
+  `aria-live` region), multi-select table rows carry a real checkbox, and
+  sortable column headers are buttons. The `Enter`/`Space` handler
+  `Compare.svelte` already had is now the shared `lib/a11y.ts` helper both
+  widgets use. Six orphan group labels were rebound to their controls, so
+  `svelte-check`'s a11y warning count on the dialog widgets drops from
+  seven to zero (#207).
+- **The update banner's Install button rendered at ~2.1:1 in light mode.**
+  It painted `var(--bg)` — a near-white — on amber, a pairing that only
+  works in dark mode. On the app's primary call to action for installing an
+  update, the label was effectively unreadable. A new `--warning-fg` token
+  (dark in both themes) fixes the button; the banner text and both TTL
+  expiry banners mixed 70–80% of their accent colour into text sitting on a
+  wash of that same colour, measuring ≈3.0–4.4:1, and now pair against
+  `--fg` instead. The `--warning`/`--danger` ramps themselves are unchanged
+  — they are used as plain foregrounds and as fills elsewhere, so the
+  pairings moved, not the tokens (#207).
+- **The TTL countdown was wrong in both directions.** The frontend
+  scheduled its banners and its auto-cancel from the moment the WebView
+  finished loading, while the backend's clock starts at registration — so
+  window creation plus a cold WebView start ate into the five-second lead
+  the auto-cancel is supposed to have over the backend sweep, and could
+  invert it, letting the backend report `ttl_expired` to the agent while
+  the user was still typing. The countdown itself decremented a local
+  counter on a one-second interval, which WebViews throttle in an occluded
+  window and stop across system sleep: come back after twenty minutes and
+  the red banner still claimed under two minutes remained. Rust now reports
+  what is actually left (`DialogRequest.remaining_secs`, additive —
+  `ttl_secs` keeps its meaning and nothing crosses the HTTP boundary), the
+  shell derives every banner from one absolute deadline on each tick, and
+  re-reads the remaining time from Rust every 30 s and whenever the window
+  becomes visible, so a monotonic-vs-wall-clock divergence across sleep
+  cannot drift either. The red banner also no longer resets the count to
+  exactly 2:00 when it fires, and the yellow banner no longer reads "About
+  15:00 min left" (#207).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
@@ -286,6 +328,21 @@ All notable changes to this project are documented here.
 
 ### Security
 
+- **The file-write approval line was hardcoded German, and showed the
+  wrong path.** That single line is the entire authorization surface for
+  writing an agent-chosen path: the `#135` design deliberately makes the
+  affirmative button the per-operation approval, so a user outside `de`
+  was approving a write they could not read — the exact confused-deputy
+  case the disclosure exists to prevent. It is now translated in both
+  catalogs, and it no longer hides in 12px muted grey. It also showed the
+  raw `~/`-form rather than the destination: a local session now shows the
+  absolute path Rust resolves (what `docs/skill.md` always promised),
+  while a bridge-served session keeps the raw form and names the host it
+  lands on — expanding `~` there would display this Mac's home for a file
+  written on another machine, a worse disclosure than showing neither. A
+  new `scripts/check-i18n-parity.sh`, wired into CI, fails any PR that
+  leaves a German literal outside a comment in a Svelte component or adds
+  a key to one catalog but not the other (#207).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

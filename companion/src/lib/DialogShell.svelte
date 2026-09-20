@@ -13,6 +13,10 @@
     id: string;
     spec: any;
     ttl_secs?: number;
+    /** Seconds actually LEFT at pull time, measured from `register_dialog`
+     *  in Rust (#207). Absent on an older payload → we fall back to
+     *  `ttl_secs` and behave as before. */
+    remaining_secs?: number;
     // Multi-window (Step 4, I8): caller-set session label + remote-injected
     // origin host, shown in the window chrome so the user can tell which
     // session this dialog belongs to when several are open at once.
@@ -21,34 +25,62 @@
   };
 
   let current = $state<DialogReq | null>(null);
+  /** field name → absolute path, for the `target` approval line. Only filled
+   *  for a local session; a bridge-served one keeps the raw `~/`-form. */
+  let resolvedTargets = $state<Record<string, string>>({});
 
-  // TTL warning state. The backend sets `DIALOG_TTL` (currently 2 h)
-  // and sends it along in `dialog:show`; we surface countdown banners
-  // 15 min and 2 min before expiry, then auto-cancel a few seconds
-  // before the backend sweep so the user's session reliably ends with
-  // a "Zeit abgelaufen — Eingaben verworfen" close instead of a stale
-  // dialog. v0.4.41. All timer state is per-dialog and reset on every
-  // new `dialog:show` event, so a second dialog after the first
-  // submitted starts with fresh banners and countdowns.
+  // TTL warning state. The backend owns the clock: `register_dialog` stamps
+  // `created_at` and `http.rs` arms `tokio::time::timeout(DIALOG_TTL)` right
+  // after it, so the only honest countdown is one anchored to what Rust says
+  // is LEFT. We surface countdown banners 15 min and 2 min before expiry,
+  // then auto-cancel a few seconds before the backend sweep so the user's
+  // session ends with a clean close instead of a stale dialog. v0.4.41.
+  //
+  // #207 replaced three latching `setTimeout`s and a decrementing counter
+  // with one absolute deadline plus a 1 s repaint tick:
+  //   - the old timers started when the WebView finished `get_dialog_spec`,
+  //     not at registration, so window creation + a cold WebView start ate
+  //     into (and could invert) the 5 s lead over the backend sweep;
+  //   - the old counter decremented locally, and WebView timers are
+  //     throttled in an occluded window and stop across system sleep, so the
+  //     banner could read "1:58 left" with the real answer being zero;
+  //   - the red timer re-seeded the count to exactly 2:00 when it fired.
+  // Deriving every banner from one deadline on each tick removes all three.
   let yellowBanner = $state(false);
   let yellowDismissed = $state(false);
   let redBanner = $state(false);
   let remainingSecs = $state<number | null>(null);
-  let ttlTimers: ReturnType<typeof setTimeout>[] = [];
-  let countdownInterval: ReturnType<typeof setInterval> | null = null;
+  let deadlineMs: number | null = null;
+  let tickInterval: ReturnType<typeof setInterval> | null = null;
+  let resyncInterval: ReturnType<typeof setInterval> | null = null;
   // ID of the dialog whose timers are currently scheduled. We snapshot
   // it on every scheduled callback so a timer that fires AFTER the
   // dialog has been replaced (or already submitted) cannot bleed into
   // the next dialog — classic race-on-rebind hazard with setTimeout.
   let ttlDialogId: string | null = null;
 
+  const YELLOW_LEAD_SECS = 15 * 60;
+  const RED_LEAD_SECS = 2 * 60;
+  // Auto-cancel 5 seconds before the backend sweep so the dialog ends
+  // cleanly on the frontend side first; the still-running `/render` HTTP
+  // call then returns the cancellation to the agent. Without this lead, the
+  // backend's TTL_EXPIRED sweep races the user's last-second submit.
+  const AUTO_CANCEL_LEAD_SECS = 5;
+  // One IPC call per half-minute per open dialog, plus one whenever the
+  // window becomes visible again.
+  const RESYNC_EVERY_MS = 30_000;
+
   function clearTtlTimers() {
-    for (const t of ttlTimers) clearTimeout(t);
-    ttlTimers = [];
-    if (countdownInterval !== null) {
-      clearInterval(countdownInterval);
-      countdownInterval = null;
+    if (tickInterval !== null) {
+      clearInterval(tickInterval);
+      tickInterval = null;
     }
+    if (resyncInterval !== null) {
+      clearInterval(resyncInterval);
+      resyncInterval = null;
+    }
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    deadlineMs = null;
     yellowBanner = false;
     yellowDismissed = false;
     redBanner = false;
@@ -63,82 +95,59 @@
    * `ttl_secs` (older companion that doesn't send the field) → no
    * timers, no banners, current behaviour.
    */
-  function scheduleTtl(ttl_secs: number | undefined, dialogId: string) {
+  function scheduleTtl(req: DialogReq) {
     clearTtlTimers();
-    if (!ttl_secs || ttl_secs <= 0) return;
-    ttlDialogId = dialogId;
-
-    const YELLOW_LEAD_SECS = 15 * 60;
-    const RED_LEAD_SECS = 2 * 60;
-    // Auto-cancel 5 seconds before the backend sweep so the dialog
-    // ends cleanly on the frontend side first; the still-running
-    // `/render` HTTP call then returns the cancellation to the agent.
-    // Without this lead, the backend's TTL_EXPIRED sweep races the
-    // user's last-second submit.
-    const AUTO_CANCEL_LEAD_SECS = 5;
-
-    const yellowDelayMs = (ttl_secs - YELLOW_LEAD_SECS) * 1000;
-    const redDelayMs = (ttl_secs - RED_LEAD_SECS) * 1000;
-    const cancelDelayMs = Math.max(0, (ttl_secs - AUTO_CANCEL_LEAD_SECS) * 1000);
-
-    if (yellowDelayMs > 0) {
-      ttlTimers.push(
-        setTimeout(() => {
-          if (ttlDialogId !== dialogId) return;
-          yellowBanner = true;
-          startCountdown(YELLOW_LEAD_SECS, dialogId);
-        }, yellowDelayMs),
-      );
-    } else {
-      // Edge case: TTL already <= 15 min on arrival. Show yellow now,
-      // start the countdown from whatever's left.
-      yellowBanner = true;
-      startCountdown(ttl_secs, dialogId);
-    }
-
-    if (redDelayMs > 0) {
-      ttlTimers.push(
-        setTimeout(() => {
-          if (ttlDialogId !== dialogId) return;
-          redBanner = true;
-          // Red overrides yellow's countdown: tighter cadence, no
-          // dismiss button.
-          startCountdown(RED_LEAD_SECS, dialogId);
-        }, redDelayMs),
-      );
-    }
-
-    ttlTimers.push(
-      setTimeout(() => {
-        if (ttlDialogId !== dialogId) return;
-        // Auto-cancel — same code path as the ESC key / Cancel button.
-        void handleCancel();
-      }, cancelDelayMs),
-    );
+    const ttl = req.ttl_secs;
+    if (!ttl || ttl <= 0) return;
+    // An older payload without `remaining_secs` degrades to the previous
+    // behaviour rather than to no countdown at all.
+    const remaining = typeof req.remaining_secs === "number" ? req.remaining_secs : ttl;
+    ttlDialogId = req.id;
+    deadlineMs = Date.now() + Math.max(0, remaining) * 1000;
+    tick();
+    if (ttlDialogId !== req.id) return; // tick() may already have auto-cancelled
+    tickInterval = setInterval(tick, 1000);
+    resyncInterval = setInterval(() => void resyncDeadline(req.id), RESYNC_EVERY_MS);
+    document.addEventListener("visibilitychange", onVisibilityChange);
   }
 
-  function startCountdown(initialSecs: number, dialogId: string) {
-    if (countdownInterval !== null) {
-      clearInterval(countdownInterval);
-      countdownInterval = null;
+  /** The single place banner state and the countdown are derived. Idempotent:
+   *  a missed tick (throttled window, sleep) costs nothing because the next
+   *  one reads the deadline afresh rather than continuing a local count. */
+  function tick() {
+    if (deadlineMs === null || ttlDialogId === null) return;
+    const left = Math.max(0, Math.round((deadlineMs - Date.now()) / 1000));
+    remainingSecs = left;
+    yellowBanner = left <= YELLOW_LEAD_SECS;
+    redBanner = left <= RED_LEAD_SECS;
+    if (left <= AUTO_CANCEL_LEAD_SECS) {
+      // Auto-cancel — same code path as the ESC key / Cancel button.
+      void handleCancel();
     }
-    remainingSecs = initialSecs;
-    countdownInterval = setInterval(() => {
-      if (ttlDialogId !== dialogId) {
-        // Race guard: dialog already replaced, stop counting for it.
-        if (countdownInterval !== null) {
-          clearInterval(countdownInterval);
-          countdownInterval = null;
-        }
-        return;
+  }
+
+  /** Rebase the deadline on what Rust says is left. Rust's `Instant` is
+   *  monotonic and on macOS/Windows may not advance while the machine sleeps,
+   *  whereas `Date.now()` does — so without this the frontend would cancel
+   *  EARLY after a sleep, the mirror image of the throttling bug. */
+  async function resyncDeadline(dialogId: string) {
+    if (ttlDialogId !== dialogId) return;
+    try {
+      const left = await invoke<number | null>("get_dialog_remaining", { id: dialogId });
+      if (ttlDialogId !== dialogId) return;
+      if (typeof left === "number") {
+        deadlineMs = Date.now() + left * 1000;
+        tick();
       }
-      if (remainingSecs !== null && remainingSecs > 0) {
-        remainingSecs -= 1;
-      } else if (countdownInterval !== null) {
-        clearInterval(countdownInterval);
-        countdownInterval = null;
-      }
-    }, 1000);
+      // `null` = the backend already resolved this dialog; Rust owns window
+      // teardown in that case, so there is nothing for us to rebase.
+    } catch (e) {
+      console.error(`[aiui] get_dialog_remaining failed for ${dialogId}: ${e}`);
+    }
+  }
+
+  function onVisibilityChange() {
+    if (!document.hidden && ttlDialogId !== null) void resyncDeadline(ttlDialogId);
   }
 
   function formatRemaining(secs: number): string {
@@ -146,6 +155,13 @@
     const m = Math.floor(safe / 60);
     const s = safe % 60;
     return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  /** The yellow banner's catalog string already carries the unit ("… min
+   *  left"), so feeding it `m:ss` produced "About 15:00 min left". Whole
+   *  minutes, rounded up so it never reads 0 while time remains. */
+  function formatMinutes(secs: number): number {
+    return Math.max(0, Math.ceil(secs / 60));
   }
 
   onMount(() => {
@@ -167,8 +183,21 @@
           }
           return;
         }
+        // #207: resolve `~/` target paths BEFORE the first paint, so the
+        // approval line never shows the raw form and then swap it out under
+        // the user. Local sessions only — for a bridge-served one the write
+        // happens on the agent's host, whose `$HOME` this app cannot know.
+        if (!req.session_origin && collectTargetFields(req.spec).length > 0) {
+          try {
+            resolvedTargets = await invoke<Record<string, string>>("resolve_dialog_targets", {
+              id: req.id,
+            });
+          } catch (e) {
+            console.error(`[aiui] resolve_dialog_targets failed for ${req.id}: ${e}`);
+          }
+        }
         current = req;
-        scheduleTtl(req.ttl_secs, req.id);
+        scheduleTtl(req);
         // Session identity (I8) is set as the native window title by Rust in
         // build_dialog_window — the frontend setTitle is permission-gated
         // (needs core:window:set-title), so we don't do it here.
@@ -373,7 +402,7 @@
 {:else if yellowBanner && !yellowDismissed}
   <div class="ttl-banner yellow" role="status" aria-live="polite">
     <span class="ttl-banner-text">
-      ⏱ {$_("dialog.ttl.yellow", { values: { countdown: remainingSecs !== null ? formatRemaining(remainingSecs) : "—" } })}
+      ⏱ {$_("dialog.ttl.yellow", { values: { countdown: remainingSecs !== null ? formatMinutes(remainingSecs) : "—" } })}
     </span>
     <button
       class="ttl-banner-dismiss"
@@ -396,7 +425,13 @@
     {#if current.spec.kind === "ask"}
       <Ask spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else if current.spec.kind === "form"}
-      <Form spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
+      <Form
+        spec={current.spec}
+        onsubmit={handleSubmit}
+        oncancel={handleCancel}
+        sessionOrigin={current.session_origin}
+        {resolvedTargets}
+      />
     {:else if current.spec.kind === "confirm"}
       <Confirm spec={current.spec} onsubmit={handleSubmit} oncancel={handleCancel} />
     {:else if current.spec.kind === "gallery"}
@@ -454,14 +489,21 @@
     flex: 1 1 auto;
     min-width: 0;
   }
+  /* #207: both banners used to mix 70–80% of the accent colour into the
+     label sitting on a wash of the same colour — ≈3.0:1 (yellow) and
+     ≈4.4:1 (red) at 12.5px, and 600 weight at 12.5px is not WCAG "large
+     text". 35% keeps the tone and lets `--fg` carry the legibility. The
+     ramps themselves are untouched: `--warning`/`--danger` are used as
+     plain foregrounds and as fills elsewhere, so the pairing is what
+     changes, not the token. */
   .ttl-banner.yellow {
     background: color-mix(in srgb, var(--warning, #f3c623) 28%, var(--bg, #fff));
-    color: color-mix(in srgb, var(--warning, #f3c623) 70%, var(--fg, #000));
+    color: color-mix(in srgb, var(--warning, #f3c623) 35%, var(--fg, #000));
     border-bottom: 1px solid color-mix(in srgb, var(--warning, #f3c623) 60%, transparent);
   }
   .ttl-banner.red {
     background: color-mix(in srgb, var(--danger, #d64545) 22%, var(--bg, #fff));
-    color: color-mix(in srgb, var(--danger, #d64545) 80%, var(--fg, #000));
+    color: color-mix(in srgb, var(--danger, #d64545) 35%, var(--fg, #000));
     border-bottom: 1px solid color-mix(in srgb, var(--danger, #d64545) 70%, transparent);
     font-weight: 600;
   }

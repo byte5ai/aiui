@@ -47,6 +47,7 @@
     "remotes.add.placeholder": "user@hostname oder SSH-Alias",
     "remotes.add.button": "Einrichten",
     "remotes.add.hint": "Trägt Reverse-Tunnel in ~/.ssh/config ein, kopiert den Auth-Token per scp zum Host und startet den Tunnel sofort.",
+    "remotes.add.error_dismiss": "Fehler ausblenden",
     "remotes.remove": "Entfernen",
     "remotes.resync.tooltip": "aiui-Verbindung zu diesem Host erneuern",
     "log.title": "Zuletzt",
@@ -87,6 +88,16 @@
     "session_aria": "Sitzung, zu der dieser Dialog gehört",
     "gallery.comment_placeholder": "Kommentar (optional)…",
     "gallery.decided": "{n}/{total} entschieden",
+    "list.moved": "{label} auf Position {pos} von {total} verschoben",
+    "date_range.to": "{label} — Enddatum",
+    "write_target": {
+      "value": "Wird zusätzlich geschrieben:",
+      "secret": "Wird geschrieben (nicht an den Agent zurück):",
+      "secret_only": "Wird nicht an den Agent zurückgegeben und nirgends gespeichert.",
+      "on_host": "auf {host}",
+      "meta": "Modus: {mode}{perm}{overwrite}",
+      "overwrite_flag": ", überschreiben"
+    },
     "ttl": {
       "yellow": "Noch ca. {countdown} Min zum Abschicken — danach werden die Eingaben automatisch verworfen.",
       "red": "Weniger als {countdown} bis zum automatischen Abbruch. Bitte jetzt abschicken oder abbrechen.",
