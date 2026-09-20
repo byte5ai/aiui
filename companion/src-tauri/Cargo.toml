@@ -59,6 +59,12 @@ hex = "0.4"
 futures = "0.3"
 regex = "1"
 chrono = "0.4"
+# #197: ordering the pending-update banner's version against our own
+# `CARGO_PKG_VERSION`, so a banner for an already-installed (or yanked)
+# release clears itself. Hand-rolled string comparison gets `0.10.2` vs
+# `0.9.9` backwards. Already in the lockfile via Tauri, so promoting it to a
+# direct dependency adds no new supply-chain surface.
+semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Direct dep so we can set SO_REUSEADDR/SO_REUSEPORT before bind. Without
 # those flags, macOS keeps the socket in TIME_WAIT for 30–60s after every

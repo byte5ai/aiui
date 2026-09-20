@@ -1852,6 +1852,11 @@ Check whether an aiui update is available and install it if so. Call the \
   will hit the new version.
 - If `updated: false` and `note: "already on latest"`, report "aiui is \
   on the latest version ({current})".
+- If `updated: false` and `note` mentions a dialog in flight, report that \
+  aiui {available} is ready but was not installed because a dialog is \
+  still open on the user's machine — installing would close it and \
+  discard what they typed. Ask them to finish it, then run /aiui:update \
+  again. Do not retry on your own.
 - If `error` is set, report the error verbatim.
 
 Keep the reply to one short sentence unless the user asked for detail.
@@ -2044,16 +2049,19 @@ async def version_tool() -> dict[str, Any]:
 
 @mcp.tool(name="update")
 async def update_tool() -> dict[str, Any]:
-    """Check for an aiui update on the user's Mac and install it silently.
+    """Check for an aiui update on the user's machine and install it.
 
-    Responds BEFORE the companion schedules its relaunch, so the caller
-    receives `{updated, current, available, note}`. Next agent call hits
-    the new version.
+    Responds BEFORE the companion goes away, so the caller receives
+    `{updated, current, available, note}`. Next agent call hits the new
+    version. Two outcomes are not installs and need no retry logic:
+    `updated: false` with `note: "already on latest"`, and `updated: false`
+    with `note: "dialog in flight — update deferred"` — the companion
+    refuses to restart out from under a dialog the user is filling in, so
+    ask them to finish it and call again.
 
-    Runs the updater against the *user's Mac*, regardless of whether the
+    Runs the updater against the *user's machine*, regardless of whether the
     MCP is local or reached via an SSH reverse-tunnel — because the
-    /update HTTP endpoint lives on the aiui.app companion, not on this
-    process.
+    /update HTTP endpoint lives on the aiui companion, not on this process.
     """
     # Use the long render timeout because download + install of the updater
     # bundle can take several seconds on a slow network.

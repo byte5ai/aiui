@@ -163,6 +163,11 @@ Check whether an aiui update is available and install it if so. Call the \
   will hit the new version.
 - If `updated: false` and `note: \"already on latest\"`, report \"aiui is \
   on the latest version ({current})\".
+- If `updated: false` and `note` mentions a dialog in flight, report that \
+  aiui {available} is ready but was not installed because a dialog is \
+  still open on the user's machine — installing would close it and \
+  discard what they typed. Ask them to finish it, then run /aiui:update \
+  again. Do not retry on your own.
 - If `error` is set, report the error verbatim.
 
 Keep the reply to one short sentence unless the user asked for detail.
@@ -672,7 +677,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "update",
-            "description": "Check for an aiui update, download-and-install if one is available, then relaunch silently. Responds BEFORE the relaunch so the caller receives {updated, current, available, note}. Next agent call hits the new version.",
+            "description": "Check for an aiui update, download-and-install if one is available, then relaunch silently. Responds BEFORE the relaunch so the caller receives {updated, current, available, note}. Next agent call hits the new version. Returns {updated: false, note: \"dialog in flight — update deferred\"} instead of installing while a dialog is waiting on the user.",
             "inputSchema": { "type": "object", "properties": {} }
         }
     ])
@@ -1775,7 +1780,7 @@ fn prompts_list() -> Value {
         },
         {
             "name": "update",
-            "description": "Check for an aiui update and install it silently, reporting the outcome.",
+            "description": "Check for an aiui update and install it, reporting the outcome. Deferred while a dialog is open on the user's machine.",
             "arguments": []
         },
         {

@@ -95,6 +95,15 @@ jobs:
         working-directory: companion
         run: npm run build
 
+      # #197: the frontend had no test runner at all, so the update path —
+      # entirely TypeScript, and the one path whose failures are invisible
+      # by construction — had zero coverage. `vitest` runs on both matrix
+      # legs: the suite is pure logic over mocked Tauri plugins, so unlike
+      # the Rust test binary it has no Windows loader problem.
+      - name: Frontend unit tests
+        working-directory: companion
+        run: npm run test
+
       - name: Cargo check
         working-directory: companion/src-tauri
         run: cargo check --release --target ${{ matrix.target }}

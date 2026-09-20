@@ -157,7 +157,7 @@ it precisely.
 | Command | What it does |
 |---|---|
 | `/aiui:teach` | Briefs the agent on aiui — loads the full widget catalog and design rules into the session. Run once per project. |
-| `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
+| `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, installs any available update, and reports the version delta back. It always answers before the restart, on macOS and on Windows alike. If a dialog is still waiting for you, nothing is installed — you get back "update deferred", because restarting would throw away what you had typed. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
 
 ## FAQ

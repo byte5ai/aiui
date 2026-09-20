@@ -1,6 +1,5 @@
 {
   "app": {
-    "title": "aiui",
     "status.connected": "Registered in Claude Desktop · port {port}",
     "status.not_connected": "Claude Desktop config will be set automatically on next launch",
     "status.background": "Runs in the background — close this window any time"
@@ -52,6 +51,7 @@
     "remotes.add.hint": "Adds the reverse tunnel to ~/.ssh/config, scp's the auth token to the host, and starts the tunnel.",
     "remotes.remove": "Remove",
     "remotes.resync.tooltip": "Refresh aiui connection on this host",
+    "remotes.add.error.dismiss": "Dismiss",
     "log.title": "Recent",
     "tunnel.connected": "connected",
     "tunnel.connected_shared": "connected (shared forward)",
@@ -59,8 +59,6 @@
     "tunnel.stopped": "stopped",
     "tunnel.failed": "Failed: {reason}",
     "tunnel.unknown": "unknown",
-    "restart.button.start": "Start Claude Desktop",
-    "restart.button.restart": "Restart Claude Desktop",
     "restart.hint": "Quits Claude Desktop and starts it again so it re-reads the current aiui entry from claude_desktop_config.json.",
     "uninstall.button": "Uninstall",
     "uninstall.confirm": "Really? Removes all aiui entries from configs and remote tokens.",
@@ -73,6 +71,15 @@
     "uninstall.done.body.other": "Configuration is gone. Click the red Quit button on the right, then remove aiui via your package manager — a running app can't remove itself.",
     "uninstall.done.quit": "Quit aiui",
     "updates.check": "Check for updates",
+    "updates.title": "aiui update",
+    "updates.check_failed": "Update check failed:\n{error}",
+    "updates.up_to_date": "You're on the current version.",
+    "updates.available": "aiui {version} is available.",
+    "updates.install_question": "Install it now?",
+    "updates.install_failed": "The update could not be installed:\n\n{error}\n\naiui is unchanged — you can try again from this window.",
+    "updates.log_failed": "Update failed",
+    "updates.deferred_dialog_open": "A dialog is still waiting for your input. Installing now would close it and discard what you have typed, so the update was not installed. Finish the dialog and click Install again.",
+    "quit.failed": "Quit failed: {error}",
     "pending_update.text": "aiui {version} is available.",
     "pending_update.install": "Install",
     "report.button": "Report issue",
@@ -87,7 +94,6 @@
     "confirm.no": "No",
     "unknown_kind": "Unknown widget kind: {kind}",
     "close": "Close",
-    "session_aria": "Session this dialog belongs to",
     "gallery.comment_placeholder": "Comment (optional)…",
     "gallery.decided": "{n}/{total} decided",
     "ttl": {

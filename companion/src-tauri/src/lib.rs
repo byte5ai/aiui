@@ -613,27 +613,29 @@ pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
 /// Would installing + relaunching right now disrupt anything the user is
 /// looking at? `true` = safe.
 ///
-/// **Nothing calls this today.** #188: the doc here used to describe the
-/// v0.4.43 silent-install path in `updater.ts` as its caller. That path was
-/// removed in v0.4.44 — a transparent self-install left the user unaware
-/// their app had restarted — so this command has had no caller since, and
-/// the comment sent the next reader looking for an auto-install mechanism
-/// that does not exist.
+/// The caller is `checkForUpdates` in `companion/src/lib/updater.ts`: the
+/// manual install path invokes this after the user confirms the native
+/// prompt and *before* `downloadAndInstall()`. `false` means a dialog is
+/// still waiting on a user response, so the install is skipped and the
+/// pending-update banner stays where it is.
 ///
-/// Kept rather than deleted because it encodes the right predicate for the
-/// open question of whether aiui should install while idle: the dialog
-/// registry being empty, i.e. no pending render waiting on user input.
+/// #197 restored that wiring. Between v0.4.44 and this change the command
+/// had no caller at all: the v0.4.43 silent-install path it was written for
+/// was removed, and the manual path never picked the gate up — so clicking
+/// *Install* while a remote agent had a form open tore that window down
+/// mid-render, the exact Invariant I5 violation this exists to prevent.
+///
+/// The predicate itself lives in `lifetime::update_install_is_safe` so it is
+/// unit-testable; the agent-facing `/update` handler applies the same rule.
 /// Settings being open is deliberately *not* part of it — the user is there
-/// intentionally, so a restart is fine. If that question is ever answered
-/// "yes", the install belongs in the headless task in `run()` (never in a
-/// window), reading `dialog_state.stats()` directly, and this command
-/// should be deleted along with its registration rather than called from
-/// the frontend.
+/// intentionally, so a restart is fine.
 #[tauri::command]
 async fn is_update_safe_to_install(
     dialog_state: tauri::State<'_, Arc<dialog::DialogState>>,
 ) -> Result<bool, String> {
-    Ok(dialog_state.stats().orphan_count == 0)
+    Ok(lifetime::update_install_is_safe(
+        dialog_state.stats().orphan_count,
+    ))
 }
 
 /// Called from the frontend right before showing a modal update dialog.
@@ -724,6 +726,32 @@ async fn clear_pending_update(
     }
     let _ = app.emit("update:available", &None::<String>);
     Ok(())
+}
+
+/// Has the on-disk version caught up with the version the banner is
+/// advertising? `true` = drop the banner.
+///
+/// #197: the pending-update slot had no expiry. A release that was yanked,
+/// or a `latest.json` that stopped advertising this platform, left the
+/// banner announcing a version the updater would no longer offer — clicking
+/// *Install* answered "you are on the current version" and the banner came
+/// straight back, with no way to dismiss it. Comparing against our own
+/// `CARGO_PKG_VERSION` closes that loop for the case that matters most: the
+/// update already installed.
+///
+/// `semver` rather than string comparison, because `"0.10.2" <= "0.9.9"`
+/// lexically and that would hide a real update. Anything either side cannot
+/// parse (empty, `"v0.10.2"`, a date) is *not* stale: refusing to clear a
+/// banner we do not understand is the safe direction — the user still gets
+/// an install button, they just do not get it taken away by a parse slip.
+fn pending_update_is_stale(pending: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(pending.trim()),
+        semver::Version::parse(current.trim()),
+    ) {
+        (Ok(pending), Ok(current)) => pending <= current,
+        _ => false,
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -824,8 +852,29 @@ async fn status(
         lock_error: lock_err.0.lock().ok().and_then(|s| s.clone()),
         http_alive,
         os: current_os(),
-        pending_update: pending_update.0.lock().ok().and_then(|s| s.clone()),
+        pending_update: current_pending_update(pending_update.inner()),
     })
+}
+
+/// Read the pending-update slot, dropping it when the on-disk version has
+/// caught up (#197). Clears the slot rather than merely filtering the
+/// report, so the 6 h headless check treats the *next* genuinely new
+/// version as news again. No `update:available` emit needed: the Settings
+/// banner is driven by this very status poll, which runs every 2 s.
+fn current_pending_update(state: &PendingUpdate) -> Option<String> {
+    let mut slot = state.0.lock().ok()?;
+    if slot
+        .as_deref()
+        .is_some_and(|v| pending_update_is_stale(v, env!("CARGO_PKG_VERSION")))
+    {
+        logging::trace(&format!(
+            "update-check: clearing stale pending-update banner (pending {:?} <= on-disk {})",
+            slot.as_deref(),
+            env!("CARGO_PKG_VERSION")
+        ));
+        *slot = None;
+    }
+    slot.clone()
 }
 
 /// Authenticated HTTP self-probe to verify our own HTTP server is
@@ -2044,7 +2093,44 @@ pub fn run() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            // #197: on Windows the updater plugin ends its install path with
+            // `std::process::exit(0)` right after handing the NSIS installer
+            // to `ShellExecuteW` (tauri-plugin-updater 2.10.1,
+            // `#[cfg(windows)] fn install_inner`). That bypasses
+            // `RunEvent::ExitRequested`, so neither our exit gate nor
+            // `pre_exit_cleanup` ever ran: every Windows update leaked the
+            // instance's `ssh -NTR` child, and the relaunched instance found
+            // the remote port already forwarded and pinned itself to
+            // `ConnectedShared` for the rest of its life.
+            //
+            // `on_before_exit` is invoked ONLY from that Windows branch — the
+            // macOS `install_inner` returns normally — which is exactly the
+            // split we want: macOS keeps latching the exit authority *after*
+            // a successful `downloadAndInstall()` in `updater.ts`, Windows
+            // latches it here, immediately before the process is torn out
+            // from under us. Latching earlier on macOS would arm the
+            // irreversible `ExitAuthority` for an install that can still
+            // fail, leaving a live host whose default-deny exit gate is
+            // permanently disarmed (an Invariant I1 regression).
+            //
+            // Version-pinned behaviour: re-check this hook when bumping
+            // tauri-plugin-updater past 2.10.1.
+            tauri_plugin_updater::Builder::new()
+                .on_before_exit({
+                    let auth = exit_authority.clone();
+                    let port = cfg.http_port;
+                    move || {
+                        logging::trace(
+                            "updater: on_before_exit — latching exit authority and \
+                             sweeping tunnels before the installer takes over",
+                        );
+                        auth.authorize();
+                        housekeeping::pre_exit_cleanup(port, "update-install");
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         // Backs the `notify` MCP tool (#17) — native OS notification shown
@@ -2380,6 +2466,25 @@ pub fn run() {
                             }
                             Ok(None) => {
                                 logging::trace("update-check: already on latest");
+                                // #197: "no update available" has to retract
+                                // the banner, not just be logged. A release
+                                // that is yanked — or a `latest.json` that
+                                // stops advertising this platform — used to
+                                // leave the slot set forever, so the user kept
+                                // a banner offering a version the updater
+                                // would no longer hand out, and every click
+                                // answered "you are on the current version".
+                                let had_pending = match pending_update_task.0.lock() {
+                                    Ok(mut slot) => slot.take().is_some(),
+                                    Err(_) => false,
+                                };
+                                if had_pending {
+                                    logging::trace(
+                                        "update-check: retracting stale pending-update banner",
+                                    );
+                                    let _ = app_handle_update
+                                        .emit("update:available", None::<String>);
+                                }
                             }
                             Err(e) => {
                                 logging::trace(&format!("update-check: check failed: {e}"));
@@ -2938,6 +3043,38 @@ mod tests {
     fn none_action_commits() {
         // The built-in submit button (`action: null` in the result).
         assert!(action_commits_targets(&spec_with_documented_actions(), None));
+    }
+
+    #[test]
+    fn pending_update_is_stale_drops_equal_and_older() {
+        // #197: the banner must retract itself once the on-disk version has
+        // caught up — equal counts as caught up, because that is what the
+        // slot looks like immediately after a successful install.
+        assert!(pending_update_is_stale("0.10.1", "0.10.1"));
+        assert!(pending_update_is_stale("0.9.9", "0.10.1"));
+        // A genuinely newer release keeps its banner. `0.10.2` sorts *below*
+        // `0.9.9` lexically, which is the trap semver is here to avoid.
+        assert!(!pending_update_is_stale("0.10.2", "0.10.1"));
+        assert!(!pending_update_is_stale("0.10.2", "0.9.9"));
+    }
+
+    #[test]
+    fn pending_update_is_stale_keeps_banner_on_unparseable_input() {
+        // Neither input is ours to trust: `pending` is whatever `latest.json`
+        // advertised. Anything we cannot order must not panic, and must not
+        // clear a banner — taking the user's only install button away on a
+        // parse slip is the worse failure.
+        assert!(!pending_update_is_stale("", "0.10.1"));
+        assert!(!pending_update_is_stale("v0.10.2", "0.10.1"));
+        assert!(!pending_update_is_stale("2026-09-20", "0.10.1"));
+        assert!(!pending_update_is_stale("0.10.2", "not-a-version"));
+    }
+
+    #[test]
+    fn pending_update_is_stale_tolerates_surrounding_whitespace() {
+        // `set_pending_update` trims, but the headless loop and the updater
+        // feed are separate sources — don't let a stray newline pin a banner.
+        assert!(pending_update_is_stale(" 0.10.1\n", "0.10.1"));
     }
 
     #[test]

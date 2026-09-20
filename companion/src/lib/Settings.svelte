@@ -36,9 +36,15 @@
     os: "macos" | "windows" | "linux" | "other";
     /** When the periodic auto-check found a newer release (set by
      * `set_pending_update` in updater.ts silent path). Settings shows a
-     * non-modal banner with this version + an "Installieren" button.
+     * non-modal banner with this version + an Install button.
      * Cleared once the user installs (clear_pending_update) or once
-     * the on-disk version catches up. v0.4.44. */
+     * the on-disk version catches up. v0.4.44.
+     *
+     * #197 made the second half true — it was documented but implemented
+     * nowhere, so a yanked release left an undismissable banner. All four
+     * paths now retract it: a successful install, a manual check that finds
+     * nothing, the headless 6 h check's `Ok(None)` arm, and `status()`
+     * itself once `CARGO_PKG_VERSION` has caught up. */
     pending_update: string | null;
   };
   let status = $state<Status | null>(null);
@@ -161,7 +167,7 @@
     } catch (e) {
       pushSingle({
         ok: false,
-        message: `Quit failed: ${String(e)}`,
+        message: $_("settings.quit.failed", { values: { error: String(e) } }),
         details: null,
       });
     }
@@ -224,15 +230,32 @@
     }
   }
 
-  /** Triggered by the "Installieren" button on the pending-update
-   * banner. Routes through the manual `checkForUpdates` path so the
-   * user sees the native modal confirmation ("install v0.4.X?") and
-   * we don't bypass the explicit-consent step. v0.4.44. */
+  /** Triggered by the Install button on the pending-update banner, and
+   * by the footer "Check for updates" button. Routes through the manual
+   * `checkForUpdates` path so the user sees the native modal confirmation
+   * ("install v0.4.X?") and we don't bypass the explicit-consent step.
+   * v0.4.44.
+   *
+   * #197: this is the ONLY entry point for the manual path, and it is
+   * what makes `disabled={busy}` mean something. The footer button used
+   * to call `checkForUpdates` directly as a floating promise, so `busy`
+   * never latched and a double-click started two concurrent
+   * `downloadAndInstall()` calls racing over the same bundle. A failure
+   * also used to vanish into the `finally` — now it lands in the inline
+   * log, next to every other thing that went wrong in this window. */
   async function installPendingUpdate() {
     if (busy) return;
     busy = true;
     try {
-      await checkForUpdates({ silent: false });
+      const outcome = await checkForUpdates({ silent: false });
+      if (!outcome.ok) {
+        pushSingle({
+          ok: false,
+          message: $_("settings.updates.log_failed"),
+          details: outcome.error ?? null,
+        });
+      }
+      await refresh();
     } finally {
       busy = false;
     }
@@ -520,7 +543,7 @@
           <button
             class="add-remote-error-dismiss"
             onclick={() => (addRemoteError = null)}
-            aria-label="Schließen">×</button>
+            aria-label={$_("settings.remotes.add.error.dismiss")}>×</button>
         </div>
       {/if}
       <p class="subtitle" style="margin: 6px 0 0 0; font-size: 11.5px;">
@@ -559,7 +582,10 @@
         <button onclick={openIssue} title={$_("settings.report.hint")}>
           {$_("settings.report.button")}
         </button>
-        <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
+        <!-- #197: routed through installPendingUpdate, not a bare
+          `checkForUpdates(...)` floating promise — otherwise `busy` never
+          latches and `disabled={busy}` is decoration. -->
+        <button onclick={installPendingUpdate} disabled={busy}>
           {$_("settings.updates.check")}
         </button>
         <button onclick={() => (confirmUninstall = true)} disabled={busy}

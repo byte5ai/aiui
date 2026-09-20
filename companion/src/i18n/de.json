@@ -1,6 +1,5 @@
 {
   "app": {
-    "title": "aiui",
     "status.connected": "In Claude Desktop eingetragen · Port {port}",
     "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt",
     "status.background": "Läuft im Hintergrund — Fenster jederzeit schließbar"
@@ -52,6 +51,7 @@
     "remotes.add.hint": "Trägt Reverse-Tunnel in ~/.ssh/config ein, kopiert den Auth-Token per scp zum Host und startet den Tunnel sofort.",
     "remotes.remove": "Entfernen",
     "remotes.resync.tooltip": "aiui-Verbindung zu diesem Host erneuern",
+    "remotes.add.error.dismiss": "Schließen",
     "log.title": "Zuletzt",
     "tunnel.connected": "verbunden",
     "tunnel.connected_shared": "verbunden (geteilter Forward)",
@@ -59,8 +59,6 @@
     "tunnel.stopped": "gestoppt",
     "tunnel.failed": "Fehler: {reason}",
     "tunnel.unknown": "unbekannt",
-    "restart.button.start": "Claude Desktop starten",
-    "restart.button.restart": "Claude Desktop neu starten",
     "restart.hint": "Beendet Claude Desktop und startet es wieder, damit der aktuelle aiui-Eintrag aus claude_desktop_config.json neu eingelesen wird.",
     "uninstall.button": "Uninstall",
     "uninstall.confirm": "Wirklich? Entfernt alle aiui-Einträge aus Configs und Remote-Tokens.",
@@ -73,6 +71,15 @@
     "uninstall.done.body.other": "Konfiguration ist weg. Klick rechts auf den roten Beenden-Button und entferne aiui anschließend über deinen Paketmanager — eine laufende App kann sich nicht selbst entfernen.",
     "uninstall.done.quit": "aiui beenden",
     "updates.check": "Nach Updates suchen",
+    "updates.title": "aiui Update",
+    "updates.check_failed": "Update-Check fehlgeschlagen:\n{error}",
+    "updates.up_to_date": "Du bist auf der aktuellen Version.",
+    "updates.available": "aiui {version} ist verfügbar.",
+    "updates.install_question": "Jetzt installieren?",
+    "updates.install_failed": "Das Update konnte nicht installiert werden:\n\n{error}\n\naiui bleibt unverändert — Du kannst es aus diesem Fenster erneut versuchen.",
+    "updates.log_failed": "Update fehlgeschlagen",
+    "updates.deferred_dialog_open": "Ein Dialog wartet noch auf Deine Eingabe. Jetzt zu installieren würde ihn schließen und das Eingetippte verwerfen — das Update wurde deshalb nicht installiert. Schließ den Dialog ab und klick erneut auf Installieren.",
+    "quit.failed": "Beenden fehlgeschlagen: {error}",
     "pending_update.text": "aiui {version} ist verfügbar.",
     "pending_update.install": "Installieren",
     "report.button": "Problem melden",
@@ -87,7 +94,6 @@
     "confirm.no": "Nein",
     "unknown_kind": "Unbekannter Widget-Typ: {kind}",
     "close": "Schließen",
-    "session_aria": "Sitzung, zu der dieser Dialog gehört",
     "gallery.comment_placeholder": "Kommentar (optional)…",
     "gallery.decided": "{n}/{total} entschieden",
     "ttl": {
