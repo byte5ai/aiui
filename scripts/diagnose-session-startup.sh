@@ -21,7 +21,11 @@
 set -euo pipefail
 
 CONFIG="${HOME}/.claude.json"
-BACKUP="${HOME}/.claude.json.aiui-toggle-backup"
+# Only the removed `aiui` entry is stashed here, never a whole-file copy:
+# restoring a stale copy would throw away everything Claude Code wrote
+# during the measurement window this script explicitly asks you to create
+# (#182). The stash is a single JSON object.
+STASH="${HOME}/.claude.json.aiui-entry"
 
 cmd="${1:-help}"
 
@@ -137,31 +141,68 @@ toggle_aiui() {
     exit 1
   fi
 
-  if [[ -f "$BACKUP" ]]; then
-    echo "Restoring aiui in $CONFIG (backup found at $BACKUP)"
-    mv "$BACKUP" "$CONFIG"
-    python3 -c "
-import json
-d = json.load(open('$CONFIG'))
-print('mcpServers now:', list((d.get('mcpServers') or {}).keys()))
-"
+  if [[ -f "$STASH" ]]; then
+    echo "Restoring the aiui entry in $CONFIG (stashed at $STASH)"
+    CONFIG="$CONFIG" STASH="$STASH" python3 - <<'PYEOF'
+import json, os, sys
+p, stash = os.environ["CONFIG"], os.environ["STASH"]
+# Re-read the CURRENT config: Claude Code has been writing to it for the whole
+# measurement window. Only the one key we removed goes back in.
+try:
+    d = json.load(open(p))
+except Exception as e:
+    sys.exit(f"{p} is not valid JSON ({e}) — fix it first; stash kept at {stash}")
+entry = json.load(open(stash))
+servers = d.get("mcpServers") or {}
+servers["aiui"] = entry
+d["mcpServers"] = servers
+tmp = p + ".aiui-tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+os.unlink(stash)
+print("mcpServers now:", list(servers.keys()))
+PYEOF
     return
   fi
 
-  cp "$CONFIG" "$BACKUP"
-  python3 -c "
-import json
-p = '$CONFIG'
-d = json.load(open(p))
-servers = d.get('mcpServers') or {}
-removed = servers.pop('aiui', None)
-d['mcpServers'] = servers
-json.dump(d, open(p, 'w'), indent=2)
-print('removed:', removed is not None)
-print('remaining mcpServers:', list(servers.keys()))
-"
+  CONFIG="$CONFIG" STASH="$STASH" python3 - <<'PYEOF'
+import json, os, sys
+p, stash = os.environ["CONFIG"], os.environ["STASH"]
+try:
+    d = json.load(open(p))
+except Exception as e:
+    sys.exit(f"{p} is not valid JSON ({e}) — refusing to touch it")
+servers = d.get("mcpServers") or {}
+entry = servers.pop("aiui", None)
+if entry is None:
+    sys.exit("no top-level `aiui` entry in mcpServers — nothing to toggle")
+with open(stash, "w") as f:
+    json.dump(entry, f, indent=2)
+d["mcpServers"] = servers
+tmp = p + ".aiui-tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+print("removed: True")
+print("remaining mcpServers:", list(servers.keys()))
+# A per-project entry would keep aiui loaded for the project you are about to
+# measure, making the A/B read "aiui is not the bottleneck" for the wrong
+# reason.
+per_project = [
+    k for k, v in (d.get("projects") or {}).items()
+    if isinstance(v, dict) and "aiui" in (v.get("mcpServers") or {})
+]
+if per_project:
+    print()
+    print("WARNING: a per-project aiui entry still exists for:")
+    for k in per_project:
+        print(f"  {k}")
+    print("aiui stays loaded for those projects — measure a different one,")
+    print("or remove those entries by hand as well.")
+PYEOF
   echo
-  echo "Backup at $BACKUP. Now: start a fresh Claude Code session, gauge startup."
+  echo "Entry stashed at $STASH. Now: start a fresh Claude Code session, gauge startup."
   echo "When done, run this command again to restore."
 }
 

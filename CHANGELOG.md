@@ -4,6 +4,54 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **A system notification when an update is found.** The settings banner
+  used to be the only surface for a pending update, which a headless app
+  nobody opens is a poor place for. The headless check now also raises a
+  native notification — once per version, not once per six-hour tick.
+  English-only: there is no i18n layer in the Rust half, and adding one for
+  a single string is not the right trade; the localised banner remains the
+  richer surface (#188).
+- **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
+  missing a shipped platform, carries an empty signature or url, points an
+  entry at another release's artifact, or advertises the wrong version. It
+  runs in the release path before anything becomes visible, and
+  `scripts/test-check-updater-feed.sh` exercises it against fixtures on
+  every PR so the guard cannot quietly stop guarding (#190).
+
+### Changed
+
+- **Two code comments described an auto-install path that does not exist.**
+  `checkForUpdates`'s header still documented transparent install and
+  relaunch, naming a file deleted in the multi-window refactor, and
+  `is_update_safe_to_install` claimed a caller it lost in v0.4.44. Both sent
+  the next contributor looking for a mechanism that was removed on purpose.
+  The command is kept rather than deleted — it encodes the right predicate
+  if install-while-idle is ever wanted — but its doc now says plainly that
+  nothing calls it, and where the install would belong if it were (#188).
+- **New file `~/.config/aiui/remote-uvx.json`** holds the `uvx` path per
+  registered remote. Deliberately a sidecar rather than a second field in
+  `remotes.json`: widening that file would make an older build parse it as
+  an empty list and silently drop the user's registered hosts on a
+  downgrade. An older build ignores the sidecar and behaves exactly as it
+  does today. Removed with the host, and on uninstall (#184).
+- **`skip_validation: true` actions no longer commit `target` file
+  writes.** They are escape hatches, and an escape hatch that writes a
+  credential to disk is a trap. The new `writes_targets: true` action flag
+  opts one back in. An action value the spec never declared is refused
+  (fail closed). Agent-facing: documented in both `skill.md` copies and in
+  the `form` tool description of both bridges. Nothing that previously
+  failed now succeeds; some writes that previously fired silently now
+  refuse with a reason (#177).
+- **Documentation updated for a two-platform product.** README, both
+  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
+  doc still described aiui as macOS-only. The README gained per-platform
+  install instructions including the expected SmartScreen warning, and
+  agent-facing path guidance no longer says "the user's Mac" — an agent
+  reading that could reasonably assume POSIX paths on a Windows user's
+  machine.
+
 ### Fixed
 
 - **A pull request based on another branch got no CI checks at all.** The
@@ -15,9 +63,216 @@ All notable changes to this project are documented here.
   stacked PR is by construction the one touching code another unmerged
   change also touches. Two of the nine PRs in this release were in that
   state (#222).
+- **README and SECURITY.md promised automatic updates that never happened.**
+  Both said the in-app updater installs patches on its own. Nothing in the
+  product has done that since v0.4.44 — the headless check and the silent
+  frontend check both *record* an available version and stop. The only
+  thing that installs is a click on the settings banner or `/aiui:update`.
+  And aiui runs headless by design: no dock icon, no menu-bar item, nothing
+  inviting the user into Settings. So a user who never opened that window
+  never learned an update existed and stayed on the installed version
+  indefinitely, security fixes included, while `SECURITY.md` told security
+  reporters those fixes were delivered automatically. Both documents now
+  describe what the code does (#188).
+- **Mermaid flowchart node labels rendered empty.** Mermaid 11 puts
+  flowchart labels in HTML inside `<foreignObject>`, and the sanitiser runs
+  with `USE_PROFILES: { svg, svgFilters }` — a DOMPurify *profile* replaces
+  the allow-list rather than adding to it, and `foreignobject` is both
+  outside the svg profile and in `DEFAULT_FORBID_CONTENTS`, so the element
+  and its text were stripped. Diagrams came out as boxes with nothing in
+  them. The v0.4.38 change that dropped `foreignObject` from `FORBID_TAGS`
+  was therefore a no-op — nothing it forbade was reachable anyway — and
+  the regression it was written to fix stayed broken.
+  Fixed at the source: `htmlLabels: false` keeps labels in `<text>` /
+  `<tspan>`, which the svg profile does allow. Deliberately **not** fixed
+  by widening the sanitiser: admitting `<foreignObject>` means admitting
+  `<div>`, `<span>`, `<img>` and `<a href>` inside the SVG, for content an
+  agent supplied. Cost: long labels use Mermaid's own line-breaking rather
+  than HTML word-wrapping (`<br/>` still works), and FontAwesome `fa:fa-x`
+  substitution in labels stops resolving. Neither was documented (#189).
+- **A link in agent-supplied markdown destroyed the dialog.** A plain
+  `[text](https://…)` in a `markdown` field or a `compare` variant
+  survived sanitisation, as it should — but clicking it navigated the
+  **dialog window itself** away from `dialog.html`. The Svelte app was
+  gone, the dialog's `/render` hung until its two-hour TTL, and the user
+  was left with a web page in a frameless window and no way back. A
+  compromised remote host could aim that anywhere. The window now refuses
+  to navigate anywhere but its own app origin, and the frontend hands
+  `http(s)` links to the user's default browser instead — which is what
+  `skill.md` had been claiming all along (#189).
+- **Mermaid diagrams rendered twice on mount.** `onMount` and an
+  `initialised`-gated `$effect` both drove the first render, and the
+  effect's guard read a flag the render itself sets. The effect now owns
+  both the first render and later source changes (#189).
+- **A hung probe could park a tunnel task forever.** `ConnectTimeout=5`
+  bounds the TCP connect only; authentication, a wedged remote shell or a
+  stalled curl were unbounded after that, and the probe is awaited inside
+  the poll loop. It now has a 15 s overall cap, is killed on drop rather
+  than orphaned, and races against cancellation at both call sites — a
+  remote removed while a probe was in flight used to wait for it (#187).
+- **The probe called outcomes that prove nothing.** A missing token on the
+  remote, a curl that timed out, a remote without curl, an ssh killed by a
+  signal: all four were reported as "the forward is gone", which in
+  shared-forward mode means a retry storm against a port that is still
+  occupied. Each is now inconclusive, which costs one extra poll. The
+  missing-token case gets its own exit code so it cannot be confused with
+  a real answer — matching what the function's own docstring always
+  claimed (#187).
+- **Every tunnel failure surfaced as "ssh exit code 255".** ssh explains
+  itself on stderr, and stderr went to `/dev/null`. It is now captured
+  into a bounded ring and the last lines are appended to the status, so
+  Settings shows e.g. `ssh exit code 255 — remote port forwarding failed
+  for listen port 7777` instead of the least informative thing ssh can
+  say (#187).
+- **The reconnect backoff never reset.** It only doubled, so a link that
+  connected, worked for hours and then dropped inherited whatever the last
+  startup stumble had left behind — a flapping connection degraded into a
+  permanent 30 s hole during which every remote dialog fails. A link that
+  survived past 30 s now starts over at 1 s, and the sleep carries ±20 %
+  jitter so several tunnels that drop together do not retry in lockstep
+  (#187).
+- **The companion quit after every dialog for anyone whose host is not
+  Claude Desktop in `/Applications`.** The exit authority was
+  `explicit || !is_claude_desktop_running()`, and liveness was probed with
+  `pgrep -f /Applications/Claude.app/`. For a Claude-Code-only or
+  Codex-only user — both first-class hosts aiui registers itself with — or
+  for a Claude Desktop installed in `~/Applications`, that predicate was
+  permanently true, so the default-**deny** exit gate inverted into
+  default-**allow**. The first dialog submit closed the only window, Tauri
+  fired `ExitRequested`, and the host exited: the v0.4.42 "lost the GUI
+  ~18 ms after submit" regression, re-opened for a whole class of users.
+  On a Mac serving only remote sessions there was no local child to
+  relaunch it, so aiui stayed dead until someone touched the machine.
+  The Wirt signal is now host-agnostic — "Claude Desktop is not my Wirt"
+  means *stay* — the macOS probe matches the bundle executable at any
+  install location (and still never the `claude` CLI), and a
+  last-window-close (`code: None`) can no longer terminate the host at all
+  (#180).
+- **Multi-instance exits left a zombie GUI and killed the live instance's
+  tunnels.** The four "another aiui already serves this" paths called
+  `app.exit(1)`, which the default-deny gate vetoed — leaving a process
+  holding a pipe it could not serve — and then swept *all* ssh-NTR
+  tunnels, although a losing instance never opened one: they belonged to
+  the instance that won. Exits now route through one `terminal_exit` that
+  uses `std::process::exit` and a sweep scoped by reason (#180).
+- **In-flight dialogs are resolved before the host exits.** Every terminal
+  path now drains the registry, sending each pending `/render` a
+  `{cancelled: true, reason: "host_exiting"}` and destroying its window,
+  then gives Axum a moment to flush — instead of leaving callers to hang
+  until their own timeout (I5/I7). The grace decision also counts open
+  dialogs: one on screen is proof someone still needs the host (#180).
+- **A transient named-pipe rotation failure no longer kills a healthy
+  Windows host.** It is retried five times with doubling backoff, and only
+  a persistent failure exits — cleanly, through the drain (#180).
+- **Both bridges forward *why* a dialog was cancelled.** The companion
+  distinguishes `host_exiting`, `ttl_expired`, `evicted` and
+  `channel_dropped`, but each bridge flattened them into a bare
+  `{"cancelled": true}` — indistinguishable from the user pressing Escape,
+  so an agent retried the wrong thing (#180).
+- **A working remote broke on the next launch, and aiui reported success.**
+  `add_remote` probes the remote for an **absolute** `uvx` path and pins it
+  — the bare name depends on Claude Code's PATH at spawn time, which is
+  exactly what fails on the hosts the probe's fallback list exists for. That
+  discovery was then thrown away. The startup resync (every remote, every
+  launch) and the Settings "Resync" button both passed no path, so the
+  script rewrote the pinned absolute path back down to `"uvx"` and logged a
+  green result. The next Claude Code session on that host could not find
+  `uvx`, and every aiui tool call failed with "command not found".
 
-### Fixed
+  A one-way downgrade, not a flip-flop: once the bare name was written,
+  later resyncs saw it as current and left it. The absolute-path discovery
+  had effectively been dead code since 0.4.29, when the auto-resync was
+  added.
 
+  The discovered path is now remembered per host and passed by both resync
+  paths. Two further guards: "no path known" no longer means "write the
+  bare name" but "keep an existing resolvable command and re-pin only the
+  version", which protects hosts upgrading from ≤ 0.10.1; and the Resync
+  button self-heals a host with no remembered path by re-probing, which
+  also gives that button the pre-flight check it never had (#184).
+- **An unparsable host config was replaced, not repaired.** Every local
+  writer of `~/.claude.json` and `claude_desktop_config.json` treated a
+  parse error as "empty file" and then wrote a document containing only
+  aiui — taking every other MCP server, every project entry and the OAuth
+  block with it. One trailing comma was enough, and the same hole sat in
+  both remote scripts, where the remove path additionally had no backup at
+  all. All six writers now stop before touching a file they could not
+  parse, and say so. An empty file still parses as `{}`, which is
+  genuinely safe. The remote scripts share one preamble (parse-or-bail,
+  backup, atomic tmp+replace) so they cannot drift apart again, and both
+  writes are atomic — they used to open-truncate-write a file a live
+  Claude Code session may also be writing (#182).
+- **The aiui entry no longer eats its own neighbours.** Registration built
+  a fresh `{command, args}` object and overwrote whatever was there, so an
+  `env` block or any other key on the entry vanished on the next launch.
+  Only those two keys are written now, in all three host configs — the
+  Codex TOML path keeps the user's other keys *and* their comments. The
+  idempotency check compares only those two keys as well, so an entry
+  carrying extras is no longer rewritten, and re-backed-up, on every single
+  launch (#182).
+- **Backups are findable and bounded.** `~/.claude.json` backed up to
+  `~/.claude.bak.<ts>` — a name that looks like a backup of a different
+  file — at second granularity, so two writes in the same second silently
+  overwrote one another, and the pile grew without limit. Backups are now
+  `<file>.bak.<ms>`, capped at five per target, and the path appears in
+  the step result so the user can actually find it (#182).
+- **A failed registration at startup is traced instead of discarded.**
+  Three call sites dropped their result with `let _ =`; with the parse-error
+  stop in place that would have turned a silent wipe into a silent no-op
+  (#182).
+- **`diagnose-session-startup.sh toggle-aiui` no longer restores a stale
+  whole-file copy.** It stashed a copy of `~/.claude.json`, then `mv`'d it
+  back — throwing away everything Claude Code wrote during the measurement
+  window the script itself asks the user to create. It now stashes only the
+  removed entry, re-reads the current file on restore, writes atomically,
+  and warns when a per-project aiui entry would keep aiui loaded for the
+  project being measured (#182).
+- **Windows: the diagnostic trace was silently discarded.** `TRACE_PATH`
+  was the hard-coded `/tmp/aiui-trace.log`, which does not exist on
+  Windows, so every `logging::trace()` line was dropped and the failed open
+  was swallowed — the platform with the youngest port shipped with no
+  diagnostics. The trace now resolves per-OS (`%LOCALAPPDATA%\aiui\logs`
+  on Windows, `<config dir>/logs` elsewhere), is opened `0600` with
+  `O_NOFOLLOW` so a planted symlink cannot redirect it, reports a failing
+  open once on stderr instead of never, and names its resolved path in
+  every session header. `/tmp` was also the wrong place on Unix: it is
+  world-readable and shared (#185).
+- **A form's Cancel button could blank the user's credential file.**
+  `target` file writes fired on *every* action except the built-in
+  `__cancel__`, so a custom `Cancel` or `Save draft` action — the pattern
+  `skill.md` itself recommends — committed the write with whatever was in
+  the field. For an untouched `secret` that is the empty string, so
+  `mode: "create"` with `overwrite: true` replaced the file with zero
+  bytes, and `mode: "substitute"` erased its own placeholder so even a
+  retry failed. The agent was told `{written: true, bytes: 0}`. Two guards
+  now close it, in both writers (native app and Python bridge): an action
+  carrying `skip_validation: true` no longer commits target writes, and an
+  empty value is refused before the filesystem is touched. A field missing
+  from the payload is reported as such instead of being laundered into a
+  blank write (#177).
+- **A release published a macOS-only update feed, breaking every Windows
+  client's update check.** `releases/latest/download/latest.json` is what
+  every installed aiui polls, and `release-macos.yml` published one
+  carrying only `darwin-aarch64` — the `windows-x86_64` entry was added
+  later by a second, manually dispatched workflow. In between, a Windows
+  update check did not report "up to date"; it failed
+  (`tauri-plugin-updater` raises `TargetsNotFound` for a missing target),
+  and if the second dispatch was forgotten it failed permanently. That is
+  what shipped in v0.10.1.
+
+  The release is now created as a **draft**, which
+  `releases/latest/download/…` does not serve, so clients keep resolving
+  the previous complete feed until both platforms are in. The Windows
+  workflow is dispatched automatically, validates the assembled feed, and
+  only then publishes the release. A Windows failure therefore holds back
+  the whole release rather than shipping half of one — the correct
+  coupling for a two-platform product.
+
+  Deliberately **not** fixed by carrying the previous release's Windows
+  entry forward: that feed would advertise the new version while pointing
+  at the old installer, which verifies and installs cleanly and leaves the
+  client on the old version — a silent reinstall loop, with `/update`
+  reporting success for a version the machine never reached (#190).
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the
@@ -29,15 +284,80 @@ All notable changes to this project are documented here.
   (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
   after this fix.
 
-### Changed
+### Security
 
-- **Documentation updated for a two-platform product.** README, both
-  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
-  doc still described aiui as macOS-only. The README gained per-platform
-  install instructions including the expected SmartScreen warning, and
-  agent-facing path guidance no longer says "the user's Mac" — an agent
-  reading that could reasonably assume POSIX paths on a Windows user's
-  machine.
+- **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
+  `classDef` directive turns caller-supplied text into emitted CSS, and
+  the svg profile does not exclude `<style>`. Attacker-controlled CSS in a
+  dialog window is UI redressing — these are the windows where the user
+  clicks Confirm on destructive actions (#189).
+- **The API token was readable from the remote host's process list.** The
+  shared-forward probe interpolated the token into
+  `curl -H "Authorization: Bearer $T"`, so the remote shell expanded it
+  before exec and the live token sat in curl's `argv` — visible in `ps` to
+  every user on that machine, once per poll (every 30 s in shared-forward
+  mode). Anyone who read it could render dialogs on the user's desktop
+  through the tunnel. The header now reaches curl over stdin, so the token
+  never becomes an argument of any process. Deliberately not via a pipe
+  from `printf` (external where it is not a builtin, which just moves the
+  leak) nor through the environment (`/proc/<pid>/environ` is readable by
+  the same users as `cmdline`) (#187).
+- **Every user file aiui rewrites came back with the wrong permissions.**
+  `atomic_write` created a fresh temp file (umask-masked `0666`) and renamed
+  it over the destination, discarding the destination's own mode. Claude
+  Code creates `~/.claude.json` as `0600` because it holds OAuth data and
+  other MCP servers' `env` blocks; after one aiui config patch it was
+  world-readable, permanently. `~/.ssh/config` got the same treatment on
+  every launch, and under a `002` umask became group-writable — which makes
+  OpenSSH refuse to run at all. The destination's mode is now copied onto
+  the temp handle *before* the rename, so there is no world-readable window
+  either. A symlinked config (a dotfiles-repo setup) is no longer replaced
+  by a regular file: the link is resolved first and written through, and a
+  symlink cycle fails loudly instead of silently swapping the link for a
+  file (#185).
+- **The API token is validated and kept at `0600`.** A malformed token
+  (empty, truncated, not 64 hex chars) is now regenerated instead of being
+  used, `0600` is re-asserted on every launch so a token restored from a
+  backup gets tightened, and the config directory itself is created `0700`.
+  The GUI lock file is created `0600` and repaired if an older install left
+  it `0644`. The Python bridge refuses a malformed token with a clear
+  message instead of sending a bare `Bearer ` (#185).
+- **Token comparison no longer leaks its prefix through timing.** `auth_ok`
+  folds every byte instead of returning at the first mismatch, and an empty
+  configured token now authenticates nobody rather than accepting an empty
+  `Bearer ` (#185).
+- **Windows: another local process could take `127.0.0.1:7777` from us.**
+  `SO_REUSEADDR` means the opposite thing on Windows — it lets an unrelated
+  process bind a socket we are already listening on and answer the bridges
+  in our place. Windows now gets `SO_EXCLUSIVEADDRUSE` instead, which
+  reserves the address; Unix keeps `SO_REUSEADDR` for the TIME_WAIT reason
+  it was added for (#185).
+- **Render specs are no longer written verbatim to the trace file.** A spec
+  carries the user's own content — question text, pre-filled defaults, file
+  paths, `target` destinations — and the trace is what people paste into
+  public bug reports. The trace now records the shape (kind, field and
+  option counts, byte size); `AIUI_TRACE_SPECS=1` restores the full body
+  when it is genuinely needed (#185).
+- **A `secret` field without a `target` handed its plaintext to the agent.**
+  Both `skill.md` and the `form` tool description promise a `secret` value
+  is "NEVER returned to you", but the stripping keyed on the presence of
+  `target`, not on the field kind — and `target` is a nested object that is
+  easy to omit. A `secret` without one sailed through validation (there was
+  even a unit test asserting that shape valid), looked identical to a
+  `password` in the UI, and its value went back in `result.values` and thus
+  into the transcript. Three layers now close it: the companion rejects the
+  shape with `invalid_spec`, and both the frontend and the Python bridge
+  strip on the kind rather than on the target, so an older companion in
+  front of a newer bridge cannot leak either. A target-less `secret` is
+  rejected rather than silently downgraded to `password`: handing over a
+  credential the docs promised would never be returned has to be loud
+  (#186).
+
+- **The Python bridge discarded the reason for a rejected spec.**
+  `raise_for_status()` threw away the companion's `{error, detail, hint}`
+  body, so a remote agent got a bare `HTTPStatusError: 422` while a local
+  Rust-bridge agent got the explanation. The reason now survives the bridge
+  (#186).
 
 ## [0.10.1] — 2026-08-31
 

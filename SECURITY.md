@@ -2,11 +2,15 @@
 
 ## Supported Versions
 
-Only the latest released version is supported with security fixes. The
-in-app updater delivers patches automatically to installed clients —
-keep aiui up to date (it auto-checks; you can also force a check via
-`/aiui:update` in Claude Code or the „Check for updates" button in
-Settings).
+Only the latest released version is supported with security fixes.
+
+aiui checks for a new version automatically every 6 hours and surfaces
+what it finds — a system notification and a banner in the settings window.
+**Installing is not automatic:** it takes one click on that banner, or
+`/aiui:update` in Claude Code, or the „Check for updates" button in
+Settings. A security fix therefore reaches a client only once its user
+acts, which is worth knowing when you are deciding how long a
+vulnerability stays exploitable in the field.
 
 ## Reporting a vulnerability
 

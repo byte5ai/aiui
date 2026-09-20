@@ -157,6 +157,14 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
     }
     let path = expand_tilde(&target.path);
     let display = path.display().to_string();
+    // An empty credential is never a legitimate write, and truncating the
+    // user's file is not a dialog's job (issue #177). Refusing here, before
+    // the mode match, covers `create` (which would clobber under
+    // `overwrite`) *and* `substitute` (which needs no `overwrite` and would
+    // destroy the sentinel, making a retry impossible).
+    if value.is_empty() {
+        return WriteOutcome::fail(display, "refusing to write an empty value".into());
+    }
     let perm = target.perm.as_deref().and_then(parse_perm).or(Some(0o600));
     match target.mode {
         WriteMode::Create => {
@@ -253,6 +261,62 @@ mod tests {
         let out3 = write_local("new", &target_ow);
         assert!(out3.written);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_refuses_empty_value() {
+        // Issue #177: a blank field must never truncate an existing file, not
+        // even with `overwrite: true` — the guard sits before the mode match.
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "ghp_existing").unwrap();
+        let target = Target {
+            mode: WriteMode::Create,
+            path: path.to_string_lossy().into_owned(),
+            perm: Some("0600".into()),
+            overwrite: true,
+            placeholder: None,
+        };
+        let out = write_local("", &target);
+        assert!(!out.written, "empty value must be refused");
+        assert_eq!(out.bytes, 0);
+        assert!(
+            out.error.as_deref().unwrap_or("").contains("empty"),
+            "error names the cause: {:?}",
+            out.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ghp_existing",
+            "file is byte-identical to before"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn substitute_refuses_empty_value() {
+        // Issue #177: the worse half — `substitute` needs no `overwrite`, and
+        // an empty value would erase the sentinel, so even a retry fails.
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "token: __AIUI_SECRET_PAT__\nother: 1\n").unwrap();
+        let target = Target {
+            mode: WriteMode::Substitute,
+            path: path.to_string_lossy().into_owned(),
+            perm: None,
+            overwrite: false,
+            placeholder: Some("__AIUI_SECRET_PAT__".into()),
+        };
+        let out = write_local("", &target);
+        assert!(!out.written, "empty value must be refused");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("__AIUI_SECRET_PAT__"),
+            "sentinel survives so a retry is still possible: {after:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

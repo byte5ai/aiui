@@ -115,6 +115,13 @@ notification-permission prompt; a denied permission comes back as
   Never style a save button red; never style a delete button green.
 - Offer an escape hatch (`skip_validation: true`) so required-field validation
   never traps the user.
+- **An escape hatch does not commit `target` file writes.** An action with
+  `skip_validation: true` is non-committing: pressing it writes no `target`
+  field to disk, and each such field comes back as
+  `{written: false, error: "action '<value>' does not commit target writes"}`.
+  The built-in submit button always commits. If an action needs both — skip
+  validation *and* write — set `writes_targets: true` on it explicitly.
+  An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
 ## The `list` field — one widget, four modes
@@ -374,8 +381,10 @@ file on the user's machine won't resolve from a remote agent, or vice versa —
 the bridge that reads it is on the agent's host; use `http(s)://` or inline
 `data:`); **bare URLs in `markdown` field text** (`![alt](url)` follows the
 same CSP — the resolver only walks `src` / `thumbnail`, not markdown
-bodies); **`<a href="https://…">` links** work as a click target but open
-in the user's default browser, not an image-rendering path. A missing file,
+bodies); **`https://…` links** in `markdown` and in a `compare` variant's
+`content` work as a click target and open in the user's default browser —
+the dialog window never navigates, so the dialog stays open and still
+returns a result. Only `http(s)` opens; anything else is ignored. A missing file,
 a CSP block, and a 404 all look identical to the user — if they report a
 broken image, ask once whether anything appeared at all.
 
@@ -446,6 +455,15 @@ bytes}`, never the value).
   `create` and `substitute` both work identically local and remote — no
   foreign host. The user sees the path and approves by submitting. Errors:
   `{written:false, error}`.
+- A `secret` field MUST carry a `target` — the write-only promise is what
+  the kind means, so a target-less `secret` is rejected (`invalid_spec`)
+  instead of returning the plaintext. Want the value back? Use `password`.
+- A blank field writes nothing: an empty value is refused in both modes
+  (`"refusing to write an empty value"`), so a skipped optional field never
+  truncates the file and `substitute` never erases its own sentinel.
+- Only an affirmative action writes: the submit button or a plain named
+  action. An action with `skip_validation: true` does not commit; set
+  `writes_targets: true` on it if it must.
 
 Replaces the fragile "guess a shell one-liner to stash a token" pattern.
 QoL + confused-deputy guard, not a hard guarantee.
@@ -489,6 +507,10 @@ aiui.form(
     ],
 )
 ```
+
+Note: `Cancel` and `Save draft` carry `skip_validation: True`, so neither
+commits a `target` file write — only `Create` does. That is the rule, not a
+property of this example.
 
 Response: `{cancelled: false, action: "commit", values: {job: "…",
 scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.

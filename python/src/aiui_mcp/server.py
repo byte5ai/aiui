@@ -151,7 +151,17 @@ def _token() -> str:
             "settings window (adds the token automatically). "
             "Download: https://github.com/byte5ai/aiui/releases/latest"
         )
-    return TOKEN_PATH.read_text().strip()
+    tok = TOKEN_PATH.read_text().strip()
+    # Issue #185: a truncated or empty token must fail loudly here rather
+    # than being sent as a bare `Bearer ` that the companion then rejects
+    # with an opaque 401. A well-formed aiui token is 64 hex chars.
+    if len(tok) != 64 or any(c not in "0123456789abcdefABCDEF" for c in tok):
+        raise RuntimeError(
+            f"aiui token at {TOKEN_PATH} is malformed ({len(tok)} chars, expected 64 hex). "
+            "Re-register this remote from the companion's settings window on your Mac "
+            "to write a fresh token."
+        )
+    return tok
 
 
 def _explain_exc(e: BaseException) -> str:
@@ -553,6 +563,32 @@ def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _collect_secret_fields(spec: dict[str, Any]) -> list[str]:
+    """Names of every `secret`-kind field, with or without a `target` (#186).
+
+    The write-only contract is a property of the KIND — the docs say a
+    secret's value is never returned — but the strip used to key on `target`,
+    so a target-less `secret` travelled back to the agent as plaintext.
+    """
+    out: list[str] = []
+
+    def scan(fields: Any) -> None:
+        if isinstance(fields, list):
+            for f in fields:
+                if (
+                    isinstance(f, dict)
+                    and f.get("kind") == "secret"
+                    and isinstance(f.get("name"), str)
+                ):
+                    out.append(f["name"])
+
+    scan(spec.get("fields"))
+    for tab in spec.get("tabs") or []:
+        if isinstance(tab, dict):
+            scan(tab.get("fields"))
+    return out
+
+
 def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
     host (the bridge runs where the agent runs, so the file is always local).
@@ -565,6 +601,15 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
         return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
     path = Path(raw_path).expanduser()
     display = str(path)
+    # Issue #177: an empty credential is never a legitimate write, and
+    # truncating the user's file is not a dialog's job. Refusing here, before
+    # the mode dispatch, covers `create` (which would clobber under
+    # `overwrite`) *and* `substitute` (which needs no `overwrite` and would
+    # erase the sentinel, making a retry impossible). Mirrors the identical
+    # guard in Rust `filewrite::write_local`.
+    if value == "":
+        return {"written": False, "target": display, "bytes": 0,
+                "error": "refusing to write an empty value"}
     mode = target.get("mode")
     perm_s = target.get("perm")
     try:
@@ -614,26 +659,96 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
         return {"written": False, "target": display, "bytes": 0, "error": str(e)}
 
 
+def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
+    """Issue #177: does the action the user pressed commit `target` file
+    writes? Mirror of the Rust `action_commits_targets`, resolved from the
+    spec the agent submitted.
+
+    The built-in submit (`action: None`/absent) always commits. A named action
+    commits unless it carries `skip_validation: True` — documented as an escape
+    hatch so required-field validation never traps the user, and an escape
+    hatch is by definition non-committing. `writes_targets: True` is the
+    explicit opt-in for an action that needs both. An action not found in the
+    spec fails closed.
+
+    Deliberately not keyed on `destructive`/`primary`: both are styling and
+    orthogonal to committing.
+    """
+    if action is None:
+        return True
+    actions = spec.get("actions")
+    if not isinstance(actions, list):
+        return False  # named action but no action list — fail closed
+    entry = next(
+        (a for a in actions if isinstance(a, dict) and a.get("value") == action),
+        None,
+    )
+    if entry is None:
+        return False  # unknown action — fail closed
+    if entry.get("writes_targets") is True:
+        return True
+    return entry.get("skip_validation") is not True
+
+
 def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
     """After a render returns, perform the local file writes for `target`
     fields on THIS host and fold the outcomes back into the result, stripping
     raw `secret` values so they never reach the agent. No-op on cancel or when
     no field carries a target. Mutates `data` in place.
+
+    Issue #177: only an affirmative action commits the writes. A
+    non-committing action (and a field absent from the payload) still yields a
+    per-field outcome, so the agent gets a reason rather than silence — and a
+    `secret` value is stripped either way.
     """
     if data.get("cancelled"):
         return
     targets = _collect_target_fields(spec)
-    if not targets:
+    secrets = _collect_secret_fields(spec)
+    # #186: a target-less `secret` is exactly the case the old
+    # `if not targets: return` short-circuited past, leaking the plaintext.
+    if not targets and not secrets:
         return
-    values = data.setdefault("result", {}).setdefault("values", {})
+    result = data.setdefault("result", {})
+    values = result.setdefault("values", {})
+    action = result.get("action")
+    commits = _action_commits_targets(spec, action)
     for field in targets:
         name = field["name"]
         v = values.get(name)
-        outcome = _write_local_target("" if v is None else str(v), field["target"])
+        if not commits:
+            label = action if action is not None else "(submit)"
+            outcome = {"written": False, "target": str(field["target"].get("path", "")),
+                       "bytes": 0,
+                       "error": f"action '{label}' does not commit target writes"}
+        elif name not in values or v is None:
+            # "Absent from the payload" is not "submitted blank": never
+            # launder a missing key into an empty write.
+            outcome = {"written": False, "target": str(field["target"].get("path", "")),
+                       "bytes": 0, "error": "no value submitted for this field"}
+        else:
+            outcome = _write_local_target(str(v), field["target"])
         if field.get("kind") == "secret":
             values[name] = outcome  # write-only: raw value never returned
         else:
             values[name] = {"value": v, **outcome}
+
+    # #186: a `secret` carrying no `target` was never in `targets`, so nothing
+    # above replaced it. A current companion rejects that shape at
+    # validate_spec, but an older companion in front of this bridge would not
+    # — and the value must not reach the agent regardless of which side is
+    # newer.
+    for name in secrets:
+        v = values.get(name)
+        if isinstance(v, dict) and "written" in v:
+            continue  # already replaced by a write outcome above
+        if name in values:
+            values[name] = {
+                "written": False,
+                "target": "",
+                "bytes": 0,
+                "error": "secret field has no target — value discarded, never returned",
+            }
 
 
 def _upload_safe_base_name(raw: str) -> str | None:
@@ -822,6 +937,22 @@ async def _post_render(
                 "session_origin": _session_origin(),
             },
         )
+        # #186/#182: a 422 from the companion carries `{error, detail, hint}`
+        # — the whole point of the structured rejection. `raise_for_status`
+        # discards the body, so a bridge-served agent used to get a bare
+        # `HTTPStatusError: 422` and no idea what was wrong with its spec,
+        # while a local Rust-bridge agent got the explanation. Surface it.
+        if r.status_code == 422:
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            detail = body.get("detail") or "the companion rejected the dialog spec"
+            hint = body.get("hint")
+            raise RuntimeError(
+                f"aiui rejected the dialog spec (invalid_spec): {detail}"
+                + (f" — {hint}" if hint else "")
+            )
         r.raise_for_status()
         first = r.json()
         if r.status_code == 202:
@@ -846,7 +977,17 @@ async def _post_render(
 
 def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("cancelled"):
-        return {"cancelled": True}
+        out: dict[str, Any] = {"cancelled": True}
+        # #180: forward WHY. The companion sets `host_exiting`,
+        # `ttl_expired`, `evicted` and `channel_dropped`, but the bridge
+        # flattened them all into a bare
+        # `{"cancelled": true}` — indistinguishable from the user pressing
+        # Escape. An agent that cannot tell "the user declined" from "the
+        # companion was shutting down" retries the wrong thing.
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason:
+            out["reason"] = reason
+        return out
     return {"cancelled": False, **payload.get("result", {})}
 
 
@@ -952,7 +1093,7 @@ async def form(
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
     - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.
     - secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you (#135). Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.
-    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value); a non-secret field with `target` is written AND returned. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
+    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value) and a `target` is REQUIRED: a target-less `secret` is rejected with `invalid_spec` instead of returning the plaintext — use `password` if you want the value back. A non-secret field with `target` is written AND returned. Only an affirmative action commits the write: the submit button or a plain named action — an action carrying `skip_validation:true` (Cancel / Save draft) writes nothing and returns `{written:false, error}` per field, unless you set `writes_targets:true` on it. A blank field writes nothing either (`refusing to write an empty value`), in both modes. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
     - number:      {kind, name, label, default?, min?, max?, step?, required?}
     - select:      {kind, name, label, options: [{label, value}], default?, required?}
     - checkbox:    {kind, name, label, default?}

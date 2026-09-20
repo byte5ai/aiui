@@ -77,7 +77,8 @@ three agree — the workflow's first step hard-fails on drift.
 
 Builds on a `macos-14` runner, Developer-ID-signs + notarizes via the App
 Store Connect API key, produces the DMG + signed updater bundle +
-`latest.json`, cuts the GitHub release, and publishes `aiui-mcp` to PyPI.
+`latest.json`, cuts the GitHub release **as a draft**, publishes
+`aiui-mcp` to PyPI, and dispatches the Windows workflow.
 
 ```sh
 gh workflow run release-macos.yml -f version=X.Y.Z --repo byte5ai/aiui
@@ -91,16 +92,33 @@ PyPI runs last, after the GitHub release succeeded, because PyPI versions
 are permanent. The tag and release steps are idempotent, so a run that
 failed at PyPI can be re-dispatched with the same version to recover.
 
+**The release stays a draft until the Windows run completes.** A draft is
+not served by `releases/latest/download/latest.json`, which is what every
+installed aiui polls — so until both platforms are in the feed, clients
+keep resolving the previous, complete one. This is deliberate: a feed
+missing a platform does not mean "no update" for that platform, it means
+an *error* (`TargetsNotFound`). v0.10.1 shipped exactly that and broke
+every Windows client's update check (#190).
+
 ### Windows — `release-windows.yml`
 
-Run **after** the macOS workflow, against the tag it created. Builds the
-NSIS installer plus the signed updater bundle, attaches all three
-artifacts to the existing release, and patches `latest.json` with the
-`windows-x86_64` entry.
+Dispatched **automatically** by the macOS workflow, against the tag it
+created. Builds the NSIS installer plus the signed updater bundle,
+attaches all three artifacts to the draft release, patches `latest.json`
+with the `windows-x86_64` entry, validates the assembled feed with
+`scripts/check-updater-feed.sh`, and only then publishes the release.
+
+If that run fails, the release **stays a draft and no client sees the new
+version** — including macOS users. That is the intended coupling for a
+two-platform product: half a release is what caused #190. Fix the cause
+and re-dispatch by hand:
 
 ```sh
 gh workflow run release-windows.yml -f tag=vX.Y.Z --repo byte5ai/aiui
 ```
+
+The run is idempotent (`gh release upload --clobber`, and the publish step
+skips an already-published release), so repeating it is safe.
 
 The Windows `.exe` ships **unsigned** — no Authenticode certificate, so
 SmartScreen warns on first launch. That is a deliberate v1 decision, not
@@ -110,6 +128,18 @@ Note that this differs from the per-push CI build: CI uses
 `tauri.ci.conf.json` (`createUpdaterArtifacts: false`) and produces the
 unsigned `.exe`. The updater signature (`<installer>.exe.sig`) that the
 update feed needs comes from `release-windows.yml` alone.
+
+### The updater feed
+
+`scripts/check-updater-feed.sh <latest.json> <tag> <version>` is the guard
+that keeps `latest.json` publishable. It refuses a feed that is missing a
+shipped platform, carries an empty signature or url, points an entry at a
+different release's artifact, or advertises the wrong version. The list of
+platforms aiui ships for lives in that script, in one place — adding one
+later is a one-line change there.
+
+`scripts/test-check-updater-feed.sh` exercises it against fixtures and runs
+on every PR, so the guard cannot quietly stop guarding.
 
 ## Issues
 

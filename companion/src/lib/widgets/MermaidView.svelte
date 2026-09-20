@@ -6,26 +6,25 @@
   //
   // Pipeline:
   //   1. mermaid.render() turns the source DSL into an SVG string
-  //   2. DOMPurify sanitises the SVG (script + event-attrs out)
+  //   2. sanitizeMermaidSvg() strips script/style/event handlers
   //   3. {@html} drops it into the DOM
   //
-  // mermaid.initialize({ securityLevel: 'strict' }) blocks HTML-in-labels
-  // upstream; the DOMPurify pass is the second line of defence.
+  // Issue #189: node labels used to come out empty. Mermaid 11 renders
+  // flowchart labels as HTML inside `<foreignObject>`, and a DOMPurify
+  // *profile* replaces the allow-list rather than adding to it — so with
+  // `USE_PROFILES: { svg, svgFilters }` the element was never allowed,
+  // and `foreignobject` is additionally in `DEFAULT_FORBID_CONTENTS`, so
+  // its children went too. Dropping it from `FORBID_TAGS` in v0.4.38 was
+  // therefore a no-op: nothing it forbade was reachable anyway, and the
+  // "Verfassungsorgane" regression it was meant to fix stayed broken.
   //
-  // v0.4.38: `<foreignObject>` is allowed through now. Mermaid 11 renders
-  // flowchart node labels inside `<foreignObject>` elements (HTML inside
-  // SVG, for proper word-wrapping). `securityLevel: 'strict'` blocks the
-  // HTML *inside* those elements being interpreted as markup, but does
-  // not stop Mermaid from emitting the elements themselves — and our
-  // previous belt-and-braces strip was deleting them outright, leaving
-  // labelless boxes (the 0.4.37 Verfassungsorgane test). DOMPurify's
-  // svg/svgFilters profile + the FORBID_ATTR list still keep scripts and
-  // event handlers out, so dropping `foreignObject` from FORBID_TAGS is
-  // safe.
+  // The real fix is `htmlLabels: false` at init, so Mermaid keeps labels
+  // in `<text>`/`<tspan>` — which the svg profile does allow. The
+  // sanitiser stays strict; see ../mermaid-config.ts for why widening it
+  // would be the wrong trade.
 
-  import { onMount } from "svelte";
   import mermaid from "mermaid";
-  import DOMPurify from "dompurify";
+  import { MERMAID_INIT_CONFIG, sanitizeMermaidSvg } from "../mermaid-config";
 
   let { source, label, max_height }: { source: string; label?: string; max_height?: number } = $props();
 
@@ -35,17 +34,7 @@
 
   function ensureInit() {
     if (initialised) return;
-    mermaid.initialize({
-      startOnLoad: false,
-      // `default` matches macOS-system-light look out of the box; we
-      // don't try to chase the OS dark-mode toggle here — the diagram
-      // sits in our themed container, contrast stays readable.
-      theme: "default",
-      // Strict means: HTML in node labels is rejected (treated as
-      // text), markdown links are not rendered as links, no
-      // <foreignObject> escape hatches.
-      securityLevel: "strict",
-    });
+    mermaid.initialize(MERMAID_INIT_CONFIG);
     initialised = true;
   }
 
@@ -60,14 +49,7 @@
     mermaid
       .render(id, source)
       .then(({ svg: rendered }) => {
-        svg = DOMPurify.sanitize(rendered, {
-          USE_PROFILES: { svg: true, svgFilters: true },
-          // Mermaid 11 emits node labels inside `<foreignObject>`, so
-          // it stays in the allow-list. `<script>` is the only tag we
-          // forbid outright; event-handler attrs are caught by FORBID_ATTR.
-          FORBID_TAGS: ["script"],
-          FORBID_ATTR: ["onclick", "onload", "onerror", "onmouseover"],
-        });
+        svg = sanitizeMermaidSvg(rendered);
         error = null;
       })
       .catch((e) => {
@@ -76,15 +58,13 @@
       });
   }
 
-  onMount(() => {
-    rerender();
-  });
-
-  // Re-render if the source changes (rare in a single dialog, but the
-  // agent can in principle re-emit a render with a different spec).
+  // One owner for both the first render and any later source change.
+  // `onMount` + an `initialised`-gated effect used to mean the first
+  // render happened twice on mount in some orderings, and never at all in
+  // others — the effect's guard reads a flag `rerender` itself sets.
   $effect(() => {
     void source;
-    if (initialised) rerender();
+    rerender();
   });
 </script>
 
