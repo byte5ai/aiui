@@ -589,7 +589,7 @@
           <button
             class="add-remote-error-dismiss"
             onclick={() => (addRemoteError = null)}
-            aria-label={$_("settings.remotes.add.error.dismiss")}>×</button>
+            aria-label={$_("settings.remotes.add.error_dismiss")}>×</button>
         </div>
       {/if}
       <p class="subtitle" style="margin: 6px 0 0 0; font-size: 11.5px;">
@@ -678,7 +678,10 @@
     padding: 8px 12px;
     border: 1px solid color-mix(in srgb, var(--warning, #f3c623) 60%, var(--border));
     background: color-mix(in srgb, var(--warning, #f3c623) 18%, var(--bg, #fff));
-    color: color-mix(in srgb, var(--warning, #f3c623) 70%, var(--fg, #000));
+    /* 70% amber against the light wash measured ≈3.2:1 — under AA for
+       12.5px text. 35% keeps the warm tint while letting `--fg` carry the
+       legibility (#207). */
+    color: color-mix(in srgb, var(--warning, #f3c623) 35%, var(--fg, #000));
     border-radius: 8px;
     font-size: 12.5px;
     line-height: 1.4;
@@ -690,7 +693,10 @@
   .update-banner-button {
     flex: 0 0 auto;
     background: var(--warning, #f3c623);
-    color: var(--bg, #fff);
+    /* `var(--bg)` here painted near-white on amber in light mode: ≈2.06:1 on
+       the app's primary update CTA. `--warning-fg` is dark in both themes
+       (#207). */
+    color: var(--warning-fg, #1b1714);
     border: none;
     border-radius: 6px;
     padding: 4px 10px;

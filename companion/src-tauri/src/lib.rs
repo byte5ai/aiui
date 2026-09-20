@@ -308,6 +308,57 @@ fn get_dialog_spec(
     Ok(state.get_request(&id))
 }
 
+/// Seconds left before the backend sweeps this dialog, or `None` if it is
+/// already gone. The open window re-reads this every ~30 s and on
+/// `visibilitychange` to rebase its countdown deadline: the WebView's
+/// `Date.now()` and Rust's monotonic `Instant` disagree across a system
+/// sleep, and WebView timers are throttled in an occluded window, so a
+/// deadline derived once at mount drifts in both directions (#207).
+#[tauri::command]
+fn get_dialog_remaining(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<Option<u64>, String> {
+    Ok(state.remaining_secs(&id))
+}
+
+/// Absolute destination per `target`-carrying field, keyed by field name, so
+/// the approval line can show the path that will actually be written instead
+/// of the agent-supplied `~/`-form (`docs/skill.md` promises the resolved
+/// path). Only meaningful for a LOCAL session — for a bridge-served one the
+/// write happens on the agent's host with *that* host's `$HOME`, so the shell
+/// does not call this and keeps the raw form, qualified with the origin
+/// (#207).
+#[tauri::command]
+fn resolve_dialog_targets(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let req = state
+        .get_request(&id)
+        .ok_or_else(|| "dialog no longer active".to_string())?;
+    let mut out = std::collections::HashMap::new();
+    for field in collect_target_fields(&req.spec) {
+        let name = match field.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let path = match field
+            .get("target")
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        out.insert(
+            name,
+            filewrite::expand_tilde(path).to_string_lossy().into_owned(),
+        );
+    }
+    Ok(out)
+}
+
 /// Frontend response to a `ui:ping` event from `/health`. Same shape as
 /// `dialog_received` but routed to the generic ack registry.
 #[tauri::command]
@@ -2230,6 +2281,8 @@ pub fn run() {
             dialog_cancel,
             write_dialog_targets,
             get_dialog_spec,
+            get_dialog_remaining,
+            resolve_dialog_targets,
             ui_pong,
             close_window,
             surface_for_dialog,

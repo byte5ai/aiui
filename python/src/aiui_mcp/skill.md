@@ -193,6 +193,9 @@ It is a UI guard, not a security control — still validate what you get.
 | – | – | ✓ | Ordering via drag handles |
 | ✓ | ✓ | ✓ | Pick-and-order |
 
+Every mode is fully keyboard-operable: Tab to an item, Enter or Space to
+select, Alt+↑/↓ (Cmd+↑/↓ also works) to reorder a sortable one.
+
 Result is always `{selected: [values], order: [values]}` — `order` reflects
 drag changes, `selected` reflects checkbox state. Each item's `value` must
 be non-empty and unique — it keys the result, and a duplicate is rejected.
@@ -205,7 +208,10 @@ carousel slides where the visual anchor matters more than the label.
 When you'd otherwise dump 30 branches / 50 search results / 20 stale
 files into chat, hand it as a `table` instead. Columns carry the context
 (date, size, owner) that `list` can't, rows are clickable for selection,
-and the agent gets back the picked rows by their `value`.
+and the agent gets back the picked rows by their `value`. Keyboard works
+too: a `multi_select` table gives every row a real checkbox, a
+single-select row is focusable (Enter/Space picks it), and sortable column
+headers are buttons reachable by Tab.
 
 ```
 columns: [{key, label, align?: "left"|"right"|"center"}]
@@ -589,8 +595,11 @@ bytes, mode}`, never the value).
 - Destination is always your own host: the aiui module there (native app
   locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
   `create` and `substitute` both work identically local and remote — no
-  foreign host. The user sees the path and approves by submitting. Errors:
-  `{written:false, error}`.
+  foreign host. The user sees the destination and approves by submitting —
+  a local session shows the resolved absolute path, a bridge-served one the
+  path as you wrote it plus the host it lands on (the companion must not
+  expand `~` for a remote write; that home is a different machine's).
+  Errors: `{written:false, error}`.
 - `path` must be absolute or `~/`-rooted; relative (`notes/key`) and
   `~user/` (`~alice/key`) are rejected — neither names a stable
   destination, same rule as `upload`'s `target_dir`. Symlinks are followed:

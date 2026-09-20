@@ -14,6 +14,18 @@ pub struct DialogRequest {
     /// auto-cancel slightly before the backend sweeps. Single source
     /// of truth for "how long the user has" is here in Rust. v0.4.41.
     pub ttl_secs: u64,
+    /// How much of `ttl_secs` is actually LEFT at the moment this payload is
+    /// pulled, measured from `created_at` — i.e. from `register_dialog`,
+    /// which is also when the authoritative `tokio::time::timeout` was armed.
+    ///
+    /// `ttl_secs` alone was not enough: the frontend scheduled its banners and
+    /// its auto-cancel from the moment the WebView finished `get_dialog_spec`,
+    /// so window creation plus a cold WebView start silently ate into the
+    /// 5 s lead the auto-cancel is supposed to have over the backend sweep —
+    /// and could make it negative. Additive: `ttl_secs` stays, and this field
+    /// never leaves the Tauri IPC boundary (#207).
+    #[serde(default)]
+    pub remaining_secs: u64,
     /// Human-legible session label the caller passed (project name, task,
     /// etc.) so the user can tell which session a dialog belongs to when
     /// several are open at once (Invariant I8). `None` if the caller passed
@@ -66,6 +78,16 @@ pub const DIALOG_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// occupancy model changes again, re-read that message and `docs/skill.md`'s
 /// `evicted` reason before shipping.
 pub const DIALOG_HARD_CAP: usize = 16;
+
+/// Seconds left of `ttl` after `elapsed` has passed, floored at zero.
+///
+/// Pure on purpose: the saturation is the whole point. `Duration::sub` panics
+/// on underflow in debug and `u64` subtraction wraps to ~1.8e19 in release —
+/// either way an entry that outlived its TTL must report `0`, not a countdown
+/// the user would believe (#207).
+pub fn remaining_ttl_secs(ttl: Duration, elapsed: Duration) -> u64 {
+    ttl.saturating_sub(elapsed).as_secs()
+}
 
 struct PendingEntry {
     /// Resolves the `/render` waiter once the user submits or cancels.
@@ -428,6 +450,9 @@ impl DialogState {
             id: id.clone(),
             spec,
             ttl_secs,
+            // Filled per-pull in `request_at` from the entry's age; the stored
+            // copy is just the full TTL at t=0.
+            remaining_secs: ttl_secs,
             session,
             session_origin,
         };
@@ -448,7 +473,37 @@ impl DialogState {
     /// gone (already resolved, evicted, or never existed) — the window then
     /// closes itself.
     pub fn get_request(&self, id: &str) -> Option<DialogRequest> {
-        self.pending.lock().unwrap().get(id).map(|e| e.request.clone())
+        self.request_at(id, Instant::now())
+    }
+
+    /// `get_request` with an injectable "now", so the age-dependent part is
+    /// testable without a `thread::sleep` in CI.
+    fn request_at(&self, id: &str, now: Instant) -> Option<DialogRequest> {
+        let map = self.pending.lock().unwrap();
+        let entry = map.get(id)?;
+        let mut request = entry.request.clone();
+        request.remaining_secs = remaining_ttl_secs(
+            Duration::from_secs(request.ttl_secs),
+            now.saturating_duration_since(entry.created_at),
+        );
+        Some(request)
+    }
+
+    /// Seconds left for `id`, or `None` when the dialog is gone (resolved,
+    /// evicted, never existed). The open dialog window re-reads this
+    /// periodically to rebase its countdown: Rust's `Instant` is monotonic and
+    /// may not advance across a system sleep while the WebView's `Date.now()`
+    /// does, so a deadline derived once at mount drifts in either direction
+    /// (#207).
+    pub fn remaining_secs(&self, id: &str) -> Option<u64> {
+        self.get_request(id).map(|r| r.remaining_secs)
+    }
+
+    /// Registration instant of `id`. Test-only: it is the anchor the
+    /// injected-clock TTL tests offset from, so they never have to sleep.
+    #[cfg(test)]
+    fn created_at(&self, id: &str) -> Option<Instant> {
+        self.pending.lock().unwrap().get(id).map(|e| e.created_at)
     }
 
     pub fn complete(&self, id: &str, result: serde_json::Value) {
@@ -640,11 +695,51 @@ mod tests {
         let req = s.get_request(&id).expect("request stored for pull");
         assert_eq!(req.id, id);
         assert_eq!(req.ttl_secs, 42);
+        // #207 is additive: `ttl_secs` keeps its meaning, and `remaining_secs`
+        // can never exceed it.
+        assert!(req.remaining_secs <= req.ttl_secs);
         assert_eq!(req.session.as_deref(), Some("my-project"));
         assert_eq!(req.session_origin.as_deref(), Some("macmini"));
         // Once resolved, the pull returns None so the window closes itself.
         s.complete(&id, serde_json::json!({}));
         assert!(s.get_request(&id).is_none());
+    }
+
+    #[test]
+    fn remaining_ttl_secs_saturates_at_zero() {
+        assert_eq!(remaining_ttl_secs(DIALOG_TTL, Duration::ZERO), 7200);
+        assert_eq!(remaining_ttl_secs(DIALOG_TTL, Duration::from_secs(100)), 7100);
+        // Past the TTL the answer is 0 — NOT an underflowed u64, which is what
+        // a plain subtraction would hand the countdown.
+        assert_eq!(remaining_ttl_secs(DIALOG_TTL, Duration::from_secs(9000)), 0);
+    }
+
+    #[test]
+    fn get_request_remaining_shrinks_with_entry_age() {
+        let s = DialogState::new();
+        let (id, _rx) = s.register_dialog(serde_json::json!({"kind": "confirm"}), None, None, 7200);
+        let created = s.created_at(&id).expect("entry just registered");
+        // Injected clock rather than a real sleep — CI stays fast.
+        let req = s
+            .request_at(&id, created + Duration::from_secs(100))
+            .expect("still pending");
+        assert_eq!(req.ttl_secs, 7200);
+        assert_eq!(req.remaining_secs, 7100);
+        // And an entry older than its TTL reports zero, not a wrapped value.
+        let stale = s
+            .request_at(&id, created + Duration::from_secs(9000))
+            .expect("still pending");
+        assert_eq!(stale.remaining_secs, 0);
+    }
+
+    #[test]
+    fn remaining_secs_is_none_for_resolved_or_unknown_dialog() {
+        let s = DialogState::new();
+        let (id, _rx) = s.register_dialog(serde_json::json!({"kind": "confirm"}), None, None, 7200);
+        assert!(s.remaining_secs(&id).is_some());
+        s.complete(&id, serde_json::json!({}));
+        assert!(s.remaining_secs(&id).is_none());
+        assert!(s.remaining_secs("no-such-dialog").is_none());
     }
 
     #[test]

@@ -233,6 +233,10 @@ a UI guard, not a security control.
 | – | – | ✓ | Ordering via drag handles |
 | ✓ | ✓ | ✓ | Pick-and-order |
 
+Every mode is fully keyboard-operable: Tab to an item, Enter or Space to
+select, Alt+↑/↓ (Cmd+↑/↓ also works) to reorder a sortable one — so a
+sortable list is answerable without a mouse, and the reorder is announced.
+
 Result is always `{selected: [values], order: [values]}` — `order` reflects
 drag changes, `selected` reflects checkbox state. Each item's `value` must
 be non-empty and unique — it keys the result, and a duplicate is rejected.
@@ -246,7 +250,10 @@ carousel slides where the visual anchor matters more than the label.
 When you'd otherwise dump 30 branches / 50 search results / 20 stale
 files into chat, hand it as a `table` instead. Columns carry the context
 (date, size, owner) that `list` can't, rows are clickable for selection,
-and the agent gets back the picked rows by their `value`.
+and the agent gets back the picked rows by their `value`. Keyboard works
+too: a `multi_select` table gives every row a real checkbox, a
+single-select table makes the row itself focusable (Enter/Space picks it),
+and sortable column headers are buttons reachable by Tab.
 
 ```
 columns: [{key, label, align?: "left"|"right"|"center"}]
@@ -850,8 +857,12 @@ that field is a `password`, not a `secret`.
   session), and it performs the write as a plain **local** file operation.
   So `create` and `substitute` behave identically local and remote (the
   entered value reaches that module over aiui's own channel, never via the
-  agent). You cannot target a foreign host; the user sees the resolved path
-  and approves it by submitting.
+  agent). You cannot target a foreign host. The user sees the destination
+  and approves it by submitting: for a local session the **resolved
+  absolute path** (`~/` expanded by the app that will do the write), for a
+  bridge-served session the path as you wrote it, qualified with the host
+  it lands on — the companion deliberately does not expand `~` there,
+  because that would name the wrong machine's home.
 - **`path` must be absolute or `~/`-rooted.** A relative path (`notes/key`)
   and a `~user/` path (`~alice/key`) are rejected — a relative path has no
   stable working directory to resolve against, and `~user/` is not portable

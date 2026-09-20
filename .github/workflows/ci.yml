@@ -203,6 +203,14 @@ jobs:
       - name: Guard the release step order
         run: ./scripts/check-release-ordering.sh
 
+      # #207: the `target` file-write approval line — the only disclosure of
+      # an arbitrary file write, and the thing the submit button approves —
+      # shipped as hardcoded German, unreadable to anyone outside `de`. This
+      # guard fails a PR that leaves a German literal in a component or that
+      # adds a key to one catalog but not the other.
+      - name: Check i18n catalog parity and hardcoded German
+        run: ./scripts/check-i18n-parity.sh
+
   workflow-pins:
     name: Workflow pin guard
     runs-on: ubuntu-latest
