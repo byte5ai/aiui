@@ -9,11 +9,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from aiui_mcp import server
 from aiui_mcp.server import (
     _action_commits_targets,
+    _annotate_target_paths,
     _collect_secret_fields,
     _apply_target_writes,
     _collect_target_fields,
+    _target_path_error,
     _write_local_target,
 )
 
@@ -288,3 +291,187 @@ def test_absent_secret_value_is_not_invented(tmp_path: Path) -> None:
     data = {"cancelled": False, "result": {"action": None, "values": {}}}
     _apply_target_writes(spec, data)
     assert "pat" not in data["result"]["values"]
+
+
+# --- issue #199: the two bridges must agree, and nothing may escape as an
+# exception after the user has already typed (and lost) a credential
+
+
+def test_substitute_preserves_existing_mode(tmp_path: Path) -> None:
+    """The headline: a 0644 compose file came back 0600 and the container
+    reading it as another uid stopped starting — reported as `written: true`,
+    with nothing in the outcome naming the change."""
+    path = tmp_path / "docker-compose.yml"
+    path.write_text("token: __PAT__\n")
+    os.chmod(path, 0o644)
+    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
+                                        "placeholder": "__PAT__"})
+    assert out["written"], out
+    assert (path.stat().st_mode & 0o777) == 0o644, "substitute keeps the file's own mode"
+    assert out["mode"] == "0644", "and the outcome says which mode was applied"
+
+    # An explicit `perm` still wins.
+    path.write_text("token: __PAT__\n")
+    out2 = _write_local_target("ghp_y", {"mode": "substitute", "path": str(path),
+                                         "placeholder": "__PAT__", "perm": "0640"})
+    assert out2["written"], out2
+    assert (path.stat().st_mode & 0o777) == 0o640
+    assert out2["mode"] == "0640"
+
+
+def test_create_defaults_to_0600_without_perm(tmp_path: Path) -> None:
+    """Pins tight-by-default against a naive "drop the 0600" fix for the
+    substitute bug — that would give a fresh credential file the umask."""
+    path = tmp_path / "token"
+    out = _write_local_target("ghp_secret", {"mode": "create", "path": str(path)})
+    assert out["written"], out
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert out["mode"] == "0600"
+
+
+def test_substitute_writes_through_symlink(tmp_path: Path) -> None:
+    """Before: the read followed the link, `os.replace` landed ON it. The link
+    became a regular file holding the secret and the real config kept its
+    untouched placeholder — reported as a successful write."""
+    real = tmp_path / "real.yml"
+    link = tmp_path / "link.yml"
+    real.write_text("token: __PAT__\n")
+    link.symlink_to(real)
+    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(link),
+                                        "placeholder": "__PAT__"})
+    assert out["written"], out
+    assert os.path.islink(link), "the link must survive as a link"
+    assert real.read_text() == "token: ghp_x\n", "the real file is the one edited"
+    assert out["target"] == str(real.resolve()), "the outcome names the real destination"
+
+
+def test_substitute_non_utf8_target_returns_error(tmp_path: Path) -> None:
+    """A latin-1 `.ini` raised UnicodeDecodeError — a ValueError, so it slipped
+    past `except OSError` and killed the tool call with a traceback."""
+    path = tmp_path / "app.ini"
+    original = "user=André\ntoken=__PAT__\n".encode("latin-1")
+    path.write_bytes(original)
+    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
+                                        "placeholder": "__PAT__"})
+    assert out["written"] is False
+    assert out.get("error"), "a structured error, not an exception"
+    assert path.read_bytes() == original, "the file is left byte-identical"
+
+
+def test_substitute_preserves_non_ascii_bytes(tmp_path: Path, monkeypatch) -> None:
+    """A UTF-8 file round-trips byte-identical apart from the placeholder even
+    when the host locale is not UTF-8. The old code read with the locale
+    encoding and wrote back UTF-8, mangling every non-ASCII byte in a file the
+    user asked to touch on exactly one line."""
+    import locale
+
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda *a, **k: "latin-1")
+    path = tmp_path / "conf"
+    path.write_bytes("user=André\ntoken=__PAT__\n".encode("utf-8"))
+    out = _write_local_target("ghp_x", {"mode": "substitute", "path": str(path),
+                                        "placeholder": "__PAT__"})
+    assert out["written"], out
+    assert path.read_bytes() == "user=André\ntoken=ghp_x\n".encode("utf-8")
+
+
+def test_write_without_fchmod_does_not_crash(tmp_path: Path, monkeypatch) -> None:
+    """The Windows bridge host: `os.fchmod` does not exist there, and the
+    unguarded call made *every* target write die with AttributeError."""
+    monkeypatch.delattr(os, "fchmod", raising=True)
+    path = tmp_path / "token"
+    out = _write_local_target("ghp_x", {"mode": "create", "path": str(path)})
+    assert out["written"] is True, out
+    assert path.read_text() == "ghp_x"
+    assert "mode" not in out, "no mode bits to report off POSIX"
+
+
+def test_malformed_target_returns_structured_error() -> None:
+    """`"target": "~/.github_tokens/byte5ai"` (a string, not an object) used to
+    raise `AttributeError: 'str' object has no attribute 'get'`."""
+    out = _write_local_target("v", "not-a-dict")
+    assert out == {"written": False, "target": "", "bytes": 0,
+                   "error": "target must be an object with mode/path"}
+
+
+def test_collect_target_fields_skips_non_dict_target() -> None:
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "secret", "name": "str_target", "target": "~/x"},
+            {"kind": "text", "name": "ok", "target": {"mode": "create", "path": "/x"}},
+        ],
+    }
+    assert [f["name"] for f in _collect_target_fields(spec)] == ["ok"]
+
+
+def test_relative_and_tilde_user_paths_rejected(tmp_path: Path, monkeypatch) -> None:
+    """The two bridges resolved these differently — the agent's cwd here, the
+    GUI's cwd (typically `/`) there; `~alice/` expanded here, a literal
+    directory there. Neither destination is the one the user approved."""
+    monkeypatch.chdir(tmp_path)
+    for bad in ("notes/key", "~alice/key", "./key"):
+        out = _write_local_target("v", {"mode": "create", "path": bad})
+        assert out["written"] is False, bad
+        assert "absolute or ~/-rooted" in out["error"], out
+    assert not (tmp_path / "notes").exists(), "nothing written anywhere"
+    # The accepted shapes still work.
+    assert _write_local_target("v", {"mode": "create", "path": str(tmp_path / "a")})["written"]
+    assert _target_path_error("~/x") is None
+
+
+def test_apply_target_writes_never_raises(tmp_path: Path, monkeypatch) -> None:
+    """One bad field used to abort the loop, so the writes that had already
+    landed were never reported and the call died with a traceback."""
+    good = tmp_path / "good"
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "text", "name": "a", "target": {"mode": "create", "path": str(good)}},
+            {"kind": "text", "name": "b", "target": {"mode": "create", "path": "relative/key"}},
+        ],
+    }
+    data = {"cancelled": False,
+            "result": {"action": None, "values": {"a": "one", "b": "two"}}}
+    _apply_target_writes(spec, data)
+    values = data["result"]["values"]
+    assert good.read_text() == "one", "the good field still lands"
+    assert values["a"]["written"] is True
+    assert values["b"]["written"] is False and values["b"]["error"]
+
+    # …and even an unexpected exception from the writer is folded into an
+    # outcome rather than propagating out of the submit path.
+    def boom(*_a: object, **_k: object) -> dict:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(server, "_write_local_target", boom)
+    data2 = {"cancelled": False, "result": {"action": None, "values": {"a": "one", "b": "two"}}}
+    _apply_target_writes(spec, data2)
+    assert data2["result"]["values"]["a"]["written"] is False
+    assert "disk on fire" in data2["result"]["values"]["a"]["error"]
+
+
+def test_annotate_target_paths_stamps_the_destination(tmp_path: Path) -> None:
+    """The approval line showed the raw spec string. It now shows what this
+    host — the one that performs the write — will actually write."""
+    real = tmp_path / "real.yml"
+    link = tmp_path / "link.yml"
+    real.write_text("x")
+    link.symlink_to(real)
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "secret", "name": "pat", "target": {"mode": "create", "path": "~/x"}},
+            {"kind": "text", "name": "plain"},
+        ],
+        "tabs": [{"label": "T", "fields": [
+            {"kind": "text", "name": "b",
+             "target": {"mode": "substitute", "path": str(link), "placeholder": "x"}},
+        ]}],
+    }
+    _annotate_target_paths(spec)
+    resolved = spec["fields"][0]["target"]["resolved_path"]
+    assert not resolved.startswith("~"), resolved
+    assert resolved == str(Path("~/x").expanduser())
+    assert "target" not in spec["fields"][1], "untargeted field untouched"
+    assert spec["tabs"][0]["fields"][0]["target"]["resolved_path"] == str(real.resolve()), \
+        "a symlinked target shows the file that really changes"

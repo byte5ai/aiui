@@ -44,6 +44,16 @@ All notable changes to this project are documented here.
   the `form` tool description of both bridges. Nothing that previously
   failed now succeeds; some writes that previously fired silently now
   refuse with a reason (#177).
+- **A `target.path` must now be absolute or `~/`-rooted.** A relative or
+  `~user/` path returns `{written: false, error}` instead of writing
+  somewhere unpredictable. This narrows the agent-facing surface, but the
+  two bridges already disagreed about where such a path landed — the
+  companion resolved it against the GUI's working directory (typically `/`
+  for a Finder launch), the bridge against the agent's — so nothing
+  portable could depend on the old behaviour. Same rule `upload`'s
+  `target_dir` has always enforced. The write outcome also gained an
+  optional `mode` field (the octal actually applied, omitted off POSIX);
+  both bridges ship it together, and the wire version is unchanged (#199).
 - **Documentation updated for a two-platform product.** README, both
   `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
   doc still described aiui as macOS-only. The README gained per-platform
@@ -54,6 +64,26 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **`target` file writes dropped permissions, detached symlinks and
+  diverged between the two bridges.** Five defects in one narrow surface,
+  all of them landing *after* the user had typed a credential they cannot
+  retype. `substitute` re-chmod'ed the file it edited to `0600`, so a
+  `0644` compose file read by a container running as another uid stopped
+  working — silently, since the outcome had no field for the mode. A
+  symlinked `path` was read through the link but written *over* it, leaving
+  the secret in what used to be the link and the real config still holding
+  its placeholder, reported as `written: true`. A relative or `~user/`
+  path resolved to a different file depending on which aiui module served
+  the session, and the approval line showed the raw spec string rather than
+  the destination. On the Python bridge a non-UTF-8 target, a Windows host
+  (`os.fchmod` does not exist there — *every* target write died) and a
+  `target` given as a string instead of an object each escaped as a raw
+  traceback, and one bad field in a multi-target form aborted the loop with
+  earlier writes already committed and unreported. Both writers now share
+  one contract: `create` stays `0600` by default, `substitute` inherits the
+  file's mode, symlinks are followed to the real file, the dialog shows the
+  resolved destination, and nothing leaves either bridge as an exception
+  (#199).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

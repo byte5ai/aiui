@@ -437,7 +437,7 @@ When a value must NOT pass through this conversation — a credential the
 user pastes that should land in a file, not your transcript — use a
 `secret` field with a `target`. Any input field may carry `target`; for a
 `secret` field the value is **write-only** (result: `{written, target,
-bytes}`, never the value).
+bytes, mode}`, never the value).
 
 ```json
 { "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
@@ -455,6 +455,14 @@ bytes}`, never the value).
   `create` and `substitute` both work identically local and remote — no
   foreign host. The user sees the path and approves by submitting. Errors:
   `{written:false, error}`.
+- `path` must be absolute or `~/`-rooted; relative (`notes/key`) and
+  `~user/` (`~alice/key`) are rejected — neither names a stable
+  destination, same rule as `upload`'s `target_dir`. Symlinks are followed:
+  `substitute` edits the file the link points at, the link stays a link,
+  and the reported `target` is that resolved path.
+- `substitute` keeps the file's existing mode unless you pass `perm` (it
+  edits a file the user owns — a 0644 config stays 0644); `create` defaults
+  to 0600. The outcome reports the octal `mode` applied.
 - A `secret` field MUST carry a `target` — the write-only promise is what
   the kind means, so a target-less `secret` is rejected (`invalid_spec`)
   instead of returning the plaintext. Want the value back? Use `password`.

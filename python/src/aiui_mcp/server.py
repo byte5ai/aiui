@@ -553,7 +553,15 @@ def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
     def scan(fields: Any) -> None:
         if isinstance(fields, list):
             for f in fields:
-                if isinstance(f, dict) and f.get("target") is not None and isinstance(f.get("name"), str):
+                # #199: `isinstance(..., dict)`, not `is not None` — a
+                # `"target": "~/x"` string used to be collected here and then
+                # `.get()`-ed in `_write_local_target`, killing the tool call
+                # with `AttributeError` *after* the user had typed a secret.
+                # A current companion rejects that shape at validate_spec; a
+                # non-dict target that still reaches us is simply not a
+                # target (a `secret` carrying one is still stripped by
+                # `_collect_secret_fields`).
+                if isinstance(f, dict) and isinstance(f.get("target"), dict) and isinstance(f.get("name"), str):
                     out.append(f)
 
     scan(spec.get("fields"))
@@ -589,17 +597,81 @@ def _collect_secret_fields(spec: dict[str, Any]) -> list[str]:
     return out
 
 
-def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
+def _target_path_error(raw_path: str) -> str | None:
+    """Why a `target.path` is unusable, or None. Mirror of the Rust
+    `filewrite::target_path_error` — same rule, same wording, because #199 was
+    exactly the two bridges quietly accepting different paths.
+
+    A relative path has no stable cwd to resolve against (the bridge's is the
+    agent's, the Finder-launched companion's is typically `/`) and `~user/`
+    only ever worked on this side, so both are rejected rather than written
+    somewhere the user never approved. Same rule `_upload_expand_dir`
+    enforces for `upload`'s `target_dir`.
+    """
+    if not raw_path or len(raw_path) > 4096 or any(
+        ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path
+    ):
+        return "invalid target path"
+    # `startswith("/")` in addition to `is_absolute()` so a POSIX-style path
+    # is accepted identically on a Windows bridge host, matching the Rust
+    # side's `has_root()`.
+    if raw_path.startswith("~/") or raw_path.startswith("/") or Path(raw_path).is_absolute():
+        return None
+    return f"target path must be an absolute or ~/-rooted path, got '{raw_path}'"
+
+
+def _resolve_target_path(path: Path) -> Path:
+    """Resolve the destination a write really lands on (#199). Mirror of the
+    Rust `filewrite::resolve_target`.
+
+    `Path.resolve(strict=True)` on the whole path is wrong here: for `create`
+    the file does not exist yet. So canonicalise the *parent* and re-join the
+    name, then follow the final component while it is an existing symlink —
+    otherwise `substitute` reads through the link but `os.replace`s a fresh
+    regular file over the link itself, leaving the real config untouched and
+    the secret in what used to be the link.
+    """
+    cur = path
+    for _ in range(32):  # bounded, so a symlink cycle can't spin here
+        try:
+            base = cur.parent.resolve(strict=True) / cur.name
+        except OSError:
+            base = cur  # parent doesn't exist yet — nothing to resolve
+        if not base.is_symlink():
+            return base
+        try:
+            dest = Path(os.readlink(base))
+        except OSError:
+            return base
+        cur = dest if dest.is_absolute() else base.parent / dest
+    return cur
+
+
+def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
     host (the bridge runs where the agent runs, so the file is always local).
     `create` (atomic tmp+rename, refuses clobber without overwrite) or
     `substitute` (replace a placeholder occurring exactly once). Never logs the
-    value. Returns `{written, target, bytes, error?}`.
+    value. Returns `{written, target, bytes, mode?, error?}`.
+
+    #199: nothing here may escape as an exception. Every failure happens
+    *after* the user has typed a value they cannot retype (a credential), so
+    a traceback loses the secret and tells the agent nothing. Structured
+    outcome or nothing.
     """
+    if not isinstance(target, dict):
+        # The Python equivalent of Rust's `WriteOutcome::invalid` — no
+        # destination to even name.
+        return {"written": False, "target": "", "bytes": 0,
+                "error": "target must be an object with mode/path"}
     raw_path = str(target.get("path", ""))
-    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path):
-        return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
-    path = Path(raw_path).expanduser()
+    why = _target_path_error(raw_path)
+    if why:
+        return {"written": False, "target": raw_path, "bytes": 0, "error": why}
+    try:
+        path = _resolve_target_path(Path(raw_path).expanduser())
+    except Exception:  # pragma: no cover - expanduser on an exotic home
+        path = Path(raw_path)
     display = str(path)
     # Issue #177: an empty credential is never a legitimate write, and
     # truncating the user's file is not a dialog's job. Refusing here, before
@@ -613,15 +685,34 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     mode = target.get("mode")
     perm_s = target.get("perm")
     try:
-        perm = int(str(perm_s), 8) if perm_s else 0o600
+        perm: int | None = int(str(perm_s), 8) if perm_s else None
     except ValueError:
-        perm = 0o600
+        perm = None
+    if perm is None:
+        # #199: one default per mode, matching Rust. `create` stays tight by
+        # default — a fresh credential file must never inherit the umask.
+        # `substitute` is editing a file the user already owns, and silently
+        # re-chmod'ing a 0644 compose file to 0600 stopped the container that
+        # read it; it keeps the destination's mode instead.
+        if mode == "substitute":
+            try:
+                perm = path.stat().st_mode & 0o7777
+            except OSError:
+                perm = 0o600  # unreadable → the read below fails anyway
+        else:
+            perm = 0o600
+    # Mirrors Rust's `#[cfg(unix)]` guard: off POSIX there are no mode bits
+    # (and `os.fchmod` does not exist — an unguarded call made *every* target
+    # write on a Windows bridge host die with AttributeError).
+    can_chmod = hasattr(os, "fchmod")
+    mode_out: dict[str, Any] = {"mode": f"{perm:04o}"} if can_chmod else {}
 
     def atomic_write(p: Path, data: bytes) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".aiui-write-", dir=str(p.parent))
         try:
-            os.fchmod(fd, perm)
+            if can_chmod:
+                os.fchmod(fd, perm)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, p)
@@ -637,14 +728,23 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
             if path.exists() and not target.get("overwrite"):
                 return {"written": False, "target": display, "bytes": 0,
                         "error": "file exists and overwrite is false (mode: create)"}
-            atomic_write(path, value.encode())
-            return {"written": True, "target": display, "bytes": len(value.encode())}
+            data = value.encode("utf-8")
+            atomic_write(path, data)
+            return {"written": True, "target": display, "bytes": len(data), **mode_out}
         if mode == "substitute":
             placeholder = target.get("placeholder")
             if not placeholder:
                 return {"written": False, "target": display, "bytes": 0,
                         "error": "substitute mode requires 'placeholder'"}
-            existing = path.read_text()
+            # #199: explicit UTF-8 on BOTH sides. The read used to take the
+            # process locale while the write-back was always UTF-8, so on a
+            # latin-1 host every non-ASCII byte in the user's file was
+            # silently re-encoded by a one-line substitution. A non-UTF-8
+            # target now fails structurally (UnicodeDecodeError is caught
+            # below), exactly as the Rust `read_to_string` already did —
+            # `errors="replace"` would trade a loud failure for silent
+            # corruption, which is the bug, not the fix.
+            existing = path.read_text(encoding="utf-8")
             count = existing.count(placeholder)
             if count != 1:
                 return {"written": False, "target": display, "bytes": 0,
@@ -652,11 +752,17 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
                                   if count == 0
                                   else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
             updated = existing.replace(placeholder, value, 1)
-            atomic_write(path, updated.encode())
-            return {"written": True, "target": display, "bytes": len(updated.encode())}
+            data = updated.encode("utf-8")
+            atomic_write(path, data)
+            return {"written": True, "target": display, "bytes": len(data), **mode_out}
         return {"written": False, "target": display, "bytes": 0, "error": f"unknown mode '{mode}'"}
-    except OSError as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers UnicodeDecodeError (a non-UTF-8 target), which is
+        # NOT an OSError and used to escape as a raw traceback.
         return {"written": False, "target": display, "bytes": 0, "error": str(e)}
+    except Exception as e:  # pragma: no cover - backstop, see the docstring
+        return {"written": False, "target": display, "bytes": 0,
+                "error": f"target write failed: {e.__class__.__name__}: {e}"}
 
 
 def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
@@ -688,6 +794,37 @@ def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
     if entry.get("writes_targets") is True:
         return True
     return entry.get("skip_validation") is not True
+
+
+def _annotate_target_paths(spec: dict[str, Any]) -> None:
+    """Stamp every `target`-carrying field with `target.resolved_path` — the
+    absolute destination THIS host will write — so the dialog's approval line
+    names the file rather than the raw spec string (#199). The companion
+    renders the spec but the write happens here, so this is the only place
+    that can resolve it truthfully. Mutates `spec` in place; always
+    overwrites, so an agent-supplied value can't misstate the destination.
+    """
+
+    def scan(fields: Any) -> None:
+        if not isinstance(fields, list):
+            return
+        for f in fields:
+            if not isinstance(f, dict) or not isinstance(f.get("target"), dict):
+                continue
+            raw = f["target"].get("path")
+            if not isinstance(raw, str) or _target_path_error(raw):
+                continue
+            try:
+                f["target"]["resolved_path"] = str(
+                    _resolve_target_path(Path(raw).expanduser())
+                )
+            except Exception:  # pragma: no cover - display only, never fatal
+                pass
+
+    scan(spec.get("fields"))
+    for tab in spec.get("tabs") or []:
+        if isinstance(tab, dict):
+            scan(tab.get("fields"))
 
 
 def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
@@ -727,7 +864,17 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
             outcome = {"written": False, "target": str(field["target"].get("path", "")),
                        "bytes": 0, "error": "no value submitted for this field"}
         else:
-            outcome = _write_local_target(str(v), field["target"])
+            try:
+                outcome = _write_local_target(str(v), field["target"])
+            except Exception as e:  # pragma: no cover - belt and braces
+                # #199: one bad field used to abort the loop mid-way, so the
+                # writes that had already landed were never reported and the
+                # tool call died with a traceback. Every field gets an
+                # outcome; nothing propagates out of the submit path.
+                outcome = {"written": False,
+                           "target": str(field["target"].get("path", "")),
+                           "bytes": 0,
+                           "error": f"target write failed: {e.__class__.__name__}: {e}"}
         if field.get("kind") == "secret":
             values[name] = outcome  # write-only: raw value never returned
         else:
@@ -923,6 +1070,10 @@ async def _post_render(
         # agent's filesystem actually exists. The Mac-side server resolver
         # only handles HTTPS.
         _resolve_local_paths(spec)
+        # #199: the write for a `target` field happens on THIS host after
+        # submit, so only this side knows where it lands. Resolve it into the
+        # spec before the companion renders the approval line.
+        _annotate_target_paths(spec)
         # Async render (Step 3): opt in via the header. A current companion
         # registers the dialog and answers immediately with `{id, ttl_secs}`
         # (202); we then poll for the result. An older companion ignores the

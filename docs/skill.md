@@ -645,7 +645,7 @@ When a value must NOT pass through this conversation — a credential the
 user pastes that should land in a file, not your transcript — use a
 `secret` field with a `target`. Any input field may carry `target`; for a
 `secret` field the value is **write-only**: aiui writes it to the file and
-returns only `{written, target, bytes}`, never the value.
+returns only `{written, target, bytes, mode}`, never the value.
 
 **A `secret` field must carry a `target`.** The write-only promise is what
 a `secret` *is*, and the only place its value can legitimately go is the
@@ -677,6 +677,19 @@ that field is a `password`, not a `secret`.
   entered value reaches that module over aiui's own channel, never via the
   agent). You cannot target a foreign host; the user sees the resolved path
   and approves it by submitting.
+- **`path` must be absolute or `~/`-rooted.** A relative path (`notes/key`)
+  and a `~user/` path (`~alice/key`) are rejected — a relative path has no
+  stable working directory to resolve against, and `~user/` is not portable
+  across the two aiui modules, so either would write somewhere the user
+  never approved. Same rule `upload`'s `target_dir` follows. Symlinks are
+  followed: `substitute` on a link edits the file the link points at and
+  leaves the link a link; the reported `target` is that resolved path.
+- **`substitute` keeps the file's existing mode** unless you pass `perm` —
+  it is editing a file the user already owns, so a `0644` config stays
+  `0644` and the service reading it keeps working. `create` defaults to
+  `0600` (tight by default for a fresh credential file). The outcome
+  carries the octal `mode` actually applied, so a permission change is
+  never invisible.
 - **A blank field writes nothing.** An empty value is refused in both modes
   — `{written: false, error: "refusing to write an empty value"}` — so a
   skipped optional field can never truncate the user's file, and

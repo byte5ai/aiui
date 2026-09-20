@@ -922,6 +922,39 @@ const KNOWN_FIELD_KINDS: &[&str] = &[
     "list", "table", "tree",
 ];
 
+/// Stamp every `target`-carrying field with `target.resolved_path` — the
+/// absolute destination `filewrite::write_local` would write on THIS host —
+/// so the dialog's approval line names the file the value lands in rather
+/// than the raw spec string (#199).
+///
+/// Only meaningful for a **local** (native-app) session, where this process
+/// is the writer. For a bridge-served session the write happens on the
+/// bridge's host, so the bridge does its own resolution before the spec gets
+/// here and this must not overwrite it.
+fn annotate_target_paths(spec: &mut serde_json::Value) {
+    fn walk(fields: Option<&mut serde_json::Value>) {
+        let Some(serde_json::Value::Array(items)) = fields else {
+            return;
+        };
+        for f in items {
+            let Some(t) = f.get_mut("target").and_then(|t| t.as_object_mut()) else {
+                continue;
+            };
+            let Some(raw) = t.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
+                continue;
+            };
+            let resolved = crate::filewrite::resolve_display(&raw);
+            t.insert("resolved_path".into(), serde_json::Value::String(resolved));
+        }
+    }
+    walk(spec.get_mut("fields"));
+    if let Some(serde_json::Value::Array(tabs)) = spec.get_mut("tabs") {
+        for tab in tabs {
+            walk(tab.get_mut("fields"));
+        }
+    }
+}
+
 /// Validate a dialog spec *before* any window is created (v0.4.46,
 /// Bug B+). On failure returns `(detail, hint)` describing precisely
 /// what's wrong; the caller turns that into a structured `invalid_spec`
@@ -1054,6 +1087,46 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                  value is written to). Use `password` if you want the value returned to you."
                     .into(),
             ));
+        }
+        // #199: a malformed `target` used to survive all the way past submit
+        // — the Python bridge then died on `'str' object has no attribute
+        // 'get'` *after* the user had typed (and lost) a credential. Check
+        // the shape here, before any window opens, so the agent fixes the
+        // spec instead of the user re-entering a secret.
+        if let Some(t) = f.get("target").filter(|t| !t.is_null()) {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+            let hint = "`target` is an object: {\"mode\": \"create\"|\"substitute\", \
+                        \"path\": \"~/…\" or \"/…\", perm?, overwrite?, placeholder?}. \
+                        The path must be absolute or `~/`-rooted — a relative or \
+                        `~user/` path has no stable destination."
+                .to_string();
+            let Some(obj) = t.as_object() else {
+                return Err((
+                    format!("form field '{name}' has a 'target' that is not an object"),
+                    hint,
+                ));
+            };
+            match obj.get("mode").and_then(|v| v.as_str()) {
+                Some("create") | Some("substitute") => {}
+                other => {
+                    return Err((
+                        format!(
+                            "form field '{name}' has target.mode '{}' — must be 'create' or 'substitute'",
+                            other.unwrap_or("<missing>")
+                        ),
+                        hint,
+                    ));
+                }
+            }
+            let Some(path) = obj.get("path").and_then(|v| v.as_str()) else {
+                return Err((
+                    format!("form field '{name}' has a 'target' without a string 'path'"),
+                    hint,
+                ));
+            };
+            if let Some(why) = crate::filewrite::target_path_error(path) {
+                return Err((format!("form field '{name}': {why}"), hint));
+            }
         }
     }
     Ok(())
@@ -1305,6 +1378,13 @@ async fn render(
             })),
         )
             .into_response();
+    }
+
+    // #199: show the user the destination, not the spec string. A bridge
+    // session already carries its own host's resolution — the write happens
+    // there, so that one is the truthful one; don't overwrite it with ours.
+    if req.session_origin.as_deref().unwrap_or("").is_empty() {
+        annotate_target_paths(&mut req.spec);
     }
 
     // Multi-window (Step 4, I8): N dialogs may be in flight at once — the
@@ -1561,6 +1641,77 @@ mod validate_tests {
         // `password` is the documented alternative and stays valid bare.
         let pw = json!({"kind":"form","fields":[{"kind":"password","name":"pw"}]});
         assert!(validate_spec(&pw).is_ok());
+    }
+
+    #[test]
+    fn validate_spec_rejects_non_object_target() {
+        // #199: `"target": "~/x"` (a bare string, the shape an agent reaches
+        // for first) used to reach the Python bridge's post-submit write and
+        // die there on `.get()` — after the user had typed a credential.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":"~/.github_tokens/byte5ai"}
+        ]});
+        let (detail, hint) = validate_spec(&spec).unwrap_err();
+        assert!(detail.contains("pat"), "names the offending field: {detail}");
+        assert!(detail.contains("target") && detail.contains("object"), "{detail}");
+        assert!(hint.contains("mode"), "shows the right shape: {hint}");
+
+        // A missing or bogus mode is the same class of spec bug.
+        let bad_mode = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"path":"~/x"}}
+        ]});
+        assert!(validate_spec(&bad_mode).is_err(), "mode is required");
+        let bad_mode2 = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"append","path":"~/x"}}
+        ]});
+        assert!(validate_spec(&bad_mode2).is_err(), "only create|substitute");
+
+        // …as is a path that names no stable destination.
+        let relative = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"notes/key"}}
+        ]});
+        let (detail, _) = validate_spec(&relative).unwrap_err();
+        assert!(detail.contains("absolute or ~/-rooted"), "{detail}");
+        let tilde_user = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~alice/key"}}
+        ]});
+        assert!(validate_spec(&tilde_user).is_err(), "~user/ is not portable");
+
+        // A well-formed target still validates, in a tab too.
+        let good = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat",
+             "target":{"mode":"create","path":"~/.github_tokens/byte5ai","perm":"0600"}},
+            {"kind":"text","name":"note",
+             "target":{"mode":"substitute","path":"/etc/app.yml","placeholder":"__X__"}}
+        ]});
+        assert!(validate_spec(&good).is_ok());
+        let tabbed = json!({"kind":"form","tabs":[{"label":"T","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~/x"}}
+        ]}]});
+        assert!(validate_spec(&tabbed).is_ok());
+    }
+
+    #[test]
+    fn annotate_target_paths_stamps_the_destination() {
+        // #199: the approval line showed the raw spec string. It now shows
+        // what this host will actually write.
+        let mut spec = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~/x"}},
+            {"kind":"text","name":"plain"}
+        ],"tabs":[{"label":"T","fields":[
+            {"kind":"text","name":"b","target":{"mode":"create","path":"/tmp/aiui-annotate"}}
+        ]}]});
+        super::annotate_target_paths(&mut spec);
+        let flat = &spec["fields"][0]["target"]["resolved_path"];
+        assert!(flat.is_string(), "flat field annotated: {flat}");
+        if dirs::home_dir().is_some() {
+            assert!(!flat.as_str().unwrap().starts_with('~'), "tilde expanded: {flat}");
+        }
+        assert!(
+            spec["tabs"][0]["fields"][0]["target"]["resolved_path"].is_string(),
+            "tab fields are covered too"
+        );
+        assert!(spec["fields"][1].get("target").is_none(), "untargeted field untouched");
     }
 
     #[test]
