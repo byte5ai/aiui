@@ -558,6 +558,43 @@ All notable changes to this project are documented here.
   file's mode, symlinks are followed to the real file, the dialog shows the
   resolved destination, and nothing leaves either bridge as an exception
   (#199).
+- **Starting the companion could disconnect a live Claude Code, Cowork or
+  Codex session.** The startup sweep terminated *any* `aiui --mcp-stdio`
+  process whose executable path differed from the running GUI's, whether or
+  not its host was still alive — so moving `aiui.app` out of `~/Downloads`,
+  running a dev build beside the released one, or updating while a session
+  was open killed that session's MCP server on the next start. Claude
+  Desktop respawns one it loses; the other three hosts do not, and the user
+  got `Server disconnected` on a tool call minutes later with nothing
+  connecting the two. The sweep now requires the child to be *orphaned* —
+  the same gate the other two sweeps were given in v0.4.46 and v0.8.2 —
+  compares canonicalized paths instead of raw strings, and never classifies
+  a process whose executable sysinfo could not read. The in-place-update
+  case it used to cover moved to where it belongs: the child notices its own
+  binary was replaced and exits cleanly, which every host does answer with a
+  respawn (#200).
+- **The orphan ssh-tunnel sweep never did anything on Windows.** It
+  identified an abandoned `ssh -N -T -R` by `ppid == 1`, which is the
+  macOS/launchd reparenting rule; Windows does not reparent, so the check
+  was false by construction there. A force-quit or crashed `aiui.exe` left
+  the tunnel running and holding the remote's port, every new tunnel then
+  died on `ExitOnForwardFailure`, and the companion sat in a 30 s-backoff
+  `ssh exit code 255` loop across restarts — reporting `swept 0 orphan
+  ssh-NTR tunnel(s)` the whole time — until the user found and killed
+  `ssh.exe` by hand. Anyone running the `aiui-mcp` bridge on a remote dev
+  host against a Windows companion was affected since v0.10.1. All three
+  sweeps now share the one cross-platform orphan predicate (#200).
+- **A sweep reported success for kills that never happened, and could
+  signal the wrong process.** Terminating a victim threw away the snapshot
+  that had just proved it, ran a second full process enumeration per victim
+  to look the bare pid up again, and signalled whatever now held it —
+  hundreds of milliseconds in which a pid could be recycled onto an
+  unrelated process. The result was discarded too, so the trace logged the
+  number of processes *found*, making "killed it", "permission denied" and
+  "signal unsupported" indistinguishable in a support log. Kills now reuse
+  the sweep's own enumeration, re-assert the victim's identity (executable
+  leaf plus argv) before signalling, and report `terminated K of N` with K
+  being the kills that actually landed (#200).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
