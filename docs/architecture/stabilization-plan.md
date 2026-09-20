@@ -240,6 +240,19 @@ The original deciding facts:
   Allow N concurrent dialogs (registry already supports `DIALOG_HARD_CAP`).
 - **One window per render**, window label = dialog id (replaces the single
   reused `DIALOG_WINDOW_LABEL`). Teardown keyed by id.
+- **Capability + command contract for that label (#195).** Because the label is
+  a per-render UUID, no capability file can name it: `capabilities/default.json`
+  is scoped `"windows": ["setup"]` and carries the Settings-side plugin
+  permissions (`updater`, `process`, `dialog`, `notification`);
+  `capabilities/dialog.json` is scoped `"windows": ["*"]` and covers dialog
+  windows with listen/unlisten only — no emit, so agent content cannot forge an
+  event into Settings. App commands are **not** ACL-checked at all (aiui ships
+  no app ACL manifest, so Tauri gates only `plugin:`-prefixed commands), so the
+  privileged ones are Settings-only by an explicit Rust gate,
+  `is_privileged_window`, and the `id`-carrying dialog commands are gated on
+  `dialog_command_allowed` (`window.label() == id`) so one session's dialog
+  cannot read or answer another's. `open_url` is the deliberate exception —
+  links in agent markdown route through it since #189.
 - **Session identifier (I8):**
   - Render spec gains a `session` field (string), set by the caller; tool
     wrappers (`mcp.rs`, `server.py`) gain a `session` param. Skill + tool

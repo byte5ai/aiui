@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "dialog",
+  "description": "Dialog windows (#195). Their label IS the dialog id — a UUID minted per render (`build_dialog_window`) — so there is no fixed string a glob could name; `*` is the only pattern that matches them. This is aiui's untrusted-content surface: it renders markdown, mermaid sources, compare bodies and gallery items authored by an agent on a remote host, so it gets the minimum. `core:event:allow-listen` / `allow-unlisten` let Rust push an event *into* the window (the `/health` `ui:ping` probe); `allow-emit` / `allow-emit-to` are deliberately absent so it cannot push one back out — it must not be able to forge `update:available` into Settings. No `updater:*`, `process:*`, `dialog:*` or `notification:*` either: none of that belongs to agent content. Privileged app commands are not expressible here at all (aiui ships no app ACL manifest, so Tauri only ACL-checks `plugin:`-prefixed commands) — those are gated in Rust by `is_privileged_window`.",
+  "windows": ["*"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}
