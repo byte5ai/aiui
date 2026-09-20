@@ -73,6 +73,7 @@ Skip the dialog for content the user reads, doesn't answer:
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
 | Mark *where* on an image (point / region) | `form` with `annotated_image` |
+| Pick from a nested structure (file subtree, config namespaces, org chart) | `form` with a `tree` field |
 | Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
@@ -201,6 +202,51 @@ not just siblings), `gallery` items, `compare` variants, plus `form`
 field `name`s and tab `label`s. A repeat keys two things the same, which
 either blanks the dialog or silently collapses two entries into one
 result — so aiui refuses the spec instead of rendering it.
+
+## Hierarchical picker: `tree`
+
+For options with real parent/child structure the user needs to see — a
+file subtree, config namespaces, monorepo packages, an org chart. Flat
+set where ordering matters → `list`. Flat one-of-N → `select`. Structure
+the user has to navigate → `tree`.
+
+```
+{kind: "tree", name, label?, items: [{label, value, description?, children?: [...]}],
+ multi_select?, default_selected?: [values], default_expanded?: [values]}
+```
+
+Result: `{selected: [values]}` — nothing else. Expand/collapse is the
+user's view, not an answer; it is stripped at submit.
+
+- **Omitting `default_expanded` expands every node** — on a large tree
+  that's a wall of rows. Pass the values you want open (usually the
+  roots).
+- **`required` is not enforced for `tree`** (same as `list`): handle an
+  empty `selected` instead of assuming a pick.
+- Parents and children select independently — picking a parent does not
+  pick its children.
+
+```
+{
+  "kind": "tree",
+  "name": "namespaces",
+  "label": "Which config namespaces should migrate?",
+  "multi_select": true,
+  "default_expanded": ["app"],
+  "items": [
+    {"label": "app", "value": "app", "children": [
+      {"label": "auth", "value": "app/auth", "description": "12 keys"},
+      {"label": "cache", "value": "app/cache", "description": "7 keys"}
+    ]},
+    {"label": "legacy", "value": "legacy", "description": "deprecated, 41 keys"}
+  ]
+}
+```
+
+Anti-pattern: faking the hierarchy with indented labels in a `select` or
+`list` (`"  └ auth"`) — the user can't collapse a picture, and the values
+come back with the structure lost. Equally wrong: a `tree` for a flat set
+because it looks fancier.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 
