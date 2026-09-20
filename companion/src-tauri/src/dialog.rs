@@ -473,6 +473,42 @@ impl DialogState {
     // A blunt "cancel everything" would wrongly tear down other sessions'
     // live dialogs.)
 
+    /// How many dialogs are pending right now.
+    ///
+    /// #180: the grace decision consults this — a dialog on screen is proof
+    /// someone still needs the host, so the host must not follow its Wirt out
+    /// while one is open.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// **Exit only.** Resolve every pending dialog so no `/render` is left
+    /// hanging when the process dies (I5/I7), returning the ids that were
+    /// cancelled so the caller can destroy their windows.
+    ///
+    /// NOT the `cancel_all` Step 4 removed, and not for mid-life use: this is
+    /// legitimate solely because the process is about to end, which makes
+    /// "tear down other sessions' live dialogs" the truth rather than a bug.
+    /// Each caller gets `reason: "host_exiting"` so the agent can tell this
+    /// apart from the user pressing Escape.
+    pub fn cancel_all_for_exit(&self, reason: &str) -> Vec<String> {
+        let drained: Vec<(String, _)> = {
+            let mut map = self.pending.lock().unwrap();
+            map.drain().collect()
+        };
+        let mut ids = Vec::with_capacity(drained.len());
+        for (id, entry) in drained {
+            let _ = entry.result_tx.send(DialogResult {
+                id: id.clone(),
+                cancelled: true,
+                result: serde_json::Value::Null,
+                reason: Some(reason.to_string()),
+            });
+            ids.push(id);
+        }
+        ids
+    }
+
     /// Snapshot for `/health` / diagnostics. Cheap: one mutex acquire.
     pub fn stats(&self) -> DialogStats {
         let map = self.pending.lock().unwrap();

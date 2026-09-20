@@ -732,6 +732,25 @@ pub fn remove_codex_config() -> StepResult {
     }
 }
 
+/// The substring that identifies a running Claude Desktop on macOS: the
+/// bundle's executable path, which is the same wherever the app is
+/// installed (#180). Private so it cannot drift from the matcher below.
+#[cfg(target_os = "macos")]
+const CLAUDE_DESKTOP_PROC_MATCH: &str = "Claude.app/Contents/MacOS/Claude";
+
+/// Is this `pgrep -af` line a running Claude Desktop?
+///
+/// The authority for the liveness probe, not a description of it: the
+/// `pgrep` pattern is a cheap pre-filter and this decides. Pure, so the
+/// rule can be unit-tested over fixtures without a running Claude Desktop —
+/// the same treatment `is_aiui_ssh_ntr_for_port` gets in `housekeeping.rs`.
+/// The two properties that matter: it finds the app wherever it is
+/// installed, and it never matches the `claude` CLI.
+#[cfg(target_os = "macos")]
+pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
+    cmdline.contains(CLAUDE_DESKTOP_PROC_MATCH)
+}
+
 /// Best-effort check whether the Claude Desktop application is currently
 /// running. Used to switch the "Restart Claude Desktop" button label
 /// between Start / Restart so we don't ask the user to "restart"
@@ -739,8 +758,9 @@ pub fn remove_codex_config() -> StepResult {
 ///
 /// Pure read-only. Per-OS process probe:
 ///
-/// - macOS: `pgrep -f /Applications/Claude.app/` matches against the full
-///   command line, which catches helper processes too (still a true positive).
+/// - macOS: `pgrep -af Claude.app` pre-filters, then
+///   [`is_claude_desktop_proc`] decides — the bundle executable, at any
+///   install location, never the `claude` CLI.
 /// - Windows: `tasklist /FI "IMAGENAME eq Claude.exe" /NH` lists running
 ///   processes by image name; non-empty stdout means at least one match.
 ///
@@ -749,12 +769,23 @@ pub fn remove_codex_config() -> StepResult {
 pub fn is_claude_desktop_running() -> bool {
     #[cfg(target_os = "macos")]
     {
+        // #180: match the bundle EXECUTABLE, not a fixed install prefix. The
+        // old `-f /Applications/Claude.app/` missed an install in
+        // `~/Applications` (which `is_claude_desktop_installed` already
+        // supports via the config dir), so the app looked permanently dead
+        // to its own liveness probe — and the exit gate inverted.
+        //
+        // `pgrep -af Claude.app` is only the cheap pre-filter; the decision
+        // is `is_claude_desktop_proc`, so the matching rule lives in one
+        // unit-tested place rather than inside an argv string.
         let out = std::process::Command::new("pgrep")
-            .args(["-f", "/Applications/Claude.app/"])
+            .args(["-af", "Claude.app"])
             .output();
         match out {
-            Ok(o) => o.status.success() && !o.stdout.is_empty(),
-            Err(_) => false,
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(is_claude_desktop_proc),
+            _ => false,
         }
     }
     #[cfg(target_os = "windows")]
@@ -1866,6 +1897,44 @@ mod tests {
         assert!(r.message.contains("dev@devhost"));
         assert!(r.message.contains("nicht erreichbar"));
         assert!(r.details.is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_desktop_proc_match_is_location_independent() {
+        // #180: the old probe hard-coded /Applications, so a ~/Applications
+        // install looked permanently dead and the exit gate inverted.
+        assert!(is_claude_desktop_proc(
+            "/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        assert!(is_claude_desktop_proc(
+            "/Users/ada/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        // The real input shape: `pgrep -af` prefixes the pid.
+        assert!(is_claude_desktop_proc(
+            "4711 /Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        assert!(
+            is_claude_desktop_proc(
+                "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app\
+                 /Contents/MacOS/Claude Helper --type=renderer"
+            ) == false,
+            "a helper's own executable path is not the main binary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_desktop_proc_match_never_matches_the_cli() {
+        // A Claude Code session must never be mistaken for Claude Desktop —
+        // that would make the host think its Wirt is alive when it is not.
+        assert!(!is_claude_desktop_proc("/usr/local/bin/claude"));
+        assert!(!is_claude_desktop_proc("node /opt/homebrew/bin/claude --print"));
+        assert!(!is_claude_desktop_proc(
+            "/Applications/aiui.app/Contents/MacOS/aiui --mcp-stdio"
+        ));
+        assert!(!is_claude_desktop_proc("claude-desktop"));
+        assert!(!is_claude_desktop_proc(""));
     }
 
     #[test]
