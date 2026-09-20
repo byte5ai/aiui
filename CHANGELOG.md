@@ -22,6 +22,21 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- **The "aiui is unreachable" message no longer blames dialog contention.**
+  It listed three causes first — a second call in the same turn, a stale
+  window pinning the companion, a parallel Claude session holding the only
+  slot — and told the agent to pick one. None of them can produce that
+  error: `/ping` is unauthenticated and answers a static `pong` whatever the
+  dialog registry is doing, and single-occupancy has been gone since the
+  multi-window work (`DIALOG_HARD_CAP`, no 409 anywhere in the HTTP layer).
+  So the user was sent hunting for leftover dialog windows that do not
+  exist, while the real cause — app not running, or a dropped SSH
+  reverse-tunnel — sat at position 4 of a list the agent was told to pick
+  *one* item from. Now just those two, each with the action that fixes it.
+  The dead 409 machinery it was written for (`RenderError::Busy`, the
+  CONFLICT branch, `aiui_busy_result`) is deleted rather than left looking
+  like live behaviour: the bundled bridge ships in the same binary as the
+  companion, so it can never meet a 409-era companion (#202).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -54,6 +69,56 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **One dropped poll killed a dialog the user was still looking at.** The
+  async-render design exists precisely so a connection failure cannot cost
+  the user's think-time — the comment above the code says so — but both
+  bridges turned the first transport error on `GET /render/{id}` into a
+  terminal tool failure. An SSH reverse-tunnel re-establishing, a Wi-Fi
+  hiccup, or the companion's WebView restarting during an in-app update was
+  enough. Meanwhile the dialog stayed on screen for its full two-hour TTL:
+  the user answered a question nobody was listening to, the agent's natural
+  retry opened a *second* window for it, and the orphan pushed the registry
+  toward the 16-dialog eviction cap — which then produced cancels
+  mislabelled as the user's own. Both bridges now re-poll the same id, with
+  a budget of five *consecutive* failures (reset on every success) capped by
+  the `ttl_secs` the 202 advertised — a value both sides previously read and
+  discarded. `POST /render` is deliberately **not** retried: that would open
+  a second dialog for the same question (#202).
+- **`confirm` could not tell "the user said no" from "we gave up".** The
+  companion labels a non-user cancellation `ttl_expired`, `evicted` or
+  `channel_dropped` so callers can distinguish the two, and
+  `format_dialog_result` forwards it — but `format_confirm_result`, the one
+  gating destructive actions, dropped it. An agent reporting "you declined
+  the migration" two hours after nobody answered is reporting a decision the
+  user never made (#202).
+- **A cancelled dialog returned a different shape on remote hosts.** The
+  Python bridge answered a bare `{"cancelled": true}`, contradicting every
+  tool's own docstring and the Rust bridge, which always emits
+  `{cancelled, confirmed}`. An agent following the documented contract and
+  reading `result["confirmed"]` worked on a Mac-local session and raised a
+  `KeyError` only over SSH — invisible where the maintainer tests. Cancels
+  now carry the documented falsy defaults (`confirmed: false`,
+  `answers: []`, `values: {}`, `decisions: {}`); `compare` keeps `selected`
+  absent, because any value there would read as a real pick (#202).
+- **A blip while registering a dialog surfaced as `error: ""`.** The Python
+  bridge's `POST /render` had no `try/except`, so an `httpx` transport error
+  escaped unexplained — `str(e)` is empty for exactly the `RemoteProtocolError`
+  / `ReadError` class a dropped tunnel produces. Non-2xx statuses went the
+  same way through `raise_for_status()`: a 401 from a mid-session token
+  rotation reached the agent as a URL and a status code. Both now produce the
+  same actionable wording the preflight already used (#202).
+- **The async path — the one a current companion actually takes — was never
+  tested.** The fake companion in the host-contract smoke test asserted the
+  bridge sent `x-aiui-async: 1` and then ignored the header, answering `200`
+  with the terminal body; every test therefore exercised only the legacy
+  synchronous fallback, and the 202→poll branch had no end-to-end coverage
+  at all. Nothing pinned `session_origin` reaching the render body — the
+  field the frontend reads to decide whether it or the bridge performs
+  `target` writes, so dropping it would write a secret on the Mac instead of
+  the agent host, silently — and nothing pinned `_apply_target_writes` being
+  wired into the async path. The fake now honours the header, serves one
+  `{pending: true}` before the result, and can drop polls, omit the render
+  id or reject a spec; `sync_mode` keeps the legacy path covered (#202).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

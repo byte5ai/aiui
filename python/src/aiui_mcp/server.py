@@ -107,6 +107,31 @@ COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
 # before we time out, letting us re-poll cleanly.
 ASYNC_POLL_TIMEOUT_S = 40.0
 
+# Poll-retry budget for the async render (#202). The whole point of the async
+# design is that a dropped connection cannot cost the user's think-time: the
+# dialog stays on the Mac's screen for the full server-side TTL, so a transport
+# error on one poll is a blip, not an answer. Aborting on the first one
+# abandoned an answered window and made the agent's natural retry open a
+# *second* dialog for the same question. Five consecutive failures a second
+# apart tolerate roughly three minutes of outage once the 40 s per-GET timeout
+# is counted in — an SSH reverse-tunnel re-establish or a WebView restart during
+# an in-app update fits comfortably. The counter resets on every successful
+# poll, so a flaky link never accumulates its way to a false give-up. Only
+# transport errors are retried: a 404 means the slot is genuinely gone.
+ASYNC_POLL_MAX_CONSECUTIVE_FAILURES = 5
+ASYNC_POLL_RETRY_BACKOFF_S = 1.0
+
+# Floor between two poll iterations. A real companion holds each GET for its
+# ~25 s poll window so the loop cannot spin today, but a companion that answers
+# `{pending: true}` immediately would turn this into a CPU spin plus a flood of
+# progress notifications.
+ASYNC_POLL_MIN_INTERVAL_S = 0.2
+
+# Fallback when a 202 body carries no `ttl_secs` — mirrors the companion's
+# `DIALOG_TTL` (2 h). The advertised TTL is the wall-clock ceiling on retrying:
+# past it the id is gone on the companion side.
+DEFAULT_POLL_TTL_S = 7200.0
+
 # Timeout for the `upload` tool's held `POST /upload` (#146). The picker + byte
 # transfer runs on one request and the user may browse their filesystem before
 # choosing, so this is deliberately generous — far beyond any realistic
@@ -849,6 +874,7 @@ async def _poll_render(
     client: httpx.AsyncClient,
     render_id: str,
     ctx: Context | None,
+    ttl_secs: float = DEFAULT_POLL_TTL_S,
 ) -> dict[str, Any]:
     """Poll `GET /render/{id}` until the terminal result (Step 3 async render).
 
@@ -858,15 +884,49 @@ async def _poll_render(
     which is what immunises the remote path against the multi-minute-ReadError
     class. Emits an MCP progress notification each pending iteration so the
     client (Claude Code) knows the tool is alive, not hung.
+
+    #202: a transport error on one poll is retried against the SAME id rather
+    than ending the call. The dialog is already on the user's screen and stays
+    there for `ttl_secs`; aborting here abandons it and makes the agent's retry
+    open a second window for the same question. Never re-POST `/render` — the
+    id from the 202 is the whole point. Bounded by
+    `ASYNC_POLL_MAX_CONSECUTIVE_FAILURES` and by the advertised TTL.
     """
     poll_url = f"{ENDPOINT}/render/{render_id}"
     iteration = 0
+    consecutive_failures = 0
+    deadline = time.monotonic() + ttl_secs
     while True:
-        pr = await client.get(
-            poll_url,
-            headers={"Authorization": f"Bearer {_token()}"},
-            timeout=ASYNC_POLL_TIMEOUT_S,
-        )
+        try:
+            pr = await client.get(
+                poll_url,
+                headers={"Authorization": f"Bearer {_token()}"},
+                timeout=ASYNC_POLL_TIMEOUT_S,
+            )
+        except httpx.HTTPError as e:
+            consecutive_failures += 1
+            if (
+                consecutive_failures >= ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
+                or time.monotonic() >= deadline
+            ):
+                # `_explain_exc` guarantees a non-empty message: httpx leaves
+                # `str(e)` empty for RemoteProtocolError / ReadError, which is
+                # exactly the class that shows up on a dropped tunnel.
+                raise RuntimeError(
+                    f"aiui lost contact with the companion while waiting for "
+                    f"render {render_id}: {_explain_exc(e)} "
+                    f"({consecutive_failures} consecutive poll failures). "
+                    f"The dialog may still be open on the Mac — check it "
+                    f"before re-asking."
+                ) from e
+            log.warning(
+                "poll %s failed (%s), retry %d/%d",
+                render_id, _explain_exc(e),
+                consecutive_failures, ASYNC_POLL_MAX_CONSECUTIVE_FAILURES,
+            )
+            await asyncio.sleep(ASYNC_POLL_RETRY_BACKOFF_S)
+            continue
+        consecutive_failures = 0
         if pr.status_code == 404:
             raise RuntimeError(
                 f"aiui lost track of render {render_id} (expired or never "
@@ -883,6 +943,7 @@ async def _poll_render(
                     await ctx.report_progress(progress=float(iteration), total=None)
                 except Exception as e:  # noqa: BLE001
                     log.debug("progress report skipped: %s", _explain_exc(e))
+            await asyncio.sleep(ASYNC_POLL_MIN_INTERVAL_S)
             continue
         return pv
 
@@ -928,15 +989,29 @@ async def _post_render(
         # (202); we then poll for the result. An older companion ignores the
         # header and answers synchronously (200 with the terminal shape) — we
         # detect that and use it directly (backward-compatible).
-        r = await client.post(
-            f"{ENDPOINT}/render",
-            headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
-            json={
-                "spec": spec,
-                "session": session,
-                "session_origin": _session_origin(),
-            },
-        )
+        try:
+            r = await client.post(
+                f"{ENDPOINT}/render",
+                headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
+                json={
+                    "spec": spec,
+                    "session": session,
+                    "session_origin": _session_origin(),
+                },
+            )
+        except httpx.HTTPError as e:
+            # #202: a blip during registration used to let a raw httpx
+            # exception escape `_post_render` entirely — not routed through
+            # `_explain_exc`, so a RemoteProtocolError (empty `str(e)`)
+            # surfaced as the `error: ""` class of bug. Retrying the POST is
+            # NOT the fix: it would open a second dialog window for the same
+            # question. Fail with an explained error and let the agent decide.
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} failed to register the dialog: "
+                f"{_explain_exc(e)}. No dialog was opened. On a remote this is "
+                f"usually the SSH reverse-tunnel dropping — check aiui "
+                f"Settings → Connections on the Mac, then retry."
+            ) from e
         # #186/#182: a 422 from the companion carries `{error, detail, hint}`
         # — the whole point of the structured rejection. `raise_for_status`
         # discards the body, so a bridge-served agent used to get a bare
@@ -953,13 +1028,46 @@ async def _post_render(
                 f"aiui rejected the dialog spec (invalid_spec): {detail}"
                 + (f" — {hint}" if hint else "")
             )
-        r.raise_for_status()
+        # #202: the remaining non-2xx statuses were left to `raise_for_status`,
+        # which hands the agent a bare `HTTPStatusError` naming a URL and a
+        # status code. Translate them into the same actionable style
+        # `_preflight` uses, so a remote session gets the guidance a
+        # Mac-local Rust-bridge session already gets.
+        if r.status_code == 401:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} rejected our token (401) while "
+                f"opening the dialog. The token was rotated mid-session, or "
+                f"another aiui process is listening on this port. Re-register "
+                f"this host from the companion's settings window on the Mac."
+            )
+        if r.status_code >= 500:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} failed to open the dialog "
+                f"(HTTP {r.status_code}): {r.text[:200]}. This is a companion-side "
+                f"fault — retry once; if it persists, restart aiui.app on the Mac."
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} refused the render "
+                f"(HTTP {r.status_code}): {r.text[:200]}"
+            )
         first = r.json()
         if r.status_code == 202:
             render_id = first.get("id")
-            if not render_id:
-                raise RuntimeError("async /render: 202 response missing `id`")
-            data = await _poll_render(client, render_id, ctx)
+            if not isinstance(render_id, str) or not render_id:
+                raise RuntimeError(
+                    "aiui accepted the dialog (202) but its response carries no "
+                    "`id`, so there is nothing to poll. The dialog may be open on "
+                    "the Mac with no one listening — check it, and report this as "
+                    "a companion bug."
+                )
+            ttl = first.get("ttl_secs")
+            ttl_secs = (
+                float(ttl)
+                if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl > 0
+                else DEFAULT_POLL_TTL_S
+            )
+            data = await _poll_render(client, render_id, ctx, ttl_secs)
         else:
             data = first  # synchronous companion — terminal result already
     # Issue #135: this bridge runs ON the agent's host, so `target` fields are
@@ -975,9 +1083,34 @@ async def _post_render(
     return data
 
 
-def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
+def _cancel_defaults(kind: str | None) -> dict[str, Any]:
+    """The falsy keys a cancelled dialog still returns, per tool (#202).
+
+    `_format_result` used to answer a bare `{"cancelled": True}`, contradicting
+    every tool's own docstring — `confirm` promises `{cancelled, confirmed}`,
+    `ask` promises `{cancelled, answers}`, `form` promises `{cancelled, values}`
+    — and contradicting the Rust bridge, whose `format_confirm_result` always
+    emits both keys. An agent following the documented shape and reading
+    `result["confirmed"]` therefore worked on a Mac-local session and raised a
+    `KeyError` only on a remote: a bridge-dependent bug invisible in local
+    testing. `compare` is deliberately absent: `docs/skill.md` documents
+    `selected` as *absent* on cancel, and inventing a falsy value there would
+    read as a real selection.
+    """
+    if kind == "confirm":
+        return {"confirmed": False}
+    if kind == "ask":
+        return {"answers": []}
+    if kind == "form":
+        return {"values": {}}
+    if kind == "gallery":
+        return {"decisions": {}}
+    return {}
+
+
+def _format_result(payload: dict[str, Any], kind: str | None = None) -> dict[str, Any]:
     if payload.get("cancelled"):
-        out: dict[str, Any] = {"cancelled": True}
+        out: dict[str, Any] = {"cancelled": True, **_cancel_defaults(kind)}
         # #180: forward WHY. The companion sets `host_exiting`,
         # `ttl_expired`, `evicted` and `channel_dropped`, but the bridge
         # flattened them all into a bare
@@ -1039,7 +1172,7 @@ async def ask(
         "multiSelect": multi_select,
         "allowOther": allow_other,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1166,7 +1299,7 @@ async def form(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1223,7 +1356,7 @@ async def confirm(
         "cancelLabel": cancel_label,
         "image": image,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1302,7 +1435,7 @@ async def gallery(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1475,7 +1608,7 @@ async def compare(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()

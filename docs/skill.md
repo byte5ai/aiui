@@ -94,6 +94,34 @@ Skip the dialog for content the user reads, doesn't answer:
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
+## Reading the result: `cancelled` and `reason`
+
+Every dialog tool returns `cancelled` plus that tool's own keys — on a
+submit *and* on a cancel, so you can read a key without guarding for it:
+
+| Tool | On submit | On cancel |
+|---|---|---|
+| `confirm` | `{cancelled: false, confirmed}` | `{cancelled: true, confirmed: false}` |
+| `ask` | `{cancelled: false, answers, other?}` | `{cancelled: true, answers: []}` |
+| `form` | `{cancelled: false, action?, values}` | `{cancelled: true, values: {}}` |
+| `gallery` | `{cancelled: false, decisions}` | `{cancelled: true, decisions: {}}` |
+| `compare` | `{cancelled: false, selected}` | `{cancelled: true}` — `selected` is *absent*, never a falsy stand-in |
+
+**`cancelled: true` does not mean the user said no.** When the dialog ended
+without anyone answering it, aiui adds a `reason`:
+
+| `reason` | What happened | What to do |
+|---|---|---|
+| *(absent)* | The user actively cancelled — Escape or the Cancel button. | A real decision. Treat it as "no" and do not re-ask. |
+| `ttl_expired` | Nobody answered within the dialog's TTL (2 h). | Nobody saw the question. Safe to re-ask later, or say the request timed out. |
+| `evicted` | aiui dropped this dialog to stay under its 16-dialog cap — usually your own later dialogs pushed it out. | Do **not** re-ask blindly; you are probably opening too many dialogs at once. |
+| `channel_dropped` | Internal: the result channel closed (companion restart, WebView reload). | A transient failure, not an answer. Retry once. |
+| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's Mac is back. |
+
+Never report a `reason`-carrying cancel as a user decision. "You declined
+the migration" after a `ttl_expired` is a decision the user never made.
+Treat an unknown `reason` as "we gave up", not as a user answer.
+
 ## Fire-and-forget: `notify`
 
 `notify` is the odd one out: it does not open a window and does not wait
@@ -492,8 +520,9 @@ line under the pane (source, score, timestamp).
 ```
 
 Result: `{cancelled, selected}` — `selected` is the `value` of the
-picked variant, present only when the user actually submits (Cancel/
-Escape leaves it absent, same as everywhere else in aiui).
+picked variant, present only when the user actually submits. Cancel/
+Escape leaves it *absent*: `compare` is the one tool with no falsy
+stand-in on cancel, because any value there would read as a real pick.
 
 **`sync_scroll: true`** locks scroll position across all panes — reach
 for it when comparing long text so the user can scroll once and see

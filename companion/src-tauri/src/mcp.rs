@@ -557,11 +557,15 @@ async fn wait_for_aiui(http: &reqwest::Client, cfg: &AppConfig) -> bool {
 /// Tool-call response signaling that the local aiui companion didn't
 /// answer `/ping` within `COLDSTART_WAIT`. Differentiates the realistic
 /// causes so the calling agent can choose between "retry once" and
-/// "tell the user something useful". v0.4.36 rewrite: the previous
-/// generic "not reachable on localhost:7777" was relayed verbatim by
-/// Claude even when the actual cause was contention (parallel session,
-/// stale dialog window, multiple aiui calls in one assistant turn) —
-/// none of which the user can fix by re-opening aiui.
+/// "tell the user something useful".
+///
+/// #202: this listed dialog-slot contention (a parallel session, a stale
+/// window, two calls in one turn) as causes 1-3 and the real ones last. None
+/// of them can produce *this* error: `/ping` is unauthenticated and answers a
+/// static "pong" regardless of dialog state, and single-occupancy is gone
+/// anyway (see `dialog::DIALOG_HARD_CAP`). The agent was told to pick one
+/// cause, so it sent users hunting for dialog windows that do not exist.
+/// Only the two causes that can actually silence `/ping` remain.
 fn aiui_unreachable_result() -> Value {
     let local = crate::lifetime::is_interactive_session();
     let context_line = if local {
@@ -576,22 +580,15 @@ fn aiui_unreachable_result() -> Value {
          {context_line}\n\
          \n\
          Likely causes (in order of frequency):\n\
-         1. **Multiple aiui calls in one assistant turn.** The previous call \
-            held the dialog window; the second one raced ahead before the \
-            companion freed the slot. Retry the failing call once after a \
-            short wait — usually succeeds.\n\
-         2. **Stale dialog window from an earlier session.** A previous \
-            agent's dialog timed out or was orphaned and is still pinning \
-            the companion. Tell the user: \"please close any leftover aiui \
-            dialog windows on your Mac and try again.\"\n\
-         3. **A parallel Claude session is using aiui right now.** Two \
-            agents on the same Mac share one companion; only one dialog at \
-            a time. Either retry shortly or tell the user the other session \
-            is currently holding the dialog.\n\
-         4. **aiui is genuinely not running** (cold-start path). If you are \
-            on the user's Mac, ask them to open aiui from /Applications. If \
-            on a remote host, the SSH-reverse-tunnel may be down — point \
-            them to aiui Settings → Connections.\n\
+         1. **aiui.app is not running.** /ping is unauthenticated and answers \
+            instantly whenever the companion is up, so no answer means no \
+            companion. If you are on the user's Mac, ask them to open aiui \
+            from /Applications — the auto-resurrect path may have been \
+            suppressed.\n\
+         2. **The SSH reverse-tunnel is down.** If you are on a remote host, \
+            port 7777 is forwarded from the Mac; a dropped tunnel looks \
+            exactly like this. Point the user to aiui Settings → \
+            Connections to re-establish it.\n\
          \n\
          Do not relay this entire message to the user verbatim — pick the \
          likely cause and phrase it plainly.",
@@ -1051,22 +1048,72 @@ async fn do_upload(args: &Value, cfg: &AppConfig, http: &reqwest::Client) -> Val
     }))
 }
 
-/// Per-call dialog rendering can fail in two structurally different
-/// ways. v0.4.36 splits them so the tool dispatcher can convert
-/// `Busy` into a structured tool result (with retry-vs-tell-user
-/// guidance) instead of bubbling it up as a generic transport error
-/// the way "render http 409" used to.
+/// Per-call dialog rendering failure. Surfaced as a generic
+/// "aiui tool error" to the agent, since these are conditions the user
+/// actually has to act on.
+///
+/// v0.4.36 also carried a `Busy` variant for the companion's 409
+/// single-occupancy rejection. That occupancy model is gone (Step 4, I8 —
+/// see `dialog::DIALOG_HARD_CAP`): N dialogs may be in flight at once and
+/// `http.rs` never answers CONFLICT. The bundled bridge ships in the same
+/// binary as the companion it talks to, so it can never meet a 409-era
+/// companion either — the variant and its `aiui_busy_result` guidance were
+/// removed in #202 rather than left looking like live behaviour.
 enum RenderError {
-    /// The companion answered 409 — another dialog is already in
-    /// flight. Carries the diagnostic counts the HTTP layer reported.
-    Busy {
-        pending_count: u64,
-        oldest_age_secs: u64,
-    },
-    /// Transport, parse, status-other-than-409, or token failures.
-    /// Surfaced as a generic "aiui tool error" to the agent, since
-    /// these are conditions the user actually has to act on.
     Transport(String),
+}
+
+/// Number of *consecutive* failed polls tolerated before `render_dialog`
+/// gives up on an in-flight dialog (#202). Five, one second apart, covers
+/// roughly three minutes of outage once the 40 s per-GET timeout is counted
+/// in — comfortably more than an SSH reverse-tunnel re-establish or a WebView
+/// restart during an in-app update. The counter resets on every successful
+/// poll, so a flaky link never accumulates its way to a false give-up.
+const POLL_MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+/// Backoff between two failed polls of the same render id.
+const POLL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Fallback when a 202 body carries no `ttl_secs` — mirrors the companion's
+/// `DIALOG_TTL` (2 h).
+const DEFAULT_POLL_TTL_SECS: u64 = 7200;
+
+/// Retry budget for the async-render poll loop (#202).
+///
+/// The async-render design exists so that a connection failure cannot cost
+/// the user's think-time: the dialog stays on screen for the whole server-side
+/// TTL, so a transport error on one poll is a blip, not an answer. This bounds
+/// how long the bridge keeps re-polling the same id — by consecutive failures
+/// *and* by the TTL the companion advertised, so we never poll an id that is
+/// certainly gone.
+struct PollBudget {
+    consecutive: u32,
+    deadline: std::time::Instant,
+}
+
+impl PollBudget {
+    fn new(ttl_secs: u64) -> Self {
+        PollBudget {
+            consecutive: 0,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+        }
+    }
+
+    /// A poll came back: the link is healthy again, so forget past failures.
+    fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Count a failed poll. `true` → sleep and re-poll the same id.
+    fn may_retry(&mut self) -> bool {
+        self.consecutive += 1;
+        self.consecutive < POLL_MAX_CONSECUTIVE_FAILURES
+            && std::time::Instant::now() < self.deadline
+    }
+
+    fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
 }
 
 async fn render_dialog(
@@ -1149,20 +1196,6 @@ async fn render_dialog(
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
-    if resp.status() == reqwest::StatusCode::CONFLICT {
-        // Body shape from http::render: { error, pending_count, oldest_age_secs }.
-        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
-        return Err(RenderError::Busy {
-            pending_count: body
-                .get("pending_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1),
-            oldest_age_secs: body
-                .get("oldest_age_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-        });
-    }
     if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
         // Invalid spec — http::render rejected it *before* showing any
         // window (v0.4.46, Bug B+). Body shape: { error, detail, hint }.
@@ -1210,15 +1243,47 @@ async fn render_dialog(
             ))
         }
     };
+    // #202: the 202 body advertises how long the id stays valid. Both bridges
+    // used to read only `id` and throw this away; it is the wall-clock ceiling
+    // for the retry budget below.
+    let ttl_secs = first
+        .get("ttl_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_POLL_TTL_SECS);
     let poll_url = format!("{}/render/{}", base_url(cfg), id);
+    let mut budget = PollBudget::new(ttl_secs);
     loop {
-        let pr = http
+        // #202: a transport error here must NOT be terminal. The dialog is
+        // already on the user's screen and stays there for the full server-side
+        // TTL, so aborting on the first blip abandons an answered window and
+        // makes the agent's retry open a second one. Re-poll the SAME id
+        // instead — never re-POST /render.
+        let pr = match http
             .get(&poll_url)
             .bearer_auth(&token)
             .timeout(std::time::Duration::from_secs(40))
             .send()
             .await
-            .map_err(|e| RenderError::Transport(format!("GET /render/{id}: {e}")))?;
+        {
+            Ok(pr) => pr,
+            Err(e) => {
+                if budget.may_retry() {
+                    trace(&format!(
+                        "render_dialog: poll {id} failed ({e}), retry {}/{}",
+                        budget.consecutive(),
+                        POLL_MAX_CONSECUTIVE_FAILURES
+                    ));
+                    tokio::time::sleep(POLL_RETRY_BACKOFF).await;
+                    continue;
+                }
+                return Err(RenderError::Transport(format!(
+                    "GET /render/{id}: {e} (gave up after {} consecutive poll \
+                     failures — the dialog may still be open on the Mac)",
+                    budget.consecutive()
+                )));
+            }
+        };
+        budget.on_success();
         if pr.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RenderError::Transport(format!(
                 "aiui lost track of render {id} (expired or never registered)"
@@ -1241,52 +1306,15 @@ async fn render_dialog(
     }
 }
 
-/// Tool-call response signaling that the companion is alive but
-/// already serving another dialog (multi-call-per-turn, second Claude
-/// session, stale window). Phrased as agent-facing guidance, parallel
-/// to `aiui_unreachable_result`.
-fn aiui_busy_result(pending_count: u64, oldest_age_secs: u64) -> Value {
-    let text = format!(
-        "aiui companion is busy serving another dialog right now \
-         (pending={pending_count}, oldest_age={oldest_age_secs}s).\n\
-         \n\
-         The companion intentionally serves only one dialog at a time. \
-         The other dialog is one of:\n\
-         1. **Your previous aiui call in this same assistant turn.** Tools \
-            in one turn run sequentially and the prior dialog hasn't been \
-            answered yet. Wait until the user answers, then issue the next \
-            call. Do not retry rapidly.\n\
-         2. **A stale dialog window from an earlier session** that the \
-            user never answered. Tell the user: \"please answer or close \
-            the leftover aiui dialog on your Mac, then I'll retry.\" The \
-            companion will sweep it automatically after 5 minutes.\n\
-         3. **A parallel Claude session is currently using aiui.** Either \
-            wait briefly and retry, or tell the user the other session \
-            holds the dialog right now.\n\
-         \n\
-         Do not relay this entire message to the user verbatim — pick the \
-         likely cause and phrase it plainly."
-    );
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": true
-    })
-}
-
-/// Dispatch a `render_dialog` outcome into a tool-call result. `Busy`
-/// becomes a successful tool call with `isError: true` and diagnostic
-/// guidance; `Transport` becomes an `Err` that `tools_call` then
-/// renders as the generic "aiui tool error: …" path.
+/// Dispatch a `render_dialog` outcome into a tool-call result: `Transport`
+/// becomes an `Err` that `tools_call` then renders as the generic
+/// "aiui tool error: …" path.
 fn dispatch_render(
     res: Result<Value, RenderError>,
     formatter: fn(Value) -> Value,
 ) -> Result<Value, String> {
     match res {
         Ok(v) => Ok(formatter(v)),
-        Err(RenderError::Busy {
-            pending_count,
-            oldest_age_secs,
-        }) => Ok(aiui_busy_result(pending_count, oldest_age_secs)),
         Err(RenderError::Transport(s)) => Err(s),
     }
 }
@@ -1392,7 +1420,19 @@ fn format_confirm_result(render: Value) -> Value {
         .and_then(|r| r.get("confirmed"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let payload = json!({ "cancelled": cancelled, "confirmed": confirmed });
+    let mut payload = json!({ "cancelled": cancelled, "confirmed": confirmed });
+    // #202: `format_dialog_result` forwards the companion's cancellation
+    // `reason` (ttl_expired / evicted / channel_dropped / host_exiting) but
+    // `confirm` — the tool that gates destructive actions — did not. An agent
+    // that reports "you declined the migration" after a 2 h TTL expiry is
+    // reporting a decision the user never made.
+    if cancelled {
+        if let Some(reason) = render.get("reason").and_then(|v| v.as_str()) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("reason".into(), json!(reason));
+            }
+        }
+    }
     value_to_tool_text(payload)
 }
 
@@ -1558,6 +1598,110 @@ mod tests {
         assert_eq!(out["cancelled"], json!(false));
         assert_eq!(out["values"]["name"], json!("Ada"));
         assert!(out.get("reason").is_none(), "not a cancel: {out}");
+    }
+
+    #[test]
+    fn format_confirm_result_passes_reason_through() {
+        // #202: `confirm` is the tool that gates destructive actions, so
+        // "the user said no" and "we gave up" must not collapse into the same
+        // answer. `confirmed` still defaults to false — the documented shape
+        // stays stable — but the reason rides along.
+        for reason in ["ttl_expired", "evicted", "channel_dropped", "host_exiting"] {
+            let render = json!({
+                "id": "d1", "cancelled": true, "result": null, "reason": reason
+            });
+            let out = tool_payload(format_confirm_result(render));
+            assert_eq!(out["cancelled"], json!(true));
+            assert_eq!(out["confirmed"], json!(false));
+            assert_eq!(out["reason"], json!(reason), "reason {reason} must survive");
+        }
+    }
+
+    #[test]
+    fn format_confirm_result_invents_no_reason_for_a_user_cancel() {
+        let render = json!({"id": "d1", "cancelled": true, "result": null});
+        let out = tool_payload(format_confirm_result(render));
+        assert_eq!(out["cancelled"], json!(true));
+        assert_eq!(out["confirmed"], json!(false));
+        assert!(out.get("reason").is_none(), "no reason invented: {out}");
+
+        // …and a real confirmation must not pick one up either.
+        let render = json!({
+            "id": "d1",
+            "cancelled": false,
+            "result": {"confirmed": true},
+            "reason": "host_exiting"
+        });
+        let out = tool_payload(format_confirm_result(render));
+        assert_eq!(out["confirmed"], json!(true));
+        assert!(out.get("reason").is_none(), "not a cancel: {out}");
+    }
+
+    /// #202: a single transport blip must not kill a live dialog. This pins
+    /// the budget the poll loop in `render_dialog` consults on every failed
+    /// `send()` — the loop itself does nothing but `continue` while this says
+    /// yes and return `RenderError::Transport` once it says no.
+    #[test]
+    fn poll_retries_transient_transport_error() {
+        let mut budget = PollBudget::new(DEFAULT_POLL_TTL_SECS);
+
+        // One failed poll then a success: the dialog survives, and the
+        // success wipes the slate so a flaky link never accumulates its way
+        // to a false give-up.
+        assert!(budget.may_retry(), "a single blip must be retried");
+        assert_eq!(budget.consecutive(), 1);
+        budget.on_success();
+        assert_eq!(budget.consecutive(), 0);
+
+        // N *consecutive* failures exhaust it — that is the only give-up.
+        for i in 1..POLL_MAX_CONSECUTIVE_FAILURES {
+            assert!(budget.may_retry(), "failure {i} is still within budget");
+        }
+        assert!(
+            !budget.may_retry(),
+            "the {POLL_MAX_CONSECUTIVE_FAILURES}th consecutive failure gives up"
+        );
+        assert_eq!(budget.consecutive(), POLL_MAX_CONSECUTIVE_FAILURES);
+    }
+
+    #[test]
+    fn poll_stops_once_the_advertised_ttl_has_elapsed() {
+        // The id from the 202 is only valid for `ttl_secs`; past that the slot
+        // is gone on the companion side and retrying it just burns the budget.
+        let mut budget = PollBudget::new(0);
+        assert!(!budget.may_retry(), "an expired id must not be re-polled");
+    }
+
+    /// #202: `/ping` is unauthenticated and returns a static "pong" whatever
+    /// the dialog registry is doing, and single-occupancy is gone anyway
+    /// (`dialog::DIALOG_HARD_CAP`) — so slot contention can never be the cause
+    /// of this error. The message told the agent to pick ONE cause and listed
+    /// three impossible ones first, sending users to close windows that do not
+    /// exist.
+    #[test]
+    fn unreachable_message_does_not_blame_dialog_occupancy() {
+        let text = aiui_unreachable_result()["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
+        for phrase in [
+            "only one dialog",
+            "freed the slot",
+            "parallel Claude session",
+            "leftover aiui",
+            "one dialog at",
+        ] {
+            assert!(
+                !text.contains(phrase),
+                "obsolete occupancy narrative back in aiui_unreachable_result: {phrase:?}"
+            );
+        }
+        // The two causes that *can* silence /ping must both be named.
+        assert!(text.contains("/Applications"), "local cause missing: {text}");
+        assert!(
+            text.contains("Settings → Connections"),
+            "remote cause missing: {text}"
+        );
     }
 
     fn test_cfg() -> Arc<AppConfig> {
