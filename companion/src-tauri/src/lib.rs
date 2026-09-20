@@ -18,6 +18,7 @@ mod tunnel;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_notification::NotificationExt;
 
 /// Tauri window labels. Setup and dialog live in *separate* windows so:
 ///  • the agent's dialog never visually overlaps the user's settings,
@@ -28,6 +29,22 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 /// rules that govern when each is created and torn down.
 pub const SETUP_WINDOW_LABEL: &str = "setup";
 pub const DIALOG_WINDOW_LABEL: &str = "dialog";
+
+/// Text of the "an update is available" system notification (#188).
+///
+/// English only: there is no i18n layer in the Rust half (the `en`/`de`
+/// catalogues are frontend-only), and building one for a single string is
+/// not the right trade. The settings banner, which is localised, stays the
+/// richer surface — this exists so a user who never opens Settings still
+/// learns the update is there.
+///
+/// Pure, so the wording is unit-testable alongside `compose_notify_body`.
+fn pending_update_notification(version: &str) -> (String, String) {
+    (
+        format!("aiui {version} is available"),
+        "Open aiui's settings window to install it, or run /aiui:update.".to_string(),
+    )
+}
 
 /// May the WebView navigate to this URL?
 ///
@@ -385,19 +402,25 @@ pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Frontend silent-update gate (v0.4.43): returns `true` iff installing
-/// + relaunching right now would NOT disrupt anything the user is
-/// currently looking at. The silent updater path in `updater.ts` calls
-/// this before `downloadAndInstall` so a post-render auto-check can
-/// install a pending update **only** while the dialog window is idle.
-/// Without this, the v0.4.39 silent-mode-too-silent regression kept
-/// updates from ever shipping automatically — the v0.4.43 design is
-/// "install transparently when safe, never interrupt a live form".
+/// Would installing + relaunching right now disrupt anything the user is
+/// looking at? `true` = safe.
 ///
-/// Criterion: the dialog registry is empty (no pending render-call
-/// waiting on user input). We deliberately don't gate on Settings
-/// being open — the user is in Settings *intentionally*; an install
-/// + relaunch there is fine.
+/// **Nothing calls this today.** #188: the doc here used to describe the
+/// v0.4.43 silent-install path in `updater.ts` as its caller. That path was
+/// removed in v0.4.44 — a transparent self-install left the user unaware
+/// their app had restarted — so this command has had no caller since, and
+/// the comment sent the next reader looking for an auto-install mechanism
+/// that does not exist.
+///
+/// Kept rather than deleted because it encodes the right predicate for the
+/// open question of whether aiui should install while idle: the dialog
+/// registry being empty, i.e. no pending render waiting on user input.
+/// Settings being open is deliberately *not* part of it — the user is there
+/// intentionally, so a restart is fine. If that question is ever answered
+/// "yes", the install belongs in the headless task in `run()` (never in a
+/// window), reading `dialog_state.stats()` directly, and this command
+/// should be deleted along with its registration rather than called from
+/// the frontend.
 #[tauri::command]
 async fn is_update_safe_to_install(
     dialog_state: tauri::State<'_, Arc<dialog::DialogState>>,
@@ -1856,8 +1879,39 @@ pub fn run() {
                                 logging::trace(&format!(
                                     "update-check: {v} available (headless, deferred to banner)"
                                 ));
-                                if let Ok(mut slot) = pending_update_task.0.lock() {
-                                    *slot = Some(v.clone());
+                                // #188: is this the first time we have seen
+                                // THIS version? Only then is it news worth a
+                                // notification — otherwise every 6 h tick
+                                // would nag about the same version.
+                                let is_new = match pending_update_task.0.lock() {
+                                    Ok(mut slot) => {
+                                        let fresh = slot.as_deref() != Some(v.as_str());
+                                        *slot = Some(v.clone());
+                                        fresh
+                                    }
+                                    Err(_) => false,
+                                };
+                                if is_new {
+                                    // #188: the banner in the settings window
+                                    // used to be the only surface for this,
+                                    // and aiui runs headless by design — no
+                                    // dock icon, no menu bar. A user with no
+                                    // reason to open Settings never learned an
+                                    // update existed, and stayed on the
+                                    // installed version indefinitely, security
+                                    // fixes included.
+                                    let (title, body) = pending_update_notification(&v);
+                                    if let Err(e) = app_handle_update
+                                        .notification()
+                                        .builder()
+                                        .title(title)
+                                        .body(body)
+                                        .show()
+                                    {
+                                        logging::trace(&format!(
+                                            "update-check: could not show notification: {e}"
+                                        ));
+                                    }
                                 }
                                 let _ = app_handle_update.emit("update:available", Some(v));
                             }
@@ -2076,6 +2130,39 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod update_notification_tests {
+    use super::*;
+
+    #[test]
+    fn the_notification_names_the_version_and_how_to_install() {
+        // #188: this is the only surface a headless install has. aiui runs
+        // with no dock icon and no menu bar by design, so a user with no
+        // reason to open Settings never learned an update existed — and
+        // stayed on the installed version indefinitely, security fixes
+        // included.
+        let (title, body) = pending_update_notification("0.11.0");
+        assert!(title.contains("0.11.0"), "the version is the news: {title}");
+        assert!(
+            body.contains("/aiui:update") || body.to_lowercase().contains("settings"),
+            "the body says how to act on it: {body}"
+        );
+        assert!(!title.is_empty() && !body.is_empty());
+    }
+
+    #[test]
+    fn the_notification_does_not_promise_an_automatic_install() {
+        // The whole point of #188: README and SECURITY.md claimed updates
+        // install themselves. Nothing in the product does that, and this
+        // string must not start the same lie over again.
+        let (title, body) = pending_update_notification("0.11.0");
+        let text = format!("{title} {body}").to_lowercase();
+        for claim in ["installing itself", "will install", "installed automatically"] {
+            assert!(!text.contains(claim), "{claim:?} in {text:?}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,13 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **A system notification when an update is found.** The settings banner
+  used to be the only surface for a pending update, which a headless app
+  nobody opens is a poor place for. The headless check now also raises a
+  native notification — once per version, not once per six-hour tick.
+  English-only: there is no i18n layer in the Rust half, and adding one for
+  a single string is not the right trade; the localised banner remains the
+  richer surface (#188).
 - **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
   missing a shipped platform, carries an empty signature or url, points an
   entry at another release's artifact, or advertises the wrong version. It
@@ -15,6 +22,14 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- **Two code comments described an auto-install path that does not exist.**
+  `checkForUpdates`'s header still documented transparent install and
+  relaunch, naming a file deleted in the multi-window refactor, and
+  `is_update_safe_to_install` claimed a caller it lost in v0.4.44. Both sent
+  the next contributor looking for a mechanism that was removed on purpose.
+  The command is kept rather than deleted — it encodes the right predicate
+  if install-while-idle is ever wanted — but its doc now says plainly that
+  nothing calls it, and where the install would belong if it were (#188).
 - **New file `~/.config/aiui/remote-uvx.json`** holds the `uvx` path per
   registered remote. Deliberately a sidecar rather than a second field in
   `remotes.json`: widening that file would make an older build parse it as
@@ -39,6 +54,17 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **README and SECURITY.md promised automatic updates that never happened.**
+  Both said the in-app updater installs patches on its own. Nothing in the
+  product has done that since v0.4.44 — the headless check and the silent
+  frontend check both *record* an available version and stop. The only
+  thing that installs is a click on the settings banner or `/aiui:update`.
+  And aiui runs headless by design: no dock icon, no menu-bar item, nothing
+  inviting the user into Settings. So a user who never opened that window
+  never learned an update existed and stayed on the installed version
+  indefinitely, security fixes included, while `SECURITY.md` told security
+  reporters those fixes were delivered automatically. Both documents now
+  describe what the code does (#188).
 - **Mermaid flowchart node labels rendered empty.** Mermaid 11 puts
   flowchart labels in HTML inside `<foreignObject>`, and the sanitiser runs
   with `USE_PROFILES: { svg, svgFilters }` — a DOMPurify *profile* replaces
