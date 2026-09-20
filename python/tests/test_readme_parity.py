@@ -58,7 +58,7 @@ def test_readme_documents_every_tool_and_prompt() -> None:
     assert len(tools) == 10, f"tool count changed: {sorted(tools)}"
     assert len(prompts) == 7, f"prompt count changed: {sorted(prompts)}"
 
-    readme = README.read_text()
+    readme = README.read_text(encoding="utf-8")
     for name in sorted(tools):
         assert f"`{name}`" in readme, f"tool {name} is missing from python/README.md"
     for name in sorted(prompts):
@@ -69,7 +69,7 @@ def test_readme_documents_every_tool_and_prompt() -> None:
 
 
 def test_user_facing_strings_are_platform_neutral() -> None:
-    source = Path(server.__file__).read_text()
+    source = Path(server.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     offenders: list[str] = []

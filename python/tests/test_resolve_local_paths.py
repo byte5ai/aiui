@@ -11,6 +11,7 @@ bugs.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -162,6 +163,10 @@ def test_resolve_local_paths_fails_soft_on_tilde_user_path() -> None:
     assert spec["fields"][1]["src"] == "~\\Pictures\\x.png"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX `~user` expansion — Windows `expanduser` does not raise for an unknown user",
+)
 def test_read_path_as_data_url_maps_unexpandable_tilde_to_value_error() -> None:
     with pytest.raises(ValueError, match="cannot expand"):
         _read_path_as_data_url("~nosuchuser42/x.png")

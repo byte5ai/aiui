@@ -92,7 +92,7 @@ def _run(body: str, home: Path) -> subprocess.CompletedProcess[str]:
         [sys.executable, "-c", _preamble() + body],
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
     )
 
 

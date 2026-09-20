@@ -27,6 +27,7 @@ for it) and is the remaining class of silent remote-vs-local drift.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -44,8 +45,9 @@ SERVER_PY = Path("python/src/aiui_mcp/server.py")
 GUARD_INPUTS = (CANON, COPY, HTTP_RS, MCP_RS, SERVER_PY)
 
 pytestmark = pytest.mark.skipif(
-    not all((REPO / p).is_file() for p in (GUARD, *GUARD_INPUTS)),
-    reason="repo checkout required (the guard reads the Rust/Python sources)",
+    os.name == "nt" or not all((REPO / p).is_file() for p in (GUARD, *GUARD_INPUTS)),
+    reason="bash drift-guard — validated on the Linux leg and the skill-drift "
+    "CI job; also needs a repo checkout (the guard reads the Rust/Python sources)",
 )
 
 

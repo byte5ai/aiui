@@ -50,6 +50,10 @@ def test_filename_header_roundtrip() -> None:
     assert _upload_safe_base_name(decoded) == original
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX absolute-path fixture (`/tmp/x`) is not absolute on Windows",
+)
 def test_expand_dir_absolute_and_tilde() -> None:
     assert _upload_expand_dir("/tmp/x") == Path("/tmp/x")
     assert _upload_expand_dir("~/Downloads") == Path.home() / "Downloads"

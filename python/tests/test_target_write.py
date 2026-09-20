@@ -8,6 +8,8 @@ and stripped before the result reaches the agent.
 from __future__ import annotations
 
 import os
+
+import pytest
 from pathlib import Path
 
 from aiui_mcp import server
@@ -342,6 +344,10 @@ def test_absent_secret_value_is_not_invented(tmp_path: Path) -> None:
 # exception after the user has already typed (and lost) a credential
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX file-mode / symlink semantics; the bridge guards Windows via `can_chmod`",
+)
 def test_substitute_preserves_existing_mode(tmp_path: Path) -> None:
     """The headline: a 0644 compose file came back 0600 and the container
     reading it as another uid stopped starting — reported as `written: true`,
@@ -366,6 +372,10 @@ def test_substitute_preserves_existing_mode(tmp_path: Path) -> None:
     assert out2["mode"] == "0640"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX file-mode / symlink semantics; the bridge guards Windows via `can_chmod`",
+)
 def test_create_defaults_to_0600_without_perm(tmp_path: Path) -> None:
     """Pins tight-by-default against a naive "drop the 0600" fix for the
     substitute bug — that would give a fresh credential file the umask."""
@@ -376,6 +386,10 @@ def test_create_defaults_to_0600_without_perm(tmp_path: Path) -> None:
     assert out["mode"] == "0600"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX file-mode / symlink semantics; the bridge guards Windows via `can_chmod`",
+)
 def test_substitute_writes_through_symlink(tmp_path: Path) -> None:
     """Before: the read followed the link, `os.replace` landed ON it. The link
     became a regular file holding the secret and the real config kept its
@@ -427,7 +441,7 @@ def test_substitute_preserves_non_ascii_bytes(tmp_path: Path, monkeypatch) -> No
 def test_write_without_fchmod_does_not_crash(tmp_path: Path, monkeypatch) -> None:
     """The Windows bridge host: `os.fchmod` does not exist there, and the
     unguarded call made *every* target write die with AttributeError."""
-    monkeypatch.delattr(os, "fchmod", raising=True)
+    monkeypatch.delattr(os, "fchmod", raising=False)
     path = tmp_path / "token"
     out = _write_local_target("ghp_x", {"mode": "create", "path": str(path)})
     assert out["written"] is True, out
@@ -503,6 +517,10 @@ def test_apply_target_writes_never_raises(tmp_path: Path, monkeypatch) -> None:
     assert "disk on fire" in data2["result"]["values"]["a"]["error"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX file-mode / symlink semantics; the bridge guards Windows via `can_chmod`",
+)
 def test_annotate_target_paths_stamps_the_destination(tmp_path: Path) -> None:
     """The approval line showed the raw spec string. It now shows what this
     host — the one that performs the write — will actually write."""
