@@ -1,6 +1,7 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
   import { renderMarkdown } from "../markdown";
+  import { handleContentClick } from "../external-link";
 
   type Variant = {
     value: string; // stable id returned as `selected`
@@ -141,7 +142,12 @@
               </div>
             {/if}
             {#if v.content}
-              <div class="compare-content">
+              <!-- #189: see Form.svelte's markdown field. The existing
+                   closest("a") early-return on the card keeps a link click
+                   from also flipping the variant pick. -->
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="compare-content" onclick={handleContentClick}>
                 <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                 {@html renderMarkdown(v.content)}
               </div>

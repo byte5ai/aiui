@@ -15,6 +15,19 @@ import DOMPurify from "dompurify";
 
 marked.setOptions({ gfm: true, breaks: true });
 
+// Issue #189: mark every surviving link as external. The dialog window is
+// not allowed to navigate (Rust refuses it), and `external-link.ts`
+// intercepts the click to hand the URL to the OS — but if either of those
+// ever fails to fire, `target="_blank"` plus `rel="noopener noreferrer"` is
+// the difference between "opens somewhere else" and "destroys the dialog".
+// Installed once at module scope; DOMPurify hooks are global.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A" && node.hasAttribute("href")) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
 export function renderMarkdown(src: string): string {
   let raw: string;
   try {
@@ -28,5 +41,8 @@ export function renderMarkdown(src: string): string {
     // forbid form-related tags to prevent autofill-driven exfiltration.
     FORBID_TAGS: ["script", "iframe", "form", "input", "button"],
     FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus"],
+    // The hook above adds these after the allow-list is applied; naming
+    // them here keeps a future DOMPurify version from stripping them.
+    ADD_ATTR: ["target", "rel"],
   });
 }

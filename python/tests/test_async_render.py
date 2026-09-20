@@ -27,7 +27,7 @@ class _FakeResp:
 
 def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     token_file = tmp_path / "token"
-    token_file.write_text("dummy-token-for-tests")
+    token_file.write_text("de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57")
     monkeypatch.setattr(server, "TOKEN_PATH", token_file)
 
 

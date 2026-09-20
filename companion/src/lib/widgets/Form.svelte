@@ -1,6 +1,7 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
   import { renderMarkdown } from "../markdown";
+  import { handleContentClick } from "../external-link";
   import TreeNode from "./TreeNode.svelte";
   import MermaidView from "./MermaidView.svelte";
   import WireframeView from "./WireframeView.svelte";
@@ -146,6 +147,13 @@
     success?: boolean;
     /** If true, field-level required-validation is skipped when this action fires (e.g. "defer"). */
     skip_validation?: boolean;
+    /**
+     * Issue #177: an action with `skip_validation` is an escape hatch and does
+     * NOT commit `target` file writes. Set this to opt such an action back in.
+     * The decision is enforced in the writers (Rust `action_commits_targets`,
+     * Python `_action_commits_targets`) against the stored spec, not here.
+     */
+    writes_targets?: boolean;
   };
 
   type Tab = { label: string; fields: Field[] };
@@ -607,7 +615,13 @@
       {#if f.kind === "static_text"}
         <div class="static-text {f.tone ?? 'info'}">{f.text}</div>
       {:else if f.kind === "markdown"}
-        <div class="markdown-field">
+        <!-- #189: links inside agent-supplied markdown open in the user's
+             browser, never by navigating this window away. Delegated, because
+             the content is {@html} and its anchors have no Svelte lifecycle.
+             Not interactive itself — the handler only acts on a real <a>. -->
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="markdown-field" onclick={handleContentClick}>
           <!-- eslint-disable-next-line svelte/no-at-html-tags -->
           {@html renderMarkdown(f.text)}
         </div>
@@ -930,6 +944,17 @@
                 >mode: {f.target.mode}{f.target.perm ? `, ${f.target.perm}` : ""}{f.target.overwrite
                   ? ", overwrite"
                   : ""}</span>
+            </p>
+          {:else if f.kind === "secret"}
+            <!-- Issue #186: the write-only promise belongs to the KIND, not to
+                 the presence of a `target`. This note used to render only for
+                 target-carrying fields, so a target-less `secret` looked and
+                 behaved exactly like `password` while the docs told the user
+                 it was write-only. A current companion rejects that shape in
+                 validate_spec; this is the layer the user actually sees. -->
+            <p class="write-target">
+              <span class="wt-icon" aria-hidden="true">↳</span>
+              Wird nicht an den Agent zurückgegeben und nirgends gespeichert.
             </p>
           {/if}
         </div>

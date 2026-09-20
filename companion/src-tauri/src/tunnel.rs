@@ -145,46 +145,205 @@ const SHARED_FORWARD_POLL_SECS: u64 = 30;
 /// there at remote-registration time). If the file is missing on the
 /// remote, the probe is treated as inconclusive — we don't have enough
 /// to decide.
-async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
+/// The shell command the probe runs on the remote.
+///
+/// #187: the token is fed to curl over STDIN, not as an argument. It used
+/// to be interpolated into `-H "Authorization: Bearer $T"`, which the
+/// remote shell expanded before exec — so the live API token sat in curl's
+/// argv, visible in `ps` to every user on that host, once per poll (every
+/// 30 s in shared-forward mode). Whoever read it could render dialogs on
+/// the user's desktop through the tunnel. `curl -H @-` reads headers from
+/// stdin, so the secret never becomes an argv element of any process.
+///
+/// The heredoc delimiter is deliberately UNQUOTED so the remote shell
+/// expands `$T`. Not `printf … | curl -H @-`: where printf is an external
+/// binary rather than a builtin, that just moves the token into *its* argv.
+/// Not the environment either — `/proc/<pid>/environ` is readable by the
+/// same set of users as `cmdline`.
+///
+/// `-f` makes curl fail on 4xx/5xx (so a 401 reads as not-shared) and
+/// `-m 3` caps its time. The missing-token case gets its own exit code so
+/// the classifier can tell it apart from a real answer.
+///
+/// A function rather than an inline `format!` so the tests exercise the
+/// string that actually ships. A malformed heredoc would break the probe
+/// on every remote at once, and Rust's line continuations make the layout
+/// easy to get wrong — a test against a re-typed copy would stay green
+/// through exactly that mistake.
+fn probe_command(port: u16) -> String {
     let url = format!("http://localhost:{port}/probe");
-    // Read the token *on the remote* and auth-bind the curl in one shell
-    // command so the token never appears in our local argv. -f makes curl
-    // return non-zero on 4xx/5xx (so 401 = not-shared); -m 3 caps total
-    // time.
-    let cmd = format!(
-        "T=$(cat ~/.config/aiui/token 2>/dev/null) && \
-         [ -n \"$T\" ] && \
-         curl -sS -f -m 3 -H \"Authorization: Bearer $T\" {url} 2>/dev/null"
-    );
-    let out = no_window_tokio(Command::new("ssh").args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "--",
-        host,
-        &cmd,
-    ]))
-    .output()
-    .await;
+    format!(
+        "T=$(cat ~/.config/aiui/token 2>/dev/null); \
+         [ -n \"$T\" ] || exit {NO_TOKEN_EXIT}; \
+         curl -sS -f -m 3 -H @- {url} <<AIUI_HDR\n\
+         Authorization: Bearer $T\n\
+         AIUI_HDR\n"
+    )
+}
+
+async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
+    let cmd = probe_command(port);
+    let fut = no_window_tokio(
+        Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "--",
+                host,
+                &cmd,
+            ])
+            // #187: without this, the timeout below drops the future and
+            // orphans the ssh child — which keeps holding the remote
+            // connection we just gave up on.
+            .kill_on_drop(true),
+    )
+    .output();
+
+    // #187: `ConnectTimeout=5` bounds the TCP connect only. Authentication,
+    // a wedged remote shell or a stalled `curl -m 3` are all unbounded after
+    // that, and this future is awaited inside the poll loop — one hung probe
+    // used to park the whole tunnel task forever.
+    let out = match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            trace(&format!(
+                "tunnel: shared-forward probe on {host} exceeded {}s — inconclusive",
+                PROBE_TIMEOUT.as_secs()
+            ));
+            return None;
+        }
+    };
+
     match out {
-        Ok(o) if o.status.success() => {
-            let body = String::from_utf8_lossy(&o.stdout);
-            Some(probe_response_is_self(&body))
-        }
         Ok(o) => {
-            // ssh ran, but the remote command failed (curl 401, port
-            // empty, missing token, …). exit 255 from ssh itself means
-            // "connection error" — keep that as inconclusive so we don't
-            // oscillate.
-            if o.status.code() == Some(255) {
-                None
-            } else {
-                Some(false)
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let verdict = classify_probe_exit(o.status.code(), &stdout);
+            if verdict.is_none() {
+                // #187: the `2>/dev/null` that used to swallow this made
+                // `-S` pointless and threw away the one line explaining an
+                // inconclusive probe.
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                trace(&format!(
+                    "tunnel: shared-forward probe on {host} inconclusive (exit {:?}): {}",
+                    o.status.code(),
+                    stderr.trim()
+                ));
             }
+            verdict
         }
-        Err(_) => None,
+        Err(e) => {
+            trace(&format!(
+                "tunnel: shared-forward probe on {host} could not run ssh: {e}"
+            ));
+            None
+        }
     }
+}
+
+/// Overall cap on one shared-forward probe (#187). `ConnectTimeout=5` bounds
+/// only the TCP connect; everything after it — authentication, a wedged
+/// remote shell, a stalled curl — was unbounded.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Exit status the remote probe script uses to say "no usable token here"
+/// (#187). Outside curl's own range, and not 126/127 (shell errors) or 255
+/// (ssh transport failure), so it cannot be confused with any of them.
+const NO_TOKEN_EXIT: i32 = 111;
+
+/// Turn the remote command's exit status into a probe verdict.
+///
+/// `Some(true)`/`Some(false)` are claims the tunnel manager acts on
+/// immediately; `None` means "inconclusive, ask again later". #187: several
+/// outcomes that prove nothing were being reported as `Some(false)` — a
+/// missing token, a curl that timed out, a remote without curl at all, an
+/// ssh killed by a signal. In `ConnectedShared` mode a wrong `Some(false)`
+/// costs a retry storm against a port that is still occupied; `None` costs
+/// one extra 30 s poll. So when in doubt, `None`.
+///
+/// Pure, so the table below is unit-testable without ssh.
+fn classify_probe_exit(code: Option<i32>, stdout: &str) -> Option<bool> {
+    match code {
+        // curl got a 2xx — the body decides whether it is us.
+        Some(0) => Some(probe_response_is_self(stdout)),
+        // Our own marker: no token on the remote, so we cannot even ask.
+        Some(NO_TOKEN_EXIT) => None,
+        // curl: 7 = connection refused (nothing listening), 22 = HTTP error
+        // under -f (401, or a foreign service). Both are real answers.
+        Some(7) | Some(22) => Some(false),
+        // curl -m 3 timed out: something listens but did not answer. A
+        // wedged responder is not proof the forward is gone.
+        Some(28) => None,
+        // Shell could not run curl at all (not found / not executable).
+        Some(126) | Some(127) => None,
+        // ssh transport failure.
+        Some(255) => None,
+        // Any other curl exit is an error we cannot interpret; and `None`
+        // means ssh was killed by a signal.
+        _ => None,
+    }
+}
+
+/// Collapse captured ssh stderr into one short fragment for
+/// `TunnelStatus::Failed.reason` (#187).
+///
+/// Every tunnel failure used to surface as "ssh exit code 255" — the least
+/// informative thing ssh can say, and the one users hit most. ssh already
+/// explains itself on stderr ("remote port forwarding failed for listen
+/// port 7777", "Permission denied (publickey)"), but stderr was piped to
+/// /dev/null.
+///
+/// Kept single-line and truncated on purpose: Settings renders the reason
+/// into a one-line `.tunnel-status` div, so a multi-line value breaks the
+/// layout. Pure, so the shaping is unit-testable.
+fn tail_for_reason(raw: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut joined = lines[start..].join("; ");
+    if joined.chars().count() > max_bytes {
+        joined = joined.chars().take(max_bytes.saturating_sub(1)).collect();
+        joined.push('…');
+    }
+    joined
+}
+
+/// How long an ssh child must survive before the link counts as having
+/// worked (#187). Matches the optimistic-connect threshold, so anything we
+/// were willing to call "connected" also resets the backoff.
+const BACKOFF_RESET_UPTIME: Duration = Duration::from_secs(30);
+
+/// Next reconnect delay.
+///
+/// #187: the backoff only ever doubled, never reset. A link that connects,
+/// works for hours and then drops inherited whatever the last startup
+/// stumble had left behind — so a flapping connection degraded into a
+/// permanent 30 s hole after a handful of drops, during which every remote
+/// dialog fails. `uptime` past [`BACKOFF_RESET_UPTIME`] means the link
+/// worked; start over.
+///
+/// Deterministic, so it stays unit-testable — jitter is applied at the
+/// sleep site.
+fn next_backoff(prev: u64, uptime: Duration) -> u64 {
+    if uptime > BACKOFF_RESET_UPTIME {
+        1
+    } else {
+        (prev * 2).min(30)
+    }
+}
+
+/// Apply ±20 % jitter to a backoff, so several tunnels that dropped
+/// together do not retry in lockstep (#187). Impure by nature — kept
+/// separate from [`next_backoff`] so the schedule itself stays testable.
+fn jittered_secs(secs: u64) -> Duration {
+    use rand::Rng;
+    let base = secs as f64;
+    let factor = rand::thread_rng().gen_range(0.8..=1.2);
+    Duration::from_millis((base * factor * 1000.0) as u64)
 }
 
 /// Pure decision: given the raw `/probe` response body, decide whether
@@ -246,7 +405,9 @@ async fn run_tunnel(
                     &host,
                 ])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                // #187: captured, not discarded. ssh explains its failures
+                // here; without it every one surfaced as "ssh exit code 255".
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true),
         )
         .spawn()
@@ -257,16 +418,48 @@ async fn run_tunnel(
                 trace(&format!("tunnel[{host}]: {err}"));
                 *status.lock().await = TunnelStatus::Failed { reason: err };
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                    _ = tokio::time::sleep(jittered_secs(backoff_secs)) => {}
                     _ = &mut cancel_pin => {
                         *status.lock().await = TunnelStatus::Stopped;
                         return;
                     }
                 }
-                backoff_secs = (backoff_secs * 2).min(30);
+                // No link ever existed here, so there is nothing to reset:
+                // plain doubling, same jitter as the other sleep site.
+                backoff_secs = next_backoff(backoff_secs, Duration::ZERO);
                 continue;
             }
         };
+
+        // Drain stderr into a bounded ring so a chatty motd or `ssh -v`
+        // cannot grow it without limit. Taken before `wait()`, because the
+        // pipe must be read while the child lives.
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        if let Some(mut err) = child.stderr.take() {
+            let sink = stderr_tail.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match err.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut guard = sink.lock().await;
+                            guard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            // Keep only the tail: 4 KB is far more than the
+                            // 4 lines we ever render, and bounds the buffer.
+                            if guard.len() > 4096 {
+                                let cut = guard.len() - 4096;
+                                *guard = guard[cut..].to_string();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // #187: how long the link lived decides whether the backoff resets.
+        let started = std::time::Instant::now();
 
         // Optimistic "connected" after 2s of process survival.
         let status_probe = status.clone();
@@ -280,12 +473,22 @@ async fn run_tunnel(
         tokio::select! {
             wait_res = child.wait() => {
                 probe.abort();
-                let msg = match wait_res {
+                let base = match wait_res {
                     Ok(s) => s
                         .code()
                         .map(|c| format!("ssh exit code {c}"))
                         .unwrap_or_else(|| "ssh killed by signal".to_string()),
                     Err(e) => format!("wait error: {e}"),
+                };
+                // #187: say WHY, not just that it died. ssh's own last words
+                // ("remote port forwarding failed for listen port 7777") are
+                // the difference between a user who can act and one who
+                // cannot.
+                let tail = tail_for_reason(&stderr_tail.lock().await.clone(), 4, 200);
+                let msg = if tail.is_empty() {
+                    base
+                } else {
+                    format!("{base} — {tail}")
                 };
                 trace(&format!("tunnel[{host}]: ssh died: {msg}"));
 
@@ -294,7 +497,16 @@ async fn run_tunnel(
                 // degrade gracefully to shared-forward polling instead of
                 // spamming `ssh -NTR` that's guaranteed to keep failing
                 // while the zombie session holds the port.
-                if let Some(true) = probe_remote_shared_forward(&host, port).await {
+                // #187: cancellable. A `remove_remote` during this probe
+                // used to be ignored until it finished.
+                let shared = tokio::select! {
+                    v = probe_remote_shared_forward(&host, port) => v,
+                    _ = &mut cancel_pin => {
+                        *status.lock().await = TunnelStatus::Stopped;
+                        return;
+                    }
+                };
+                if let Some(true) = shared {
                     trace(&format!(
                         "tunnel[{host}]: shared forward detected — switching to poll mode"
                     ));
@@ -314,14 +526,19 @@ async fn run_tunnel(
                 }
 
                 *status.lock().await = TunnelStatus::Failed { reason: msg };
+                // #187: a link that worked resets the backoff, so a flapping
+                // connection cannot degrade into a permanent 30 s hole.
+                // Jitter only at the sleep site, so next_backoff stays
+                // deterministic and testable.
+                backoff_secs = next_backoff(backoff_secs, started.elapsed());
+                let jittered = jittered_secs(backoff_secs);
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                    _ = tokio::time::sleep(jittered) => {}
                     _ = &mut cancel_pin => {
                         *status.lock().await = TunnelStatus::Stopped;
                         return;
                     }
                 }
-                backoff_secs = (backoff_secs * 2).min(30);
             }
             _ = &mut cancel_pin => {
                 probe.abort();
@@ -352,31 +569,233 @@ async fn shared_forward_poll_loop(
     cancel_pin: &mut std::pin::Pin<Box<oneshot::Receiver<()>>>,
 ) -> PollOutcome {
     loop {
+        // Wait out the poll interval — cancellable.
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(SHARED_FORWARD_POLL_SECS)) => {
-                match probe_remote_shared_forward(host, port).await {
-                    Some(true) => continue,
-                    Some(false) => {
-                        trace(&format!(
-                            "tunnel[{host}]: shared forward gone — will re-attempt ssh -NTR"
-                        ));
-                        return PollOutcome::LostShare;
-                    }
-                    None => {
-                        // Inconclusive (ssh itself failed). Keep the label
-                        // as shared; next poll will retry. If it's really
-                        // gone, the probe will eventually return Some(false).
-                        trace(&format!(
-                            "tunnel[{host}]: shared-forward probe inconclusive, keeping state"
-                        ));
-                        let _ = status;
-                    }
-                }
-            }
+            _ = tokio::time::sleep(Duration::from_secs(SHARED_FORWARD_POLL_SECS)) => {}
             _ = &mut *cancel_pin => {
                 return PollOutcome::Cancelled;
             }
         }
+        // #187: race the probe against cancellation too. It used to sit
+        // inside the sleep branch, so a `remove_remote` arriving while the
+        // probe was in flight waited for it — and before the probe had its
+        // own timeout, that could be forever.
+        let verdict = tokio::select! {
+            v = probe_remote_shared_forward(host, port) => v,
+            _ = &mut *cancel_pin => {
+                return PollOutcome::Cancelled;
+            }
+        };
+        match verdict {
+            Some(true) => continue,
+            Some(false) => {
+                trace(&format!(
+                    "tunnel[{host}]: shared forward gone — will re-attempt ssh -NTR"
+                ));
+                return PollOutcome::LostShare;
+            }
+            None => {
+                // Inconclusive. Keep the label as shared; the next poll
+                // retries. If it really is gone, a later probe says so.
+                trace(&format!(
+                    "tunnel[{host}]: shared-forward probe inconclusive, keeping state"
+                ));
+                let _ = status;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_cmd_tests {
+    use super::*;
+
+    /// The production builder, so these tests check the string that really
+    /// ships rather than a re-typed copy that could drift away from it.
+    use super::probe_command as probe_cmd;
+
+    #[test]
+    fn the_token_is_never_an_argument() {
+        // #187 in one assertion: the command may reference the shell
+        // variable, but must never place it where argv can be read by
+        // another user on the remote host.
+        let cmd = probe_cmd(7777);
+        assert!(
+            !cmd.contains("-H \"Authorization"),
+            "no -H with an inline value: {cmd}"
+        );
+        assert!(cmd.contains("-H @-"), "headers come from stdin: {cmd}");
+    }
+
+    #[test]
+    fn the_heredoc_is_well_formed() {
+        // A malformed heredoc breaks the probe on every remote at once, and
+        // Rust's line continuations make the layout easy to get wrong: `\`
+        // at end of line eats the newline AND the next line's indentation.
+        let cmd = probe_cmd(7777);
+        let lines: Vec<&str> = cmd.lines().collect();
+        assert_eq!(lines.len(), 3, "three lines exactly: {lines:?}");
+        assert!(lines[0].ends_with("<<AIUI_HDR"), "line 0: {:?}", lines[0]);
+        assert_eq!(
+            lines[1], "Authorization: Bearer $T",
+            "the header body must start at column 0, unindented"
+        );
+        assert_eq!(lines[2], "AIUI_HDR", "the terminator must be alone on its line");
+        assert!(
+            !cmd.contains("<<'AIUI_HDR'"),
+            "the delimiter must be UNQUOTED so the remote shell expands $T"
+        );
+    }
+
+    #[test]
+    fn the_command_is_valid_shell() {
+        // Syntax-check with a real shell rather than by eye.
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(probe_cmd(7777))
+            .output()
+            .expect("sh is available");
+        assert!(
+            out.status.success(),
+            "sh -n rejected the probe command: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn no_token_exits_with_our_marker() {
+        // Run the real command with HOME pointed at an empty dir: no token
+        // file, so it must exit with the reserved code rather than running
+        // curl and having its failure misread as "the port is free".
+        let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe_cmd(7777))
+            .env("HOME", &dir)
+            .output()
+            .expect("sh is available");
+        assert_eq!(out.status.code(), Some(NO_TOKEN_EXIT));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_token_file_also_exits_with_the_marker() {
+        let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".config").join("aiui")).unwrap();
+        std::fs::write(dir.join(".config").join("aiui").join("token"), "").unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe_cmd(7777))
+            .env("HOME", &dir)
+            .output()
+            .expect("sh is available");
+        assert_eq!(out.status.code(), Some(NO_TOKEN_EXIT));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backoff_resets_after_a_link_that_worked() {
+        // #187: the backoff only ever doubled. A link that connected, ran
+        // for hours and then dropped inherited the last startup stumble, so
+        // a flapping connection degraded into a permanent 30 s hole during
+        // which every remote dialog fails.
+        assert_eq!(next_backoff(16, Duration::from_secs(3600)), 1, "worked for an hour");
+        assert_eq!(next_backoff(30, Duration::from_secs(31)), 1, "just past the threshold");
+        // …but a link that never really came up keeps backing off.
+        assert_eq!(next_backoff(1, Duration::from_secs(2)), 2);
+        assert_eq!(next_backoff(2, Duration::ZERO), 4);
+        assert_eq!(next_backoff(16, Duration::from_secs(29)), 30, "capped");
+        assert_eq!(next_backoff(30, Duration::from_secs(1)), 30, "stays capped");
+    }
+
+    #[test]
+    fn backoff_schedule_is_bounded_and_climbs() {
+        // A cold start that never connects: 1,2,4,8,16,30,30…
+        let mut b = 1u64;
+        let mut seen = vec![b];
+        for _ in 0..8 {
+            b = next_backoff(b, Duration::ZERO);
+            seen.push(b);
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30, 30, 30]);
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        for secs in [1u64, 5, 30] {
+            for _ in 0..200 {
+                let d = jittered_secs(secs).as_millis() as f64 / 1000.0;
+                assert!(
+                    d >= secs as f64 * 0.79 && d <= secs as f64 * 1.21,
+                    "{d}s is outside ±20% of {secs}s"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_for_reason_keeps_the_useful_last_words() {
+        // The failure users hit most, and least understand.
+        let raw = "Warning: Permanently added 'devhost' to the list of known hosts.\n\
+                   Warning: remote port forwarding failed for listen port 7777\n";
+        let out = tail_for_reason(raw, 4, 200);
+        assert!(out.contains("remote port forwarding failed for listen port 7777"));
+        assert!(!out.contains('\n'), "single line for the Settings row: {out:?}");
+    }
+
+    #[test]
+    fn tail_for_reason_keeps_only_the_last_lines() {
+        // A chatty motd, or `ssh -v`, can produce a lot. Only the tail is
+        // rendered — ssh explains itself last.
+        let raw = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = tail_for_reason(&raw, 4, 200);
+        assert_eq!(out, "line 196; line 197; line 198; line 199");
+        assert!(!out.contains('\n'), "single line for the Settings row");
+    }
+
+    #[test]
+    fn tail_for_reason_truncates_long_output() {
+        // Four lines can still overflow the one-line Settings row, so the
+        // byte cap applies after the line cap.
+        let raw = (0..10)
+            .map(|i| format!("line {i} {}", "x".repeat(120)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = tail_for_reason(&raw, 4, 200);
+        assert_eq!(out.chars().count(), 200, "exactly the cap: {}", out.chars().count());
+        assert!(out.ends_with('…'), "truncation is visible: {out:?}");
+        assert!(!out.contains('\n'));
+        // Still starts at the tail, not the head.
+        assert!(out.starts_with("line 6 "), "{out:?}");
+    }
+
+    #[test]
+    fn tail_for_reason_handles_empty_and_blank_input() {
+        assert_eq!(tail_for_reason("", 4, 200), "");
+        assert_eq!(tail_for_reason("\n\n   \n", 4, 200), "");
+    }
+
+    #[test]
+    fn classify_probe_exit_is_conservative() {
+        // Exits that prove nothing must not be reported as a decision: in
+        // ConnectedShared mode a wrong `Some(false)` costs a retry storm
+        // against a port that is still occupied.
+        assert_eq!(classify_probe_exit(Some(NO_TOKEN_EXIT), ""), None, "no token");
+        assert_eq!(classify_probe_exit(Some(28), ""), None, "curl timeout");
+        assert_eq!(classify_probe_exit(Some(127), ""), None, "no curl on the remote");
+        assert_eq!(classify_probe_exit(Some(126), ""), None, "curl not executable");
+        assert_eq!(classify_probe_exit(Some(255), ""), None, "ssh transport");
+        assert_eq!(classify_probe_exit(None, ""), None, "killed by a signal");
+        assert_eq!(classify_probe_exit(Some(35), ""), None, "an unmapped curl error");
+
+        // …and the ones that do prove something still do.
+        assert_eq!(classify_probe_exit(Some(7), ""), Some(false), "refused");
+        assert_eq!(classify_probe_exit(Some(22), ""), Some(false), "401 / foreign");
     }
 }
 

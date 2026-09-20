@@ -53,7 +53,7 @@ def test_explain_exc_works_for_non_httpx_exceptions() -> None:
 def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """Make the token-file lookup succeed with a dummy bearer."""
     token_file = tmp_path / "token"
-    token_file.write_text("dummy-token-for-tests")
+    token_file.write_text("de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57")
     monkeypatch.setattr("aiui_mcp.server.TOKEN_PATH", token_file)
 
 

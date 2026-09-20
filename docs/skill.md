@@ -151,6 +151,13 @@ an expected outcome, not a bug to retry around.
   Never style a save button red; never style a delete button green.
 - Offer an escape hatch (`skip_validation: true`) so required-field validation
   never traps the user.
+- **An escape hatch does not commit `target` file writes.** An action with
+  `skip_validation: true` is non-committing: pressing it writes no `target`
+  field to disk, and each such field comes back as
+  `{written: false, error: "action '<value>' does not commit target writes"}`.
+  The built-in submit button always commits. If an action needs both — skip
+  validation *and* write — set `writes_targets: true` on it explicitly.
+  An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
 ## The `list` field — one widget, four modes
@@ -573,9 +580,12 @@ What does **not** work — known footguns:
   follows the same CSP — the URL has to resolve to `data:` somehow.
   The resolver only walks `src` / `thumbnail` properties, not the
   bodies of markdown blocks.
-- **Linking out** with `<a href="https://...">` from `markdown` —
-  works as a click target, but opens in the user's default browser
-  (we explicitly intercept it). It's not an image-rendering question.
+- **Linking out** with `[text](https://…)` or `<a href="https://…">` from
+  `markdown` (and from a `compare` variant's `content`) — works as a click
+  target. It opens in the user's default browser; the dialog window itself
+  never navigates, so the dialog stays open and still returns a result.
+  Only `http(s)` links open; anything else is ignored. It's not an
+  image-rendering question.
 
 If you tried a path or URL and the user reports a broken image, ask
 them once whether anything appeared at all — a missing file, a CSP
@@ -637,6 +647,12 @@ user pastes that should land in a file, not your transcript — use a
 `secret` field the value is **write-only**: aiui writes it to the file and
 returns only `{written, target, bytes}`, never the value.
 
+**A `secret` field must carry a `target`.** The write-only promise is what
+a `secret` *is*, and the only place its value can legitimately go is the
+file — so a `secret` without a `target` is rejected with `invalid_spec`
+rather than silently handing you the plaintext. If you want the value back,
+that field is a `password`, not a `secret`.
+
 ```json
 { "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
   "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
@@ -661,6 +677,16 @@ returns only `{written, target, bytes}`, never the value.
   entered value reaches that module over aiui's own channel, never via the
   agent). You cannot target a foreign host; the user sees the resolved path
   and approves it by submitting.
+- **A blank field writes nothing.** An empty value is refused in both modes
+  — `{written: false, error: "refusing to write an empty value"}` — so a
+  skipped optional field can never truncate the user's file, and
+  `substitute` can never erase its own sentinel. Leaving a `target` field
+  blank is a safe no-op that reports itself, which is what makes the
+  "paste a new token only if you want to rotate it" flow legitimate.
+- **Only an affirmative action writes.** The write is committed by the
+  submit button or a plain named action; an action carrying
+  `skip_validation: true` (your Cancel / Save-draft escape hatch) does not
+  write. See *Action buttons* above.
 - **Errors** come back as `{written:false, error}` — no silent success.
 
 Why it exists: it replaces the fragile "guess a shell one-liner to stash a
@@ -710,6 +736,10 @@ aiui.form(
     ],
 )
 ```
+
+Note: `Cancel` and `Save draft` carry `skip_validation: True`, so neither
+commits a `target` file write — only `Create` does. That is the rule, not a
+property of this example.
 
 Response: `{cancelled: false, action: "commit", values: {job: "…",
 scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.
