@@ -35,6 +35,11 @@
      * Cleared once the user installs (clear_pending_update) or once
      * the on-disk version catches up. v0.4.44. */
     pending_update: string | null;
+    /** True when aiui runs from a location it won't still be at next
+     * launch (translocated off the DMG, ~/Downloads, a temp dir). Host
+     * registration is refused in that state — the banner asks the user to
+     * move the app and relaunch. #198. */
+    ephemeral_install: boolean;
   };
   let status = $state<Status | null>(null);
   let newHost = $state("");
@@ -131,6 +136,21 @@
     try {
       const result = await invoke<StepResult>("repair_skill");
       pushSingle(result);
+      await refresh();
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Re-writes the aiui entry into every MCP host installed here. Only
+   *  surfaced when `claude_config_ok` is false — before #198 a stale entry
+   *  the health predicate had accepted could not be healed from the UI at
+   *  all, because the auto-patch on launch is gated by that same predicate. */
+  async function repairClaudeConfig() {
+    busy = true;
+    try {
+      const results = await invoke<StepResult[]>("repair_claude_config");
+      pushLog(results);
       await refresh();
     } finally {
       busy = false;
@@ -263,6 +283,18 @@
           {:else}
             {$_("app.status.not_connected")}
           {/if}
+          <!-- #198: the repair button mirrors the skill row below. It
+            matters most for the case that motivated the issue: an entry
+            with the right `command` but missing `--mcp-stdio` args, which
+            the launch-time auto-patch will never touch because its gate is
+            the very predicate that now reports it red. No point offering it
+            while the app runs from a temporary location — the banner above
+            names the only fix there. -->
+          {#if !status.claude_config_ok && !status.ephemeral_install}
+            <button class="header-action" onclick={repairClaudeConfig} disabled={busy}>
+              {$_("settings.config.repair")}
+            </button>
+          {/if}
         </div>
         <!-- Skill status sits next to the connection status: both are
           "is aiui plumbed in correctly?" signals, both are dot+text, and
@@ -312,6 +344,20 @@
     {/if}
 
     <div class="window-scroll">
+    <!-- #198: aiui is running from a location it won't still be at on the
+      next launch — translocated off the DMG, out of ~/Downloads, or a temp
+      dir. Registering that path would make every tool call fail with "no
+      such file" and rewrite all three host configs on every launch, so
+      registration is refused until the user moves the app. This sits above
+      the HTTP banner because it invalidates everything below it. -->
+    {#if status.ephemeral_install}
+      <section class="http-error">
+        <strong>{$_("settings.ephemeral.title")}</strong>
+        <p>{$_(`settings.ephemeral.body.${status.os === "windows" ? "windows" : "macos"}`)}</p>
+        <p class="http-error-hint">{status.app_binary_path}</p>
+      </section>
+    {/if}
+
     <!-- Show the banner only when the live Rust-side TCP self-probe says
       the HTTP server isn't accepting connections. `status.http_error` is
       the explanatory text from the original bind-failure if any — but

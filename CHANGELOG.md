@@ -54,6 +54,63 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A green status dot over a Claude config that could never work.** The
+  `is_*_current` health predicates stopped at the entry's `command` and
+  never looked at `args`, while the patchers write `command` **and**
+  `args`. An `aiui` entry missing `--mcp-stdio` therefore showed a green
+  dot and passed the welcome-wizard check — but that binary starts the
+  Tauri GUI instead of speaking MCP on stdio, so Claude waited forever on a
+  process that never answers the protocol. And because the same predicate
+  is the repair gate in the launch-time setup path, the broken entry was
+  never healed: there was no way out from inside the app. Predicate and
+  patcher now share one definition of "current", and a **Repair config**
+  button sits next to the red dot (#198).
+- **aiui registered a path that stops existing.** Launched straight off the
+  mounted DMG or out of `~/Downloads`, Gatekeeper App Translocation hands
+  the app a `/private/var/folders/…/AppTranslocation/<uuid>/…` path that is
+  gone when it quits and carries a fresh UUID next time. That string went
+  verbatim into all three host configs, so every tool call failed with "no
+  such file" — and since the random path never matched, all three files
+  were rewritten and three fresh `.bak.<ts>` copies dropped on *every*
+  launch, forever. Nothing in the UI or the trace log named the cause.
+  aiui now detects the ephemeral location, refuses to register, and shows a
+  banner asking the user to move the app to Applications and relaunch.
+  Substituting the canonical `/Applications` path would only swap a broken
+  path for one pointing at nothing (#198).
+- **A Windows uninstall left Claude Desktop permanently broken.** The
+  removal counterpart rebuilt the macOS config path by hand
+  (`~/Library/Application Support/Claude/…`) while its own patcher went
+  through the per-OS helper. On Windows that path never exists, so
+  Uninstall printed the green line "claude_desktop_config.json existiert
+  nicht, nichts zu tun." while `%APPDATA%\Claude\claude_desktop_config.json`
+  kept pointing `mcpServers.aiui` at an `aiui.exe` the user was about to
+  delete — leaving Claude Desktop with a permanent MCP-server-failed error
+  and no aiui left to fix it. The legacy `aiui-local` key was never cleaned
+  up there either. Both halves now take the path from the same helper, so
+  the drift cannot return (#198).
+- **`~/.ssh/config` was backed up and rewritten on every launch.** The
+  legacy-forward cleanup computed whether anything changed but used it only
+  to word the message — the backup and the write ran unconditionally, once
+  per registered remote, on every GUI start. A user with two remotes
+  collected two more full copies of their ssh config per launch. Worse, the
+  file was re-serialised through `str::lines()`, which drops the `\r` of a
+  CRLF pair: a `~/.ssh/config` written by a Windows editor was silently
+  converted to LF-only, and a file without a trailing newline grew one.
+  Nothing is touched now unless there is really an aiui line to remove, and
+  surviving lines come back byte-identical (#198).
+- **Skill removal always reported success, and a failed `ssh` reported the
+  wrong error.** Uninstall discarded both filesystem results and returned
+  green regardless, so a read-only home showed a clean uninstall while
+  `~/.claude/skills/aiui/SKILL.md` stayed on disk and Claude Code kept
+  loading the skill for a product the user had just removed. And in the
+  remote skill install, the `mkdir` result was inspected only on the branch
+  where `ssh` actually started — when it could not be spawned at all (no
+  OpenSSH client on Windows, say), execution fell through and the user was
+  shown the subsequent `scp` error instead of the real cause (#198).
+- **Claude Desktop's config was rewritten on every launch even when
+  correct.** It was the last patcher without the already-current
+  short-circuit its two siblings gained in #182, so it dropped a fresh
+  timestamped backup on each start for no change at all (#198).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

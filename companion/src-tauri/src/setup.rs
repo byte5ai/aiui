@@ -184,7 +184,18 @@ fn read_json_config(path: &PathBuf) -> Result<Option<Value>, String> {
 }
 
 pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
-    let path = claude_desktop_config_path();
+    patch_claude_desktop_config_at(&claude_desktop_config_path(), app_binary_path)
+}
+
+/// The real body, with the target file passed in.
+///
+/// #198: the removal counterpart used to rebuild the macOS path by hand
+/// while this one went through [`claude_desktop_config_path`], so the two
+/// silently disagreed on Windows. Both halves now take a path, both public
+/// wrappers pass the same helper, and tempdir tests exercise the logic
+/// without touching `$HOME`.
+pub(crate) fn patch_claude_desktop_config_at(path: &Path, app_binary_path: &str) -> StepResult {
+    let path = path.to_path_buf();
 
     // #182: a parse error must never be laundered into an empty object —
     // that replaced the user's whole config with one containing only aiui.
@@ -215,6 +226,20 @@ pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
     // `/aiui-local:test-dialog`). Unify on `aiui` and drop the old entry on
     // every patch — idempotent for fresh installs, healing for upgrades.
     let had_legacy = servers.contains_key("aiui-local");
+
+    // #198: don't rewrite — and don't drop a fresh timestamped `.bak` — a
+    // file that already says exactly what we would write. `patch_claude_code_config`
+    // and `patch_codex_config` have had this short-circuit since #182; this
+    // was the last patcher writing on every single GUI launch. A leftover
+    // `aiui-local` key still forces the write: that migration has to run.
+    if !had_legacy && aiui_entry_is_current(servers.get("aiui"), app_binary_path) {
+        return StepResult {
+            ok: true,
+            message: "aiui ist bereits in der Claude Desktop Config eingetragen.".into(),
+            details: None,
+        };
+    }
+
     servers.remove("aiui-local");
     let was_present = servers.contains_key("aiui");
     upsert_aiui_entry(&mut servers, app_binary_path);
@@ -440,43 +465,120 @@ fn default_app_binary_path() -> &'static str {
     "/usr/local/bin/aiui"
 }
 
-pub fn is_claude_config_current(app_binary_path: &str) -> bool {
-    let path = claude_desktop_config_path();
-    let Ok(s) = fs::read_to_string(&path) else {
+/// Whether the JSON host config at `path` already carries the `aiui` entry
+/// our patcher writes.
+///
+/// #198: both predicates used to stop at `command` and never look at
+/// `args`, while the patchers write `command` **and** `args`. An entry
+/// missing `--mcp-stdio` therefore showed a green dot — over a binary that
+/// starts the Tauri GUI instead of speaking MCP on stdio, so the host's MCP
+/// client waits forever on a process that never answers. Worse, the same
+/// predicate is the repair gate in `lib.rs`'s setup closure, so a
+/// green-but-broken entry was never healed. Predicate and patcher now share
+/// [`aiui_entry_is_current`]: "current" means exactly one thing, and it
+/// compares only the keys aiui owns, so a user's `env` block can't start a
+/// rewrite loop.
+fn json_config_is_current(path: &Path, app_binary_path: &str) -> bool {
+    let Ok(s) = fs::read_to_string(path) else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<Value>(&s) else {
         return false;
     };
-    let Some(entry) = v.pointer("/mcpServers/aiui") else {
-        return false;
-    };
-    entry
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(|c| c == app_binary_path)
-        .unwrap_or(false)
+    aiui_entry_is_current(v.pointer("/mcpServers/aiui"), app_binary_path)
+}
+
+pub fn is_claude_config_current(app_binary_path: &str) -> bool {
+    json_config_is_current(&claude_desktop_config_path(), app_binary_path)
 }
 
 /// Same shape as `is_claude_config_current`, but for Claude Code's
 /// `~/.claude.json`. Used by the welcome health-check so we can tell the
 /// user *which* Claude variant is wired up vs. missing.
 pub fn is_claude_code_config_current(app_binary_path: &str) -> bool {
-    let path = home().join(".claude.json");
-    let Ok(s) = fs::read_to_string(&path) else {
+    json_config_is_current(&home().join(".claude.json"), app_binary_path)
+}
+
+/// Is this binary sitting somewhere it won't still be on the next launch?
+///
+/// #198: [`app_binary_path`] is written verbatim as `command` into three
+/// host configs. Launch aiui straight off the mounted DMG or out of
+/// `~/Downloads` and Gatekeeper App Translocation hands us
+/// `/private/var/folders/<rand>/AppTranslocation/<uuid>/d/aiui.app/Contents/MacOS/aiui`
+/// — a read-only copy that is gone when the app quits and carries a fresh
+/// UUID next time. Registering it makes every tool call fail with "no such
+/// file", and because the path never matches, all three configs get
+/// rewritten and a fresh `.bak.<ts>` dropped on every single launch.
+///
+/// Refusing to register is the correct outcome. Substituting the canonical
+/// `/Applications/aiui.app/…` would swap a broken path for one pointing at
+/// nothing (or at a different build) — the user has to move the app, and
+/// the banner in Settings tells them so.
+///
+/// `SecTranslocateIsTranslocatedURL` is the authoritative macOS answer but
+/// needs a CoreFoundation bridge; the path check catches the failure we
+/// actually see and stays unit-testable without a Mac.
+pub fn is_ephemeral_binary_path(p: &str) -> bool {
+    is_ephemeral_binary_path_in(p, dirs::home_dir().as_deref())
+}
+
+/// [`is_ephemeral_binary_path`] with the home directory injected, so the
+/// rules are testable without depending on the test runner's `$HOME`.
+fn is_ephemeral_binary_path_in(p: &str, home_dir: Option<&Path>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // The translocation mount itself, and the temp tree it lives in.
+        if p.contains("/AppTranslocation/")
+            || p.starts_with("/private/var/folders/")
+            || p.starts_with("/var/folders/")
+        {
+            return true;
+        }
+        // A DMG mounts under /Volumes; a download sits in ~/Downloads.
+        // Rather than enumerate the bad places, require a good one: the
+        // app belongs in /Applications or ~/Applications.
+        if p.starts_with("/Applications/") {
+            return false;
+        }
+        if let Some(h) = home_dir {
+            if Path::new(p).starts_with(h.join("Applications")) {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // NSIS installs per user under %LOCALAPPDATA%; the failure mode here
+        // is running the unpacked .exe straight out of Downloads or a temp
+        // extraction dir, both of which the user empties sooner or later.
+        let lower = p.to_lowercase();
+        if lower.contains("\\temp\\") || lower.contains("/temp/") {
+            return true;
+        }
+        if let Some(h) = home_dir {
+            if Path::new(p).starts_with(h.join("Downloads")) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = (p, home_dir);
+        false
+    }
+}
+
+/// Whether *this* running binary sits in an ephemeral location, i.e. host
+/// registration must be refused. Always false for a debug build: `tauri
+/// dev` runs out of `target/debug`, and a developer's local build is not
+/// what this guard is about.
+pub fn is_ephemeral_install() -> bool {
+    if cfg!(debug_assertions) {
         return false;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&s) else {
-        return false;
-    };
-    let Some(entry) = v.pointer("/mcpServers/aiui") else {
-        return false;
-    };
-    entry
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(|c| c == app_binary_path)
-        .unwrap_or(false)
+    }
+    is_ephemeral_binary_path(&app_binary_path())
 }
 
 // ─── Installed-host detection (#168) ────────────────────────────────────
@@ -988,11 +1090,23 @@ pub fn remove_claude_code_config() -> StepResult {
 }
 
 pub fn remove_claude_desktop_config() -> StepResult {
-    let path = home()
-        .join("Library")
-        .join("Application Support")
-        .join("Claude")
-        .join("claude_desktop_config.json");
+    remove_claude_desktop_config_at(&claude_desktop_config_path())
+}
+
+/// The real body, with the target file passed in — see
+/// [`patch_claude_desktop_config_at`].
+///
+/// #198: this used to rebuild the macOS path literally
+/// (`~/Library/Application Support/Claude/…`) while its own patcher went
+/// through [`claude_desktop_config_path`]. On Windows that path never
+/// exists, so uninstall printed the green "nothing to do" line while
+/// `%APPDATA%\Claude\claude_desktop_config.json` kept pointing
+/// `mcpServers.aiui` at an `aiui.exe` the user was about to delete —
+/// leaving Claude Desktop with a permanent MCP-server-failed error and no
+/// aiui left to fix it. The legacy `aiui-local` key was never cleaned up
+/// there either.
+pub(crate) fn remove_claude_desktop_config_at(path: &Path) -> StepResult {
+    let path = path.to_path_buf();
     if !path.exists() {
         return StepResult {
             ok: true,
@@ -1072,12 +1186,63 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
         };
     };
 
+    // #198: this is called for every registered remote on every GUI launch.
+    // It used to back up and rewrite `~/.ssh/config` unconditionally —
+    // `changed` only picked the wording — so a user with two remotes
+    // accumulated two more full copies of their ssh config per app start,
+    // forever, for a migration that ended releases ago. Short-circuit
+    // before touching anything, like the other patchers do.
+    let Some(out) = strip_aiui_forward_lines(&existing, match_name, port) else {
+        return StepResult {
+            ok: true,
+            message: format!("Host '{host_alias}' hatte keine aiui-Einträge."),
+            details: None,
+        };
+    };
+
+    let bak = match backup(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return StepResult {
+                ok: false,
+                message: "Backup fehlgeschlagen".into(),
+                details: Some(e.to_string()),
+            }
+        }
+    };
+    match atomic_write(&path, out.as_bytes()) {
+        Ok(_) => StepResult {
+            ok: true,
+            message: format!("aiui-Einträge aus Host '{host_alias}' entfernt."),
+            details: backup_detail(bak),
+        },
+        Err(e) => StepResult {
+            ok: false,
+            message: "Schreiben fehlgeschlagen".into(),
+            details: Some(e.to_string()),
+        },
+    }
+}
+
+/// Strip aiui's three lines from the `Host <match_name>` block(s).
+/// Returns `None` when there was nothing to strip, so the caller can skip
+/// the backup and the write entirely.
+///
+/// #198: the old code split on [`str::lines`], which drops the `\r` of a
+/// CRLF pair, and re-joined with a hard-coded `"\n"` plus a forced
+/// trailing newline — silently converting a `~/.ssh/config` written by a
+/// Windows editor to LF-only, and appending a newline to a file that never
+/// had one. Splitting on `'\n'` alone keeps every surviving line
+/// byte-identical (any `\r` rides along inside the piece) and the final
+/// empty piece reproduces the original's trailing newline, or its absence.
+fn strip_aiui_forward_lines(existing: &str, match_name: &str, port: u16) -> Option<String> {
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut preamble_done = false;
-    for line in existing.lines() {
+    for line in existing.split('\n') {
         let t = line.trim_start();
-        if t.starts_with("Host ") || t == "Host" {
+        // `trim_end` so a CRLF file's bare `Host\r` is still recognised.
+        if t.starts_with("Host ") || t.trim_end() == "Host" {
             if !current.is_empty() || preamble_done {
                 blocks.push(std::mem::take(&mut current));
             }
@@ -1121,39 +1286,17 @@ pub fn remove_ssh_forward(host_alias: &str, port: u16) -> StepResult {
         }
     }
 
-    let out: String = blocks
-        .into_iter()
-        .map(|b| b.join("\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = if out.ends_with('\n') { out } else { format!("{out}\n") };
-
-    let bak = match backup(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            return StepResult {
-                ok: false,
-                message: "Backup fehlgeschlagen".into(),
-                details: Some(e.to_string()),
-            }
-        }
-    };
-    match atomic_write(&path, out.as_bytes()) {
-        Ok(_) => StepResult {
-            ok: true,
-            message: if changed {
-                format!("aiui-Einträge aus Host '{host_alias}' entfernt.")
-            } else {
-                format!("Host '{host_alias}' hatte keine aiui-Einträge.")
-            },
-            details: backup_detail(bak),
-        },
-        Err(e) => StepResult {
-            ok: false,
-            message: "Schreiben fehlgeschlagen".into(),
-            details: Some(e.to_string()),
-        },
+    if !changed {
+        return None;
     }
+
+    Some(
+        blocks
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Patch ~/.claude.json on a remote host so aiui is available in every Claude
@@ -2199,5 +2342,228 @@ startup_timeout_ms = 30000
         let once = codex_toml_upsert(None, AIUI_BIN).unwrap();
         let twice = codex_toml_upsert(Some(&once), AIUI_BIN).unwrap();
         assert_eq!(once, twice, "second apply changed the document");
+    }
+
+    // ─── #198: a StepResult asserts the outcome, not the intent ─────────
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aiui-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn count_backups(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().unwrap().contains(".bak."))
+            .count()
+    }
+
+    #[test]
+    fn entry_current_requires_mcp_stdio_arg() {
+        // #198: the predicate stopped at `command`, so an entry without
+        // `--mcp-stdio` showed a green dot — over a binary that starts the
+        // Tauri GUI instead of speaking MCP on stdio. And since the
+        // predicate is also the repair gate, the entry was never healed.
+        let no_args = serde_json::json!({ "command": AIUI_BIN });
+        assert!(
+            !aiui_entry_is_current(Some(&no_args), AIUI_BIN),
+            "a missing `args` is not current — the host would hang forever"
+        );
+
+        let correct = serde_json::json!({ "command": AIUI_BIN, "args": ["--mcp-stdio"] });
+        assert!(aiui_entry_is_current(Some(&correct), AIUI_BIN));
+
+        let wrong_arg = serde_json::json!({ "command": AIUI_BIN, "args": ["--serve"] });
+        assert!(!aiui_entry_is_current(Some(&wrong_arg), AIUI_BIN), "wrong arg");
+
+        let other_bin = serde_json::json!({ "command": "/tmp/aiui", "args": ["--mcp-stdio"] });
+        assert!(!aiui_entry_is_current(Some(&other_bin), AIUI_BIN), "other binary");
+    }
+
+    #[test]
+    fn entry_current_ignores_unknown_keys() {
+        // The mirror-image bug: comparing whole objects would rewrite a
+        // hand-added `env` block away and drop a fresh `.bak` on every
+        // launch. We compare what we own, and preserve what we don't.
+        let with_env = serde_json::json!({
+            "command": AIUI_BIN, "args": ["--mcp-stdio"], "env": {}
+        });
+        assert!(
+            aiui_entry_is_current(Some(&with_env), AIUI_BIN),
+            "a foreign key must not start a per-launch rewrite loop"
+        );
+    }
+
+    #[test]
+    fn patch_then_predicate_agree() {
+        // #198's core invariant: an `is_*_current` predicate must read back
+        // true for exactly what its patcher writes, because the predicate is
+        // the repair gate.
+        let dir = tmpdir("patch-agree");
+        let cfg = dir.join("claude_desktop_config.json");
+        std::fs::write(&cfg, r#"{"mcpServers": {"other": {"command": "keep-me"}}}"#).unwrap();
+
+        let first = patch_claude_desktop_config_at(&cfg, AIUI_BIN);
+        assert!(first.ok, "{}", first.message);
+        assert!(
+            json_config_is_current(&cfg, AIUI_BIN),
+            "the predicate must read back what the patcher just wrote"
+        );
+
+        let baks_after_first = count_backups(&dir);
+        let second = patch_claude_desktop_config_at(&cfg, AIUI_BIN);
+        assert!(second.ok);
+        assert!(
+            second.message.contains("bereits"),
+            "a second patch must report already-current, got: {}",
+            second.message
+        );
+        assert_eq!(
+            count_backups(&dir),
+            baks_after_first,
+            "an unchanged config must not produce a second .bak"
+        );
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["other"]["command"], "keep-me", "other servers survive");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_claude_desktop_config_uses_shared_path() {
+        // #198: the removal counterpart rebuilt the macOS path literally, so
+        // on Windows uninstall reported "nothing to do" while the real
+        // config kept pointing at an aiui.exe about to be deleted.
+        let dir = tmpdir("remove-desktop");
+        let cfg = dir.join("claude_desktop_config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers": {
+                "aiui": {"command": "/old/aiui", "args": ["--mcp-stdio"]},
+                "aiui-local": {"command": "uvx", "args": ["aiui-mcp"]},
+                "other": {"command": "keep-me"}
+            }}"#,
+        )
+        .unwrap();
+
+        let r = remove_claude_desktop_config_at(&cfg);
+        assert!(r.ok, "{}", r.message);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v.pointer("/mcpServers/aiui").is_none(), "aiui removed");
+        assert!(
+            v.pointer("/mcpServers/aiui-local").is_none(),
+            "the legacy aiui-local key is removed too"
+        );
+        assert_eq!(v["mcpServers"]["other"]["command"], "keep-me");
+
+        // And the public wrapper resolves through the same helper the
+        // patcher uses, so the macOS literal cannot come back: on Windows
+        // that path lives under %APPDATA%, never under ~/Library.
+        let shared = claude_desktop_config_path();
+        assert!(shared.ends_with("Claude/claude_desktop_config.json"));
+        #[cfg(target_os = "windows")]
+        assert!(
+            !shared.to_string_lossy().contains("Library"),
+            "Windows must not use the macOS Application Support layout: {}",
+            shared.display()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn strip_forward_returns_none_when_no_aiui_lines() {
+        // #198: `changed` used to pick the wording only — backup + write ran
+        // regardless, on every registered remote, on every GUI launch.
+        let cfg = "Host devhost\n  User ada\n  Port 22\n";
+        assert!(
+            strip_aiui_forward_lines(cfg, "devhost", 7777).is_none(),
+            "nothing to strip must mean no backup and no write"
+        );
+    }
+
+    #[test]
+    fn strip_forward_preserves_crlf() {
+        // #198: `str::lines()` drops the `\r`, so a config written by a
+        // Windows editor was silently converted to LF-only.
+        let cfg = "Host devhost\r\n  RemoteForward 7777 localhost:7777\r\n  User ada\r\n";
+        let out = strip_aiui_forward_lines(cfg, "devhost", 7777).expect("a line was stripped");
+        assert_eq!(out, "Host devhost\r\n  User ada\r\n");
+        assert!(!out.contains("RemoteForward"));
+        for line in out.split('\n').filter(|l| !l.is_empty()) {
+            assert!(line.ends_with('\r'), "surviving line lost its CR: {line:?}");
+        }
+
+        // A file without a trailing newline keeps not having one.
+        let no_eol = "Host devhost\n  RemoteForward 7777 localhost:7777\n  User ada";
+        let out = strip_aiui_forward_lines(no_eol, "devhost", 7777).unwrap();
+        assert_eq!(out, "Host devhost\n  User ada");
+    }
+
+    #[test]
+    fn strip_forward_only_touches_matching_host_block() {
+        let cfg = "Host other\n  RemoteForward 7777 localhost:7777\n  ServerAliveInterval 30\n\
+                   \nHost devhost\n  RemoteForward 7777 localhost:7777\n  ExitOnForwardFailure no\n  User ada\n";
+        let out = strip_aiui_forward_lines(cfg, "devhost", 7777).expect("devhost block changed");
+        assert!(
+            out.contains("Host other\n  RemoteForward 7777 localhost:7777\n  ServerAliveInterval 30"),
+            "another Host block must survive byte-for-byte: {out:?}"
+        );
+        assert!(out.contains("Host devhost\n  User ada"), "got: {out:?}");
+        assert!(!out.contains("ExitOnForwardFailure"), "got: {out:?}");
+    }
+
+    #[test]
+    fn is_ephemeral_binary_path_flags_translocation() {
+        let home = PathBuf::from("/Users/ada");
+        let translocated = "/private/var/folders/xy/T/AppTranslocation/\
+                            1D0E4F0A-0000-0000-0000-000000000000/d/aiui.app/Contents/MacOS/aiui";
+        let installed = "/Applications/aiui.app/Contents/MacOS/aiui";
+
+        #[cfg(target_os = "macos")]
+        {
+            let h = Some(home.as_path());
+            assert!(
+                is_ephemeral_binary_path_in(translocated, h),
+                "a translocated path is gone when the app quits"
+            );
+            assert!(
+                !is_ephemeral_binary_path_in(installed, h),
+                "the documented install location must behave exactly as before"
+            );
+            assert!(
+                !is_ephemeral_binary_path_in("/Users/ada/Applications/aiui.app/Contents/MacOS/aiui", h),
+                "a per-user ~/Applications install is a real install"
+            );
+            assert!(
+                is_ephemeral_binary_path_in("/Users/ada/Downloads/aiui.app/Contents/MacOS/aiui", h),
+                "~/Downloads is not an install location"
+            );
+            assert!(
+                is_ephemeral_binary_path_in("/Volumes/aiui/aiui.app/Contents/MacOS/aiui", h),
+                "a mounted DMG is not an install location"
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let win_home = PathBuf::from(r"C:\Users\ada");
+            let h = Some(win_home.as_path());
+            assert!(is_ephemeral_binary_path_in(r"C:\Users\ada\Downloads\aiui.exe", h));
+            assert!(is_ephemeral_binary_path_in(
+                r"C:\Users\ada\AppData\Local\Temp\aiui.exe",
+                h
+            ));
+            assert!(!is_ephemeral_binary_path_in(
+                r"C:\Users\ada\AppData\Local\aiui\aiui.exe",
+                h
+            ));
+        }
+
+        // Keeps the fixtures used on every platform.
+        let _ = (translocated, installed, home);
     }
 }
