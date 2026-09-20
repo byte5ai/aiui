@@ -15,6 +15,12 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- **New file `~/.config/aiui/remote-uvx.json`** holds the `uvx` path per
+  registered remote. Deliberately a sidecar rather than a second field in
+  `remotes.json`: widening that file would make an older build parse it as
+  an empty list and silently drop the user's registered hosts on a
+  downgrade. An older build ignores the sidecar and behaves exactly as it
+  does today. Removed with the host, and on uninstall (#184).
 - **`skip_validation: true` actions no longer commit `target` file
   writes.** They are escape hatches, and an escape hatch that writes a
   credential to disk is a trap. The new `writes_targets: true` action flag
@@ -54,18 +60,6 @@ All notable changes to this project are documented here.
   version", which protects hosts upgrading from ≤ 0.10.1; and the Resync
   button self-heals a host with no remembered path by re-probing, which
   also gives that button the pre-flight check it never had (#184).
-
-### Changed
-
-- **New file `~/.config/aiui/remote-uvx.json`** holds the `uvx` path per
-  registered remote. Deliberately a sidecar rather than a second field in
-  `remotes.json`: widening that file would make an older build parse it as
-  an empty list and silently drop the user's registered hosts on a
-  downgrade. An older build ignores the sidecar and behaves exactly as it
-  does today. Removed with the host, and on uninstall (#184).
-
-### Fixed
-
 - **An unparsable host config was replaced, not repaired.** Every local
   writer of `~/.claude.json` and `claude_desktop_config.json` treated a
   parse error as "empty file" and then wrote a document containing only
