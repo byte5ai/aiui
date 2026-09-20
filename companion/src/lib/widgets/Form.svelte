@@ -939,7 +939,13 @@
             <p class="write-target">
               <span class="wt-icon" aria-hidden="true">↳</span>
               {f.kind === "secret" ? "Wird geschrieben (nicht an den Agent zurück):" : "Wird zusätzlich geschrieben:"}
-              <code>{f.target.path}</code>
+              <!-- #199: `resolved_path` is the destination the writing host
+                   (this app locally, the bridge for a remote session) will
+                   actually write, with `~/` expanded and symlinks followed.
+                   An older bridge doesn't send it; `path` is absolute or
+                   `~/`-rooted either way, so the fallback still identifies
+                   the file. -->
+              <code>{f.target.resolved_path ?? f.target.path}</code>
               <span class="wt-meta"
                 >mode: {f.target.mode}{f.target.perm ? `, ${f.target.perm}` : ""}{f.target.overwrite
                   ? ", overwrite"

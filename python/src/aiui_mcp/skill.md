@@ -405,3 +405,151 @@ per-file cap — never fails the render. The dialog opens with a broken
 player where that clip should be, and the result carries a
 `media_warnings: [...]` list naming each path and why. Read it: without it
 you'd believe the user saw something they didn't.
+
+Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
+against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
+file on the user's machine won't resolve from a remote agent, or vice versa —
+the bridge that reads it is on the agent's host; use `http(s)://` or inline
+`data:`); **bare URLs in `markdown` field text** (`![alt](url)` follows the
+same CSP — the resolver only walks `src` / `thumbnail`, not markdown
+bodies); **`https://…` links** in `markdown` and in a `compare` variant's
+`content` work as a click target and open in the user's default browser —
+the dialog window never navigates, so the dialog stays open and still
+returns a result. Only `http(s)` opens; anything else is ignored. A missing file,
+a CSP block, and a 404 all look identical to the user — if they report a
+broken image, ask once whether anything appeared at all.
+
+### Anti-pattern: shell-encoding `data:` URLs
+
+Don't write the encoded bytes to a tempfile then `cat` / `printf` them back
+through bash to construct the JSON tool call. Two failure modes seen in the
+wild: the terminal recognises the `data:image/...` prefix in stdout and
+tries to render it inline (eating the rest of the pipeline), and the
+encoded payload spans multiple shell-line buffers and gets word-split or
+quoting-mangled. The fix is structural — the tool call is JSON, not shell:
+build the spec in your runtime and pass
+`src=f"data:image/png;base64,{b64}"` straight into the call, or hand aiui
+the path and let the bridge do the encoding.
+
+## `datetime` field
+
+Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
+one field instead of splitting into two `text` fields with manual
+validation. Native `<input type="datetime-local">`, returns ISO
+`YYYY-MM-DDTHH:MM`.
+
+## Tabs — long forms without scroll fatigue
+
+Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
+One submit covers all tabs; validation jumps to the first invalid tab
+automatically. Tabs are *display structure*, not a wizard — no per-tab
+confirmation, no per-tab actions, all values land in one response.
+
+Use when a single dialog naturally falls into 2-4 distinct topical
+groups (e.g. "Identity / Permissions / Notifications" on a user-create
+form). Don't reach for tabs to cram a 30-field form into 5 tabs — split
+into multiple `form` calls instead.
+
+## Password fields
+
+For short-lived secrets (one-off API tokens, test passwords), prefer
+`form` with a `password` field over asking in chat: the value is masked
+on screen while the user types, so it doesn't appear in screen
+recordings or to a shoulder-surfer.
+
+Be honest with the user, though — the value still returns to you as
+plaintext in the tool response. For long-lived or high-value secrets,
+use the `secret` field with a `target` (below) so the value never enters
+the conversation.
+
+## Secrets & file-write: `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only** (result: `{written, target,
+bytes, mode}`, never the value).
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- `mode:"create"` — write raw value (needs `overwrite:true` to clobber).
+- `mode:"substitute"` — replace a `placeholder` occurring exactly once in
+  an existing file (YAML/TOML/INI/env); 0 or >1 → error (never misapplied).
+  Pick a **distinctive sentinel** (`__AIUI_SECRET_GITHUB_PAT__`, not a common
+  word) so the single match is unambiguous, not just lucky.
+- Destination is always your own host: the aiui module there (native app
+  locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
+  `create` and `substitute` both work identically local and remote — no
+  foreign host. The user sees the path and approves by submitting. Errors:
+  `{written:false, error}`.
+- `path` must be absolute or `~/`-rooted; relative (`notes/key`) and
+  `~user/` (`~alice/key`) are rejected — neither names a stable
+  destination, same rule as `upload`'s `target_dir`. Symlinks are followed:
+  `substitute` edits the file the link points at, the link stays a link,
+  and the reported `target` is that resolved path.
+- `substitute` keeps the file's existing mode unless you pass `perm` (it
+  edits a file the user owns — a 0644 config stays 0644); `create` defaults
+  to 0600. The outcome reports the octal `mode` applied.
+- A `secret` field MUST carry a `target` — the write-only promise is what
+  the kind means, so a target-less `secret` is rejected (`invalid_spec`)
+  instead of returning the plaintext. Want the value back? Use `password`.
+- A blank field writes nothing: an empty value is refused in both modes
+  (`"refusing to write an empty value"`), so a skipped optional field never
+  truncates the file and `substitute` never erases its own sentinel.
+- Only an affirmative action writes: the submit button or a plain named
+  action. An action with `skip_validation: true` does not commit; set
+  `writes_targets: true` on it if it must.
+
+Replaces the fragile "guess a shell one-liner to stash a token" pattern.
+QoL + confused-deputy guard, not a hard guarantee.
+
+## Anti-patterns (slop vs. clean)
+
+| Slop | Clean |
+|---|---|
+| `confirm(title="Are you sure?")` | `confirm(title="Drop table 'orders'?", destructive=True, message="18,432 rows will be removed.")` |
+| `ask(question="Choose one", options=[{"label": "Option 1"}, …])` | `ask(question="Which migration strategy?", options=[{"label":"In-place","description":"Fast, no rollback."}, …])` |
+| `form` with 15 `text` fields | Split into logical steps, or push back to chat entirely |
+| Button labels "OK" / "Cancel" | "Deploy" / "Discard" — name what happens |
+| `static_text` echoing the title | `static_text` adds context the labels can't carry alone |
+
+## Quick-reference example
+
+```python
+aiui.form(
+    title="New feature draft",
+    header="Discovery",
+    fields=[
+        {"kind": "text", "name": "job", "label": "User job",
+         "multiline": True, "required": True},
+        {"kind": "select", "name": "scope", "label": "Scope",
+         "options": [{"label": "Quick win", "value": "qw"},
+                     {"label": "Feature", "value": "f"},
+                     {"label": "Epic", "value": "e"}],
+         "default": "f"},
+        {"kind": "list", "name": "stakeholders", "label": "Stakeholders",
+         "items": [{"label": "Product", "value": "prod"},
+                   {"label": "Design", "value": "design"},
+                   {"label": "Engineering", "value": "eng"}],
+         "selectable": True, "multi_select": True,
+         "default_selected": ["prod", "eng"]},
+        {"kind": "date", "name": "deadline", "label": "Target date"},
+    ],
+    actions=[
+        {"label": "Cancel", "value": "cancel", "skip_validation": True},
+        {"label": "Save draft", "value": "draft", "skip_validation": True},
+        {"label": "Create", "value": "commit", "primary": True},
+    ],
+)
+```
+
+Note: `Cancel` and `Save draft` carry `skip_validation: True`, so neither
+commits a `target` file write — only `Create` does. That is the rule, not a
+property of this example.
+
+Response: `{cancelled: false, action: "commit", values: {job: "…",
+scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.

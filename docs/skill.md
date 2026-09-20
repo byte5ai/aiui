@@ -602,3 +602,193 @@ per-file cap — does not fail the render. The dialog opens anyway, with a
 broken player where that clip should be, and the result carries a
 `media_warnings: [...]` list naming each path and why. Read it: without it
 you'd believe the user saw something they didn't.
+
+What does **not** work — known footguns:
+
+- **Relative paths** (`./foo.png`, `foo.png`, `../assets/x.png`).
+  Resolved against an undefined `cwd`. Use absolute or `~/` paths.
+- **Cross-host paths.** A path that exists on the user's machine but not
+  on the remote where the agent runs (or vice versa) won't resolve —
+  the bridge that does the reading is on the agent's host. If you
+  need to render a file on the user's machine from a remote agent, use `http(s)://`
+  or pass the bytes inline as `data:`.
+- **Bare URLs in `markdown` field text.** Markdown's `![alt](url)`
+  follows the same CSP — the URL has to resolve to `data:` somehow.
+  The resolver only walks `src` / `thumbnail` properties, not the
+  bodies of markdown blocks.
+- **Linking out** with `[text](https://…)` or `<a href="https://…">` from
+  `markdown` (and from a `compare` variant's `content`) — works as a click
+  target. It opens in the user's default browser; the dialog window itself
+  never navigates, so the dialog stays open and still returns a result.
+  Only `http(s)` links open; anything else is ignored. It's not an
+  image-rendering question.
+
+If you tried a path or URL and the user reports a broken image, ask
+them once whether anything appeared at all — a missing file, a CSP
+block, and a 404 all look identical to the user. The companion logs
+the failure (`imageresolve: …`) but agents can't read those logs.
+
+### Anti-pattern: shell-encoding `data:` URLs
+
+Don't write the encoded bytes to a tempfile, then `cat` or `printf` them
+back through bash to construct the JSON tool call. Two failure modes
+seen in the wild:
+
+1. The terminal recognises the `data:image/...` prefix in stdout and
+   tries to render it inline — eats the rest of the pipeline.
+2. The encoded payload spans multiple shell-line buffers and gets
+   word-split or quoting-mangled.
+
+The fix is structural: the tool call is JSON, not shell. Either build
+the spec dict in your runtime and pass `src=f"data:image/png;base64,{b64}"`
+straight into the tool call, or hand aiui the path and let the bridge
+do the encoding for you.
+
+## `datetime` field
+
+Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
+one field instead of splitting into two `text` fields with manual
+validation. Native `<input type="datetime-local">`, returns ISO
+`YYYY-MM-DDTHH:MM`.
+
+## Tabs — long forms without scroll fatigue
+
+Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
+One submit covers all tabs; validation jumps to the first invalid tab
+automatically. Tabs are *display structure*, not a wizard — no per-tab
+confirmation, no per-tab actions, all values land in one response.
+
+Use when a single dialog naturally falls into 2-4 distinct topical
+groups (e.g. "Identity / Permissions / Notifications" on a user-create
+form). Don't reach for tabs to cram a 30-field form into 5 tabs — split
+into multiple `form` calls instead.
+
+## Password fields
+
+For short-lived secrets (one-off API tokens, test passwords), prefer
+`form` with a `password` field over asking in chat: the value is masked
+on screen while the user types, so it doesn't appear in screen
+recordings or to a shoulder-surfer.
+
+Be honest with the user, though — the value still returns to you as
+plaintext in the tool response. For long-lived or high-value secrets,
+use the `secret` field with a `target` instead (below) so the value
+never enters the conversation.
+
+## Secrets & file-write: the `secret` field + `target` (#135)
+
+When a value must NOT pass through this conversation — a credential the
+user pastes that should land in a file, not your transcript — use a
+`secret` field with a `target`. Any input field may carry `target`; for a
+`secret` field the value is **write-only**: aiui writes it to the file and
+returns only `{written, target, bytes, mode}`, never the value.
+
+**A `secret` field must carry a `target`.** The write-only promise is what
+a `secret` *is*, and the only place its value can legitimately go is the
+file — so a `secret` without a `target` is rejected with `invalid_spec`
+rather than silently handing you the plaintext. If you want the value back,
+that field is a `password`, not a `secret`.
+
+```json
+{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
+  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+              "perm": "0600", "overwrite": true } }
+```
+
+- **`mode: "create"`** — write the raw value. Needs `overwrite: true` to
+  replace an existing file (a path typo otherwise fails loudly rather than
+  clobbering).
+- **`mode: "substitute"`** — replace a `placeholder` that occurs *exactly
+  once* in an existing file (format-agnostic: YAML/TOML/INI/env). 0 or >1
+  matches → error, never a partial or wrong write. **Pick a distinctive
+  sentinel** that cannot collide with real file content — e.g.
+  `__AIUI_SECRET_GITHUB_PAT__`, never a common word like `TOKEN` or `X`. The
+  exactly-once rule is the safety net (a colliding placeholder errors instead
+  of being misapplied), but a distinctive sentinel makes the match
+  unambiguous in the first place.
+- **Destination is always your own host** — an aiui module already runs
+  there (the native app for a local session, the bridge on a remote SSH
+  session), and it performs the write as a plain **local** file operation.
+  So `create` and `substitute` behave identically local and remote (the
+  entered value reaches that module over aiui's own channel, never via the
+  agent). You cannot target a foreign host; the user sees the resolved path
+  and approves it by submitting.
+- **`path` must be absolute or `~/`-rooted.** A relative path (`notes/key`)
+  and a `~user/` path (`~alice/key`) are rejected — a relative path has no
+  stable working directory to resolve against, and `~user/` is not portable
+  across the two aiui modules, so either would write somewhere the user
+  never approved. Same rule `upload`'s `target_dir` follows. Symlinks are
+  followed: `substitute` on a link edits the file the link points at and
+  leaves the link a link; the reported `target` is that resolved path.
+- **`substitute` keeps the file's existing mode** unless you pass `perm` —
+  it is editing a file the user already owns, so a `0644` config stays
+  `0644` and the service reading it keeps working. `create` defaults to
+  `0600` (tight by default for a fresh credential file). The outcome
+  carries the octal `mode` actually applied, so a permission change is
+  never invisible.
+- **A blank field writes nothing.** An empty value is refused in both modes
+  — `{written: false, error: "refusing to write an empty value"}` — so a
+  skipped optional field can never truncate the user's file, and
+  `substitute` can never erase its own sentinel. Leaving a `target` field
+  blank is a safe no-op that reports itself, which is what makes the
+  "paste a new token only if you want to rotate it" flow legitimate.
+- **Only an affirmative action writes.** The write is committed by the
+  submit button or a plain named action; an action carrying
+  `skip_validation: true` (your Cancel / Save-draft escape hatch) does not
+  write. See *Action buttons* above.
+- **Errors** come back as `{written:false, error}` — no silent success.
+
+Why it exists: it replaces the fragile "guess a shell one-liner to stash a
+token" pattern with a native dialog + a correct, atomic write whose target
+the user sees first. It's a QoL + confused-deputy guard, **not** a hard
+guarantee the agent can't read the value some other way — for that, the
+user still types it themselves outside any agent path.
+
+## Anti-patterns (slop vs. clean)
+
+| Slop | Clean |
+|---|---|
+| `confirm(title="Are you sure?")` | `confirm(title="Drop table 'orders'?", destructive=True, message="18,432 rows will be removed.")` |
+| `ask(question="Choose one", options=[{"label": "Option 1"}, …])` | `ask(question="Which migration strategy?", options=[{"label":"In-place","description":"Fast, no rollback."}, …])` |
+| `form` with 15 `text` fields | Split into logical steps, or push back to chat entirely |
+| Button labels "OK" / "Cancel" | "Deploy" / "Discard" — name what happens |
+| `static_text` echoing the title | `static_text` adds context the labels can't carry alone |
+| `image(src="./shot.png")` (relative path — undefined `cwd`) | `image(src="/Users/me/shot.png")` — absolute, the bridge reads it locally |
+| Writing base64 to a tempfile, `cat`-ing it through bash to build the tool call | Pass the path as `src` and let the bridge encode, or build the `data:` URL directly in your runtime — never via shell pipes |
+
+## Quick-reference example
+
+```python
+aiui.form(
+    title="New feature draft",
+    header="Discovery",
+    fields=[
+        {"kind": "text", "name": "job", "label": "User job",
+         "multiline": True, "required": True},
+        {"kind": "select", "name": "scope", "label": "Scope",
+         "options": [{"label": "Quick win", "value": "qw"},
+                     {"label": "Feature", "value": "f"},
+                     {"label": "Epic", "value": "e"}],
+         "default": "f"},
+        {"kind": "list", "name": "stakeholders", "label": "Stakeholders",
+         "items": [{"label": "Product", "value": "prod"},
+                   {"label": "Design", "value": "design"},
+                   {"label": "Engineering", "value": "eng"}],
+         "selectable": True, "multi_select": True,
+         "default_selected": ["prod", "eng"]},
+        {"kind": "date", "name": "deadline", "label": "Target date"},
+    ],
+    actions=[
+        {"label": "Cancel", "value": "cancel", "skip_validation": True},
+        {"label": "Save draft", "value": "draft", "skip_validation": True},
+        {"label": "Create", "value": "commit", "primary": True},
+    ],
+)
+```
+
+Note: `Cancel` and `Save draft` carry `skip_validation: True`, so neither
+commits a `target` file write — only `Create` does. That is the rule, not a
+property of this example.
+
+Response: `{cancelled: false, action: "commit", values: {job: "…",
+scope: "f", stakeholders: {selected: [...], order: [...]}, deadline: "…"}}`.
