@@ -796,11 +796,17 @@ async fn version(
     }))
 }
 
-/// Check for an aiui update, download-and-install it if present, and answer
-/// the caller *before* scheduling the relaunch. The 500ms delay between
-/// returning the response and calling `app.restart()` gives Axum time to
-/// finalize the wire response so the MCP client receives `{updated: true,
-/// from, to}` even though the process exits shortly after.
+/// Check for an aiui update, install it if present, and answer the caller
+/// *before* the process goes away. The 500 ms delay in front of
+/// `app.restart()` gives Axum time to finalize the wire response so the MCP
+/// client receives `{updated, current, available}` even though the process
+/// exits shortly after.
+///
+/// #197 added two things: the install is deferred while a dialog is pending
+/// (Invariant I5, same gate as the Settings path), and on Windows the
+/// response is built *before* `download_and_install` rather than after —
+/// there the plugin exits the process inside that call, so "after" meant
+/// never. See the comments inline.
 async fn update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -860,8 +866,69 @@ async fn update(
     };
 
     let to_version = update.version.clone();
+
+    // #197: same Invariant I5 gate the Settings install path applies. An
+    // install means a relaunch, and a relaunch under a pending dialog tears
+    // the window down mid-`/render`: the user's half-filled form is gone and
+    // the agent that opened it gets a cancelled result. Wire-compatible —
+    // `updated: false` plus a `note` is a shape every bridge already handles.
+    let pending_dialogs = state.dialog.stats().orphan_count;
+    if !crate::lifetime::update_install_is_safe(pending_dialogs) {
+        trace(&format!(
+            "update: {pending_dialogs} dialog(s) in flight — deferring install of {to_version}"
+        ));
+        return Ok(Json(UpdateResponse {
+            updated: false,
+            current,
+            available: Some(to_version),
+            error: None,
+            note: Some("dialog in flight — update deferred".into()),
+        }));
+    }
+
     trace(&format!("update: installing {current} -> {to_version}"));
 
+    // #197: on Windows the updater plugin hands the NSIS installer to
+    // `ShellExecuteW` and then calls `std::process::exit(0)` — the process
+    // dies *inside* `download_and_install`, so nothing after it ever runs.
+    // Building the response afterwards meant the `{updated, current,
+    // available}` JSON was never flushed and `aiui-mcp`'s `update_tool`
+    // raised a transport error instead of reporting the version delta —
+    // `/aiui:update` was structurally broken there. So on Windows: answer
+    // first, install after the same 500 ms settle delay the macOS restart
+    // path uses. Exit-time cleanup (latching `ExitAuthority`, sweeping the
+    // ssh-NTR children) is covered by the updater plugin's `on_before_exit`
+    // hook in `lib.rs`, which the plugin invokes only on that branch.
+    //
+    // `cfg!` rather than `#[cfg]` on purpose: both arms then type-check on
+    // every target, so the Windows path is compiled — and reviewed — by the
+    // macOS CI leg too.
+    if cfg!(windows) {
+        let version_for_task = to_version.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            trace(&format!(
+                "update: launching installer for {version_for_task} (response already flushed)"
+            ));
+            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+                // Only reachable if the download or the signature check
+                // fails — a successful Windows install never returns.
+                trace(&format!("update: install failed: {e}"));
+            }
+        });
+
+        return Ok(Json(UpdateResponse {
+            updated: true,
+            current,
+            available: Some(to_version),
+            error: None,
+            note: Some("installer launched — aiui restarts into the new version".into()),
+        }));
+    }
+
+    // macOS/Linux: `install_inner` returns normally, so we install first and
+    // report the real outcome — including a failure, which the Windows
+    // branch structurally cannot.
     if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
         trace(&format!("update: install failed: {e}"));
         return Ok(Json(UpdateResponse {
@@ -1157,6 +1224,20 @@ async fn resolve_dialog(
         "render: got response id={} cancelled={}",
         result.id, result.cancelled
     ));
+    // Lifecycle-driven update check (#42): fire once after every render, so
+    // update checks cluster around actual aiui use. The frontend gates with
+    // the 6 h cooldown in `lifecycle.ts`, so this is never noisier than the
+    // Rust headless timer, and costs nothing when nobody is talking to aiui.
+    //
+    // #197: this emit used to sit in the *synchronous* POST branch, past the
+    // async branch's `return` — and both shipping bridges set
+    // `x-aiui-async: "1"` unconditionally, so in production it never fired
+    // once. `resolve_dialog` is the single point both paths run through,
+    // which makes it the only place the trigger behaves identically for
+    // every caller. Keep it here; do not move it back up into a branch.
+    if let Err(e) = state.app.emit("update:check", "post-render") {
+        trace(&format!("render: emit update:check failed: {e}"));
+    }
     // Authoritative window teardown (v0.4.46, Bug B): single point that
     // guarantees a dialog window never outlives its dialog. Idempotent —
     // a no-op on the submit/cancel paths where the window is already gone.
@@ -1408,14 +1489,6 @@ async fn render(
     // connection still cleans up; `resolve_dialog` runs the terminal teardown.
     let result = resolve_dialog(state.clone(), id.clone(), result_rx).await;
     guard.disarm();
-
-    // Lifecycle-driven update check (#42): fire once after every
-    // successful render. Frontend gates with a 30-min cooldown so this is
-    // never noisier than the old 6h timer in active use, and zero load
-    // when nobody is talking to aiui.
-    if let Err(e) = state.app.emit("update:check", "post-render") {
-        trace(&format!("render: emit update:check failed: {e}"));
-    }
 
     Json(RenderResponse {
         id: result.id,

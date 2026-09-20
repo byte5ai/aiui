@@ -497,17 +497,59 @@ fn is_aiui_ssh_ntr_for_port(args: &[String], port: u16) -> bool {
     has_n && has_t && has_r
 }
 
+/// Is this tunnel child orphaned — i.e. did the aiui that spawned it die
+/// without taking it along?
+///
+/// The answer is platform-shaped, which is why the rule is a parameter
+/// rather than a `cfg!` buried in the filter (it keeps both branches
+/// testable from whichever host the suite runs on):
+///
+///  * `reparents_to_init` (POSIX): a dead parent hands the child to
+///    launchd/init, so `ppid == 1` *is* the orphan signal, and a live ppid
+///    means a live owner. Deliberately strict — a second aiui must not read
+///    the winner's active tunnels as abandoned.
+///  * Windows: nothing re-parents. The child keeps pointing at a ppid that
+///    simply no longer exists, so the criterion is "parent not in the
+///    snapshot" — the same reasoning `is_orphaned_child` already applies to
+///    stranded mcp-stdio children.
+///
+/// #197: the filter used to test `ppid == Some(1)` unconditionally, so on
+/// Windows the startup sweep could never reclaim anything. Combined with the
+/// updater's `process::exit(0)`, every Windows update leaked an `ssh -NTR`
+/// child that the next instance then mistook for a healthy shared forward.
+fn ssh_ntr_is_orphan(snap: &[ProcSnap], p: &ProcSnap, reparents_to_init: bool) -> bool {
+    if reparents_to_init {
+        p.ppid == Some(1)
+    } else {
+        match p.ppid {
+            None => true,
+            Some(pp) => !snap.iter().any(|q| q.pid == pp),
+        }
+    }
+}
+
 /// Filter: every `ssh -NTR <port>:localhost:<port>` process matching our
-/// tunnel signature. When `only_orphans` is true, restrict to processes
-/// whose ppid is 1 (launchd/init) — the case where an earlier aiui crashed
-/// out of `app.exit()` / `process::exit()` without firing `kill_on_drop`,
-/// leaving the ssh child re-parented to launchd. When false, return all
+/// tunnel signature. When `only_orphans` is true, restrict to the ones whose
+/// spawning aiui is gone — see [`ssh_ntr_is_orphan`] for the per-platform
+/// rule — the case where an earlier aiui crashed out of `app.exit()` /
+/// `process::exit()` without firing `kill_on_drop`. When false, return all
 /// matching processes (used pre-exit so we sweep our own active tunnels
 /// before the rust-side Drop is skipped). Pure over a snapshot.
 fn find_aiui_ssh_ntr(snap: &[ProcSnap], port: u16, only_orphans: bool) -> Vec<u32> {
+    find_aiui_ssh_ntr_with_rule(snap, port, only_orphans, cfg!(unix))
+}
+
+/// [`find_aiui_ssh_ntr`] with the orphan rule spelled out, so both platform
+/// behaviours can be asserted from a single test host.
+fn find_aiui_ssh_ntr_with_rule(
+    snap: &[ProcSnap],
+    port: u16,
+    only_orphans: bool,
+    reparents_to_init: bool,
+) -> Vec<u32> {
     snap.iter()
         .filter(|p| is_aiui_ssh_ntr_for_port(&p.args, port))
-        .filter(|p| !only_orphans || p.ppid == Some(1))
+        .filter(|p| !only_orphans || ssh_ntr_is_orphan(snap, p, reparents_to_init))
         .map(|p| p.pid)
         .collect()
 }
@@ -852,11 +894,48 @@ mod tests {
             // Active tunnel from the current GUI (ppid != 1).
             snap_with_ppid(40000, 76770, "/usr/bin/ssh", &ssh_ntr_args("customer@macmini", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
         ];
-        let orphans = find_aiui_ssh_ntr(&s, 7777, true);
+        // Pinned to the POSIX rule explicitly (#197): the shared entry point
+        // now picks the rule per platform, and this assertion is about the
+        // re-parenting one.
+        let orphans = find_aiui_ssh_ntr_with_rule(&s, 7777, true, true);
         assert_eq!(orphans, vec![30295]);
 
-        let all = find_aiui_ssh_ntr(&s, 7777, false);
+        let all = find_aiui_ssh_ntr_with_rule(&s, 7777, false, true);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn find_aiui_ssh_ntr_orphans_on_windows_ignores_ppid() {
+        // #197: Windows never re-parents to pid 1, so the POSIX filter
+        // matched nothing there and the startup sweep could not reclaim a
+        // tunnel leaked by the updater's `process::exit(0)`. Under the
+        // Windows rule the discriminator is whether the parent is still in
+        // the snapshot — a matching `ssh -NTR` with `ppid != Some(1)` is an
+        // orphan exactly when its parent is gone.
+        let s = vec![
+            // The surviving aiui that owns pid 40000's tunnel.
+            snap_with_ppid(76770, 500, CURRENT, &[CURRENT]),
+            // Leaked by a previous instance: ppid 9001 is nowhere any more.
+            snap_with_ppid(30295, 9001, "ssh.exe", &ssh_ntr_args("dev@devhost", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
+            // Live tunnel of the instance above — must be spared.
+            snap_with_ppid(40000, 76770, "ssh.exe", &ssh_ntr_args("customer@macmini", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
+        ];
+        let orphans = find_aiui_ssh_ntr_with_rule(&s, 7777, true, false);
+        assert_eq!(
+            orphans,
+            vec![30295],
+            "a ppid that no longer exists is the Windows orphan signal"
+        );
+
+        // Same snapshot under the POSIX rule: neither ppid is 1, so the old
+        // filter reclaimed nothing at all — the defect, in one assertion.
+        assert!(find_aiui_ssh_ntr_with_rule(&s, 7777, true, true).is_empty());
+
+        // `only_orphans: false` stays rule-independent.
+        assert_eq!(
+            find_aiui_ssh_ntr_with_rule(&s, 7777, false, false).len(),
+            2
+        );
     }
 
     // ---------- find_orphaned_mcp_stdio_to_kill (Bug A, v0.4.46) ----------

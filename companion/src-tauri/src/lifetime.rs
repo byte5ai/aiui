@@ -75,6 +75,25 @@ pub fn wirt_gone(cd_is_wirt: bool, cd_running: bool) -> bool {
     cd_is_wirt && !cd_running
 }
 
+/// May an update be installed right now?
+///
+/// Installing means `downloadAndInstall` + relaunch, which tears down every
+/// window — including a dialog the user is filling in, whose in-flight
+/// `/render` would come back to the agent as a cancelled transport result.
+/// That is the Invariant I5 case: never destroy a pending dialog to apply an
+/// update. `orphan_count` is `DialogState::stats().orphan_count`, i.e. the
+/// number of registered dialogs still waiting on a user response.
+///
+/// Settings being open is deliberately *not* part of the predicate — the user
+/// is standing there on purpose, so a restart is exactly what they asked for.
+///
+/// Pure so the semantics the gate depends on can be pinned in a unit test;
+/// the `is_update_safe_to_install` command and the agent-facing `/update`
+/// handler are the two callers.
+pub fn update_install_is_safe(orphan_count: usize) -> bool {
+    orphan_count == 0
+}
+
 /// Should this `RunEvent::ExitRequested` be honoured?
 ///
 /// #180: belt and braces on top of [`wirt_gone`]. Tauri fires
@@ -827,6 +846,22 @@ mod tests {
     fn wirt_gone_only_when_our_wirt_left() {
         assert!(wirt_gone(true, false), "CD is the Wirt and it quit");
         assert!(!wirt_gone(true, true), "CD is the Wirt and it runs");
+    }
+
+    #[test]
+    fn update_install_is_safe_only_with_empty_registry() {
+        // #197: the gate exists so an install never restarts the app out from
+        // under a dialog the user is filling in. One pending dialog is enough
+        // to defer — there is no "only one, that's fine" threshold.
+        assert!(
+            update_install_is_safe(0),
+            "no dialog pending — installing is safe"
+        );
+        assert!(
+            !update_install_is_safe(1),
+            "one dialog waiting on the user — installing would destroy it"
+        );
+        assert!(!update_install_is_safe(7));
     }
 
     #[test]

@@ -19,6 +19,12 @@ All notable changes to this project are documented here.
   runs in the release path before anything becomes visible, and
   `scripts/test-check-updater-feed.sh` exercises it against fixtures on
   every PR so the guard cannot quietly stop guarding (#190).
+- **A frontend test runner.** The companion had none — CI ran
+  `svelte-check` and a Vite build, so every line of TypeScript was covered
+  by "it compiles". `npm run test` (vitest) now runs on both CI legs, with
+  the update path and de/en catalogue parity as its first suites. The
+  update path is where this matters most: its failures are invisible by
+  construction, which is exactly what made #197 survive so long (#197).
 
 ### Changed
 
@@ -54,6 +60,75 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A failed update install said nothing at all.** Only the release check
+  was wrapped; everything from `downloadAndInstall()` to the relaunch was
+  bare. A dead network, a minisign signature mismatch, a full disk and a
+  cancelled admin prompt therefore all ended the same way: the spinner
+  stopped, no message appeared, the banner still offered the update, and
+  the app never changed. That is the one support signature a maintainer
+  cannot work with — "aiui never updates", with nothing in the UI log to
+  say why. Every failure now raises a native error modal naming the cause
+  and lands in the Settings log; `checkForUpdates` returns its outcome
+  instead of swallowing it (#197).
+- **Clicking Install while a dialog was open destroyed that dialog.** The
+  guard written to prevent exactly this, `is_update_safe_to_install`, had
+  had no caller since v0.4.44 — the install path went straight from the
+  confirmation to `downloadAndInstall()` and a relaunch. A user installing
+  from the banner while a remote agent had a form open tore that window
+  down mid-`/render`: their typed content was gone and the agent got a
+  cancelled result. Both install paths — the Settings button and the
+  agent-facing `/update` — now check the dialog registry first and defer,
+  leaving the banner in place (#197).
+- **Double-clicking "Check for updates" started two installs.** The footer
+  button called `checkForUpdates` as a floating promise and never set
+  `busy`, so its own `disabled={busy}` was decoration and two concurrent
+  `downloadAndInstall()` calls could race over the same bundle — on macOS
+  that is two renames over the live `.app`. It now routes through the same
+  guarded entry point as the banner, backed by a module-level latch (#197).
+- **Windows updates leaked an SSH tunnel and broke `/aiui:update`.**
+  `tauri-plugin-updater` ends its Windows install with
+  `std::process::exit(0)`, which bypasses `ExitRequested` — so the exit
+  cleanup never ran and every update left the previous instance's
+  `ssh -NTR` child alive. The relaunched instance then saw the port already
+  forwarded and pinned itself to "connected (shared forward)" for the rest
+  of its life, with its own forward never binding; only a manual `taskkill`
+  or a reboot recovered it. The startup sweep could not reclaim the child
+  either, because it identified orphans by `ppid == 1`, which is a POSIX
+  re-parenting rule that does not hold on Windows. Cleanup now runs from
+  the plugin's `on_before_exit` hook, and the sweep uses "parent is gone
+  from the process table" off POSIX. Same root cause, second symptom: the
+  `/update` endpoint built its response *after* the install, i.e. after the
+  process had already exited, so the Python bridge raised a transport error
+  instead of returning the version delta — `/aiui:update` was structurally
+  broken on Windows. It now answers first and installs after (#197).
+- **The pending-update banner could not be got rid of.** Its type comment
+  promised it clears "once the user installs or the on-disk version catches
+  up"; the second half was implemented nowhere. After a release was yanked
+  — or a `latest.json` stopped advertising the platform — the banner
+  offered a version the updater would no longer hand out, clicking Install
+  answered "you are on the current version", and the banner came straight
+  back. It is deliberately dismiss-free, so the only way out was restarting
+  the companion. All four paths now retract it: a successful install, a
+  manual check that finds nothing, the headless six-hour check, and the
+  status poll once the installed version has caught up (#197).
+- **The post-render update trigger had never fired in production.** The
+  `update:check` event was emitted only on the synchronous render path,
+  past the async branch's `return` — and both shipping bridges request the
+  async path unconditionally, so the emit was unreachable for every real
+  caller. Updates were not stalled (the per-window mount check and the Rust
+  six-hour loop still ran), but the trigger that clusters checks around
+  actual use was gone, and nothing would have revealed it. The emit moved
+  into `resolve_dialog`, the single point both paths run through (#197).
+- **The whole update surface was hardcoded German.** aiui auto-detects its
+  locale and ships a complete English catalogue, yet every string in the
+  update flow was a German literal — and these are *native OS modals*, the
+  most prominent text the product shows. An English-locale user got German
+  dialogs with no explanation. Both HTML entry points also declared
+  `lang="de"` unconditionally, which gave English sessions German
+  screen-reader pronunciation and German spellcheck inside every `form`
+  textarea. The update strings, the add-remote dismiss button and the
+  quit-failure message are now translated, and the document language
+  follows the resolved locale (#197).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
