@@ -122,17 +122,21 @@ fn dialog_cancel(
 ///
 /// `target`/mode/path are read authoritatively from the **stored spec** (not
 /// from the frontend) so the destination can't be tampered with after the user
-/// approved it. Returns a per-field outcome map; for a `secret` field the
-/// outcome carries status only, never the value.
+/// approved it — and so is the decision whether the submitted `action` commits
+/// writes at all (issue #177). Returns a per-field outcome map; for a `secret`
+/// field the outcome carries status only, never the value.
 #[tauri::command]
 fn write_dialog_targets(
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     values: std::collections::HashMap<String, String>,
+    action: Option<String>,
 ) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
+
+    let commits = action_commits_targets(&req.spec, action.as_deref());
 
     let mut out = std::collections::HashMap::new();
     for field in collect_target_fields(&req.spec) {
@@ -151,10 +155,81 @@ fn write_dialog_targets(
                     continue;
                 }
             };
-        let value = values.get(&name).map(String::as_str).unwrap_or("");
-        out.insert(name, filewrite::write_local(value, &target));
+        // A non-committing action still gets a per-field outcome, so the agent
+        // is told why nothing was written instead of being left guessing.
+        if !commits {
+            let label = action.as_deref().unwrap_or("(submit)");
+            out.insert(
+                name,
+                filewrite::WriteOutcome::invalid(format!(
+                    "action '{label}' does not commit target writes"
+                )),
+            );
+            continue;
+        }
+        // "Field absent from the payload" is not the same as "field submitted
+        // blank": the former means the frontend never sent it, which must not
+        // be laundered into an empty write.
+        match values.get(&name) {
+            Some(value) => out.insert(name, filewrite::write_local(value, &target)),
+            None => out.insert(
+                name,
+                filewrite::WriteOutcome::invalid("no value submitted for this field".into()),
+            ),
+        };
     }
     Ok(out)
+}
+
+/// Trace a startup registration step that failed.
+///
+/// #182: these three call sites used to discard their `StepResult` with
+/// `let _ =`. With the parse-error hard stop in place, a broken host config
+/// turns a silent wipe into a silent no-op — better, but the user still
+/// never learns their config is broken and aiui is simply not registered.
+/// Settings shows step results; the GUI startup path has only the trace.
+fn trace_step(what: &str, step: setup::StepResult) {
+    if !step.ok {
+        logging::trace(&format!(
+            "gui: {what} did not succeed: {}{}",
+            step.message,
+            step.details
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default()
+        ));
+    }
+}
+
+/// Issue #177: decide whether the action the user pressed commits `target`
+/// file writes. Resolved from the **stored spec**, never from the frontend.
+///
+/// Rule: the built-in submit (`None`, i.e. `action: null` in the result)
+/// always commits. A named action commits unless it carries
+/// `skip_validation: true` — documented as an escape hatch so required-field
+/// validation never traps the user, and an escape hatch is by definition
+/// non-committing. `writes_targets: true` is the explicit opt-in for the rare
+/// action that needs both. An action **not found** in the spec fails closed.
+///
+/// Deliberately *not* keyed on `destructive` or `primary`: both are styling
+/// and orthogonal to committing — a red "Rollback" may legitimately write, and
+/// a neutral action may be the only affirmative one in the form.
+fn action_commits_targets(spec: &serde_json::Value, action: Option<&str>) -> bool {
+    let Some(name) = action else {
+        return true; // built-in __submit__
+    };
+    let Some(actions) = spec.get("actions").and_then(|v| v.as_array()) else {
+        return false; // named action but no action list — fail closed
+    };
+    let Some(entry) = actions
+        .iter()
+        .find(|a| a.get("value").and_then(|v| v.as_str()) == Some(name))
+    else {
+        return false; // unknown action — fail closed
+    };
+    if entry.get("writes_targets").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    entry.get("skip_validation").and_then(|v| v.as_bool()) != Some(true)
 }
 
 /// Collect every form field that carries a non-null `target`, walking both the
@@ -892,6 +967,15 @@ async fn add_remote(
         list.push(host_alias.clone());
         let _ = setup::save_remotes(&list);
     }
+    // #184: remember the absolute uvx path the probe just found. Without
+    // this it was discovered, pinned once, and then thrown away — so the
+    // next launch's resync passed `None`, rewrote the entry down to the
+    // bare name, and reported success while breaking the host. Written on
+    // every add (not only the first) so a re-add refreshes a moved uvx.
+    let _ = setup::save_remote_uvx(
+        &host_alias,
+        uvx_loc.as_ref().map(|l| l.uvx_path.as_str()),
+    );
     tm.ensure(host_alias).await;
     Ok(results)
 }
@@ -923,14 +1007,36 @@ async fn resync_remote(
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
     let our_version = env!("CARGO_PKG_VERSION");
+    // #184: use the uvx path discovered when this host was added. Passing
+    // `None` here is what rewrote a pinned absolute path back down to the
+    // bare name — which then depends on Claude Code's PATH at spawn time,
+    // the exact fragility the probe exists to avoid.
+    let mut results = Vec::new();
+    let mut uvx = setup::load_remote_uvx(&host_alias);
+    if uvx.is_none() {
+        // Self-heal a host registered by an older build, which has no
+        // persisted path. `check_remote_aiui_mcp` is a cheap, idempotent
+        // `uvx --version` probe, and running it here also restores the
+        // pre-flight guarantee this button never had. Deliberately NOT on
+        // the startup path: that would be an extra SSH round-trip per
+        // remote on every launch, and the persisted path covers the
+        // steady state.
+        let (reach_step, uvx_loc) = setup::check_remote_aiui_mcp(&host_alias);
+        uvx = uvx_loc.as_ref().map(|l| l.uvx_path.clone());
+        if uvx.is_some() {
+            let _ = setup::save_remote_uvx(&host_alias, uvx.as_deref());
+        }
+        results.push(reach_step);
+    }
     // Re-pin in `~/.claude.json` on the remote (idempotent — if already
     // pinned, no rewrite, returns AlreadyCurrent).
     let (pin_step, _patch) = setup::patch_claude_code_config_remote(
         &host_alias,
-        None,
+        uvx.as_deref(),
         our_version,
     );
-    Ok(vec![pin_step])
+    results.push(pin_step);
+    Ok(results)
 }
 
 #[tauri::command]
@@ -960,6 +1066,9 @@ async fn remove_remote(
         .filter(|h| h != &host_alias)
         .collect();
     let _ = setup::save_remotes(&list);
+    // #184: forget the host's uvx path too, so a later re-add starts from a
+    // fresh probe rather than a stale path to a uvx that may have moved.
+    let _ = setup::save_remote_uvx(&host_alias, None);
     Ok(results)
 }
 
@@ -1007,6 +1116,9 @@ async fn uninstall_all(
     let _ = std::fs::remove_file(&cfg.token_path);
     let _ = std::fs::remove_file(cfg.config_dir.join("first_run_done"));
     let _ = setup::save_remotes(&[]);
+    // #184: the uvx sidecar is local state too — uninstall must not leave
+    // it behind.
+    let _ = std::fs::remove_file(cfg.config_dir.join("remote-uvx.json"));
     results.push(setup::StepResult {
         ok: true,
         message: format!(
@@ -1331,7 +1443,7 @@ pub fn run() {
         Ok(g) => g,
         Err(e) => {
             // Another aiui-GUI is alive and holds the lock. Exit
-            // immediately, traced so the post-mortem in /tmp/aiui-trace.log
+            // immediately, traced so the post-mortem in the trace log
             // explains the silent disappearance.
             logging::trace(&format!(
                 "[aiui] exit (gui-lock-busy): another aiui-GUI holds {} ({e}); \
@@ -1507,7 +1619,7 @@ pub fn run() {
             // user doesn't use. Idempotent, GUI mode only.
             let bin = setup::app_binary_path();
             if setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
-                let _ = setup::patch_claude_desktop_config(&bin);
+                trace_step("Claude Desktop config registration", setup::patch_claude_desktop_config(&bin));
             }
 
             // Kill any `aiui --mcp-stdio` children left over from an older app
@@ -1529,7 +1641,7 @@ pub fn run() {
             // every session sees aiui without a uv/uvx dependency — but only
             // if Claude Code is set up here (#168).
             if setup::is_claude_code_installed() {
-                let _ = setup::patch_claude_code_config(&bin);
+                trace_step("Claude Code config registration", setup::patch_claude_code_config(&bin));
             }
 
             // Same self-contained registration for OpenAI Codex, if it's set
@@ -1537,7 +1649,7 @@ pub fn run() {
             // pointing at the same bundled --mcp-stdio server — no manual setup,
             // exactly like the Claude hosts.
             if setup::is_codex_installed() {
-                let _ = setup::patch_codex_config(&bin);
+                trace_step("Codex config registration", setup::patch_codex_config(&bin));
             }
 
             // Auto-install the aiui skill into the local Claude Code skill
@@ -1673,9 +1785,14 @@ pub fn run() {
                     // SSH/Python pipeline is sync. Ordering across
                     // hosts is irrelevant; pin-syncs are independent.
                     tokio::task::spawn_blocking(move || {
+                        // #184: the persisted path, not `None`. This task
+                        // runs for every remote on every launch, so passing
+                        // `None` downgraded a working absolute path to the
+                        // bare name once per start.
+                        let uvx = setup::load_remote_uvx(&host_for_task);
                         let (step, patch) = setup::patch_claude_code_config_remote(
                             &host_for_task,
-                            None,
+                            uvx.as_deref(),
                             &our_version_owned,
                         );
                         if step.ok {
@@ -1873,7 +1990,7 @@ pub fn run() {
             // via `api.prevent_exit()`. The watcher owns the CD-gone exit in
             // normal operation; this gate is the backstop for every other
             // Tauri-initiated termination.
-            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
                 // Default-deny (Invariant I1). The only legitimate planned
                 // exits are: (b) uninstall / (c) update-restart — both latch
                 // `ExitAuthority` before asking Tauri to terminate — or (a) the
@@ -1887,10 +2004,22 @@ pub fn run() {
                     .try_state::<Arc<lifetime::ExitAuthority>>()
                     .map(|a| a.is_authorized())
                     .unwrap_or(false);
+                // #180: "is Claude Desktop running" is only the Wirt signal
+                // when Claude Desktop IS our Wirt. For a Claude-Code-only or
+                // Codex-only user it is permanently absent, which turned this
+                // default-DENY gate into default-ALLOW — the host quit as soon
+                // as a dialog submit closed its only window.
+                let cd_is_wirt = setup::is_claude_desktop_installed();
                 let cd_running = setup::is_claude_desktop_running();
-                if !lifetime::host_should_exit(explicit, cd_running) {
+                let gone = lifetime::wirt_gone(cd_is_wirt, cd_running);
+                // `code: None` is Tauri's user-interaction exit — including
+                // the last window being destroyed, which happens after every
+                // dialog submit. That must never end the host, whatever the
+                // Wirt probe says.
+                if !lifetime::honour_exit_request(*code, explicit, gone) {
                     logging::trace(&format!(
-                        "[aiui] veto ExitRequested (default-deny): explicit={explicit}, \
+                        "[aiui] veto ExitRequested (default-deny): code={code:?}, \
+                         explicit={explicit}, cd_is_wirt={cd_is_wirt}, \
                          claude_desktop_running={cd_running}"
                     ));
                     lifecycle_log::record(lifecycle_log::LifecycleEvent::ExitDenied);
@@ -1907,16 +2036,10 @@ pub fn run() {
                 } else {
                     "exit-claude-desktop-gone"
                 };
-                lifecycle_log::transition(lifecycle_log::Phase::Exiting);
-                lifecycle_log::record(lifecycle_log::LifecycleEvent::HostExit { reason });
-                // Forensic dump of the lifetime event ring on the way out —
-                // the post-hoc record that was missing during the 0.4.x
-                // instability (#137 cross-cutting).
-                for line in lifecycle_log::recent() {
-                    logging::trace(&format!("[aiui] lifecycle-dump {line}"));
-                }
                 logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
-                housekeeping::pre_exit_cleanup(port, reason);
+                // Drains pending dialogs, flushes, sweeps, dumps the ring and
+                // exits. Does not return.
+                lifetime::terminal_exit(app, reason, 0, port, housekeeping::SweepScope::All);
             }
 
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
@@ -2001,5 +2124,107 @@ mod navigation_tests {
         assert!(!is_allowed_app_navigation(&url("http://tauri.localhost.evil.com/")));
         assert!(!is_allowed_app_navigation(&url("https://localhost/")));
         assert!(!is_allowed_app_navigation(&url("http://notlocalhost/")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The documented Cancel / Save-draft / Create triple from
+    /// `docs/skill.md`, which is what made issue #177 reachable with a
+    /// copy-pasted example.
+    fn spec_with_documented_actions() -> serde_json::Value {
+        json!({
+            "kind": "form",
+            "fields": [{
+                "kind": "secret",
+                "name": "pat",
+                "label": "GitHub PAT",
+                "target": {"mode": "create", "path": "~/.github_tokens/x", "overwrite": true}
+            }],
+            "actions": [
+                {"label": "Cancel", "value": "cancel", "skip_validation": true},
+                {"label": "Save draft", "value": "draft", "skip_validation": true},
+                {"label": "Create", "value": "commit"}
+            ]
+        })
+    }
+
+    #[test]
+    fn none_action_commits() {
+        // The built-in submit button (`action: null` in the result).
+        assert!(action_commits_targets(&spec_with_documented_actions(), None));
+    }
+
+    #[test]
+    fn skip_validation_action_does_not_commit() {
+        let spec = spec_with_documented_actions();
+        assert!(!action_commits_targets(&spec, Some("cancel")));
+        assert!(!action_commits_targets(&spec, Some("draft")));
+    }
+
+    #[test]
+    fn plain_named_action_commits() {
+        assert!(action_commits_targets(
+            &spec_with_documented_actions(),
+            Some("commit")
+        ));
+    }
+
+    #[test]
+    fn writes_targets_overrides_skip_validation() {
+        let spec = json!({
+            "actions": [
+                {"label": "Save anyway", "value": "force",
+                 "skip_validation": true, "writes_targets": true}
+            ]
+        });
+        assert!(action_commits_targets(&spec, Some("force")));
+    }
+
+    #[test]
+    fn unknown_action_does_not_commit() {
+        // Fail closed: an action the stored spec never declared.
+        let spec = spec_with_documented_actions();
+        assert!(!action_commits_targets(&spec, Some("not-in-spec")));
+    }
+
+    #[test]
+    fn named_action_without_action_list_does_not_commit() {
+        let spec = json!({"kind": "form", "fields": []});
+        assert!(!action_commits_targets(&spec, Some("whatever")));
+        // …while the built-in submit still works on such a spec.
+        assert!(action_commits_targets(&spec, None));
+    }
+
+    #[test]
+    fn collect_target_fields_walks_flat_and_tabs() {
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "plain"},
+                {"kind": "secret", "name": "a", "target": {"mode": "create", "path": "/tmp/a"}},
+                {"kind": "text", "name": "nulled", "target": serde_json::Value::Null}
+            ],
+            "tabs": [
+                {"label": "T1", "fields": [
+                    {"kind": "secret", "name": "b", "target": {"mode": "create", "path": "/tmp/b"}}
+                ]},
+                {"label": "T2", "fields": [{"kind": "text", "name": "c"}]}
+            ]
+        });
+        let names: Vec<String> = collect_target_fields(&spec)
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_empty_when_no_targets() {
+        let spec = json!({"kind": "form", "fields": [{"kind": "text", "name": "x"}]});
+        assert!(collect_target_fields(&spec).is_empty());
     }
 }

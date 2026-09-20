@@ -84,13 +84,30 @@ impl ProcessLock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        // Issue #185: the lock file must not be world-readable/writable.
+        // `mode()` applies only on creation, so an install that already
+        // carries a 0644 lock is repaired right after a successful acquire.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
         file.try_lock_exclusive()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&path) {
+                if md.permissions().mode() & 0o177 != 0 {
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
         Ok(Self { file, path })
     }
 
@@ -501,13 +518,45 @@ fn find_aiui_ssh_ntr(snap: &[ProcSnap], port: u16, only_orphans: bool) -> Vec<u3
 ///
 /// Called immediately before every exit point in the GUI process. v0.4.37.
 pub fn pre_exit_cleanup(port: u16, reason: &str) {
-    trace(&format!(
-        "[aiui] exit ({reason}): cleaning up ssh-NTR tunnels before shutdown"
-    ));
-    let killed = kill_aiui_ssh_ntr(port, false);
-    trace(&format!(
-        "[aiui] exit ({reason}): swept {killed} ssh-NTR child(ren); proceeding"
-    ));
+    exit_cleanup(port, reason, SweepScope::All);
+}
+
+/// How much of the ssh-NTR tunnel fleet an exiting instance may sweep.
+///
+/// #180: the sweep used to be unconditional, which is wrong for the
+/// multi-instance exits. A second aiui that loses the startup race never
+/// opened a tunnel — every `ssh -N -T -R` on the machine belongs to the
+/// instance that *won*. Sweeping "all" on its way out therefore killed the
+/// live instance's tunnels, dropping every remote session's dialogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepScope {
+    /// This instance owned the tunnels: take them with us.
+    All,
+    /// Take only tunnels whose parent is gone.
+    OrphansOnly,
+    /// Another instance owns them. Touch nothing.
+    None,
+}
+
+pub fn exit_cleanup(port: u16, reason: &str, scope: SweepScope) {
+    match scope {
+        SweepScope::None => {
+            trace(&format!(
+                "[aiui] exit ({reason}): another instance owns the ssh-NTR tunnels — not sweeping"
+            ));
+        }
+        SweepScope::OrphansOnly | SweepScope::All => {
+            let only_orphans = scope == SweepScope::OrphansOnly;
+            let mode = if only_orphans { "orphan" } else { "all" };
+            trace(&format!(
+                "[aiui] exit ({reason}): cleaning up {mode} ssh-NTR tunnels before shutdown"
+            ));
+            let killed = kill_aiui_ssh_ntr(port, only_orphans);
+            trace(&format!(
+                "[aiui] exit ({reason}): swept {killed} ssh-NTR child(ren); proceeding"
+            ));
+        }
+    }
 }
 
 /// Sweep ssh-NTR tunnel children — see `find_aiui_ssh_ntr` for the filter.

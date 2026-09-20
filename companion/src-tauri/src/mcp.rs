@@ -336,7 +336,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. Non-secret fields with a `target` are written AND returned. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. A `secret` therefore REQUIRES a `target` — without one the render is rejected with `invalid_spec` rather than handing you the plaintext; if you want the value back, that field is a `password`, not a `secret`. Non-secret fields with a `target` are written AND returned. **Only an affirmative action commits the write:** the submit button or a plain named action. An action carrying `skip_validation:true` (your Cancel / Save-draft escape hatch) writes nothing and returns `{written:false, error}` per field — set `writes_targets:true` on it if it really must write. A blank field also writes nothing (`refusing to write an empty value`), in both modes, so a skipped optional field never truncates the user's file and `substitute` never erases its own sentinel. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — Mac-companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -1412,6 +1412,19 @@ fn format_dialog_result(render: Value) -> Value {
     } else {
         payload = json!({ "cancelled": cancelled });
     }
+    // #180: forward WHY a dialog was cancelled. The companion sets
+    // `host_exiting`, `ttl_expired`, `evicted` and `channel_dropped`;
+    // dropping them left the agent unable to tell "the user declined" from
+    // "the companion was shutting down". Forwarded generically, so a reason
+    // added later needs no bridge change. I6 — the Python bridge does the
+    // same.
+    if cancelled {
+        if let Some(reason) = render.get("reason").and_then(|v| v.as_str()) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("reason".into(), json!(reason));
+            }
+        }
+    }
     value_to_tool_text(payload)
 }
 
@@ -1491,6 +1504,61 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Pull the JSON payload back out of the MCP tool-result envelope.
+    fn tool_payload(v: Value) -> Value {
+        let text = v["content"][0]["text"].as_str().expect("text content");
+        serde_json::from_str(text).expect("payload is JSON")
+    }
+
+    #[test]
+    fn cancel_reason_reaches_the_agent() {
+        // #180: the companion sets host_exiting / ttl_expired / evicted /
+        // channel_dropped, but the bridge flattened every one into a bare
+        // {"cancelled": true} — indistinguishable from the user pressing
+        // Escape, so an agent retried the wrong thing. `future_reason` stands
+        // in for one added later: forwarding is generic on purpose.
+        for reason in [
+            "host_exiting",
+            "ttl_expired",
+            "evicted",
+            "channel_dropped",
+            "future_reason",
+        ] {
+            let render = json!({
+                "id": "d1", "cancelled": true, "result": null, "reason": reason
+            });
+            let out = tool_payload(format_dialog_result(render));
+            assert_eq!(out["cancelled"], json!(true));
+            assert_eq!(out["reason"], json!(reason), "reason {reason} must survive");
+        }
+    }
+
+    #[test]
+    fn a_plain_user_cancel_carries_no_reason() {
+        // The user pressing Escape has no reason attached, and inventing one
+        // would be worse than omitting it.
+        let render = json!({"id": "d1", "cancelled": true, "result": null});
+        let out = tool_payload(format_dialog_result(render));
+        assert_eq!(out["cancelled"], json!(true));
+        assert!(out.get("reason").is_none(), "no reason invented: {out}");
+    }
+
+    #[test]
+    fn a_submitted_dialog_keeps_its_values_and_gains_no_reason() {
+        // The happy path must not regress, and a stale reason on a successful
+        // submit would be actively misleading.
+        let render = json!({
+            "id": "d1",
+            "cancelled": false,
+            "result": {"values": {"name": "Ada"}},
+            "reason": "host_exiting"
+        });
+        let out = tool_payload(format_dialog_result(render));
+        assert_eq!(out["cancelled"], json!(false));
+        assert_eq!(out["values"]["name"], json!("Ada"));
+        assert!(out.get("reason").is_none(), "not a cancel: {out}");
+    }
 
     fn test_cfg() -> Arc<AppConfig> {
         Arc::new(AppConfig {

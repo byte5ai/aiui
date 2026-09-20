@@ -23,7 +23,10 @@ labels: bug
 
 **What actually happened**:
 
-**Relevant log lines** (`/tmp/aiui-trace.log` and `~/Library/Logs/de.byte5.aiui/aiui.log`):
+**Relevant log lines** — the trace path is printed in the first line of every
+log session (`~/.config/aiui/logs/aiui-trace.log` on macOS,
+`%LOCALAPPDATA%\aiui\logs\aiui-trace.log` on Windows), plus
+`~/Library/Logs/de.byte5.aiui/aiui.log` on macOS:
 
 ```
 ```

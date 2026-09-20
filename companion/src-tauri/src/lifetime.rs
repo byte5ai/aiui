@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::io::AsyncReadExt;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -50,17 +50,48 @@ use tokio::sync::Notify;
 /// in a loop.
 pub const SHUTDOWN_GRACE_SECS: u64 = 5;
 
-/// The single exit authority (Invariant I1). A host *planned* exit is legitimate
-/// in exactly three cases: (b) aiui is uninstalled or (c) restarting into an
-/// update — both signalled explicitly via [`ExitAuthority`] by `quit_app` /
-/// the updater — or (a) Claude Desktop, the host process aiui lives with, has
-/// terminated. Every other process exit is a crash, never a clean shutdown.
+/// Did *our* Wirt leave?
 ///
-/// Pure so it can be unit-tested without a live Claude Desktop or a running
-/// Tauri app: callers pass the two facts in. The impure shell reads them from
-/// [`ExitAuthority`] state and `setup::is_claude_desktop_running()`.
-pub fn host_should_exit(explicit_uninstall_or_update: bool, claude_desktop_running: bool) -> bool {
-    explicit_uninstall_or_update || !claude_desktop_running
+/// #180: this used to be a bare `!claude_desktop_running`, with liveness
+/// probed by `pgrep -f /Applications/Claude.app/`. For anyone whose host is
+/// not a running Claude Desktop in `/Applications`, that predicate was
+/// permanently true and the default-deny exit gate inverted into
+/// default-ALLOW — so the companion quit after the first dialog submit
+/// closed its only window. That hits three real setups: Claude-Code-only and
+/// Codex-only users (both first-class hosts — `setup.rs` patches
+/// `~/.claude.json` and `~/.codex/config.toml`), a Claude Desktop installed
+/// in `~/Applications`, and the window between CD quitting and relaunching.
+///
+/// So: "Claude Desktop is not my Wirt" must mean **stay**, never *exit*.
+/// With CD not installed the host lives until an explicit uninstall or
+/// update — exactly as it does today while CD runs.
+///
+/// Deliberately NOT falling back to the attached-child count or the
+/// registered-remote count. That is the proxy Step 1 of the stabilization
+/// plan explicitly retired, because it *was* the v0.4.4x bug. An
+/// idle-timeout exit for non-CD hosts is a separate feature, not a
+/// prerequisite for this fix.
+pub fn wirt_gone(cd_is_wirt: bool, cd_running: bool) -> bool {
+    cd_is_wirt && !cd_running
+}
+
+/// Should this `RunEvent::ExitRequested` be honoured?
+///
+/// #180: belt and braces on top of [`wirt_gone`]. Tauri fires
+/// `ExitRequested` with `code: None` for user-interaction exits — including
+/// the last window being destroyed, which happens after *every* dialog
+/// submit, since `tauri.conf.json` declares no windows and a dialog window
+/// is created per render. Such an exit must never terminate the host,
+/// whatever the Wirt probe says. A programmatic exit (`app.exit(code)`,
+/// `app.restart()`) carries `code: Some(_)` and is judged on its merits.
+pub fn honour_exit_request(code: Option<i32>, explicit: bool, wirt_gone: bool) -> bool {
+    if explicit {
+        return true; // uninstall (b) or update-restart (c)
+    }
+    if code.is_none() {
+        return false; // user interaction / last window destroyed — never
+    }
+    wirt_gone
 }
 
 /// What the post-grace re-check decides. The child counter participates only as
@@ -79,12 +110,73 @@ pub enum GraceOutcome {
 /// MCP-stdio child re-attached during the grace; `claude_desktop_running` is a
 /// fresh liveness probe. Exit only when the Wirt is gone *and* nothing came
 /// back — Claude-Desktop liveness always wins (I1).
-pub fn grace_outcome(child_returned: bool, claude_desktop_running: bool) -> GraceOutcome {
-    if claude_desktop_running || child_returned {
+pub fn grace_outcome(
+    child_returned: bool,
+    wirt_gone: bool,
+    pending_dialogs: usize,
+) -> GraceOutcome {
+    // #180: a dialog on screen is proof someone still needs the host, so it
+    // outranks the grace. Bounded, not indefinite: `resolve_dialog` caps
+    // every wait at DIALOG_TTL and cancels the entry on timeout, so the
+    // count drains on its own.
+    if !wirt_gone || child_returned || pending_dialogs > 0 {
         GraceOutcome::Stay
     } else {
         GraceOutcome::Exit
     }
+}
+
+/// The single terminal-exit path (#180).
+///
+/// Every site that ends the process routes through here so the same four
+/// things always happen, in the same order:
+///
+/// 1. **Drain the dialog registry** (I5/I7): each pending `/render` gets a
+///    terminal `{cancelled: true, reason: "host_exiting"}` instead of being
+///    left to hang until its caller times out, and the window comes down
+///    with it so nothing visible outlives the registry.
+/// 2. **Give Axum a moment** to flush those responses onto the wire.
+/// 3. **Sweep tunnels, scoped by reason.** A multi-instance loser never
+///    opened a tunnel, so sweeping "all" there killed the *winning*
+///    instance's tunnels and dropped every remote session.
+/// 4. Record `HostExit`, dump the lifecycle ring, and `std::process::exit`.
+///
+/// `std::process::exit` rather than `app.exit` on purpose: the multi-instance
+/// paths used `app.exit(1)` through `run_on_main_thread`, which the
+/// default-deny `ExitRequested` gate vetoed — leaving a zombie GUI holding a
+/// pipe it could not serve. This bypasses the gate by construction, matching
+/// the watcher's long-standing precedent.
+pub fn terminal_exit(
+    app: &AppHandle,
+    reason: &'static str,
+    code: i32,
+    port: u16,
+    scope: crate::housekeeping::SweepScope,
+) -> ! {
+    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Exiting);
+
+    if let Some(state) = app.try_state::<Arc<crate::dialog::DialogState>>() {
+        let ids = state.cancel_all_for_exit("host_exiting");
+        if !ids.is_empty() {
+            trace(&format!(
+                "lifetime: exit ({reason}) — resolved {} pending dialog(s) as cancelled",
+                ids.len()
+            ));
+            for id in &ids {
+                crate::destroy_dialog_window(app, id);
+            }
+            // Let the /render handlers observe their result channel and write
+            // the response before the process disappears underneath them.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    crate::housekeeping::exit_cleanup(port, reason, scope);
+    crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::HostExit { reason });
+    for line in crate::lifecycle_log::recent() {
+        trace(&format!("lifecycle-dump {line}"));
+    }
+    std::process::exit(code)
 }
 
 /// Explicit exit authority for the two non-Wirt-death cases (uninstall, update
@@ -202,12 +294,13 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
                     "lifetime: another aiui already serves {} — exiting (multi-instance)",
                     sock.display()
                 ));
-                let app_for_exit = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-live");
-                    app_for_exit.exit(1)
-                });
-                return;
+                terminal_exit(
+                    &app,
+                    "multi-instance-live",
+                    1,
+                    http_port,
+                    crate::housekeeping::SweepScope::None,
+                );
             }
             Err(_) => {
                 // Stale; safe to remove and re-bind.
@@ -225,12 +318,13 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
                 "lifetime: bind {} failed: {e} — exiting (multi-instance race)",
                 sock.display()
             ));
-            let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-bind-race");
-                app_for_exit.exit(1)
-            });
-            return;
+            terminal_exit(
+                &app,
+                "multi-instance-bind-race",
+                1,
+                http_port,
+                crate::housekeeping::SweepScope::None,
+            );
         }
     };
     trace(&format!("lifetime: listening on {}", sock.display()));
@@ -286,23 +380,25 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
             trace(&format!(
                 "lifetime: another aiui already serves {pipe_name} — exiting (multi-instance)"
             ));
-            let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-live");
-                app_for_exit.exit(1)
-            });
-            return;
+            terminal_exit(
+                &app,
+                "multi-instance-live",
+                1,
+                http_port,
+                crate::housekeeping::SweepScope::None,
+            );
         }
         Err(e) if e.raw_os_error() == Some(231) => {
             trace(&format!(
                 "lifetime: pipe {pipe_name} busy — another aiui is up, exiting"
             ));
-            let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-pipe-busy");
-                app_for_exit.exit(1)
-            });
-            return;
+            terminal_exit(
+                &app,
+                "multi-instance-pipe-busy",
+                1,
+                http_port,
+                crate::housekeeping::SweepScope::None,
+            );
         }
         Err(_) => {
             // Pipe name is free — proceed to bind.
@@ -318,12 +414,13 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
             trace(&format!(
                 "lifetime: create_pipe {pipe_name} failed: {e} — exiting (multi-instance race)"
             ));
-            let app_for_exit = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                crate::housekeeping::pre_exit_cleanup(http_port, "multi-instance-pipe-race");
-                app_for_exit.exit(1)
-            });
-            return;
+            terminal_exit(
+                &app,
+                "multi-instance-pipe-race",
+                1,
+                http_port,
+                crate::housekeeping::SweepScope::None,
+            );
         }
     };
     trace(&format!("lifetime: listening on {pipe_name}"));
@@ -339,16 +436,26 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
         // Immediately rotate to a fresh server instance so the pipe stays
         // available for the *next* client; otherwise a second connect
         // attempt would race with the rotation and see ERROR_PIPE_BUSY.
-        next_server = match ServerOptions::new().create(&pipe_name) {
+        // #180: a transient create failure (a momentary handle shortage, an
+        // AV scanner holding the name) must not take down a healthy host that
+        // may be serving dialogs. Retry with bounded backoff first; only give
+        // up when every attempt fails — and then exit *cleanly* through
+        // terminal_exit, which drains pending dialogs, rather than leaving a
+        // zombie. Deliberately not `break`: an unserved pipe sends
+        // `mcp_attach` into the same respawn storm from the other direction.
+        next_server = match rotate_pipe_with_retry(&pipe_name).await {
             Ok(s) => s,
             Err(e) => {
-                trace(&format!("lifetime: pipe rotate failed: {e} — exiting"));
-                let app_for_exit = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    crate::housekeeping::pre_exit_cleanup(http_port, "pipe-rotate-failed");
-                    app_for_exit.exit(1)
-                });
-                return;
+                trace(&format!(
+                    "lifetime: pipe rotate failed after {PIPE_ROTATE_ATTEMPTS} attempts: {e} — exiting"
+                ));
+                terminal_exit(
+                    &app,
+                    "pipe-rotate-failed",
+                    1,
+                    http_port,
+                    crate::housekeeping::SweepScope::All,
+                );
             }
         };
 
@@ -392,6 +499,9 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
     let wake = Arc::new(Notify::new());
     let conns_w = conns.clone();
     let wake_w = wake.clone();
+    // #180: decided once, at startup. If Claude Desktop is not installed it
+    // is not our Wirt, and its absence must never be read as "the Wirt left".
+    let cd_is_wirt = crate::setup::is_claude_desktop_installed();
     tokio::spawn(async move {
         loop {
             wake_w.notified().await;
@@ -426,7 +536,13 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
             tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
             let child_returned = conns_w.load(Ordering::SeqCst) > 0;
             let cd_running = crate::setup::is_claude_desktop_running();
-            let outcome = grace_outcome(child_returned, cd_running);
+            // #180: "Claude Desktop is not my Wirt" means stay, not exit.
+            let gone = wirt_gone(cd_is_wirt, cd_running);
+            let pending = app
+                .try_state::<Arc<crate::dialog::DialogState>>()
+                .map(|s| s.pending_count())
+                .unwrap_or(0);
+            let outcome = grace_outcome(child_returned, gone, pending);
             crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
                 outcome: match outcome {
                     GraceOutcome::Stay => "stay",
@@ -439,29 +555,38 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
                 GraceOutcome::Stay => {
                     crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
                     trace(&format!(
-                        "lifetime: staying after grace \
-                         (claude_desktop_running={cd_running}, child_returned={child_returned})"
+                        "lifetime: staying after grace (cd_is_wirt={cd_is_wirt}, \
+                         claude_desktop_running={cd_running}, child_returned={child_returned}, \
+                         pending_dialogs={pending})"
                     ));
+                    // #180: if the ONLY thing holding us is an open dialog,
+                    // decide again when it is gone. Otherwise the host could
+                    // outlive its Wirt indefinitely, waiting for a child edge
+                    // that will never come — the Wirt that would have spawned
+                    // one is dead. Deliberately re-arming rather than polling
+                    // in general: this loop exists only in the narrow window
+                    // "Wirt gone, nothing attached, a dialog still on screen",
+                    // and DIALOG_TTL bounds it.
+                    if gone && !child_returned && pending > 0 {
+                        wake_w.notify_one();
+                    }
                 }
                 GraceOutcome::Exit => {
-                    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Exiting);
-                    crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::HostExit {
-                        reason: "claude-desktop-gone",
-                    });
                     trace(
-                        "lifetime: Claude Desktop gone after grace and no child returned — \
-                         host follows Wirt, exiting",
+                        "lifetime: Claude Desktop gone after grace, no child returned and no \
+                         dialog open — host follows Wirt, exiting",
                     );
-                    for line in crate::lifecycle_log::recent() {
-                        trace(&format!("lifecycle-dump {line}"));
-                    }
                     // Hard exit: this is exit case (a), the watcher's own
                     // authority. It bypasses Tauri's ExitRequested gate (which
                     // default-denies) because the gate has no way to know the
-                    // watcher already established `!is_claude_desktop_running()`.
-                    crate::housekeeping::pre_exit_cleanup(http_port, "claude-desktop-gone");
-                    let _ = app;
-                    std::process::exit(0);
+                    // watcher already established that the Wirt is gone.
+                    terminal_exit(
+                        &app,
+                        "claude-desktop-gone",
+                        0,
+                        http_port,
+                        crate::housekeeping::SweepScope::All,
+                    );
                 }
             }
         }
@@ -581,6 +706,54 @@ async fn try_attach(sock: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// How many times a named-pipe rotation is retried before the host gives up
+/// (#180). Five attempts at 100 ms doubling covers ~3 s of transient trouble.
+///
+/// Not gated on `cfg(windows)` even though only the Windows path uses it:
+/// keeping the schedule platform-independent means the macOS/Linux test run
+/// — the one CI actually executes, since the Windows test binary is only
+/// linked (#141) — still covers it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub const PIPE_ROTATE_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry `attempt` (0-based): 100 ms, 200, 400, 800, 1600.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn pipe_rotate_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(100u64 << attempt.min(4))
+}
+
+/// Create the next pipe server instance, retrying transient failures.
+#[cfg(target_os = "windows")]
+async fn rotate_pipe_with_retry(pipe_name: &str) -> std::io::Result<NamedPipeServer> {
+    let mut last_err = None;
+    for attempt in 0..PIPE_ROTATE_ATTEMPTS {
+        match ServerOptions::new().create(pipe_name) {
+            Ok(s) => {
+                if attempt > 0 {
+                    trace(&format!(
+                        "lifetime: pipe rotate recovered on attempt {}",
+                        attempt + 1
+                    ));
+                }
+                return Ok(s);
+            }
+            Err(e) => {
+                trace(&format!(
+                    "lifetime: pipe rotate attempt {} failed: {e}",
+                    attempt + 1
+                ));
+                last_err = Some(e);
+                if attempt + 1 < PIPE_ROTATE_ATTEMPTS {
+                    tokio::time::sleep(pipe_rotate_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("pipe rotate failed with no recorded error")
+    }))
+}
+
 /// Spawn the GUI process and detach so the MCP-stdio child does not own
 /// it.
 ///
@@ -642,41 +815,85 @@ mod tests {
     // the ExitRequested gate reads.
 
     #[test]
-    fn host_stays_while_claude_desktop_runs() {
-        // I1: with Claude Desktop alive and no explicit uninstall/update, the
-        // host may never plan an exit — whatever the child count did.
-        assert!(!host_should_exit(false, true));
+    fn claude_desktop_not_installed_is_never_a_dead_wirt() {
+        // #180: the whole defect in one assertion. With Claude Desktop not
+        // installed — a Claude-Code-only or Codex-only user — its absence
+        // must read as "not my Wirt", never as "my Wirt died".
+        assert!(!wirt_gone(false, false));
+        assert!(!wirt_gone(false, true));
     }
 
     #[test]
-    fn host_exits_when_claude_desktop_quits() {
-        // Case (a): Wirt gone, no explicit signal → exit authorized.
-        assert!(host_should_exit(false, false));
+    fn wirt_gone_only_when_our_wirt_left() {
+        assert!(wirt_gone(true, false), "CD is the Wirt and it quit");
+        assert!(!wirt_gone(true, true), "CD is the Wirt and it runs");
     }
 
     #[test]
-    fn host_exits_on_explicit_uninstall_or_update_even_if_cd_alive() {
-        // Cases (b)/(c): uninstall / update-restart authorize exit regardless
-        // of Claude-Desktop liveness.
-        assert!(host_should_exit(true, true));
-        assert!(host_should_exit(true, false));
+    fn last_window_close_never_exits_the_host() {
+        // #180: Tauri fires ExitRequested{code: None} when the last window is
+        // destroyed — which happens after EVERY dialog submit, since
+        // tauri.conf.json declares no windows and each render makes its own.
+        // This is the v0.4.42 "lost the GUI ~18 ms after submit" regression.
+        assert!(!honour_exit_request(None, false, false));
+        // Not even when the Wirt really is gone: the watcher owns that exit
+        // and has already established the fact properly.
+        assert!(!honour_exit_request(None, false, true));
     }
 
     #[test]
-    fn child_flap_with_claude_desktop_alive_stays() {
+    fn explicit_uninstall_or_update_always_wins() {
+        // Cases (b)/(c) — including the `code: None` shape, so an explicit
+        // quit can never be vetoed by the window-close rule above.
+        assert!(honour_exit_request(Some(0), true, false));
+        assert!(honour_exit_request(None, true, false));
+    }
+
+    #[test]
+    fn programmatic_exit_is_judged_on_the_wirt() {
+        assert!(honour_exit_request(Some(0), false, true), "Wirt gone");
+        assert!(!honour_exit_request(Some(0), false, false), "Wirt alive");
+    }
+
+    #[test]
+    fn child_flap_with_the_wirt_alive_stays() {
         // The pivotal regression case: the last child disconnected (Cowork
-        // churn / MCP re-spawn) but Claude Desktop is alive — STAY. This is the
+        // churn / MCP re-spawn) but the Wirt is alive — STAY. This is the
         // exact scenario the old 60 s child-count grace got wrong by exiting.
-        assert_eq!(grace_outcome(false, true), GraceOutcome::Stay);
+        assert_eq!(grace_outcome(false, false, 0), GraceOutcome::Stay);
         // A child re-attaching during the grace also keeps us up, trivially.
-        assert_eq!(grace_outcome(true, true), GraceOutcome::Stay);
-        assert_eq!(grace_outcome(true, false), GraceOutcome::Stay);
+        assert_eq!(grace_outcome(true, false, 0), GraceOutcome::Stay);
+        assert_eq!(grace_outcome(true, true, 0), GraceOutcome::Stay);
     }
 
     #[test]
-    fn claude_desktop_quit_with_no_child_exits() {
+    fn wirt_gone_with_no_child_exits() {
         // Wirt gone after the grace and nothing came back → host follows Wirt.
-        assert_eq!(grace_outcome(false, false), GraceOutcome::Exit);
+        assert_eq!(grace_outcome(false, true, 0), GraceOutcome::Exit);
+    }
+
+    #[test]
+    fn pipe_rotate_backoff_is_bounded_and_doubles() {
+        // #180: a transient pipe-create failure must be retried, not turned
+        // into a host exit — but the retry has to terminate.
+        let waits: Vec<u64> = (0..PIPE_ROTATE_ATTEMPTS)
+            .map(|i| pipe_rotate_backoff(i).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, vec![100, 200, 400, 800, 1600]);
+        let total: u64 = waits.iter().sum();
+        assert!(total < 5_000, "the whole retry window stays under 5s: {total}ms");
+        // Saturates rather than overflowing if the attempt count ever grows.
+        assert_eq!(pipe_rotate_backoff(99).as_millis(), 1600);
+    }
+
+    #[test]
+    fn an_open_dialog_outranks_the_grace() {
+        // #180 (I5): a dialog on screen is proof someone still needs the
+        // host. Bounded, not indefinite — DIALOG_TTL drains the count.
+        assert_eq!(grace_outcome(false, true, 1), GraceOutcome::Stay);
+        assert_eq!(grace_outcome(false, true, 7), GraceOutcome::Stay);
+        // …and once it resolves, the original decision stands.
+        assert_eq!(grace_outcome(false, true, 0), GraceOutcome::Exit);
     }
 
     #[test]

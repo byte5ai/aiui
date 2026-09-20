@@ -52,6 +52,7 @@ on:
 
 permissions:
   contents: write # tag push + release creation
+  actions: write # dispatch release-windows.yml (#190)
 
 concurrency:
   group: release-macos
@@ -85,6 +86,19 @@ jobs:
             || { echo "pyproject.toml is ${PYV}, expected ${VERSION}"; exit 1; }
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag ${TAG} already exists — bump the version or delete the tag first."
+            exit 1
+          fi
+          # #191: a run that publishes no bridge must not be able to produce
+          # a directly-promotable full release. The companion pins
+          # `aiui-mcp==${VERSION}`, so without the PyPI artifact every
+          # remote's tool calls fail. Skipping the publish is legitimate for
+          # a validate-first pre-release; combining it with a full release
+          # is not.
+          if [ "${{ inputs.publish-pypi }}" != "true" ] \
+             && [ "${{ inputs.prerelease }}" != "true" ]; then
+            echo "publish-pypi=false requires prerelease=true: a full release"
+            echo "without the aiui-mcp ${VERSION} artifact would pin every"
+            echo "remote to a version that does not exist."
             exit 1
           fi
 
@@ -252,6 +266,55 @@ jobs:
           uv build
           ls dist/aiui_mcp-${VERSION}-*.whl dist/aiui_mcp-${VERSION}.tar.gz
 
+      # #191: PyPI BEFORE the release, not after.
+      #
+      # The companion pins the bridge to its own version
+      # (`aiui-mcp==<version>`) in every remote's ~/.claude.json. Publishing
+      # the app first therefore ships a pin that cannot resolve: on every
+      # remote host, `uvx` fails and EVERY aiui tool call returns nothing —
+      # for as long as the gap lasts, which is forever if the PyPI step
+      # fails and nobody re-runs it.
+      #
+      # The old ordering was justified by PyPI versions being permanent. The
+      # priority is backwards: a published bridge with no matching app is
+      # inert (nothing resolves it — the pin only ever names the version the
+      # companion was compiled as), while an app with no matching bridge is
+      # a dead feature on every remote the user owns.
+      - name: Publish aiui-mcp to PyPI
+        if: ${{ inputs.publish-pypi }}
+        working-directory: python
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+        # --check-url keeps a same-version recovery re-run working: already
+        # uploaded files are skipped instead of failing the run. Without it
+        # the reorder would trade one broken recovery path for another.
+        run: uv publish --check-url https://pypi.org/simple/aiui-mcp/
+
+      # The index is not instantly consistent, so "upload returned 0" is not
+      # yet "a remote can resolve it". Poll until it can.
+      #
+      # A plain HTTPS index check, deliberately not `uvx aiui-mcp==$VERSION
+      # --help`: the package has no --help handler, so the flag is ignored,
+      # the MCP server starts, and it blocks on stdin forever — the trap
+      # documented in setup.rs.
+      - name: Wait for aiui-mcp to be resolvable
+        if: ${{ inputs.publish-pypi }}
+        run: |
+          set -euo pipefail
+          URL="https://pypi.org/pypi/aiui-mcp/${VERSION}/json"
+          for i in $(seq 1 10); do
+            CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || echo 000)"
+            if [ "$CODE" = "200" ]; then
+              echo "aiui-mcp ${VERSION} is resolvable on PyPI (attempt $i)"
+              exit 0
+            fi
+            echo "attempt $i: PyPI returned $CODE for ${VERSION}, retrying in 6s"
+            sleep 6
+          done
+          echo "aiui-mcp ${VERSION} never appeared on PyPI — refusing to cut a"
+          echo "release whose remote pin cannot resolve."
+          exit 1
+
       - name: Tag + GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -286,6 +349,16 @@ jobs:
           if gh release view "$TAG" --repo byte5ai/aiui >/dev/null 2>&1; then
             echo "release $TAG already exists — skipping create; PyPI step still runs"
           else
+            # DRAFT on purpose (#190). `releases/latest/download/latest.json`
+            # is what every installed aiui polls, and a draft is not served
+            # there — so clients keep resolving the previous COMPLETE feed
+            # while this release is still missing its Windows half. The
+            # release-windows run validates the assembled feed and un-drafts
+            # it; until then nothing is advertised to anyone.
+            #
+            # v0.10.1 is why: it published a darwin-only feed immediately, and
+            # every Windows client's update check went into the error path
+            # until a human remembered to dispatch the second workflow.
             gh release create "$TAG" \
               "aiui-${VERSION}-arm64.dmg" \
               "aiui-${VERSION}-arm64.zip" \
@@ -294,20 +367,36 @@ jobs:
               --repo byte5ai/aiui \
               --title "aiui ${TAG}" \
               --notes-file notes.md \
+              --draft \
               $PRERELEASE_FLAG
           fi
 
-      # PyPI LAST, after the GitHub release succeeded — PyPI versions are
-      # permanent. If this step fails, the Tauri side is already shipped;
-      # recovery is re-running with the same version and publish-pypi only
-      # after fixing the token (uv publish is idempotent-safe: re-uploading
-      # an existing version fails loudly instead of overwriting).
-      - name: Publish aiui-mcp to PyPI
-        if: ${{ inputs.publish-pypi }}
-        working-directory: python
+      # #190: the release is a DRAFT until the Windows half lands, so the
+      # second workflow is no longer something a human has to remember —
+      # forgetting it would now leave the whole release invisible, not just
+      # Windows clients broken. Dispatched last, so a failure here does not
+      # roll back a good macOS build; the run can be re-dispatched by hand
+      # (the workflow is idempotent and `gh release upload --clobber`s).
+      - name: Dispatch the Windows release
         env:
-          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
-        run: uv publish
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "dispatching release-windows.yml for $TAG (release is a draft until it completes)"
+          gh workflow run release-windows.yml \
+            -f tag="$TAG" \
+            --repo byte5ai/aiui
+          {
+            echo "### Release $TAG is a DRAFT"
+            echo ""
+            echo "\`release-windows.yml\` has been dispatched. It attaches the"
+            echo "Windows installer, completes \`latest.json\`, validates the feed"
+            echo "and publishes the release."
+            echo ""
+            echo "If that run fails, the release stays a draft and **no client sees"
+            echo "this version** — which is the intended behaviour: a half-published"
+            echo "feed breaks update checks on the missing platform."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up keychain
         if: always()
