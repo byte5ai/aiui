@@ -3,8 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter (#222). `pull_request.branches` matches the BASE,
+  # so `[main]` meant a PR stacked on another feature branch got no checks
+  # at all — not a failure, not a skip, simply nothing. That is the inverse
+  # of what you want: a stacked PR is by construction the one touching code
+  # another unmerged change also touches, and a missing check looks like a
+  # passing one at a glance.
+  #
+  # `push` keeps its filter, so a branch push does not trigger a second run
+  # alongside the PR event; the concurrency group below collapses
+  # superseded runs either way.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read

@@ -54,6 +54,15 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A pull request based on another branch got no CI checks at all.** The
+  workflow's `pull_request.branches: [main]` filter matches the *base*, so
+  a stacked PR — the normal shape of a multi-step change — produced no
+  build, no tests, no clippy, no drift guard. Not a failure, not a skip:
+  nothing, which at a glance looks the same as passing. That removed the
+  safety net from exactly the change shape most likely to need it, since a
+  stacked PR is by construction the one touching code another unmerged
+  change also touches. Two of the nine PRs in this release were in that
+  state (#222).
 - **README and SECURITY.md promised automatic updates that never happened.**
   Both said the in-app updater installs patches on its own. Nothing in the
   product has done that since v0.4.44 — the headless check and the silent

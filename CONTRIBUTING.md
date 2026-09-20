@@ -164,6 +164,18 @@ For bug reports, please include:
    `en.json`, keyed by short stable paths.
 4. Run `npm run check` in `companion/` before pushing — catches Svelte /
    TypeScript issues early.
+5. If your change would conflict with another PR that is still open — the
+   usual case is two changes to the same function — base it on that PR's
+   branch instead of `main`:
+
+   ```sh
+   gh pr create --base the-other-branch --head your-branch
+   ```
+
+   GitHub retargets it at `main` automatically once the parent merges. Say
+   in the description which PR it is stacked on and why. CI runs on every
+   pull request regardless of base, so a stacked PR is checked like any
+   other.
 
 ## Design principles
 
