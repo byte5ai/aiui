@@ -116,21 +116,28 @@ fn dialog_torn_down_recently() -> bool {
         .unwrap_or(false)
 }
 
+/// `window` is injected by Tauri, not passed by the frontend — see
+/// `dialog_command_allowed` for why every `id`-carrying dialog command needs
+/// it, and `close_window` for the pattern.
 #[tauri::command]
 fn dialog_submit(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     result: serde_json::Value,
 ) -> Result<(), String> {
+    require_own_dialog(&window, &id, "dialog_submit")?;
     state.complete(&id, result);
     Ok(())
 }
 
 #[tauri::command]
 fn dialog_cancel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<(), String> {
+    require_own_dialog(&window, &id, "dialog_cancel")?;
     state.cancel(&id);
     Ok(())
 }
@@ -151,11 +158,13 @@ fn dialog_cancel(
 /// field the outcome carries status only, never the value.
 #[tauri::command]
 fn write_dialog_targets(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     values: std::collections::HashMap<String, String>,
     action: Option<String>,
 ) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
+    require_own_dialog(&window, &id, "write_dialog_targets")?;
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
@@ -290,9 +299,11 @@ fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
 /// window closes itself.
 #[tauri::command]
 fn get_dialog_spec(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<Option<dialog::DialogRequest>, String> {
+    require_own_dialog(&window, &id, "get_dialog_spec")?;
     Ok(state.get_request(&id))
 }
 
@@ -312,6 +323,76 @@ fn ui_pong(
 /// reused dialog window with a fixed label.
 pub(crate) fn is_dialog_window_label(label: &str) -> bool {
     label != SETUP_WINDOW_LABEL
+}
+
+/// Message handed back to a window that tried a command it may not run.
+/// Deliberately terse and identical for every command — a caller that is not
+/// supposed to be here learns nothing from it.
+const NOT_ALLOWED_FROM_THIS_WINDOW: &str = "not allowed from this window";
+
+/// May this window run the privileged, Settings-side commands (#195)?
+///
+/// Only the setup window may. Everything else is a dialog window rendering
+/// markdown, mermaid and `compare` bodies that an agent on a remote host
+/// wrote — aiui's one untrusted-content surface.
+///
+/// This has to be a Rust check rather than a capability entry: Tauri only
+/// consults the ACL for `plugin:`-prefixed commands unless the app ships its
+/// own ACL manifest, and aiui ships none. So `capabilities/*.json` says
+/// nothing whatsoever about `uninstall_all`, `quit_app` or `add_remote`, and
+/// before this gate *any* window could invoke *any* of the 22 app commands.
+/// An app manifest would also work, but it would move a security boundary
+/// into generated JSON that no test reads; one line of Rust is greppable and
+/// unit-testable without a running app.
+///
+/// Pure, so the rule is testable without a window.
+pub(crate) fn is_privileged_window(label: &str) -> bool {
+    label == SETUP_WINDOW_LABEL
+}
+
+/// `Ok(())` iff `window` may run `command`; logs and refuses otherwise.
+fn require_privileged_window(window: &tauri::WebviewWindow, command: &str) -> Result<(), String> {
+    if is_privileged_window(window.label()) {
+        return Ok(());
+    }
+    log::warn!(
+        "[aiui] refusing privileged command {command} from window {}",
+        window.label()
+    );
+    Err(NOT_ALLOWED_FROM_THIS_WINDOW.to_string())
+}
+
+/// May the window labelled `window_label` act on dialog `id` (#195)?
+///
+/// A dialog window's label IS its dialog id, so the only legitimate answer is
+/// "its own dialog". The commands that take an `id` — `get_dialog_spec`,
+/// `dialog_submit`, `dialog_cancel`, `write_dialog_targets` — took it purely
+/// on trust, so with N concurrent dialogs open (the I8 multi-session case this
+/// window model exists for) one session's window could read or answer
+/// another's, including a `form` holding a secret.
+///
+/// The setup window is deliberately not exempt: it never renders a dialog.
+/// `ui_pong` is deliberately not covered: its `id` is an ack token, not a
+/// dialog id, and has no window to compare against.
+///
+/// Pure, so the rule is testable without a window.
+pub(crate) fn dialog_command_allowed(window_label: &str, id: &str) -> bool {
+    // The empty-string guard is not reachable through Tauri (a window always
+    // has a label), but it keeps the rule fail-closed rather than resting on
+    // `"" == ""` if it is ever called from somewhere else.
+    !window_label.is_empty() && window_label == id
+}
+
+/// `Ok(())` iff `window` owns dialog `id`; logs and refuses otherwise.
+fn require_own_dialog(window: &tauri::WebviewWindow, id: &str, command: &str) -> Result<(), String> {
+    if dialog_command_allowed(window.label(), id) {
+        return Ok(());
+    }
+    log::warn!(
+        "[aiui] refusing {command} for dialog {id} from window {}",
+        window.label()
+    );
+    Err(NOT_ALLOWED_FROM_THIS_WINDOW.to_string())
 }
 
 /// macOS: drop back to Accessory (no Dock icon) once no dialog window remains
@@ -559,7 +640,11 @@ async fn is_update_safe_to_install(
 /// won't reliably bring its dialogs to the foreground — we temporarily
 /// promote the app to Regular so the prompt actually becomes visible.
 #[tauri::command]
-async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
+async fn surface_for_dialog(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_privileged_window(&window, "surface_for_dialog")?;
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -592,10 +677,16 @@ pub struct PendingUpdate(pub std::sync::Mutex<Option<String>>);
 
 #[tauri::command]
 async fn set_pending_update(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<PendingUpdate>>,
     version: String,
 ) -> Result<(), String> {
+    // #195: this emits `update:available` to every window, so an untrusted
+    // dialog window could otherwise forge an update banner in Settings —
+    // exactly what withholding `core:event:allow-emit` from `dialog.json`
+    // prevents on the plugin side.
+    require_privileged_window(&window, "set_pending_update")?;
     let trimmed = version.trim();
     let new_value = if trimmed.is_empty() {
         None
@@ -614,9 +705,11 @@ async fn set_pending_update(
 
 #[tauri::command]
 async fn clear_pending_update(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<PendingUpdate>>,
 ) -> Result<(), String> {
+    require_privileged_window(&window, "clear_pending_update")?;
     if let Ok(mut slot) = state.0.lock() {
         *slot = None;
     }
@@ -689,11 +782,15 @@ const fn current_os() -> &'static str {
 
 #[tauri::command]
 async fn status(
+    window: tauri::WebviewWindow,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
     pending_update: tauri::State<'_, Arc<PendingUpdate>>,
 ) -> Result<StatusReport, String> {
+    // #195: this discloses the token path, the HTTP port and every registered
+    // SSH alias — reconnaissance for anything that got script into a dialog.
+    require_privileged_window(&window, "status")?;
     let bin = setup::app_binary_path();
     let http_alive = probe_http_self(&cfg).await;
     Ok(StatusReport {
@@ -755,7 +852,11 @@ async fn probe_http_self(cfg: &config::AppConfig) -> bool {
 /// next launch. Frontend calls this when the user clicks "Got it" on the
 /// first-run welcome section.
 #[tauri::command]
-fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), String> {
+fn dismiss_welcome(
+    window: tauri::WebviewWindow,
+    cfg: tauri::State<'_, Arc<config::AppConfig>>,
+) -> Result<(), String> {
+    require_privileged_window(&window, "dismiss_welcome")?;
     mark_first_run_done(&cfg);
     Ok(())
 }
@@ -766,7 +867,8 @@ fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), 
 /// case; this command is for the rare situation where the file got removed
 /// or corrupted between launches.
 #[tauri::command]
-fn repair_skill() -> Result<setup::StepResult, String> {
+fn repair_skill(window: tauri::WebviewWindow) -> Result<setup::StepResult, String> {
+    require_privileged_window(&window, "repair_skill")?;
     Ok(skill::install_locally())
 }
 
@@ -782,6 +884,17 @@ fn repair_skill() -> Result<setup::StepResult, String> {
 /// metacharacters (`&`, `|`, `^`, …) inside the URL stay inert — closing
 /// the command-injection surface that the previous `cmd /C start "" …`
 /// path had on Windows (Codex review of PR #128).
+///
+/// #195 deliberately leaves this the **one** command a dialog window may
+/// still call. It is not an oversight: since #189 a `[text](https://…)` link
+/// in agent-supplied markdown is *meant* to route through here
+/// (`external-link.ts` swallows the click and invokes `open_url`, because
+/// `is_allowed_app_navigation` refuses to let the window navigate itself).
+/// Gating it on `is_privileged_window` would make every link in a `markdown`
+/// or `compare` field silently dead. What the dialog window gains is bounded
+/// to "open an http(s) URL in the user's browser" — no local state, no
+/// disclosure, nothing irreversible — and the scheme check below is the gate
+/// that matters here.
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     // Sanity-check: only allow http(s) so a compromised renderer can't
@@ -801,7 +914,8 @@ fn open_url(url: String) -> Result<(), String> {
 /// still couldn't drag aiui.app to the Trash because the process kept
 /// running. Issue #72.
 #[tauri::command]
-async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+async fn quit_app(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_privileged_window(&window, "quit_app")?;
     // Case (b): explicit uninstall. Latch the exit authority *first* so the
     // `ExitRequested` default-deny gate honours the `app.exit(0)` below instead
     // of vetoing it (Invariant I1).
@@ -833,8 +947,12 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 /// The HTTP `/update` path latches the same authority directly in Rust.
 #[tauri::command]
 async fn authorize_exit_for_update(
+    window: tauri::WebviewWindow,
     exit_authority: tauri::State<'_, Arc<lifetime::ExitAuthority>>,
 ) -> Result<(), String> {
+    // #195: the latch is irreversible — once set, the very next window close
+    // terminates the host process. Settings-only.
+    require_privileged_window(&window, "authorize_exit_for_update")?;
     exit_authority.authorize();
     logging::trace("authorize_exit_for_update: exit authority latched for update-restart");
     Ok(())
@@ -857,7 +975,8 @@ async fn authorize_exit_for_update(
 ///   We probe both; whichever exists wins. If neither does, surface a
 ///   clear error instead of silently no-oping.
 #[tauri::command]
-async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
+async fn restart_claude_desktop(window: tauri::WebviewWindow) -> Result<setup::StepResult, String> {
+    require_privileged_window(&window, "restart_claude_desktop")?;
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -1013,10 +1132,14 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
 
 #[tauri::command]
 async fn add_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    // #195: SSHes to a user-registered alias and writes persistent state on
+    // it. Settings-only, never from a window rendering agent content.
+    require_privileged_window(&window, "add_remote")?;
     // Validate at the API boundary: anything that doesn't pass
     // `is_valid_host_alias` is rejected here, before we spawn ssh or
     // touch persistent state. This is the primary defense against
@@ -1130,7 +1253,8 @@ async fn add_remote(
 }
 
 #[tauri::command]
-async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
+async fn reinstall_skill(window: tauri::WebviewWindow) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "reinstall_skill")?;
     let mut results = vec![skill::install_locally()];
     for host in setup::load_remotes() {
         results.push(skill::install_to_remote(&host));
@@ -1153,8 +1277,10 @@ async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
 /// path is to end and restart that Claude Code session.
 #[tauri::command]
 async fn resync_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "resync_remote")?;
     let our_version = env!("CARGO_PKG_VERSION");
     // #184: use the uvx path discovered when this host was added. Passing
     // `None` here is what rewrote a pinned absolute path back down to the
@@ -1190,10 +1316,12 @@ async fn resync_remote(
 
 #[tauri::command]
 async fn remove_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "remove_remote")?;
     // Stop the tunnel first so the forward port is freed before we touch
     // ssh config and remote token.
     tm.stop(&host_alias).await;
@@ -1241,9 +1369,13 @@ fn uninstall_app_removal_hint() -> &'static str {
 
 #[tauri::command]
 async fn uninstall_all(
+    window: tauri::WebviewWindow,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    // #195: the largest blast radius in the app — stops every tunnel, deletes
+    // the token, the skill and every local *and remote* host config.
+    require_privileged_window(&window, "uninstall_all")?;
     tm.stop_all().await;
     let mut results = Vec::new();
     results.push(setup::remove_claude_desktop_config());
@@ -2355,6 +2487,231 @@ mod navigation_tests {
         assert!(!is_allowed_app_navigation(&url("http://tauri.localhost.evil.com/")));
         assert!(!is_allowed_app_navigation(&url("https://localhost/")));
         assert!(!is_allowed_app_navigation(&url("http://notlocalhost/")));
+    }
+}
+
+/// #195: the window permission model — which window may run which command,
+/// and which capability file covers which window.
+///
+/// These tests exist because nothing else reads `capabilities/`. The retired
+/// `"dialog"` label sat in `default.json` from PR #137 until #195 without
+/// anyone noticing, precisely because a capability that matches no window
+/// fails silently: the app commands kept working (Tauri does not ACL-check
+/// them), so the only symptom was a `plugin:` command being denied in a
+/// window nobody was testing plugin commands in.
+#[cfg(test)]
+mod window_permission_tests {
+    use super::*;
+
+    /// A label of the shape `build_dialog_window` actually produces — a v4
+    /// UUID, which is what every dialog window has been called since Step 4.
+    const SAMPLE_DIALOG_LABEL: &str = "9f1c2d34-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+    /// What a dialog window — aiui's untrusted-content surface — may be
+    /// granted. Listen/unlisten so Rust can push an event *into* it (the
+    /// `/health` `ui:ping` probe); nothing that lets it push one back out,
+    /// and nothing from the updater/process/dialog/notification plugins.
+    const DIALOG_ALLOWED_PERMISSIONS: &[&str] =
+        &["core:event:allow-listen", "core:event:allow-unlisten"];
+
+    /// Plugin permission prefixes that must never leave the setup window.
+    const SETUP_ONLY_PERMISSION_PREFIXES: &[&str] =
+        &["updater:", "process:", "dialog:", "notification:"];
+
+    /// Every `*.json` under `capabilities/`, parsed. Read from the directory
+    /// rather than a hard-coded list so a capability file added later is
+    /// covered by these assertions without anyone remembering to add it.
+    fn capabilities() -> Vec<(String, serde_json::Value)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("capabilities/ is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let src = std::fs::read_to_string(&path).expect("capability file is readable");
+            let value = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} is not valid JSON: {e}"));
+            out.push((name, value));
+        }
+        assert!(!out.is_empty(), "no capability files found in {dir:?}");
+        out
+    }
+
+    fn string_list(cap: &serde_json::Value, key: &str) -> Vec<String> {
+        cap.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stand-in for the `glob::Pattern` match Tauri applies to a capability's
+    /// window list (`tauri-2.10.3 src/ipc/authority.rs:457-461`). Only the two
+    /// shapes aiui uses need to be understood: a literal label, and the bare
+    /// `*` — which matches any label containing no `/`, and a UUID has none.
+    fn window_glob_matches(pattern: &str, label: &str) -> bool {
+        match pattern {
+            "*" => !label.contains('/'),
+            literal => literal == label,
+        }
+    }
+
+    fn covers(cap: &serde_json::Value, label: &str) -> bool {
+        let windows = string_list(cap, "windows");
+        let webviews = string_list(cap, "webviews");
+        windows
+            .iter()
+            .chain(webviews.iter())
+            .any(|p| window_glob_matches(p, label))
+    }
+
+    #[test]
+    fn capabilities_do_not_reference_retired_dialog_label() {
+        // The defect: PR #137 gave every dialog window its own UUID label,
+        // and `"dialog"` in `default.json` has matched nothing since. The
+        // file read as if dialog windows were permissioned; they were not.
+        for (name, cap) in capabilities() {
+            for key in ["windows", "webviews"] {
+                for entry in string_list(&cap, key) {
+                    assert_ne!(
+                        entry, DIALOG_WINDOW_LABEL,
+                        "{name}: `{key}` still names the retired label {DIALOG_WINDOW_LABEL:?}; \
+                         a dialog window's label is its dialog id"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn privileged_plugin_permissions_are_setup_scoped() {
+        // The updater, the relaunch, the native dialog and notifications are
+        // Settings-side, all of them. Any capability that hands one of them
+        // out must reach the setup window and nothing else.
+        let mut seen = 0;
+        for (name, cap) in capabilities() {
+            let permissions = string_list(&cap, "permissions");
+            let privileged: Vec<&String> = permissions
+                .iter()
+                .filter(|p| {
+                    SETUP_ONLY_PERMISSION_PREFIXES
+                        .iter()
+                        .any(|prefix| p.starts_with(prefix))
+                })
+                .collect();
+            if privileged.is_empty() {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                string_list(&cap, "windows"),
+                vec![SETUP_WINDOW_LABEL.to_string()],
+                "{name} grants {privileged:?} — it must be scoped to the setup window alone"
+            );
+            assert!(
+                string_list(&cap, "webviews").is_empty(),
+                "{name} grants {privileged:?} and widens its scope via `webviews`"
+            );
+            assert!(
+                !covers(&cap, SAMPLE_DIALOG_LABEL),
+                "{name} grants {privileged:?} to a dialog window"
+            );
+        }
+        assert_eq!(
+            seen, 1,
+            "exactly one capability should carry the Settings-side plugin permissions"
+        );
+    }
+
+    #[test]
+    fn dialog_capability_matches_a_uuid_label() {
+        // The other half of the same defect: a dialog window must now be
+        // covered by *something*, and that something must be the minimum.
+        let matching: Vec<(String, serde_json::Value)> = capabilities()
+            .into_iter()
+            .filter(|(_, cap)| covers(cap, SAMPLE_DIALOG_LABEL))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one capability should cover a dialog window, got {:?}",
+            matching.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+        let (name, cap) = &matching[0];
+        for permission in string_list(cap, "permissions") {
+            assert!(
+                DIALOG_ALLOWED_PERMISSIONS.contains(&permission.as_str()),
+                "{name} grants {permission:?} to the untrusted-content window; \
+                 allowed: {DIALOG_ALLOWED_PERMISSIONS:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_capability_lets_a_dialog_window_emit_events() {
+        // `allow-emit` / `allow-emit-to` would let the untrusted window forge
+        // `update:available` (or any other app event) into Settings.
+        for (name, cap) in capabilities() {
+            if !covers(&cap, SAMPLE_DIALOG_LABEL) {
+                continue;
+            }
+            for permission in string_list(&cap, "permissions") {
+                assert!(
+                    !permission.starts_with("core:event:allow-emit"),
+                    "{name} grants {permission:?} to a dialog window"
+                );
+                assert_ne!(
+                    permission, "core:event:default",
+                    "{name}: `core:event:default` includes allow-emit — \
+                     list allow-listen/allow-unlisten explicitly"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_privileged_window_only_for_setup() {
+        assert!(is_privileged_window(SETUP_WINDOW_LABEL));
+        assert!(!is_privileged_window(SAMPLE_DIALOG_LABEL));
+        assert!(!is_privileged_window(""));
+        // The retired label is not a back door either: nothing builds a
+        // window called "dialog" any more, but if anything did, it would be
+        // a dialog window like all the others.
+        assert!(!is_privileged_window(DIALOG_WINDOW_LABEL));
+        // The two predicates must stay each other's complement.
+        for label in [SETUP_WINDOW_LABEL, SAMPLE_DIALOG_LABEL, "", "Setup"] {
+            assert_ne!(is_privileged_window(label), is_dialog_window_label(label));
+        }
+    }
+
+    #[test]
+    fn dialog_command_allowed_requires_matching_id() {
+        // The legitimate call: `DialogShell.svelte` passes
+        // `getCurrentWindow().label` as the id, so this is a no-op for it.
+        assert!(dialog_command_allowed(
+            SAMPLE_DIALOG_LABEL,
+            SAMPLE_DIALOG_LABEL
+        ));
+        // The cross-session read this closes: two dialogs open, one asks for
+        // the other's spec — which may be a `form` holding a secret.
+        assert!(!dialog_command_allowed(
+            SAMPLE_DIALOG_LABEL,
+            "00000000-0000-4000-8000-000000000000"
+        ));
+        // The setup window is not exempt — it never renders a dialog.
+        assert!(!dialog_command_allowed(
+            SETUP_WINDOW_LABEL,
+            SAMPLE_DIALOG_LABEL
+        ));
+        // Fail closed on the degenerate cases rather than matching "" == "".
+        assert!(!dialog_command_allowed(SAMPLE_DIALOG_LABEL, ""));
+        assert!(!dialog_command_allowed("", SAMPLE_DIALOG_LABEL));
+        assert!(!dialog_command_allowed("", ""));
     }
 }
 

@@ -334,6 +334,15 @@ All notable changes to this project are documented here.
   an oversize clip; the Python read moved off the event loop so the progress
   heartbeat keeps firing, and `MemoryError` no longer escapes the best-effort
   handler (#194).
+- **Every dialog render left two unhandled promise rejections in the
+  window.** The dialog window installed the frontend update-check triggers,
+  whose `plugin:event|listen` and `plugin:updater|check` calls were both
+  refused by the ACL, with nothing catching either — noise in exactly the
+  traces used to debug a hung dialog. The dialog window no longer runs those
+  triggers at all: it renders agent-authored content and has no business
+  holding the updater, and the headless six-hourly check in Rust already
+  detects new releases independently of any window, so update detection is
+  unchanged (#195).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
@@ -610,6 +619,35 @@ All notable changes to this project are documented here.
   widgets actually play, everything else stores as `bin`, and `/media/blob`
   responses carry `X-Content-Type-Options: nosniff` and
   `Content-Security-Policy: sandbox` (#194).
+- **A dialog window could invoke every one of aiui's commands.** Tauri only
+  ACL-checks `plugin:`-prefixed commands unless the app ships its own ACL
+  manifest, and aiui ships none — so `capabilities/` said nothing about
+  `uninstall_all`, `quit_app`, `authorize_exit_for_update`, `add_remote`,
+  `remove_remote` or `status`, and the one window that renders content an
+  agent on a remote host wrote could call all of them. Not a live exploit
+  (agent content passes through DOMPurify first), but the second barrier was
+  missing, and the blast radius behind it was the whole install plus the
+  user's SSH aliases. Those commands are now Settings-only, gated in Rust by
+  `is_privileged_window`. `open_url` stays reachable on purpose: links in
+  agent markdown have routed through it since #189, and it opens an http(s)
+  URL in the browser and nothing else (#195).
+- **One session's dialog could read or answer another's.** `get_dialog_spec`,
+  `dialog_submit`, `dialog_cancel` and `write_dialog_targets` took the dialog
+  `id` on trust and never compared it with the calling window's label — which
+  *is* its dialog id. With two dialogs open, one window could pull the other's
+  spec, including a `form` holding a secret. Exactly the isolation the
+  one-window-per-render model was introduced to provide; it is now enforced
+  (#195).
+- **`capabilities/default.json` was scoped to a window that no longer
+  exists.** The multi-window refactor gave every dialog window its own UUID
+  label, and the file still listed the literal `"dialog"` — a glob that has
+  matched nothing since. It read as if dialog windows were permissioned while
+  granting them nothing, and the Settings-side plugins (`updater`, `process`,
+  `dialog`, `notification`) were nominally offered to them. `default.json` is
+  now `"windows": ["setup"]`; the new `capabilities/dialog.json` covers dialog
+  windows with `core:event:allow-listen`/`allow-unlisten` and nothing else —
+  no emit, so agent content cannot forge an event into the Settings window
+  (#195).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

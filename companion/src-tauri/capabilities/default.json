@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
-  "windows": ["setup", "*"],
+  "description": "Settings-window permissions. Everything here is Settings-side: the updater, `process` (relaunch after install), the native dialog plugin (the update prompt) and `notification`. Scoped to `setup` alone since #195 — the second entry this list used to carry named a window label that the multi-window refactor retired, so it matched nothing while reading as if dialog windows were permissioned. Dialog windows are covered by `dialog.json`.",
+  "windows": ["setup"],
   "permissions": [
     "core:default",
     "updater:default",
