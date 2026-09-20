@@ -11,7 +11,8 @@ indefinitely with no automatic recovery.
 1. Failure modes that today require a manual GUI restart should self-heal.
 2. No background polling. Idle companion = zero load except the OS-level
    event loop and the TCP listener. Every health/cleanup action must be
-   triggered by a real cause.
+   triggered by a real cause. *A visible Settings window is a real cause;
+   a hidden one is not* — see "The Settings status poll" below.
 3. `/health` must reflect actual usability, not just "axum is up".
 
 ## Non-goals
@@ -119,11 +120,45 @@ Replace the recurring poll with checks at:
 These cluster around real user activity. A companion that sits unused for a
 week does no update polling — which is fine, because nobody is using it.
 
+### 8. The Settings status poll (#208)
+
+The one `setInterval` that survives, and the conditions under which it is
+allowed to. `Settings.svelte` polls the `status` command every 2 s so the
+pane shows live tunnel state — but the setup window is *hidden* on close,
+never destroyed (Invariant I2 in `lib.rs`), so its Svelte component stays
+mounted for the life of the process and `onDestroy` never runs. Until #208
+that meant one interval ticking forever: ~43k HTTP self-probes and
+`pgrep`/`tasklist` child spawns per idle day, for a window nobody was
+looking at. The principle above and the code said opposite things.
+
+Two gates, so they now agree:
+
+- **Visibility.** The poll runs only while the pane can be seen. It stops
+  on `visibilitychange → hidden` and on window blur, and — because a
+  hidden WKWebView can keep reporting `visibilityState: "visible"` — on a
+  `setup:visibility` event Rust emits from the `CloseRequested` hide path
+  and from every path that surfaces the window again. Reopening refreshes
+  once immediately, then resumes ticking. An uninstall stops it for good.
+- **A server-side TTL.** The two expensive halves of `status` — the
+  authenticated HTTP self-probe and `is_claude_desktop_running()` (which
+  spawns `pgrep` on macOS, `tasklist` on Windows) — sit behind a 15 s
+  cache in `ExpensiveStatusCache`. A visible window therefore spawns at
+  most four child processes a minute, while the cheap half (config flags,
+  skill stat, remotes, tunnels, pending update) still answers every tick.
+  User-triggered refreshes pass `force: true` and bypass the TTL, so a
+  button never looks like it did nothing.
+
+Note what was *not* done: the window is still hidden rather than
+destroyed. Destroying it would unmount the component and make the symptom
+disappear, at the cost of Invariant I2 — the process must keep serving the
+HTTP endpoint and the lifetime socket after the window goes away.
+
 ## What this removes
 
 - `setInterval(..., 6 * 60 * 60 * 1000)` for update polling.
 - Any future temptation to add a `setInterval` for liveness, registry GC,
-  or child sweeping.
+  or child sweeping. The Settings status poll is the single exception and
+  is gated as described in §8; anything new needs the same two gates.
 - The need for a manual "restart aiui" instruction in user-facing
   troubleshooting.
 

@@ -76,6 +76,14 @@ jobs:
         working-directory: companion
         run: npx svelte-check --tsconfig ./tsconfig.json --threshold error
 
+      # Frontend unit tests (#208). The settings pane is the only UI
+      # surface outside dialogs and holds behaviour `cargo test` cannot
+      # reach — the visibility-gated status poll, the health-banner
+      # debounce, the two-step remote removal.
+      - name: Frontend tests
+        working-directory: companion
+        run: npm test
+
       - name: Vite build
         working-directory: companion
         run: npm run build

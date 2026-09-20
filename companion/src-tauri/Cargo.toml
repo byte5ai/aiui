@@ -38,6 +38,12 @@ tauri-plugin-process = "2"
 # dialog response. On macOS this drives UNUserNotificationCenter (one-time
 # permission prompt on first send, same as any other native app).
 tauri-plugin-notification = "2"
+# Backs the `copy_to_clipboard` command (#208). The welcome wizard's "copy
+# demo prompt" button used `navigator.clipboard`, which needs a secure
+# context WKWebView does not always grant; the Rust API has no such
+# requirement. Used from Rust only — no capability is granted, so the
+# WebView cannot reach the plugin's own commands.
+tauri-plugin-clipboard-manager = "2"
 serde_json = "1.0"
 # Format-preserving TOML editing for `~/.codex/config.toml` (#168) — Codex
 # reads TOML, and the file is the user's own, so we must keep their comments
