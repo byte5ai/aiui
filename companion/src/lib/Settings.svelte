@@ -25,6 +25,11 @@
     build_info: string;
     welcome_pending: boolean;
     http_error: string | null;
+    /** Set when `gui.lock` could not be acquired for a reason other than
+     * another aiui GUI holding it (#196). aiui keeps running without the
+     * lock — the banner explains why, instead of the process disappearing
+     * with exit code 0. */
+    lock_error: string | null;
     http_alive: boolean;
     /** Lower-case OS identifier from the backend. Used to pick the right
      * variant of OS-specific UI copy (e.g. uninstall instructions). */
@@ -176,9 +181,16 @@
   async function dismissWelcome() {
     try {
       await invoke("dismiss_welcome");
-    } finally {
-      // Either way, hide locally — server-side state will catch up on next refresh.
+      // Hide only once the flag is actually persisted. Hiding optimistically
+      // meant a failed write brought the whole wizard back on the next 2 s
+      // status tick, with the error visible nowhere. Issue #196.
       if (status) status = { ...status, welcome_pending: false };
+    } catch (e) {
+      pushSingle({
+        ok: false,
+        message: $_("settings.welcome.dismiss_failed"),
+        details: String(e),
+      });
     }
   }
 
@@ -326,6 +338,17 @@
         <!-- OS-specific because the diagnostic command differs: `lsof` on
           macOS, `Get-NetTCPConnection` on Windows, `ss` on Linux. -->
         <p class="http-error-hint">{$_(`settings.http_error.hint.${status.os}`, { values: { port: status.http_port } })}</p>
+      </section>
+    {/if}
+
+    <!-- #196: `gui.lock` failed for a reason that is not another aiui GUI
+      holding it. aiui keeps running without the lock — say so, instead of
+      the old silent exit that also mislabelled the cause. -->
+    {#if status.lock_error}
+      <section class="http-error">
+        <strong>{$_("settings.lock_error.title")}</strong>
+        <p>{status.lock_error}</p>
+        <p class="http-error-hint">{$_("settings.lock_error.hint")}</p>
       </section>
     {/if}
 

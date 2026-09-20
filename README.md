@@ -137,6 +137,10 @@ back in chat — without it, the agent might forget aiui exists.
 aiui runs purely locally on your own machine. No telemetry, no usage data, no
 content leaves your system. A local auth token lives in the per-user config
 directory and is only scp'd to hosts you explicitly register in settings.
+That directory — `~/.config/aiui/` on macOS and Linux, `%APPDATA%\aiui\` on
+Windows — also holds the list of registered hosts (`remotes.json`) and the
+first-run flag; uninstall removes all of it, together with the cached
+review media.
 
 | | Token location | Protection |
 |---|---|---|
@@ -162,8 +166,9 @@ it precisely.
 notarized, and built only in public GitHub Actions — never on a
 maintainer's machine — from third-party actions pinned to commit SHAs and
 a Rust compiler pinned in `rust-toolchain.toml`. It never phones home.
-The auth token stays under `~/.config/aiui/` on your machine and is only
-copied to hosts you explicitly register in settings.
+The auth token stays in aiui's config directory on your machine —
+`~/.config/aiui/` on macOS and Linux, `%APPDATA%\aiui\` on Windows — and
+is only copied to hosts you explicitly register in settings.
 
 **Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships
 inside the aiui.app bundle as native Rust code — drag-and-drop install

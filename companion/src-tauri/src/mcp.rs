@@ -214,8 +214,10 @@ Show the user a quick rundown of their registered aiui remotes — same as \
 the Settings window's \"Eingerichtete Remote-Hosts\" section, but in chat. \
 Hit the companion's GET /health endpoint via `aiui_health` first to make \
 sure aiui is up; if it isn't, just tell the user that and stop. Otherwise \
-read the user's `~/.config/aiui/remotes.json` (one host per line / JSON \
-list) and present them in a compact table with hostname only. If the file \
+read the user's `remotes.json` from aiui's config directory — \
+`~/.config/aiui/` on macOS and Linux, `%APPDATA%\\aiui\\` on Windows (one \
+host per line / JSON list) — and present them in a compact table with \
+hostname only. If the file \
 is missing or empty, say \"no remotes registered yet — open Settings to \
 add one\".
 ";
