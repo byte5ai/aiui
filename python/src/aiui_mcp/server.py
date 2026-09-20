@@ -846,7 +846,17 @@ async def _post_render(
 
 def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("cancelled"):
-        return {"cancelled": True}
+        out: dict[str, Any] = {"cancelled": True}
+        # #180: forward WHY. The companion sets `host_exiting`,
+        # `ttl_expired`, `evicted` and `channel_dropped`, but the bridge
+        # flattened them all into a bare
+        # `{"cancelled": true}` — indistinguishable from the user pressing
+        # Escape. An agent that cannot tell "the user declined" from "the
+        # companion was shutting down" retries the wrong thing.
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason:
+            out["reason"] = reason
+        return out
     return {"cancelled": False, **payload.get("result", {})}
 
 

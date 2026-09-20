@@ -6,6 +6,47 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **The companion quit after every dialog for anyone whose host is not
+  Claude Desktop in `/Applications`.** The exit authority was
+  `explicit || !is_claude_desktop_running()`, and liveness was probed with
+  `pgrep -f /Applications/Claude.app/`. For a Claude-Code-only or
+  Codex-only user — both first-class hosts aiui registers itself with — or
+  for a Claude Desktop installed in `~/Applications`, that predicate was
+  permanently true, so the default-**deny** exit gate inverted into
+  default-**allow**. The first dialog submit closed the only window, Tauri
+  fired `ExitRequested`, and the host exited: the v0.4.42 "lost the GUI
+  ~18 ms after submit" regression, re-opened for a whole class of users.
+  On a Mac serving only remote sessions there was no local child to
+  relaunch it, so aiui stayed dead until someone touched the machine.
+  The Wirt signal is now host-agnostic — "Claude Desktop is not my Wirt"
+  means *stay* — the macOS probe matches the bundle executable at any
+  install location (and still never the `claude` CLI), and a
+  last-window-close (`code: None`) can no longer terminate the host at all
+  (#180).
+- **Multi-instance exits left a zombie GUI and killed the live instance's
+  tunnels.** The four "another aiui already serves this" paths called
+  `app.exit(1)`, which the default-deny gate vetoed — leaving a process
+  holding a pipe it could not serve — and then swept *all* ssh-NTR
+  tunnels, although a losing instance never opened one: they belonged to
+  the instance that won. Exits now route through one `terminal_exit` that
+  uses `std::process::exit` and a sweep scoped by reason (#180).
+- **In-flight dialogs are resolved before the host exits.** Every terminal
+  path now drains the registry, sending each pending `/render` a
+  `{cancelled: true, reason: "host_exiting"}` and destroying its window,
+  then gives Axum a moment to flush — instead of leaving callers to hang
+  until their own timeout (I5/I7). The grace decision also counts open
+  dialogs: one on screen is proof someone still needs the host (#180).
+- **A transient named-pipe rotation failure no longer kills a healthy
+  Windows host.** It is retried five times with doubling backoff, and only
+  a persistent failure exits — cleanly, through the drain (#180).
+- **Both bridges forward *why* a dialog was cancelled.** The companion
+  distinguishes `host_exiting`, `ttl_expired`, `evicted` and
+  `channel_dropped`, but each bridge flattened them into a bare
+  `{"cancelled": true}` — indistinguishable from the user pressing Escape,
+  so an agent retried the wrong thing (#180).
+
+### Fixed
+
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the

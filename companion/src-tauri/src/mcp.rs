@@ -1412,6 +1412,19 @@ fn format_dialog_result(render: Value) -> Value {
     } else {
         payload = json!({ "cancelled": cancelled });
     }
+    // #180: forward WHY a dialog was cancelled. The companion sets
+    // `host_exiting`, `ttl_expired`, `evicted` and `channel_dropped`;
+    // dropping them left the agent unable to tell "the user declined" from
+    // "the companion was shutting down". Forwarded generically, so a reason
+    // added later needs no bridge change. I6 — the Python bridge does the
+    // same.
+    if cancelled {
+        if let Some(reason) = render.get("reason").and_then(|v| v.as_str()) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("reason".into(), json!(reason));
+            }
+        }
+    }
     value_to_tool_text(payload)
 }
 
@@ -1491,6 +1504,61 @@ fn prompts_get(params: Value) -> Result<Value, RpcError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Pull the JSON payload back out of the MCP tool-result envelope.
+    fn tool_payload(v: Value) -> Value {
+        let text = v["content"][0]["text"].as_str().expect("text content");
+        serde_json::from_str(text).expect("payload is JSON")
+    }
+
+    #[test]
+    fn cancel_reason_reaches_the_agent() {
+        // #180: the companion sets host_exiting / ttl_expired / evicted /
+        // channel_dropped, but the bridge flattened every one into a bare
+        // {"cancelled": true} — indistinguishable from the user pressing
+        // Escape, so an agent retried the wrong thing. `future_reason` stands
+        // in for one added later: forwarding is generic on purpose.
+        for reason in [
+            "host_exiting",
+            "ttl_expired",
+            "evicted",
+            "channel_dropped",
+            "future_reason",
+        ] {
+            let render = json!({
+                "id": "d1", "cancelled": true, "result": null, "reason": reason
+            });
+            let out = tool_payload(format_dialog_result(render));
+            assert_eq!(out["cancelled"], json!(true));
+            assert_eq!(out["reason"], json!(reason), "reason {reason} must survive");
+        }
+    }
+
+    #[test]
+    fn a_plain_user_cancel_carries_no_reason() {
+        // The user pressing Escape has no reason attached, and inventing one
+        // would be worse than omitting it.
+        let render = json!({"id": "d1", "cancelled": true, "result": null});
+        let out = tool_payload(format_dialog_result(render));
+        assert_eq!(out["cancelled"], json!(true));
+        assert!(out.get("reason").is_none(), "no reason invented: {out}");
+    }
+
+    #[test]
+    fn a_submitted_dialog_keeps_its_values_and_gains_no_reason() {
+        // The happy path must not regress, and a stale reason on a successful
+        // submit would be actively misleading.
+        let render = json!({
+            "id": "d1",
+            "cancelled": false,
+            "result": {"values": {"name": "Ada"}},
+            "reason": "host_exiting"
+        });
+        let out = tool_payload(format_dialog_result(render));
+        assert_eq!(out["cancelled"], json!(false));
+        assert_eq!(out["values"]["name"], json!("Ada"));
+        assert!(out.get("reason").is_none(), "not a cancel: {out}");
+    }
 
     fn test_cfg() -> Arc<AppConfig> {
         Arc::new(AppConfig {

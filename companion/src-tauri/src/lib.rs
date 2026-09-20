@@ -1833,7 +1833,7 @@ pub fn run() {
             // via `api.prevent_exit()`. The watcher owns the CD-gone exit in
             // normal operation; this gate is the backstop for every other
             // Tauri-initiated termination.
-            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
                 // Default-deny (Invariant I1). The only legitimate planned
                 // exits are: (b) uninstall / (c) update-restart — both latch
                 // `ExitAuthority` before asking Tauri to terminate — or (a) the
@@ -1847,10 +1847,22 @@ pub fn run() {
                     .try_state::<Arc<lifetime::ExitAuthority>>()
                     .map(|a| a.is_authorized())
                     .unwrap_or(false);
+                // #180: "is Claude Desktop running" is only the Wirt signal
+                // when Claude Desktop IS our Wirt. For a Claude-Code-only or
+                // Codex-only user it is permanently absent, which turned this
+                // default-DENY gate into default-ALLOW — the host quit as soon
+                // as a dialog submit closed its only window.
+                let cd_is_wirt = setup::is_claude_desktop_installed();
                 let cd_running = setup::is_claude_desktop_running();
-                if !lifetime::host_should_exit(explicit, cd_running) {
+                let gone = lifetime::wirt_gone(cd_is_wirt, cd_running);
+                // `code: None` is Tauri's user-interaction exit — including
+                // the last window being destroyed, which happens after every
+                // dialog submit. That must never end the host, whatever the
+                // Wirt probe says.
+                if !lifetime::honour_exit_request(*code, explicit, gone) {
                     logging::trace(&format!(
-                        "[aiui] veto ExitRequested (default-deny): explicit={explicit}, \
+                        "[aiui] veto ExitRequested (default-deny): code={code:?}, \
+                         explicit={explicit}, cd_is_wirt={cd_is_wirt}, \
                          claude_desktop_running={cd_running}"
                     ));
                     lifecycle_log::record(lifecycle_log::LifecycleEvent::ExitDenied);
@@ -1867,16 +1879,10 @@ pub fn run() {
                 } else {
                     "exit-claude-desktop-gone"
                 };
-                lifecycle_log::transition(lifecycle_log::Phase::Exiting);
-                lifecycle_log::record(lifecycle_log::LifecycleEvent::HostExit { reason });
-                // Forensic dump of the lifetime event ring on the way out —
-                // the post-hoc record that was missing during the 0.4.x
-                // instability (#137 cross-cutting).
-                for line in lifecycle_log::recent() {
-                    logging::trace(&format!("[aiui] lifecycle-dump {line}"));
-                }
                 logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
-                housekeeping::pre_exit_cleanup(port, reason);
+                // Drains pending dialogs, flushes, sweeps, dumps the ring and
+                // exits. Does not return.
+                lifetime::terminal_exit(app, reason, 0, port, housekeeping::SweepScope::All);
             }
 
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
