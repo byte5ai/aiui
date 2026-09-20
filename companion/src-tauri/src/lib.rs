@@ -1574,12 +1574,30 @@ pub fn run() {
                 .level_for("aiui_lib", log::LevelFilter::Trace)
                 .max_file_size(5_000_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("aiui".into()),
-                    }),
-                ])
+                .targets({
+                    // #181: no stdout target in a release build. The GUI can
+                    // be started by `aiui --mcp-stdio`, whose stdout *is* the
+                    // host's JSON-RPC pipe; a single `[aiui] http listening
+                    // on …` line landing there is a protocol error the host
+                    // sees and our own logs do not. `spawn_detached` already
+                    // stops the handle from being inherited — this is the
+                    // second half of the same fix, so no future spawn site
+                    // can reopen it. The LogDir target and
+                    // `/tmp/aiui-trace.log` are unchanged; only running the
+                    // release binary from a terminal no longer streams logs
+                    // to the console.
+                    let mut targets = vec![tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::LogDir {
+                            file_name: Some("aiui".into()),
+                        },
+                    )];
+                    if cfg!(debug_assertions) {
+                        targets.push(tauri_plugin_log::Target::new(
+                            tauri_plugin_log::TargetKind::Stdout,
+                        ));
+                    }
+                    targets
+                })
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())

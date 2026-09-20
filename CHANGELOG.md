@@ -89,6 +89,51 @@ All notable changes to this project are documented here.
   `name`s. Triggers were ordinary: two assets sharing a basename, two
   `config.yaml` rows from different directories, two tabs called "Options"
   (#178).
+- **On Windows the companion wrote its log output into the host's
+  JSON-RPC stream.** A cold start goes Claude Desktop → `aiui --mcp-stdio`
+  → no GUI yet → re-spawn the GUI, and that re-spawn used a plain
+  `Command::spawn()`, whose stdio defaults to *inherit*. The new GUI
+  therefore held the mcp-stdio child's stdin and stdout — which are the
+  host's MCP pipes — and its first `[aiui] http listening on …` line
+  landed inside the framing stream as a non-JSON frame. Depending on the
+  client that is a protocol error, a dropped frame or a dropped
+  connection, and it was invisible from our side: aiui's own trace log
+  looked perfectly healthy. Holding the write end open also meant the host
+  never saw EOF when the child exited, so quitting Claude Desktop could
+  hang on the teardown. Every spawn branch now goes through
+  `proc_ext::spawn_detached`, which nulls all three streams (and on
+  Windows adds `DETACHED_PROCESS`), and the release build no longer
+  installs a stdout log target at all — both halves are needed, since an
+  inherited handle blocks EOF even with nothing written to it. Present on
+  every Windows cold start since v0.10.1; macOS was never affected,
+  because LaunchServices gives the new process fresh stdio. Only visible
+  behaviour change: running the release binary from a terminal no longer
+  streams logs to the console (#181).
+- **A failed named-pipe `connect()` was counted as an attached child.** The
+  Windows accept loop logged the error and fell through into the attach
+  path: it took the unconnected pipe instance as a client, incremented the
+  child counter, recorded `ChildAttached` and spawned a reader that failed
+  on its first read — producing a phantom detach edge that armed the 5 s
+  shutdown grace for a client that never existed. Since
+  `is_claude_desktop_running()` reports `false` for any `tasklist` that
+  does not succeed, one hiccup inside that window was enough to quit the
+  companion with Claude Desktop still on screen. The attach path is now
+  unreachable without a connected stream — enforced by control flow, not
+  by a runtime check (#181).
+- **A persistently failing accept/connect spun at 100 % CPU.** Neither
+  loop classified its error or paced its retry, so the non-transient
+  failures — descriptor exhaustion on Unix, a pipe name in a bad state on
+  Windows — returned instantly and forever: one tokio worker pinned, an
+  unbounded append to `/tmp/aiui-trace.log` (which cannot rotate
+  mid-process), no new child able to attach while `/health` still answered
+  "up", and the 256-entry lifecycle ring overrun in milliseconds, erasing
+  the forensic trail it exists to keep. Both loops now reset their failure
+  counter on success, retry `Interrupted`/`WouldBlock` immediately so no
+  legitimate attach pays for it, and otherwise back off 100 ms doubling to
+  a 5 s cap, logging once per backoff step and recording one
+  `ChannelAcceptFailing` lifecycle event past five consecutive failures.
+  Neither loop can exit the process — the three legitimate exit causes are
+  unchanged (#181).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

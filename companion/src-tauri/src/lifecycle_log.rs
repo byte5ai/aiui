@@ -61,6 +61,11 @@ pub enum LifecycleEvent {
     /// An MCP-stdio child attached / detached; carries the new live count.
     ChildAttached { count: usize },
     ChildDetached { count: usize },
+    /// The GUI channel's accept/connect loop keeps failing (#181). Recorded
+    /// once, when the consecutive-failure count first crosses the threshold,
+    /// so a degraded channel is visible in the exit dump and `/health`
+    /// forensics instead of only in a rate-limited trace line.
+    ChannelAcceptFailing { consecutive: u32, backoff_ms: u64 },
     /// Last child gone — grace timer armed for `secs` before the liveness
     /// re-check.
     GraceArmed { secs: u64 },
@@ -90,6 +95,12 @@ impl LifecycleEvent {
             LifecycleEvent::Serving { port } => format!("serving on :{port}"),
             LifecycleEvent::ChildAttached { count } => format!("child attached (count={count})"),
             LifecycleEvent::ChildDetached { count } => format!("child detached (count={count})"),
+            LifecycleEvent::ChannelAcceptFailing {
+                consecutive,
+                backoff_ms,
+            } => format!(
+                "channel accept failing (consecutive={consecutive}, backoff={backoff_ms}ms)"
+            ),
             LifecycleEvent::GraceArmed { secs } => format!("grace armed ({secs}s)"),
             LifecycleEvent::GraceResolved {
                 outcome,
