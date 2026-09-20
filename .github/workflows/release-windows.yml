@@ -6,12 +6,23 @@
 # in a second step because the Windows port is WIP and not every release
 # ships one.
 #
-# This workflow is **manually triggered** (`workflow_dispatch`) against
-# a tag/release that `release-macos.yml` already created. That workflow
-# publishes the macOS GitHub release plus the initial `latest.json`;
-# this workflow then attaches the Windows installer + updater bundle to
-# the same release and rewrites `latest.json` to add the
-# `windows-x86_64` platform entry.
+# This workflow runs against a tag/release that `release-macos.yml`
+# already created. Since #190 that release is created as a **draft** and
+# this workflow is **dispatched automatically** by it — `workflow_dispatch`
+# is kept so a failed run can be repeated by hand.
+#
+# What this workflow does: attach the Windows installer + updater bundle to
+# the release, add the `windows-x86_64` entry to `latest.json`, validate
+# the assembled feed (`scripts/check-updater-feed.sh`), and only then
+# un-draft the release.
+#
+# Why the draft matters: `releases/latest/download/latest.json` is what
+# every installed aiui polls, and a feed missing a platform sends that
+# platform's update check into `TargetsNotFound` — an error, not an
+# "up to date". v0.10.1 published a darwin-only feed immediately and broke
+# every Windows client's update check until this workflow was remembered.
+# A draft is not served there, so clients keep resolving the previous
+# complete feed until this run finishes.
 #
 # Prerequisites:
 #
@@ -182,6 +193,33 @@ jobs:
           $json | ConvertTo-Json -Depth 10 | Set-Content -Path latest.json -NoNewline
 
           gh release upload "$env:TAG" latest.json --repo "$env:REPO" --clobber
+
+      # #190: the feed is what every installed aiui polls. Validate it before
+      # the release becomes visible — a run that fails here leaves a draft
+      # nobody is served, which is strictly better than publishing a feed that
+      # sends one platform's update check into the error path.
+      - name: Validate the updater feed
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.bundle.outputs.version }}
+        run: ./scripts/check-updater-feed.sh latest.json "$TAG" "$VERSION"
+
+      # Only now is the release served by `releases/latest/download/…`.
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit "$TAG" --draft=false --repo "$REPO"
+            echo "published $TAG — the feed now carries both platforms"
+          else
+            echo "$TAG is already published — nothing to un-draft"
+          fi
 
       - name: Verification summary
         run: |

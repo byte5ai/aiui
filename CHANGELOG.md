@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
+  missing a shipped platform, carries an empty signature or url, points an
+  entry at another release's artifact, or advertises the wrong version. It
+  runs in the release path before anything becomes visible, and
+  `scripts/test-check-updater-feed.sh` exercises it against fixtures on
+  every PR so the guard cannot quietly stop guarding (#190).
+
+### Changed
+
+- **`skip_validation: true` actions no longer commit `target` file
+  writes.** They are escape hatches, and an escape hatch that writes a
+  credential to disk is a trap. The new `writes_targets: true` action flag
+  opts one back in. An action value the spec never declared is refused
+  (fail closed). Agent-facing: documented in both `skill.md` copies and in
+  the `form` tool description of both bridges. Nothing that previously
+  failed now succeeds; some writes that previously fired silently now
+  refuse with a reason (#177).
+- **Documentation updated for a two-platform product.** README, both
+  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
+  doc still described aiui as macOS-only. The README gained per-platform
+  install instructions including the expected SmartScreen warning, and
+  agent-facing path guidance no longer says "the user's Mac" — an agent
+  reading that could reasonably assume POSIX paths on a Windows user's
+  machine.
+
 ### Fixed
 
 - **A form's Cancel button could blank the user's credential file.**
@@ -19,18 +46,29 @@ All notable changes to this project are documented here.
   empty value is refused before the filesystem is touched. A field missing
   from the payload is reported as such instead of being laundered into a
   blank write (#177).
+- **A release published a macOS-only update feed, breaking every Windows
+  client's update check.** `releases/latest/download/latest.json` is what
+  every installed aiui polls, and `release-macos.yml` published one
+  carrying only `darwin-aarch64` — the `windows-x86_64` entry was added
+  later by a second, manually dispatched workflow. In between, a Windows
+  update check did not report "up to date"; it failed
+  (`tauri-plugin-updater` raises `TargetsNotFound` for a missing target),
+  and if the second dispatch was forgotten it failed permanently. That is
+  what shipped in v0.10.1.
 
-### Changed
+  The release is now created as a **draft**, which
+  `releases/latest/download/…` does not serve, so clients keep resolving
+  the previous complete feed until both platforms are in. The Windows
+  workflow is dispatched automatically, validates the assembled feed, and
+  only then publishes the release. A Windows failure therefore holds back
+  the whole release rather than shipping half of one — the correct
+  coupling for a two-platform product.
 
-- **`skip_validation: true` actions no longer commit `target` file
-  writes.** They are escape hatches, and an escape hatch that writes a
-  credential to disk is a trap. The new `writes_targets: true` action flag
-  opts one back in. An action value the spec never declared is refused
-  (fail closed). Agent-facing: documented in both `skill.md` copies and in
-  the `form` tool description of both bridges. Nothing that previously
-  failed now succeeds; some writes that previously fired silently now
-  refuse with a reason (#177).
-
+  Deliberately **not** fixed by carrying the previous release's Windows
+  entry forward: that feed would advertise the new version while pointing
+  at the old installer, which verifies and installs cleanly and leaves the
+  client on the old version — a silent reinstall loop, with `/update`
+  reporting success for a version the machine never reached (#190).
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the
@@ -41,16 +79,6 @@ All notable changes to this project are documented here.
   produced filename, so the url can't desync from the signed artifact
   (#175). The v0.10.1 Windows artifacts were shipped by a re-dispatch
   after this fix.
-
-### Changed
-
-- **Documentation updated for a two-platform product.** README, both
-  `skill.md` copies, `python/README.md`, CONTRIBUTING and the strategy
-  doc still described aiui as macOS-only. The README gained per-platform
-  install instructions including the expected SmartScreen warning, and
-  agent-facing path guidance no longer says "the user's Mac" — an agent
-  reading that could reasonably assume POSIX paths on a Windows user's
-  machine.
 
 ## [0.10.1] — 2026-08-31
 
