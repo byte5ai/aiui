@@ -449,14 +449,26 @@ user chooses is streamed back and written to `target_dir/<filename>` on
   path. Existing files are **never overwritten**; a name clash returns an
   error instead of clobbering (pick another `target_dir` or move the old
   file first).
+- **One picker at a time:** a second `upload` while another is still
+  waiting comes back with *"another upload is already waiting for the
+  user"*. Two stacked system panels are indistinguishable to the user, so
+  aiui refuses the second rather than showing it. Let the first finish,
+  then retry.
+- **`session`** (optional) — a short label like `billing-migration`. It
+  titles the picker window, so a user running several agents can tell
+  which one is asking for a file. Same label you pass to the dialog tools.
 - **Result:** `{status: "ok", path, filename, bytes}` on success, or
   `{status: "error", error}` for a cancelled picker, an unreadable file, a
-  file over the 512 MB cap, or a missing/unwritable target dir. Report it
-  briefly; on `ok`, name the path the file landed at.
+  file over the 512 MB cap, a missing/unwritable target dir, another upload
+  in flight, or a picker nobody ever answered. Report it briefly; on `ok`,
+  name the path the file landed at.
 
 Blocks until the user picks or dismisses the picker, exactly like the
 dialog tools — progress notifications fire every ~10 s while you wait, so
-a slow response just means the user is browsing, not that aiui broke.
+a slow response just means the user is browsing, not that aiui broke. The
+picker itself may take a moment to come forward. It does not wait forever:
+an unanswered picker eventually returns an error, so you are never stuck
+on a dialog the user never saw.
 
 ## Side-by-side compare: `compare`
 
@@ -566,6 +578,13 @@ In all of them the same three input formats render correctly:
 
 **Pick the simplest one that works:** path first if the file's on
 disk, then URL if it's reachable, `data:` only as last resort.
+
+**When a clip doesn't make it:** a local video or audio file that can't be
+pushed to the `/media` cache — missing, unreadable, or over the 512 MB
+per-file cap — does not fail the render. The dialog opens anyway, with a
+broken player where that clip should be, and the result carries a
+`media_warnings: [...]` list naming each path and why. Read it: without it
+you'd believe the user saw something they didn't.
 
 What does **not** work — known footguns:
 

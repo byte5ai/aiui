@@ -45,3 +45,25 @@ def test_submitted_dialog_keeps_values_and_gains_no_reason() -> None:
         {"cancelled": False, "result": {"values": {"name": "Ada"}}, "reason": "host_exiting"}
     )
     assert out == {"cancelled": False, "values": {"name": "Ada"}}
+
+
+def test_media_warnings_reach_the_agent() -> None:
+    """#194: a clip that never made it into the media cache left the user with
+    a broken player and the agent with no signal at all. Forwarded on both
+    branches — a user may well cancel *because* of the broken player."""
+    warnings = ["video not shown — /tmp/clip.mp4: too large: 999 bytes (max 512)"]
+    out = _format_result(
+        {"cancelled": False, "result": {"values": {}}, "media_warnings": warnings}
+    )
+    assert out == {"cancelled": False, "values": {}, "media_warnings": warnings}
+
+    out = _format_result({"cancelled": True, "result": None, "media_warnings": warnings})
+    assert out == {"cancelled": True, "media_warnings": warnings}
+
+
+def test_clean_render_has_no_media_warnings_key() -> None:
+    """An always-present empty list trains agents to ignore the key."""
+    out = _format_result({"cancelled": False, "result": {"values": {}}})
+    assert "media_warnings" not in out
+    out = _format_result({"cancelled": False, "result": {}, "media_warnings": []})
+    assert "media_warnings" not in out

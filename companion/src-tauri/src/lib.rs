@@ -309,10 +309,20 @@ fn is_dialog_window_label(label: &str) -> bool {
 
 /// macOS: drop back to Accessory (no Dock icon) once no dialog window remains
 /// open *other than* `except` (the one currently being torn down — `destroy()`
-/// may not have removed it from the window list yet) and the setup window is
-/// hidden. Matches the Regular-mode promote in `build_dialog_window`.
+/// may not have removed it from the window list yet), the setup window is
+/// hidden, and no native file picker is open. Matches the Regular-mode
+/// promote in `build_dialog_window` and in [`surface_for_native_picker`].
+///
+/// #194: the picker check is not optional. A native `NSOpenPanel` is not a
+/// Tauri window, so it never shows up in `webview_windows()` — without the
+/// [`PickerGuard::is_open`] test, a dialog closing while an `upload` picker
+/// is on screen would demote out from under the picker and sink it behind
+/// whatever the user is looking at.
 #[cfg(target_os = "macos")]
 fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
+    if PickerGuard::is_open() {
+        return;
+    }
     let setup_open = app
         .get_webview_window(SETUP_WINDOW_LABEL)
         .and_then(|w| w.is_visible().ok())
@@ -324,6 +334,115 @@ fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
     if !other_dialog_open && !setup_open {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
+}
+
+/// Set while a native file picker (`POST /upload`) is open. Process-global
+/// because the thing it guards is process-global: there is exactly one
+/// NSOpenPanel-capable app, and exactly one activation policy.
+static PICKER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII permit for opening the one native file picker (#194).
+///
+/// Does two jobs that `upload_pick`'s five early-return paths made
+/// unmaintainable by hand:
+///
+/// 1. **Serialises.** Only one picker may be open at a time — two stacked
+///    system panels give the user no way to tell which agent asked for
+///    which file. A second `POST /upload` gets `None` here and answers 409.
+/// 2. **Surfaces and un-surfaces.** On macOS the companion normally runs as
+///    an `LSUIElement` agent (no Dock icon, no Cmd-Tab entry) and macOS will
+///    not reliably bring an Accessory app's panels forward, so the picker is
+///    born behind the user's frontmost window with nothing to click to reach
+///    it. [`surface_for_native_picker`] promotes to `Regular` first; dropping
+///    the guard demotes again — on *every* exit path, including the timeout
+///    and the 413.
+pub(crate) struct PickerGuard {
+    /// Only read by the macOS demote-on-drop; the field does not exist on
+    /// other targets, where the activation policy is a no-op concept.
+    #[cfg(target_os = "macos")]
+    app: Option<tauri::AppHandle>,
+}
+
+impl PickerGuard {
+    /// Claim the single picker slot without touching the activation policy.
+    /// `None` means a picker is already open. Separate from
+    /// [`surface_for_native_picker`] so the serialisation half is testable
+    /// without an `AppHandle`.
+    pub(crate) fn try_claim() -> Option<Self> {
+        PICKER_OPEN
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| PickerGuard {
+                #[cfg(target_os = "macos")]
+                app: None,
+            })
+    }
+
+    /// Is a native picker open right now? Consulted by
+    /// `demote_if_no_dialogs_except` so an unrelated dialog closing cannot
+    /// demote the app while the picker is up — a macOS-only concern, hence
+    /// the dead-code exemption everywhere else (the tests use it on every
+    /// platform).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn is_open() -> bool {
+        PICKER_OPEN.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for PickerGuard {
+    fn drop(&mut self) {
+        // Release the slot *before* demoting, so the demote sees an
+        // accurate `is_open()`.
+        PICKER_OPEN.store(false, std::sync::atomic::Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Some(app) = self.app.take() {
+            // Not a blind demote: a dialog window may have opened while the
+            // picker was up, and it still needs Regular mode.
+            demote_if_no_dialogs_except(&app, "");
+        }
+    }
+}
+
+/// Claim the picker slot and make the app able to show a native panel the
+/// user can actually see. Returns `None` when another picker is already
+/// open (the caller answers 409).
+///
+/// Deliberately *not* `surface_for_dialog`: that is a `#[tauri::command]`
+/// invoked from the frontend, and it hunts for a window to show and focus —
+/// `upload_pick` has neither a frontend nor a window of its own. Opening a
+/// throwaway window just to have something to promote would flash an empty
+/// frame at the user and skew the dialog-count arithmetic
+/// `demote_if_no_dialogs_except` depends on.
+pub(crate) fn surface_for_native_picker(app: &tauri::AppHandle) -> Option<PickerGuard> {
+    let guard = PickerGuard::try_claim()?;
+    #[cfg(target_os = "macos")]
+    let guard = {
+        let mut guard = guard;
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        guard.app = Some(app.clone());
+        guard
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    Some(guard)
+}
+
+/// The window a native picker should be parented to, if any is *visible*.
+///
+/// Parenting matters on Windows, where an unowned dialog can land behind the
+/// foreground app. On macOS a parented panel becomes a window-modal sheet —
+/// which is why an invisible parent is worse than none at all: the sheet
+/// would be attached to a window nobody can see. Hence the visibility test,
+/// not merely "any window exists".
+pub(crate) fn visible_window_for_picker(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_visible().unwrap_or(false))
 }
 
 #[tauri::command]

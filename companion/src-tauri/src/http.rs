@@ -222,6 +222,23 @@ pub async fn serve(
         crate::media::MEDIA_TOTAL_CAP,
     );
 
+    // The hardened blob service (#194), built with explicit `Layer::layer`
+    // calls rather than a `ServiceBuilder` — same composition, no extra
+    // import at module scope.
+    let blob_service = {
+        use tower::Layer as _;
+        let sandboxed = tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox"),
+        )
+        .layer(tower_http::services::ServeDir::new(&media_path));
+        tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        )
+        .layer(sandboxed)
+    };
+
     let router = Router::new()
         .route("/health", get(health))
         .route("/render", post(render))
@@ -247,10 +264,14 @@ pub async fn serve(
         .route("/upload", post(upload_pick))
         // Capability-URL playback: unauthenticated (filename is a UUID),
         // range-capable for video seeking via tower-http's ServeDir.
-        .nest_service(
-            "/media/blob",
-            tower_http::services::ServeDir::new(&media_path),
-        )
+        //
+        // #194: belt-and-braces over `media::sanitize_ext`'s allowlist. Even
+        // if some future extension slipped through, `nosniff` stops the
+        // browser from second-guessing the type and `sandbox` denies the
+        // response script execution and same-origin privileges — so nothing
+        // served out of the media cache can act inside the API's own
+        // `127.0.0.1:<port>` origin.
+        .nest_service("/media/blob", blob_service)
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -555,10 +576,46 @@ fn pct_encode_filename(s: &str) -> String {
     out
 }
 
-/// `POST /upload` — open a native file picker on the Mac and stream the picked
-/// file's bytes back to the caller (#146). This is the reverse of
-/// `POST /media`: bytes flow Mac → agent-host, over the same authenticated
-/// :7777 channel (loopback locally, the SSH reverse-tunnel remotely).
+/// How long the companion itself waits for the user to answer the picker
+/// before giving up and returning `504` (#194).
+///
+/// Sits deliberately *under* both bridges' 900 s `POST /upload` timeout, so
+/// when a picker is never answered the companion's own diagnosis wins the
+/// race and the agent learns "the picker timed out" instead of a generic
+/// transport error. Without any bound at all the tokio task outlived every
+/// client timeout and leaked for the life of the process.
+const UPLOAD_PICK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Optional body of `POST /upload` (#194). Additive in both directions: an
+/// old bridge sends no body (axum 0.7's blanket `Option<T: FromRequest>`
+/// yields `None` on any rejection, a missing `Content-Type` included), and an
+/// old companion ignores a body it never reads.
+#[derive(Deserialize)]
+struct UploadRequest {
+    /// Human-legible session label, same one the dialog tools forward. Shown
+    /// in the picker's title bar so a user facing several agents can tell
+    /// which one asked for a file.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Title for the native picker: the session label when the caller sent one,
+/// plain `aiui` otherwise. Split out so the composition is unit-testable
+/// without an `AppHandle`.
+fn picker_title(session: Option<&str>) -> String {
+    match session.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => format!("aiui — {s}"),
+        None => "aiui".to_string(),
+    }
+}
+
+/// `POST /upload` — open a native file picker on the user's machine and stream
+/// the picked file's bytes back to the caller (#146). This is the reverse of
+/// `POST /media`: bytes flow user-machine → agent-host, over the same
+/// authenticated :7777 channel (loopback locally, the SSH reverse-tunnel
+/// remotely).
+///
+/// Optional JSON body: `{"session": "<label>"}` — titles the panel.
 ///
 /// Responses:
 /// - `200 OK` — body is the raw file bytes; `x-aiui-filename` header carries
@@ -567,7 +624,10 @@ fn pct_encode_filename(s: &str) -> String {
 ///   filename header present — distinct from the cancel case below.
 /// - `204 No Content` — the user dismissed the picker without choosing a file.
 ///   No body, no filename header.
+/// - `409 Conflict` — another `/upload` already has a picker open (#194).
 /// - `413 Payload Too Large` — the picked file exceeds `UPLOAD_FILE_CAP`.
+/// - `504 Gateway Timeout` — nobody answered the picker within
+///   `UPLOAD_PICK_TIMEOUT` (#194).
 /// - `500` — the file could not be read, or the picker failed unexpectedly.
 ///
 /// The handler blocks until the user picks or cancels; the caller's MCP
@@ -576,24 +636,64 @@ fn pct_encode_filename(s: &str) -> String {
 async fn upload_pick(
     State(state): State<AppState>,
     headers: HeaderMap,
+    // Body extractor last — axum requires it, and the `Option` makes the body
+    // genuinely optional for older bridges.
+    body: Option<Json<UploadRequest>>,
 ) -> impl IntoResponse {
     if !auth_ok(&headers, &state.cfg.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
+    // #194: promote out of Accessory mode (macOS) so the panel is reachable,
+    // and serialise — a second concurrent picker is a stack of identical
+    // system panels the user cannot tell apart. Dropping the guard demotes
+    // again on every path below, including the timeout and the 413.
+    let Some(_picker) = crate::surface_for_native_picker(&state.app) else {
+        trace("upload_pick: rejected — a picker is already open");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "picker_busy"})),
+        )
+            .into_response();
+    };
+
+    let session = body.and_then(|Json(b)| b.session);
     // The native picker is callback-based; bridge it to async via a oneshot.
     // `pick_file` dispatches to the main thread internally (rfd requirement on
     // macOS), so calling it from this tokio task is safe.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.app.dialog().file().pick_file(move |picked| {
+    let mut builder = state
+        .app
+        .dialog()
+        .file()
+        .set_title(picker_title(session.as_deref()));
+    // Parent to a *visible* window when there is one: on Windows that keeps
+    // the dialog owned (an unowned one can land behind the foreground app).
+    // A hidden parent would make the panel a sheet on an invisible window —
+    // worse than no parent — hence the visibility test in the helper.
+    if let Some(win) = crate::visible_window_for_picker(&state.app) {
+        builder = builder.set_parent(&win);
+    }
+    builder.pick_file(move |picked| {
         let _ = tx.send(picked);
     });
 
-    let picked = match rx.await {
-        Ok(p) => p,
-        Err(_) => {
+    let picked = match tokio::time::timeout(UPLOAD_PICK_TIMEOUT, rx).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
             trace("upload_pick: picker channel dropped");
             return (StatusCode::INTERNAL_SERVER_ERROR, "picker closed unexpectedly")
+                .into_response();
+        }
+        Err(_) => {
+            trace("upload_pick: no answer within the picker timeout");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "no file was picked within {} s — the picker was never answered",
+                    UPLOAD_PICK_TIMEOUT.as_secs()
+                ),
+            )
                 .into_response();
         }
     };
@@ -1878,7 +1978,39 @@ mod async_render_tests {
 
 #[cfg(test)]
 mod upload_tests {
-    use super::pct_encode_filename;
+    use super::{pct_encode_filename, picker_title};
+    use crate::PickerGuard;
+
+    #[test]
+    fn second_concurrent_pick_is_rejected() {
+        // #194: two stacked system file panels give the user nothing to tell
+        // them apart — which agent asked for which file? The second
+        // `POST /upload` must be refused (409) while the first picker is up.
+        // The guard is tested directly: the handler itself needs an
+        // `AppHandle`, which no unit test has.
+        assert!(!PickerGuard::is_open(), "no picker open before the first claim");
+        let first = PickerGuard::try_claim().expect("first claim succeeds");
+        assert!(PickerGuard::is_open(), "the slot is held while the picker is up");
+        assert!(
+            PickerGuard::try_claim().is_none(),
+            "a second concurrent picker must be refused, not stacked"
+        );
+        drop(first);
+        assert!(!PickerGuard::is_open(), "dropping the guard releases the slot");
+        // And the slot is reusable — the refusal is not a one-way latch.
+        let again = PickerGuard::try_claim().expect("the slot is claimable again");
+        drop(again);
+    }
+
+    #[test]
+    fn picker_title_names_the_session_when_given() {
+        assert_eq!(picker_title(Some("billing-migration")), "aiui — billing-migration");
+        assert_eq!(picker_title(None), "aiui");
+        // Whitespace-only is the same as absent — an empty suffix after the
+        // dash reads like a bug to the user.
+        assert_eq!(picker_title(Some("   ")), "aiui");
+        assert_eq!(picker_title(Some(" api-work ")), "aiui — api-work");
+    }
 
     #[test]
     fn plain_ascii_name_is_unchanged() {

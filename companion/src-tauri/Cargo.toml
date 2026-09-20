@@ -48,7 +48,10 @@ log = "0.4"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+# `set-header` (#194): the `/media/blob` capability URLs are served with
+# `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`,
+# so a cached file can never act inside the API's own loopback origin.
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 rand = "0.8"

@@ -22,6 +22,18 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- **`upload`'s `session` parameter now does something.** Both bridges
+  advertised it and both discarded it; the schema promised a label the user
+  would see and delivered an anonymous system panel. It is forwarded as an
+  optional `POST /upload` body and titles the picker — `aiui — billing-migration`
+  — so a user facing several agents can tell which one is asking. Additive in
+  both directions: an old companion ignores the body, a new one tolerates a
+  body-less POST (#194).
+- **A dropped video or audio clip is reported to the agent.** A local clip the
+  bridge could not push to the media cache left the user looking at a broken
+  player while the agent believed it was on screen — the failure reached the
+  trace log and nowhere else. The render still proceeds unchanged; the result
+  now also carries `media_warnings` naming each path and why (#194).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -54,6 +66,38 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **The `upload` file picker opened where nobody could see it, then hung for
+  15 minutes.** On macOS the companion runs as an agent app with no Dock icon,
+  and macOS will not bring such an app's panels forward — so the picker was
+  born behind whatever the user was looking at, with nothing to click and no
+  window to Cmd-Tab to, while the bridge held the call for the full 900 s.
+  The handler now promotes to Regular mode for the picker's lifetime (via an
+  RAII guard, so every exit path demotes), gives the panel a title and a
+  parent window when a visible one exists, bounds its own wait at 600 s with
+  a `504` that says what happened, and refuses a second concurrent picker with
+  a `409` both bridges translate into "another upload is already waiting". A
+  dialog closing while a picker is open can no longer demote the app out from
+  under it (#194).
+- **Uploads to exFAT / FAT32 / SMB destinations failed after the bytes had
+  already been transferred.** The never-clobber guarantee came from a hard
+  link, which those filesystems do not support — routine on Windows with a
+  `target_dir` on a USB stick. The completed transfer was thrown away with a
+  message that named no cause. Both bridges keep the hard-link fast path and
+  fall back to creating the destination with `O_EXCL`, which preserves
+  never-clobber without needing link support (#194).
+- **A `~user`-style `target_dir` crashed the Python `upload` tool.** Any
+  leading `~` went to `expanduser()`, and `~nosuchuser/x` raises — escaping
+  the tool's contract that every failure comes back as `{status, error}`. Only
+  `~` and `~/…` expand now, byte-for-byte the Rust rule, and an unavailable
+  process cwd returns the documented error dict instead of raising (#194).
+- **A local video or audio file was read fully into RAM before anything
+  checked its size.** A 3–4 GB screen recording in a `gallery` item was
+  materialised before the 512 MB cap was consulted — an allocation failure
+  there is an OOM kill of the bridge, which the MCP host reports as the
+  thoroughly unhelpful "Server disconnected". Both bridges stat first and skip
+  an oversize clip; the Python read moved off the event loop so the progress
+  heartbeat keeps firing, and `MemoryError` no longer escapes the best-effort
+  handler (#194).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no
@@ -286,6 +330,16 @@ All notable changes to this project are documented here.
 
 ### Security
 
+- **`POST /media` could mint any Content-Type on the API's own origin.** The
+  `ext` parameter went through a sanitiser that kept any five lowercase
+  alphanumerics, and `ServeDir` derives the served `Content-Type` from it — so
+  `?ext=html` produced a `text/html` document on `127.0.0.1:<port>`, the same
+  origin as the authenticated API, reachable through an unauthenticated
+  capability URL. A prompt-injected agent holding the token could put that URL
+  in front of the user. The extension is now an allowlist of the ten types the
+  widgets actually play, everything else stores as `bin`, and `/media/blob`
+  responses carry `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox` (#194).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

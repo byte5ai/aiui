@@ -9,6 +9,7 @@ bugs.
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -288,3 +289,75 @@ def test_collect_and_replace_local_audio_mirrors_rust() -> None:
     # Untouched: https audio and the image.
     assert spec["fields"][1]["src"] == "https://x.test/two.mp3"
     assert spec["fields"][2]["src"] == "/Users/me/pic.png"
+
+
+class _RefusingClient:
+    """Stand-in for `httpx.AsyncClient` that fails the test if anything is
+    POSTed. The point of the size pre-check (#194) is that an oversize clip
+    never reaches the wire — and never reaches RAM either.
+    """
+
+    async def post(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("no /media POST may be attempted for an oversize clip")
+
+
+def _sparse_file(path: Path, size: int) -> None:
+    """A file that *reports* `size` without occupying it — reading it would
+    cost half a gigabyte, which is exactly what must not happen."""
+    with path.open("wb") as f:
+        f.truncate(size)
+
+
+def test_upload_local_videos_skips_oversize_file(tmp_path: Path) -> None:
+    from aiui_mcp.server import _MEDIA_FILE_CAP, _upload_local_videos
+
+    clip = tmp_path / "screen-recording.mp4"
+    _sparse_file(clip, _MEDIA_FILE_CAP + 1)
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": str(clip)}]}
+
+    warnings = asyncio.run(_upload_local_videos(spec, _RefusingClient()))
+
+    # The path is left exactly as the agent wrote it — the render goes ahead,
+    # only without this clip.
+    assert spec["items"][0]["src"] == str(clip)
+    assert len(warnings) == 1
+    assert "too large" in warnings[0]
+    assert str(clip) in warnings[0]
+
+
+def test_upload_local_audios_skips_oversize_file(tmp_path: Path) -> None:
+    from aiui_mcp.server import _MEDIA_FILE_CAP, _upload_local_audios
+
+    memo = tmp_path / "voice-memo.mp3"
+    _sparse_file(memo, _MEDIA_FILE_CAP + 1)
+    spec = {"kind": "form", "fields": [{"kind": "audio", "src": str(memo)}]}
+
+    warnings = asyncio.run(_upload_local_audios(spec, _RefusingClient()))
+
+    assert spec["fields"][0]["src"] == str(memo)
+    assert len(warnings) == 1
+    assert "too large" in warnings[0]
+
+
+def test_upload_local_videos_reports_a_missing_clip(tmp_path: Path) -> None:
+    # A missing path is the same class of non-fatal failure: the render
+    # proceeds, and the agent is told rather than left to wonder why the user
+    # saw a broken player (#194).
+    from aiui_mcp.server import _upload_local_videos
+
+    missing = tmp_path / "gone.mp4"
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": str(missing)}]}
+    warnings = asyncio.run(_upload_local_videos(spec, _RefusingClient()))
+    assert len(warnings) == 1
+    assert "not a file" in warnings[0]
+    assert spec["items"][0]["src"] == str(missing)
+
+
+def test_a_clean_render_produces_no_warnings(tmp_path: Path) -> None:
+    # The warning list must stay empty when nothing failed — `_post_render`
+    # only adds `media_warnings` to the result when there is something to
+    # say, and an always-present empty list trains agents to skip the key.
+    from aiui_mcp.server import _upload_local_videos
+
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": "https://x.test/clip.mp4"}]}
+    assert asyncio.run(_upload_local_videos(spec, _RefusingClient())) == []

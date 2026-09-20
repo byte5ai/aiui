@@ -307,6 +307,10 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
 
 _SRC_KEYS = {"src", "thumbnail"}
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB — mirrors the Rust resolver
+# Largest single clip the companion's `/media` cache accepts (#194). Mirrors
+# `media::MEDIA_FILE_CAP` in the Rust half; checked here *before* the read so
+# an oversize file is skipped rather than pulled into RAM first.
+_MEDIA_FILE_CAP = 512 * 1024 * 1024
 _LOCAL_PATH_MIME_OVERRIDES = {
     # mimetypes.guess_type returns None for SVG without a hint on some
     # Pythons, and `image/svg` (without `+xml`) on others. Lock it down
@@ -429,7 +433,32 @@ def _replace_srcs(node: Any, mapping: dict[str, str]) -> None:
             _replace_srcs(item, mapping)
 
 
-async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+async def _read_media_file(p: str) -> bytes:
+    """Read a local media file for the `/media` push, size-checked first (#194).
+
+    Two things the old inline `read_bytes()` got wrong. It learned the size
+    only *after* materialising the file, so a 3–4 GB screen recording — an
+    ordinary thing to hand a `gallery` — was pulled into RAM before anything
+    compared it to the companion's 512 MB ceiling; the `MemoryError` that can
+    follow is not an `OSError`, so it escaped the best-effort handler and
+    killed the whole tool call instead of skipping one clip. And it was
+    blocking I/O inside an `async def`, stalling the event loop — and with it
+    the progress heartbeat — for the whole read.
+
+    Raises `ValueError` for a file that is missing, not a file, or over the
+    cap; `OSError` for a read that fails. Same shape as
+    `_read_path_as_data_url`.
+    """
+    path = Path(p).expanduser()
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
+    size = path.stat().st_size
+    if size > _MEDIA_FILE_CAP:
+        raise ValueError(f"too large: {size} bytes (max {_MEDIA_FILE_CAP})")
+    return await asyncio.to_thread(path.read_bytes)
+
+
+async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> list[str]:
     """Push local video files to the companion's `/media` cache and rewrite
     their `src`/`thumbnail` to the returned loopback playback URL.
 
@@ -439,17 +468,23 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
     locally, reverse tunnel remotely). Best-effort: a read error, a 413, or
     an old companion without `/media` (404) leaves the path untouched, and
     `_resolve_local_paths` then does whatever it can with it.
+
+    Returns one human-readable warning per clip that did not make it (#194).
+    The render still happens — only the silence was wrong: the user saw a
+    broken player while the agent believed the clip was on screen.
     """
     paths: list[str] = []
     _collect_local_videos(spec, paths)
+    warnings: list[str] = []
     if not paths:
-        return
+        return warnings
     mapping: dict[str, str] = {}
     for p in paths:
         try:
-            data = Path(p).expanduser().read_bytes()
-        except OSError as e:
+            data = await _read_media_file(p)
+        except (OSError, ValueError, MemoryError) as e:
             log.warning("video skipped (read failed) %s: %s", p, e)
+            warnings.append(f"video not shown — {p}: {e}")
             continue
         ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp4"
         try:
@@ -466,10 +501,12 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
             url = r.json().get("url")
         except (httpx.HTTPError, ValueError) as e:
             log.warning("video upload failed %s: %s", p, e)
+            warnings.append(f"video not shown — {p}: {e}")
             continue
         if url:
             mapping[p] = url
     _replace_srcs(spec, mapping)
+    return warnings
 
 
 _AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac")
@@ -501,7 +538,7 @@ def _collect_local_audios(node: Any, out: list[str]) -> None:
             _collect_local_audios(item, out)
 
 
-async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) -> list[str]:
     """Push local audio files to the companion's `/media` cache and rewrite
     their `src`/`thumbnail` to the returned loopback playback URL (#25).
 
@@ -512,17 +549,22 @@ async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) 
     Best-effort: a read error, a 413, or an old companion without `/media`
     (404) leaves the path untouched, and `_resolve_local_paths` then does
     whatever it can with it.
+
+    Returns one warning per clip that did not make it (#194), same contract
+    as the video half.
     """
     paths: list[str] = []
     _collect_local_audios(spec, paths)
+    warnings: list[str] = []
     if not paths:
-        return
+        return warnings
     mapping: dict[str, str] = {}
     for p in paths:
         try:
-            data = Path(p).expanduser().read_bytes()
-        except OSError as e:
+            data = await _read_media_file(p)
+        except (OSError, ValueError, MemoryError) as e:
             log.warning("audio skipped (read failed) %s: %s", p, e)
+            warnings.append(f"audio not played — {p}: {e}")
             continue
         ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp3"
         try:
@@ -539,10 +581,12 @@ async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) 
             url = r.json().get("url")
         except (httpx.HTTPError, ValueError) as e:
             log.warning("audio upload failed %s: %s", p, e)
+            warnings.append(f"audio not played — {p}: {e}")
             continue
         if url:
             mapping[p] = url
     _replace_srcs(spec, mapping)
+    return warnings
 
 
 def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -767,9 +811,21 @@ def _upload_expand_dir(raw: str) -> Path | None:
     relative path — there is no stable cwd contract to resolve it against, so
     it's treated as a caller error (the cwd default is applied by the caller
     only when `target_dir` is absent). Mirrors `expand_dir` in the Rust bridge.
+
+    #194: only `~` and `~/…` are expandable, byte-for-byte the Rust rule. Any
+    other leading `~` — `~nosuchuser/x` — used to reach `expanduser()`, which
+    raises `RuntimeError: Could not determine home directory` for an unknown
+    user. That escaped the `upload` tool entirely and broke its contract that
+    every failure comes back as `{status: "error", error}`. It is now just
+    another unexpandable path, and the caller says so in words.
     """
+    if raw == "~" or raw.startswith("~/"):
+        try:
+            return Path(raw).expanduser()
+        except (RuntimeError, OSError):
+            return None
     if raw.startswith("~"):
-        return Path(raw).expanduser()
+        return None
     p = Path(raw)
     return p if p.is_absolute() else None
 
@@ -794,14 +850,48 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
                 os.link(tmp, dest)
             except FileExistsError:
                 return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+            except OSError as e:
+                # #194: exFAT/FAT32 and many SMB mounts have no hard links, so
+                # an upload to a USB stick or a share failed *after* the bytes
+                # had crossed the tunnel, with an OS message that named no
+                # cause the user could act on. Fall back to creating the
+                # destination with O_EXCL: no-clobber survives (that is the
+                # promise), atomicity does not (which nothing promises).
+                log.info("hard link unsupported for %s (%s) — writing directly", dest, e)
+                _upload_write_exclusive(dest, data)
         finally:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+    except FileExistsError:
+        return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
     except OSError as e:
         return {"status": "error", "error": f"writing {dest}: {e}"}
     return {"status": "ok", "path": str(dest), "filename": filename, "bytes": len(data)}
+
+
+def _upload_write_exclusive(dest: Path, data: bytes) -> None:
+    """Create `dest` with `O_EXCL` and write `data` into it (#194).
+
+    The never-clobber half of `_upload_write` for filesystems without hard
+    links. Raises `FileExistsError` when the destination is taken — the same
+    signal `os.link` gives — and cleans up a partially written file it created
+    itself, so a retry doesn't trip over our own debris. Mirrors
+    `fsutil::write_new_unlinked` in the Rust bridge.
+    """
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
 
 
 async def _upload_heartbeat(ctx: Context) -> None:
@@ -911,11 +1001,11 @@ async def _post_render(
         # Video first: push local video files to the Mac's /media cache and
         # swap their `src` for the returned playback URL — BEFORE the image
         # inliner runs, so it never tries to base64 a huge clip.
-        await _upload_local_videos(spec, client)
+        media_warnings = await _upload_local_videos(spec, client)
         # Audio (#25): same reasoning — local audio for the form `audio`
         # field is routed through the /media cache instead of the 10 MB
         # `data:` inliner, uniformly regardless of clip size.
-        await _upload_local_audios(spec, client)
+        media_warnings += await _upload_local_audios(spec, client)
         # Resolve any absolute / `~/`-rooted file paths *before* shipping
         # the spec down the HTTP wire. This bridge runs on the same host
         # as the agent — local for Mac use, remote for SSH-tunneled
@@ -967,6 +1057,12 @@ async def _post_render(
     # channel, never via the agent). Secret values are written and stripped
     # before the result is handed to the agent.
     _apply_target_writes(spec, data)
+    # #194: a clip that never reached the media cache used to produce a
+    # broken player for the user and no signal at all for the agent. The key
+    # only appears when something actually failed — an always-present empty
+    # list trains agents to skip it.
+    if media_warnings:
+        data["media_warnings"] = media_warnings
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
@@ -987,8 +1083,22 @@ def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
         reason = payload.get("reason")
         if isinstance(reason, str) and reason:
             out["reason"] = reason
+        _carry_media_warnings(payload, out)
         return out
-    return {"cancelled": False, **payload.get("result", {})}
+    out = {"cancelled": False, **payload.get("result", {})}
+    _carry_media_warnings(payload, out)
+    return out
+
+
+def _carry_media_warnings(payload: dict[str, Any], out: dict[str, Any]) -> None:
+    """Forward `media_warnings` from the render payload onto the tool result
+    (#194). Mirrors `carry_media_warnings` in the Rust bridge — and applies to
+    the cancelled branch too: a user who cancels *because* the clip was a
+    broken player is exactly the case the agent needs the warning for.
+    """
+    warnings = payload.get("media_warnings")
+    if warnings:
+        out["media_warnings"] = warnings
 
 
 @mcp.tool()
@@ -1337,19 +1447,25 @@ async def upload(
       `target_dir` or move the old file first.
     - Blocks until the user picks a file or dismisses the picker. Progress
       notifications fire every ~10 s meanwhile — a slow response just means the
-      user is choosing a file, not that aiui is broken.
+      user is choosing a file, not that aiui is broken. The picker may take a
+      moment to come forward.
+    - Only one picker at a time: a concurrent `upload` errors with "another
+      upload is already waiting" — let that one finish, then retry. An
+      unanswered picker times out with an error rather than hanging forever.
 
     Returns `{status: "ok", path, filename, bytes}` on success, or
     `{status: "error", error}` on any failure (user cancelled, file unreadable,
-    file too large — 512 MB cap, target directory missing/not writable). Report
-    briefly; on `ok`, mention the path the file landed at.
+    file too large — 512 MB cap, target directory missing/not writable, another
+    upload in flight, picker never answered). Report briefly; on `ok`, mention
+    the path the file landed at.
 
     Args:
         target_dir: Absolute or `~/`-rooted directory on your host where the
             picked file is written as `<target_dir>/<filename>`. Defaults to
             your process's cwd.
-        session: Short human label for this session, shown in aiui's window
-            chrome so parallel dialogs stay distinguishable.
+        session: Short human label for this session, shown in the file
+            picker's title bar so the user can tell which agent asked for a
+            file.
     """
     # Resolve the destination up front so a bad target_dir fails before the
     # picker even opens (nothing worse than picking a file only to be rejected).
@@ -1361,7 +1477,15 @@ async def upload(
                 "error": f"target_dir must be an absolute or ~/-rooted path, got '{target_dir}'",
             }
     else:
-        dest_dir = Path.cwd()
+        # #194: `Path.cwd()` raises when the process's working directory has
+        # been removed — an exception escaping `upload` breaks its contract
+        # that every failure comes back as `{status: "error", error}`. The
+        # Rust bridge already answered "no target_dir given and cwd
+        # unavailable"; say the same thing here.
+        try:
+            dest_dir = Path.cwd()
+        except (OSError, RuntimeError) as e:
+            return {"status": "error", "error": f"no target_dir given and cwd unavailable: {e}"}
     if not dest_dir.is_dir():
         return {"status": "error", "error": f"target directory does not exist: {dest_dir}"}
 
@@ -1374,6 +1498,10 @@ async def upload(
             r = await client.post(
                 f"{ENDPOINT}/upload",
                 headers={"Authorization": f"Bearer {_token()}"},
+                # #194: the optional body titles the picker, so a user facing
+                # several agents can tell which one is asking. Additive — an
+                # older companion has no body extractor and ignores it.
+                json={"session": session},
             )
     except httpx.HTTPError as e:
         return {"status": "error", "error": f"POST /upload failed: {_explain_exc(e)}"}
@@ -1383,6 +1511,26 @@ async def upload(
 
     if r.status_code == 204:
         return {"status": "error", "error": "upload cancelled — no file was selected"}
+    if r.status_code == 409:
+        # #194: the companion serialises the native picker — two stacked
+        # system panels are indistinguishable to the user.
+        return {
+            "status": "error",
+            "error": (
+                "another upload is already waiting for the user — one file picker at a "
+                "time. Wait for that one to be answered, then retry."
+            ),
+        }
+    if r.status_code == 504:
+        # #194: the companion's own 600 s bound fires before this bridge's
+        # 900 s, so its diagnosis wins the race over a generic timeout.
+        return {
+            "status": "error",
+            "error": (
+                "the file picker was never answered — it timed out on the user's "
+                "machine. Ask the user whether the picker appeared, then retry."
+            ),
+        }
     if r.status_code == 413:
         return {"status": "error", "error": f"selected file too large: {r.text[:200]}"}
     if r.status_code != 200:

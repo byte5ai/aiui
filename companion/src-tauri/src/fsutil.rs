@@ -149,7 +149,32 @@ pub fn atomic_write_with_mode(
 /// by the upload tool, whose contract is a deterministic destination that
 /// must not clobber the user's data even under a concurrent create (codex
 /// review P2).
+///
+/// #194: hard links do not exist on exFAT/FAT32 and many SMB mounts — an
+/// upload to a USB stick or a network share failed *after* the bytes had
+/// crossed the tunnel, with `ERROR_NOT_SUPPORTED` and no hint that the
+/// filesystem was the problem. Any link error that is **not**
+/// `AlreadyExists` therefore falls back to [`write_new_unlinked`]. Never
+/// `exists()` + `rename`: that reopens the very race the hard link closes.
 pub fn write_new(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    write_new_with_linker(path, content, hard_link_exact)
+}
+
+/// `fs::hard_link` at exactly the signature [`write_new_with_linker`] wants.
+/// The generic `fs::hard_link` itself cannot be passed there: its type
+/// parameters fix the argument lifetimes at instantiation, so the fn item
+/// does not satisfy the higher-ranked `Fn(&Path, &Path)` bound.
+fn hard_link_exact(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::hard_link(from, to)
+}
+
+/// [`write_new`] with the link step injected, so the unsupported-link
+/// fallback is testable on a filesystem that happily supports links.
+fn write_new_with_linker(
+    path: &Path,
+    content: &[u8],
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let tmp = path.with_extension(format!(
@@ -168,9 +193,42 @@ pub fn write_new(path: &Path, content: &[u8]) -> std::io::Result<()> {
         f.write_all(content)?;
         f.sync_all()?;
     }
-    let res = fs::hard_link(&tmp, path);
+    let res = link(&tmp, path);
     let _ = fs::remove_file(&tmp);
-    res
+    match res {
+        Ok(()) => Ok(()),
+        // The destination exists — the one error that is the contract, not a
+        // filesystem limitation. Report it unchanged.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        // Anything else (no link support, cross-device, ACL) → write at the
+        // destination directly.
+        Err(_) => write_new_unlinked(path, content),
+    }
+}
+
+/// Never-clobber write for filesystems without hard links: create the
+/// destination with `O_EXCL`/`CREATE_NEW` and write into it.
+///
+/// `create_new` keeps the guarantee that matters — a destination that
+/// already exists (or appears between the open and the write) fails with
+/// `AlreadyExists`, never gets clobbered. What is lost is *atomicity*: a
+/// crash mid-write can leave a partial file where the hard-link path would
+/// have left nothing. `upload`'s contract promises no-clobber, not
+/// all-or-nothing, and a partial file on a stick beats a refused transfer
+/// after the bytes already crossed the wire.
+fn write_new_unlinked(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(e) = f.write_all(content) {
+        // A half-written destination we created ourselves is worse than
+        // none: the next attempt would hit AlreadyExists on our own debris.
+        drop(f);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    f.sync_all()
 }
 
 #[cfg(test)]
@@ -200,6 +258,59 @@ mod tests {
         let err = write_new(&target, b"second").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_new_falls_back_when_link_unsupported() {
+        // #194: exFAT/FAT32/SMB have no hard links, so the link fails with
+        // something that is *not* AlreadyExists — after the upload's bytes
+        // have already crossed the tunnel. The file must still land.
+        let dir = std::env::temp_dir().join(format!("aiui-fsutil-nolink-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("stick.bin");
+        // A plain fn, not a closure: only its lifetimes are generic, so it
+        // satisfies the higher-ranked `Fn(&Path, &Path)` bound as-is.
+        fn unsupported(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the request is not supported",
+            ))
+        }
+        write_new_with_linker(&target, b"first", unsupported).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+        // No-clobber survives the fallback: `create_new` fails the same way
+        // the hard link would have.
+        let err = write_new_with_linker(&target, b"second", unsupported).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+        // And the temp file is cleaned up on both attempts.
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["stick.bin".to_string()], "stray temps: {names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_new_keeps_already_exists_from_the_link() {
+        // The one error that must NOT trigger the fallback: a destination
+        // that already exists is the contract, not a filesystem limitation.
+        let dir = std::env::temp_dir().join(format!("aiui-fsutil-exists-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("taken.txt");
+        fs::write(&target, "original").unwrap();
+        fn taken(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "exists",
+            ))
+        }
+        let err = write_new_with_linker(&target, b"new", taken).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -302,9 +302,16 @@ a **native file picker on the user's machine**; the chosen file is written to
 - Don't ask which file or where — the user picks in the dialog, you infer
   the target. Deterministic: lands at exactly `target_dir/<filename>`, no
   staging path. Existing files are never overwritten (a clash errors).
+- One picker at a time: a second `upload` while another is waiting errors
+  with "another upload is already waiting for the user" — two stacked system
+  panels are indistinguishable to the user. Let the first finish, then retry.
+- Optional `session` (e.g. `billing-migration`) titles the picker window, so
+  a user running several agents can tell which one is asking.
 - Returns `{status:"ok", path, filename, bytes}` or `{status:"error", error}`
-  (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir).
-  Blocks until pick/cancel; progress fires every ~10 s meanwhile.
+  (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir,
+  another upload in flight, picker never answered). Blocks until pick/cancel;
+  progress fires every ~10 s meanwhile. The picker may take a moment to come
+  forward, and an unanswered one times out with an error rather than hanging.
 
 ## Side-by-side compare: `compare`
 
@@ -374,6 +381,13 @@ Three input formats render correctly:
 
 **Pick the simplest one that works:** path if the file's on disk, then URL
 if reachable, `data:` only as last resort.
+
+**When a clip doesn't make it:** a local video or audio file that can't be
+pushed to the `/media` cache — missing, unreadable, or over the 512 MB
+per-file cap — never fails the render. The dialog opens with a broken
+player where that clip should be, and the result carries a
+`media_warnings: [...]` list naming each path and why. Read it: without it
+you'd believe the user saw something they didn't.
 
 Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
 against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
