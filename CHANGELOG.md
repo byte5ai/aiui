@@ -228,6 +228,36 @@ All notable changes to this project are documented here.
   job runs a `3.10 / 3.12 / 3.14` matrix on all three operating systems, so
   the declared `requires-python` floor and the bridge's own Windows
   token-path branch are exercised rather than asserted (#210).
+- **An `npm audit` gate in CI** — `npm audit --audit-level=high
+  --omit=optional` in the `companion` job, so a new high advisory turns the
+  PR red instead of accumulating unseen until someone runs the command by
+  hand. `--omit=optional` is the `appdmg` exemption and the reason is
+  written next to it: it builds the release DMG, its `image-size`
+  advisories are denial-of-service parsers fed exactly one input — our own
+  `background.png` — and npm's proposed fix is a downgrade to
+  `appdmg@0.1.0`, which does not build a DMG (#212).
+- **`.github/dependabot.yml`**, covering npm (companion), cargo
+  (companion/src-tauri), pip (python) and github-actions, weekly. Nothing
+  looked at a dependency after it was pinned; the audit gate stops a new
+  advisory landing, and this is what produces the PR that clears one. It is
+  also the maintenance half of SHA-pinned actions (#192) — a pinned SHA is
+  only safe while something bumps it (#212).
+- **Frontend unit tests** — `npm test` (vitest, jsdom) alongside
+  `svelte-check` in CI. The first suite renders hostile Mermaid sources
+  through the real renderer and the real sanitiser, and asserts both
+  directions: no caller-supplied CSS reaches the DOM, and node labels are
+  still there afterwards, so neither the injection path nor the #189
+  blank-diagram regression can come back with a version bump (#212).
+
+### Changed
+
+- **Build-chain dependencies updated out of their advisory ranges.** `vite`
+  8.0.9 → 8.3.0 clears its own advisory and, with it, the transitive
+  `postcss` and `nanoid` ones. `svelte-i18n` stays on its current major:
+  npm's proposed fix is a downgrade to 3.7.1, so its bundled `esbuild` is
+  pinned forward with an `overrides` entry instead. `npm audit --omit=optional`
+  in `companion/` now reports zero advisories at every severity, not only
+  above the gate's threshold (#212).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -1418,6 +1448,26 @@ All notable changes to this project are documented here.
   new `scripts/check-i18n-parity.sh`, wired into CI, fails any PR that
   leaves a German literal outside a comment in a Svelte component or adds
   a key to one catalog but not the other (#207).
+- **A Mermaid `classDef` could put arbitrary CSS into a dialog window.**
+  Forbidding the `<style>` element (#189) closed only half the path:
+  Mermaid writes a `classDef`'s declarations verbatim into an inline
+  `style` attribute on the styled node, with `!important` appended to each
+  one. DOMPurify's svg profile allows that attribute and does not read the
+  CSS inside it, so an agent-supplied
+  `classDef x position:fixed,width:100vw,height:100vh,z-index:99999,opacity:0.02`
+  reached the DOM as an all-but-invisible sheet over the Confirm button —
+  UI redressing in exactly the window where destructive actions are
+  approved. `style` is now forbidden as an attribute as well as an
+  element, which costs nothing: the theme's own styling travels in the
+  stylesheet that was already being dropped. Hostile sources now go
+  through the real renderer and the real sanitiser in CI (#212).
+- **`dompurify`, `mermaid` and `svelte` updated out of their advisory
+  ranges** — 3.4.1 → 3.4.15, 11.14.0 → 11.17.2, 5.55.4 → 5.57.1. The
+  `dompurify` advisories are scoped to `IN_PLACE` sanitization, which aiui
+  never uses (both call sites pass a string and use the returned string),
+  and the `svelte` SSR advisory cannot apply to a client-only Vite SPA
+  inside Tauri; those two upgrades are hygiene rather than exposure. The
+  `mermaid` one was not (#212).
 - **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
   `classDef` directive turns caller-supplied text into emitted CSS, and
   the svg profile does not exclude `<style>`. Attacker-controlled CSS in a

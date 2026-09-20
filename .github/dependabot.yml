@@ -1,32 +1,70 @@
-# Keeps the SHA pins from #192 maintained rather than frozen.
+# Issue #212. Before this file, nothing in the repo looked at a dependency
+# after it was pinned: no `schedule:` trigger anywhere in `.github/`, no audit
+# step, so the advisory count against the lockfile could only grow between
+# releases and the only way anyone found out was running `npm audit` by hand.
 #
-# Pinning every `uses:` to a commit SHA removes the "an upstream tag
-# moved under us" risk and replaces it with "nobody ever updates these
-# again" — which is the same risk on a longer fuse. Dependabot rewrites
-# the SHA *and* the trailing `# vX.Y.Z` comment, so a bump stays a
-# reviewable one-line diff.
+# CI's `npm audit --audit-level=high` is the gate that stops a new high
+# advisory landing; this is the other half — the thing that produces the
+# update PR that clears one. It also keeps #192's SHA-pinned actions from
+# rotting: a pinned SHA is only safe as long as something bumps it.
+#
+# Weekly, on Monday, so the four ecosystems arrive together rather than
+# trickling in; `open-pull-requests-limit` is kept low deliberately, because a
+# queue nobody reads is the same as no queue.
 version: 2
 updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: chore
-
+  # Tauri companion frontend. `appdmg` lives here as an optionalDependency and
+  # is exempt from the CI audit gate (see ci.yml for why) — dependabot still
+  # reports on it, which is the right asymmetry: exempt from blocking, not
+  # exempt from being looked at.
   - package-ecosystem: npm
     directory: /companion
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    groups:
+      # `vite`, `svelte` and their plugins move together; one PR per bump of
+      # a shared build chain is noise, not signal.
+      build-chain:
+        patterns:
+          - "vite"
+          - "@sveltejs/*"
+          - "svelte"
+          - "svelte-check"
+          - "typescript"
+          - "vitest"
+          - "jsdom"
     commit-message:
       prefix: chore
 
+  # Tauri companion backend.
   - package-ecosystem: cargo
     directory: /companion/src-tauri
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+
+  # The Python MCP bridge. `pip` is dependabot's name for the ecosystem; it
+  # reads `pyproject.toml` here, uv's lockfile is not a dependabot format.
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+
+  # The workflows themselves — the maintenance half of #192's SHA pinning.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
     open-pull-requests-limit: 5
     commit-message:
       prefix: chore

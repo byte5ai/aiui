@@ -89,20 +89,29 @@ jobs:
         working-directory: companion
         run: npm ci
 
-      # #210: `--threshold error` alone let the warning count grow unnoticed
-      # — 10 today, and nothing said so. The guard fails on any error (as
-      # before) and on any warning ABOVE the recorded baseline, so the number
-      # can only fall. Lower the baseline in the script when it does.
+      # #212: npm audit is the gate — a new *high* advisory against the pinned
+      # lockfile turns the PR red; moderates ride dependabot's weekly PRs
+      # (.github/dependabot.yml) rather than blocking unrelated work.
+      # `--omit=optional` exempts appdmg (an optionalDependency used only by
+      # release-macos.yml's DMG build, fed only our own src-tauri/dmg/
+      # background.png — no attacker input); npm's "fix" is a downgrade to
+      # appdmg@0.1.0 that cannot build the DMG.
+      - name: npm audit (production + dev, optional deps exempt)
+        working-directory: companion
+        run: npm audit --audit-level=high --omit=optional
+
+      # #210: fails on any error and on any warning ABOVE the recorded
+      # baseline, so the count can only fall. Lower it in the script when it does.
       - name: Svelte type-check (errors + warning baseline)
         shell: bash
         run: ./scripts/check-svelte-warnings.sh
 
-      # #206/#208: the frontend's form logic and the settings pane — what the
-      # user's answer actually IS, plus the visibility-gated status poll, the
-      # health-banner debounce and the two-step remote removal — were covered
-      # by nothing but the type-check above. Runs on every matrix leg; the
-      # unit half is DOM-free, the component half uses jsdom, so both are
-      # platform-independent.
+      # The frontend vitest suite, on every matrix leg (a DOM-free unit half
+      # plus a jsdom component half, both platform-independent): the form logic
+      # and the settings pane — what the user's answer actually IS (#206/#208) —
+      # the TypeScript update path (#197), and hostile-Mermaid sanitisation,
+      # which stops a dependency bump from reopening the classDef CSS-injection
+      # path or emptying diagrams the way #189 did (#212).
       - name: Frontend tests
         working-directory: companion
         run: npm test
@@ -110,15 +119,6 @@ jobs:
       - name: Vite build
         working-directory: companion
         run: npm run build
-
-      # #197: the frontend had no test runner at all, so the update path —
-      # entirely TypeScript, and the one path whose failures are invisible
-      # by construction — had zero coverage. `vitest` runs on both matrix
-      # legs: the suite is pure logic over mocked Tauri plugins, so unlike
-      # the Rust test binary it has no Windows loader problem.
-      - name: Frontend unit tests
-        working-directory: companion
-        run: npm run test
 
       - name: Cargo check
         working-directory: companion/src-tauri

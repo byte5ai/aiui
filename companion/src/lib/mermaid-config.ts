@@ -50,11 +50,30 @@ export const MERMAID_INIT_CONFIG = {
  * Mermaid's `classDef` directive turns caller-supplied text into emitted
  * CSS, and attacker-controlled CSS in a dialog window is UI redressing —
  * these windows are where the user clicks Confirm on destructive actions.
+ *
+ * #212 measured where that CSS actually lands, and the `<style>` element is
+ * not the whole answer: Mermaid emits a `classDef`'s declarations as an
+ * inline `style` attribute on the styled node, verbatim and with
+ * `!important` appended to every one of them. DOMPurify's svg profile allows
+ * `style`, and DOMPurify does not parse the CSS inside it — so a source line
+ * like
+ *
+ *   classDef x position:fixed,top:0,width:100vw,height:100vh,z-index:99999,opacity:0.02
+ *
+ * reached the DOM intact as a near-invisible overlay covering the whole
+ * dialog, including the Confirm button. Hence `style` is forbidden as an
+ * attribute too, not only as an element. The cost is nil: the theme's own
+ * styling travels in the `<style>` block this sanitiser already drops, so
+ * nothing we ship was getting its look from an inline `style` either.
+ *
+ * Both halves are exercised against the real renderer in
+ * `mermaid-config.test.ts` — a Mermaid bump that moves caller-supplied CSS
+ * to some third channel is meant to turn that red.
  */
 export function sanitizeMermaidSvg(raw: string): string {
   return DOMPurify.sanitize(raw, {
     USE_PROFILES: { svg: true, svgFilters: true },
     FORBID_TAGS: ["script", "style", "foreignObject"],
-    FORBID_ATTR: ["onclick", "onload", "onerror", "onmouseover"],
+    FORBID_ATTR: ["style", "onclick", "onload", "onerror", "onmouseover"],
   });
 }
