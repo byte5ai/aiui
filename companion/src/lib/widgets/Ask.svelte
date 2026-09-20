@@ -73,7 +73,10 @@
       </button>
     {/each}
 
-    {#if spec.allowOther ?? true}
+    <!-- Opt-in, never defaulted on (#203): a spec that omits `allowOther`
+         gets the option list only. Both bridges send the key explicitly, so
+         this fallback only governs a hand-rolled POST /render. -->
+    {#if spec.allowOther === true}
       <!-- The text field is a SIBLING of the toggle, never nested inside a
            <button>. Nesting an <input> in a <button> made WebKit treat the
            Space key as button-activation, which flipped `otherActive` off,

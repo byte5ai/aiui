@@ -46,13 +46,73 @@ def _version() -> str:
 VERSION = _version()
 BUILD_INFO = f"aiui-mcp v{VERSION}"
 
+
+# Warnings raised while parsing env knobs *before* `basicConfig` has run —
+# drained through `log` the moment it exists, just below `basicConfig`.
+_ENV_WARNINGS: list[str] = []
+
+
+def _env_warn(message: str) -> None:
+    """Queue or emit a bad-env-value warning depending on whether logging is
+    configured yet. `AIUI_LOG_LEVEL` is parsed before `basicConfig`, so that
+    one warning has nowhere to go until afterwards."""
+    if "log" in globals():
+        log.warning("%s", message)
+    else:
+        _ENV_WARNINGS.append(message)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float knob from the environment, never letting a typo in one
+    stop the server from starting (#203).
+
+    These parses run at import time, before FastMCP registers a single tool,
+    so an unguarded `float("120s")` turns `AIUI_TIMEOUT_S=120s` into "the aiui
+    MCP server failed to start", with the cause buried in a log the user may
+    not know how to open — and these are exactly the knobs someone reaches
+    for while debugging a flaky tunnel. A bad value falls back to the default
+    and is *warned about*: silently ignoring it would leave the user believing
+    a knob took effect that never did.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _env_warn(f"{name}={raw!r} is not a number — ignoring it, using {default}")
+        return default
+
+
+# Spelled out rather than via `logging.getLevelNamesMapping()`, which only
+# exists from 3.11 — this package supports 3.10.
+_LOG_LEVELS = frozenset({"CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET"})
+
+
+def _env_log_level(default: str = "INFO") -> str:
+    """Same contract as `_env_float`, for `AIUI_LOG_LEVEL`. `basicConfig`
+    raises `ValueError: Unknown level: 'TRACE'` for anything that is not a
+    known level name, which would kill the process just as dead."""
+    raw = os.environ.get("AIUI_LOG_LEVEL")
+    if raw is None:
+        return default
+    level = raw.strip().upper()
+    if level in _LOG_LEVELS:
+        return level
+    _env_warn(f"AIUI_LOG_LEVEL={raw!r} is not a known log level — using {default}")
+    return default
+
+
 logging.basicConfig(
-    level=os.environ.get("AIUI_LOG_LEVEL", "INFO").upper(),
+    level=_env_log_level(),
     format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stderr,
 )
 log = logging.getLogger("aiui")
+for _queued in _ENV_WARNINGS:
+    log.warning("%s", _queued)
+_ENV_WARNINGS.clear()
 log.info("---- %s started pid=%d ----", BUILD_INFO, os.getpid())
 
 
@@ -82,8 +142,8 @@ def _default_token_path() -> str:
 
 TOKEN_PATH = Path(os.environ.get("AIUI_TOKEN_PATH", _default_token_path())).expanduser()
 ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
-TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
-HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
+TIMEOUT_S = _env_float("AIUI_TIMEOUT_S", 120.0)
+HEALTH_TIMEOUT_S = _env_float("AIUI_HEALTH_TIMEOUT_S", 3.0)
 
 # Cooperative version floor (Step 2). The wire contract between this bridge and
 # the Mac companion is versioned independently of either side's release version.
@@ -100,7 +160,7 @@ _wire_checked = False
 # companion answers or this budget elapses — so a freshly-launched Claude
 # Desktop / just-up SSH tunnel gets time to start serving instead of failing
 # the first call. Replaces the brittle single 3 s /health preflight.
-COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
+COLDSTART_WAIT_S = _env_float("AIUI_COLDSTART_WAIT_S", 30.0)
 
 # Per-GET timeout for the async-render poll. Must exceed the companion's
 # ~25 s server-side poll window so the server always answers `{pending:true}`
@@ -142,7 +202,7 @@ CANCEL_RENDER_TIMEOUT_S = 2.0
 # choosing, so this is deliberately generous — far beyond any realistic
 # file-picker think-time. A periodic progress notification keeps the MCP client
 # reassured while the call is held.
-UPLOAD_TIMEOUT_S = float(os.environ.get("AIUI_UPLOAD_TIMEOUT_S", "900"))
+UPLOAD_TIMEOUT_S = _env_float("AIUI_UPLOAD_TIMEOUT_S", 900.0)
 UPLOAD_FILE_CAP = 512 * 1024 * 1024  # mirrors the companion's cap
 
 _INSTRUCTIONS = """\
@@ -1537,7 +1597,7 @@ async def ask(
     options: list[dict[str, Any]],
     header: str | None = None,
     multi_select: bool = False,
-    allow_other: bool = True,
+    allow_other: bool = False,
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -1569,7 +1629,11 @@ async def ask(
             "thumbnail"?: str}`.
         header: Short chip above the question (≤ 14 chars).
         multi_select: Allow selecting multiple options.
-        allow_other: Offer a free-text fallback.
+        allow_other: Offer a free-text fallback. Off by default — opt in when
+            an answer you did not list is genuinely useful, because the reply
+            then comes back in `other` instead of `answers`.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "ask",
@@ -1691,6 +1755,8 @@ async def form(
             Rarely needed — prefer `size`.
         height: Explicit starting height in logical px (overrides `size`).
             Rarely needed — prefer `size`.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "form",
@@ -1747,11 +1813,16 @@ async def confirm(
         message: One-sentence explanation of what happens on confirm.
         header: Chip above the title.
         destructive: Red confirm button.
-        confirm_label: Defaults to "Ja".
-        cancel_label: Defaults to "Nein".
+        confirm_label: Defaults to the companion's localized affirmative
+            label — resolved from the user's locale, so do not name it in
+            chat unless you set it yourself.
+        cancel_label: Defaults to the companion's localized negative label,
+            same rule.
         image: `{"src": str, "alt"?: str, "max_height"?: int}`. Shown above
             the title for visual confirmation. `src` follows the standard
             aiui resolution rules.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "confirm",
@@ -2097,6 +2168,11 @@ async def notify(
         sound: Optional OS notification sound name (e.g. "default").
             Omit for silent.
     """
+    # Cold-start gate, same as the render path (#203). `notify` is by
+    # definition called when a long task finishes — the moment the tunnel is
+    # most likely to have just been re-established — so failing instantly
+    # against a companion that is still starting is exactly the wrong trade.
+    await _wait_for_aiui()
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
             r = await client.post(
@@ -2278,6 +2354,10 @@ async def aiui_health() -> dict[str, Any]:
     ``ok`` reports whether the companion answered 200, so a degraded-but-serving
     companion comes back as ``ok: true`` with ``ready: false``.
     """
+    # Deliberately NOT gated by `_wait_for_aiui` (#203). Every other tool
+    # waits out a cold start; this one is the diagnostic and must answer fast
+    # — spending COLDSTART_WAIT_S before reporting "unreachable" would make
+    # the tool people run *because* things hang hang too. Do not "fix" this.
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
             r = await client.get(
@@ -2326,6 +2406,7 @@ async def version_tool() -> dict[str, Any]:
     Cheap; does not hit the network. Works against both a local companion
     (on-Mac) and a remote one reached via SSH tunnel.
     """
+    await _wait_for_aiui()  # cold-start gate, as on every other tool (#203)
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
             r = await client.get(
@@ -2361,6 +2442,10 @@ async def update_tool() -> dict[str, Any]:
     MCP is local or reached via an SSH reverse-tunnel — because the
     /update HTTP endpoint lives on the aiui companion, not on this process.
     """
+    # Cold-start gate (#203): `update` is the tool a user reaches for right
+    # after restarting things, i.e. against a companion that is still coming
+    # up.
+    await _wait_for_aiui()
     # Use the long render timeout because download + install of the updater
     # bundle can take several seconds on a slow network.
     try:

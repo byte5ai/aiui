@@ -9,7 +9,8 @@ aiui exposes MCP tools that render native dialogs on the user's machine,
 plus one that doesn't wait for the user at all:
 
 - `confirm` — irreversible yes/no
-- `ask` — single- or multi-choice with descriptions and optional free-text fallback
+- `ask` — single- or multi-choice with descriptions and an optional
+  free-text fallback (`allow_other`, default off)
 - `form` — composite window with typed fields and multiple action buttons
 - `gallery` — batch review of images/videos, one decision per item
 - `compare` — side-by-side A/B (or A/B/C) content compare, pick one

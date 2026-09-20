@@ -104,6 +104,34 @@ All notable changes to this project are documented here.
   CONFLICT branch, `aiui_busy_result`) is deleted rather than left looking
   like live behaviour: the bundled bridge ships in the same binary as the
   companion, so it can never meet a 409-era companion (#202).
+- **`ask`'s free-text fallback is now off by default on every host.** The
+  remote bridge defaulted `allow_other` to `true` and the companion's own
+  bridge to `false`, so identical agent code showed the user an "Other
+  answer" box over the SSH tunnel and a bare option list on the Mac — and
+  could get back, in `other`, an answer it never offered. `false` wins: the
+  agent opts in to receiving an answer outside its list, which is what both
+  `skill.md` copies already implied and now state. Visible to remote callers
+  that relied on the box appearing; they pass `allow_other=True`. Not a wire
+  break — both bridges always send the key, so old and new halves pair in
+  either direction (#203).
+- **`notify`, `version` and `update` wait out a cold companion on the remote
+  bridge.** They skipped the `/ping` gate every other tool runs, which is
+  worst on `notify`: it is called when a long task finishes — exactly when
+  the tunnel may have just come back — and failed instantly where the local
+  bridge would have waited and succeeded. When the companion is genuinely
+  down these now take up to `AIUI_COLDSTART_WAIT_S` to fail instead of
+  failing at once; that is the trade the render path already makes.
+  `aiui_health` stays un-gated on purpose — it is the diagnostic (#203).
+- **`session` is documented on all six dialog tools.** `ask`, `confirm` and
+  `form` described it nowhere, so a remote agent saw a bare untyped
+  parameter on the three most-used tools and labelled its dialogs less often
+  exactly where a user with parallel sessions needs the window titles to
+  differ (#203).
+- **`confirm` no longer promises German buttons.** Its docstring stated as
+  fact that the labels default to "Ja"/"Nein"; they are resolved through
+  svelte-i18n from the user's locale, so most users read Yes/No and the
+  agent was telling them to click a button that wasn't there. Both bridges
+  now describe the labels as locale-resolved rather than naming any (#203).
 - **Two code comments described an auto-install path that does not exist.**
   `checkForUpdates`'s header still documented transparent install and
   relaunch, naming a file deleted in the multi-window refactor, and
@@ -681,6 +709,32 @@ All notable changes to this project are documented here.
   wired into the async path. The fake now honours the header, serves one
   `{pending: true}` before the result, and can drop polls, omit the render
   id or reject a spec; `sync_mode` keeps the legacy path covered (#202).
+- **MCP `ping` was answered `-32601 method not found`.** The spec requires a
+  prompt empty result and lets the sender treat a missing one as a stale
+  connection and terminate the session — so a host doing ping-based liveness
+  saw aiui as disconnected rather than as a server that simply hadn't
+  implemented a utility method. One named arm; the catch-all stays strict,
+  because that `-32601` is also the 2026-07-28 `server/discover` downgrade
+  signal (#203).
+- **`notify` without a `body` died as a serde dump.** The companion's bridge
+  posted absent optionals as explicit `null`, and `#[serde(default)]` fires
+  only for an *absent* key — so the request was rejected by axum's extractor
+  with a plain-text "invalid type: null, expected a string at line 1 column
+  …" and never reached the purpose-built `{"error":"invalid_request",
+  "detail":…}` path a few lines below. The bridge now omits what it has no
+  value for, `/notify` treats a null as not-given, and a structured error
+  from the companion is unwrapped to its `detail` instead of concatenated
+  raw — as the remote bridge already did. Reads as "your call was wrong"
+  rather than "aiui is broken" (#203).
+- **A typo in an env var was an MCP server that would not start.** Five
+  unguarded parses ran at import, before a single tool was registered, so
+  `AIUI_TIMEOUT_S=120s` or `AIUI_LOG_LEVEL=trace` — natural guesses for
+  knobs documented nowhere — produced "the aiui MCP server failed to start"
+  with the cause buried in a log. They are the knobs someone reaches for
+  while debugging a flaky tunnel, i.e. at the worst possible moment. A bad
+  value now falls back to the default and logs a warning naming the variable
+  and the value, and `python/README.md` gained the table that was missing
+  (#203).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

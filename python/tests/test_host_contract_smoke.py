@@ -246,6 +246,30 @@ def test_ask_roundtrip_over_loopback(companion: _FakeCompanion) -> None:
     assert companion.last_render["spec"]["kind"] == "ask"
 
 
+def test_ask_without_allow_other_defaults_to_false(companion: _FakeCompanion) -> None:
+    """#203: the free-text box is opt-in on BOTH bridges. This bridge used to
+    default it on, so identical agent code showed the user an "Other answer"
+    field over the tunnel and not on the Mac — and could get back an answer in
+    `other` that it never offered."""
+    asyncio.run(
+        ask(question="Which deploy strategy?", options=[{"label": "Blue"}, {"label": "Green"}])
+    )
+    assert companion.last_render["spec"]["allowOther"] is False
+
+
+def test_ask_allow_other_true_is_forwarded(companion: _FakeCompanion) -> None:
+    """The flip is a default, not a removal — an agent that asks for the
+    free-text fallback still gets it, so the fix can't be over-corrected."""
+    asyncio.run(
+        ask(
+            question="Which deploy strategy?",
+            options=[{"label": "Blue"}, {"label": "Green"}],
+            allow_other=True,
+        )
+    )
+    assert companion.last_render["spec"]["allowOther"] is True
+
+
 def test_form_roundtrip_over_loopback(companion: _FakeCompanion) -> None:
     out = asyncio.run(
         form(title="New user", fields=[{"kind": "text", "name": "name", "label": "Name"}])

@@ -253,11 +253,18 @@ struct UpdateResponse {
 /// required (empty `title` is rejected below, mirroring the `confirm`
 /// tool's requirement); `subtitle` and `sound` are optional and silently
 /// ignored on platforms/notification backends that don't support them.
+///
+/// `title` and `body` tolerate an explicit `null` as well as an absent key
+/// (#203): `#[serde(default)]` alone fires only for an absent key, so a
+/// caller that posted `"body": null` was rejected by axum's `Json` extractor
+/// with a plain-text serde dump — before the handler's own structured
+/// `invalid_request` 422 could ever run. A null is treated as "not given",
+/// which is what the caller meant.
 #[derive(Deserialize)]
 struct NotifyRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     body: String,
     #[serde(default)]
     subtitle: Option<String>,
@@ -266,6 +273,15 @@ struct NotifyRequest {
     /// name is swallowed by the OS rather than erroring the call.
     #[serde(default)]
     sound: Option<String>,
+}
+
+/// Deserialize a string field that may arrive as JSON `null`, mapping the
+/// null to `""`. See `NotifyRequest` for why (#203).
+fn null_to_empty_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Serialize)]
@@ -2988,7 +3004,46 @@ mod render_guard_tests {
 
 #[cfg(test)]
 mod notify_tests {
-    use super::{compose_notify_body, notify_title_is_valid};
+    use super::{compose_notify_body, notify_title_is_valid, NotifyRequest};
+    use serde_json::json;
+
+    /// #203: the Rust bridge posted every absent optional as an explicit
+    /// `null`. `#[serde(default)]` fires only for an *absent* key, so
+    /// `{"body": null}` was rejected by axum's `Json` extractor with a
+    /// plain-text serde dump — the agent never saw the companion's own
+    /// `invalid_request` message. A null now means "not given".
+    #[test]
+    fn notify_request_accepts_explicit_null_body() {
+        let req: NotifyRequest =
+            serde_json::from_value(json!({"title": "Tests green", "body": null}))
+                .expect("an explicit null body must deserialize");
+        assert_eq!(req.body, "");
+        assert_eq!(req.title, "Tests green");
+        assert!(notify_title_is_valid(&req.title));
+    }
+
+    /// A null `title` is tolerated by the extractor too — and then rejected
+    /// by the handler's own structured 422, which is the whole point: the
+    /// request has to *reach* the validation to be told what is wrong.
+    #[test]
+    fn notify_request_accepts_explicit_null_title_then_fails_validation() {
+        let req: NotifyRequest =
+            serde_json::from_value(json!({"title": null, "body": "whatever"}))
+                .expect("an explicit null title must deserialize");
+        assert_eq!(req.title, "");
+        assert!(!notify_title_is_valid(&req.title));
+    }
+
+    /// Absent keys keep working exactly as before — `#[serde(default)]`
+    /// still covers them.
+    #[test]
+    fn notify_request_still_accepts_absent_optionals() {
+        let req: NotifyRequest = serde_json::from_value(json!({"title": "Done"}))
+            .expect("an absent body must deserialize");
+        assert_eq!(req.body, "");
+        assert!(req.subtitle.is_none());
+        assert!(req.sound.is_none());
+    }
 
     #[test]
     fn title_must_be_non_empty() {
