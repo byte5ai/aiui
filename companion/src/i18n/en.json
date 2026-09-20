@@ -97,6 +97,8 @@
     "confirm.yes": "Yes",
     "confirm.no": "No",
     "unknown_kind": "Unknown widget kind: {kind}",
+    "validation.missing": "{n} field(s) still need a valid value.",
+    "validation.missing_on_tab": "{n} field(s) still need a valid value — see “{tab}”.",
     "close": "Close",
     "gallery.comment_placeholder": "Comment (optional)…",
     "gallery.decided": "{n}/{total} decided",

@@ -97,6 +97,8 @@
     "confirm.yes": "Ja",
     "confirm.no": "Nein",
     "unknown_kind": "Unbekannter Widget-Typ: {kind}",
+    "validation.missing": "{n} Feld(er) brauchen noch einen gültigen Wert.",
+    "validation.missing_on_tab": "{n} Feld(er) brauchen noch einen gültigen Wert — siehe „{tab}“.",
     "close": "Schließen",
     "gallery.comment_placeholder": "Kommentar (optional)…",
     "gallery.decided": "{n}/{total} entschieden",

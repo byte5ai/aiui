@@ -91,6 +91,14 @@ jobs:
         working-directory: companion
         run: npx svelte-check --tsconfig ./tsconfig.json --threshold error
 
+      # #206: the frontend's form logic — what the user's answer actually IS —
+      # used to be covered by nothing but the type-check above. Runs on every
+      # matrix leg; the unit half is DOM-free, the component half uses jsdom,
+      # so both are platform-independent.
+      - name: Frontend tests
+        working-directory: companion
+        run: npm test
+
       - name: Vite build
         working-directory: companion
         run: npm run build

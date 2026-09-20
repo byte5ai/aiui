@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { resolve } from "node:path";
 
@@ -28,5 +28,14 @@ export default defineConfig({
         dialog: resolve(__dirname, "dialog.html"),
       },
     },
+  },
+  // Under Vitest, resolve Svelte through its browser condition — the server
+  // build would otherwise be picked and component tests could not mount.
+  resolve: process.env.VITEST ? { conditions: ["browser"] } : undefined,
+  // #206: the frontend had no test runner at all, so 1300 lines of
+  // contract-bearing form logic were covered by nothing but a type-check.
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.{test,spec}.{js,ts}"],
   },
 });

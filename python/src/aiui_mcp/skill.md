@@ -159,6 +159,30 @@ notification-permission prompt; a denied permission comes back as
   An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
+## What the dialog enforces before it submits
+
+Declared constraints are checked in the dialog, not just handed to the
+widget — an affirmative action only fires once they hold:
+
+- `required` — blank, whitespace-only, a half-set `date_range`, or an empty
+  `table` / `image_grid` / `annotated_image` selection blocks the submit.
+- `min` / `max` on `number` and `slider` — a value outside the interval
+  blocks it too, including one typed straight into the box.
+- Pressing the action anyway is never a silent no-op: the dialog switches
+  to the offending tab, shows a footer message and marks the fields.
+  `skip_validation: True` is the way past all of it.
+
+Two normalisations happen before the user sees the form, so what comes
+back is what was on screen:
+
+- A `select` without a `default` resolves to its **first option**, not `""`.
+- A `default` the native control cannot represent is normalised or cleared
+  instead of round-tripped: `date` / `datetime` must be ISO
+  (`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`), `color` must be `#rrggbb`, and a
+  `number` / `slider` default outside `[min, max]` is clamped.
+
+It is a UI guard, not a security control — still validate what you get.
+
 ## The `list` field — one widget, four modes
 
 | `selectable` | `multi_select` | `sortable` | Mode |
@@ -337,8 +361,8 @@ directly instead of describing it in words. A `form` field. Spec:
   rectangle), or `"both"` (a Point/Region toggle; both are returned).
 - `default` — seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized
   units to pre-place a marker the user then nudges.
-- `required` — submit stays disabled until the user has marked what the
-  mode calls for.
+- `required` — submitting before the user has marked what the mode calls
+  for highlights the field and says what is missing instead.
 
 Result under the field `name`:
 `{point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null}`.
@@ -521,8 +545,9 @@ validation. Native `<input type="datetime-local">`, returns ISO
 ## Tabs — long forms without scroll fatigue
 
 Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
-One submit covers all tabs; validation jumps to the first invalid tab
-automatically. Tabs are *display structure*, not a wizard — no per-tab
+One submit covers all tabs; pressing it with something invalid switches to
+the first invalid tab, names it in a footer message and marks the offending
+fields — it never submits silently. Tabs are *display structure*, not a wizard — no per-tab
 confirmation, no per-tab actions, all values land in one response.
 
 Use when a single dialog naturally falls into 2-4 distinct topical
