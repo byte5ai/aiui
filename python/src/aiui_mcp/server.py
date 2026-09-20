@@ -107,6 +107,18 @@ COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
 # before we time out, letting us re-poll cleanly.
 ASYNC_POLL_TIMEOUT_S = 40.0
 
+# Transport-error retries for a single poll GET (#193). Safe *only* because the
+# companion now delivers a terminal result idempotently: a GET that dies on the
+# wire after the server drained the slot used to destroy the user's answer, and
+# the retry was told the render never existed. Never applied to a 404 — that is
+# terminal, not a blip.
+ASYNC_POLL_RETRIES = 2
+ASYNC_POLL_RETRY_BACKOFF_S = 0.5
+
+# Budget for the best-effort `DELETE /render/{id}` that retracts a dialog whose
+# caller was cancelled. Short: cleanup must never outlive the thing it cleans up.
+CANCEL_RENDER_TIMEOUT_S = 2.0
+
 # Timeout for the `upload` tool's held `POST /upload` (#146). The picker + byte
 # transfer runs on one request and the user may browse their filesystem before
 # choosing, so this is deliberately generous — far beyond any realistic
@@ -887,6 +899,56 @@ async def _wait_for_aiui() -> None:
             await asyncio.sleep(0.5)
 
 
+async def _cancel_render(render_id: str) -> None:
+    """Best-effort `DELETE /render/{id}` (#193) — tell the companion to retract a
+    dialog this bridge no longer has a caller for, so it doesn't sit on the
+    user's Mac waiting for an agent that is gone.
+
+    Builds its own client on purpose: the `async with httpx.AsyncClient(...)` in
+    `_post_render` may already be unwinding when this runs. Every failure is
+    swallowed, and a `404`/`405` simply means an older companion without the
+    route — nothing to do, never an error.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=CANCEL_RENDER_TIMEOUT_S) as client:
+            r = await client.delete(
+                f"{ENDPOINT}/render/{render_id}",
+                headers={"Authorization": f"Bearer {_token()}"},
+            )
+            if r.status_code in (404, 405):
+                log.debug("cancel render %s: companion has no DELETE route", render_id)
+            else:
+                log.info("cancelled render %s (http %s)", render_id, r.status_code)
+    except Exception as e:  # noqa: BLE001
+        log.debug("cancel render %s failed: %s", render_id, _explain_exc(e))
+
+
+async def _poll_get(client: httpx.AsyncClient, poll_url: str) -> httpx.Response:
+    """One poll GET, retrying a transport error up to `ASYNC_POLL_RETRIES` times.
+
+    The tunnel is where blips actually happen, and a GET is only safe to repeat
+    because the companion's delivery became idempotent (#193) — do not add this
+    retry without that. Status codes are *not* retried here: a 404 is terminal
+    and the caller must see it on the first try.
+    """
+    last: Exception | None = None
+    for attempt in range(ASYNC_POLL_RETRIES + 1):
+        try:
+            return await client.get(
+                poll_url,
+                headers={"Authorization": f"Bearer {_token()}"},
+                timeout=ASYNC_POLL_TIMEOUT_S,
+            )
+        except httpx.TransportError as e:
+            last = e
+            if attempt == ASYNC_POLL_RETRIES:
+                break
+            log.debug("poll transport error (retrying): %s", _explain_exc(e))
+            await asyncio.sleep(ASYNC_POLL_RETRY_BACKOFF_S * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 async def _poll_render(
     client: httpx.AsyncClient,
     render_id: str,
@@ -900,33 +962,46 @@ async def _poll_render(
     which is what immunises the remote path against the multi-minute-ReadError
     class. Emits an MCP progress notification each pending iteration so the
     client (Claude Code) knows the tool is alive, not hung.
+
+    On cancellation (#193) the dialog is retracted before the exception
+    propagates. The MCP SDK already cancels this task on a `CancelledNotification`,
+    so the task died today but the window on the Mac did not.
     """
     poll_url = f"{ENDPOINT}/render/{render_id}"
     iteration = 0
-    while True:
-        pr = await client.get(
-            poll_url,
-            headers={"Authorization": f"Bearer {_token()}"},
-            timeout=ASYNC_POLL_TIMEOUT_S,
-        )
-        if pr.status_code == 404:
-            raise RuntimeError(
-                f"aiui lost track of render {render_id} (expired or never "
-                f"registered). Restart the dialog."
+    try:
+        while True:
+            pr = await _poll_get(client, poll_url)
+            if pr.status_code == 404:
+                raise RuntimeError(
+                    f"aiui lost track of render {render_id} (expired or never "
+                    f"registered). Restart the dialog."
+                )
+            pr.raise_for_status()
+            pv = pr.json()
+            if pv.get("pending") is True:
+                iteration += 1
+                if ctx is not None:
+                    # Best-effort: a missing progressToken or any reporting
+                    # hiccup must never break the render.
+                    try:
+                        await ctx.report_progress(progress=float(iteration), total=None)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("progress report skipped: %s", _explain_exc(e))
+                continue
+            return pv
+    except asyncio.CancelledError:
+        # `shield` is load-bearing: a bare `await` inside an `except
+        # CancelledError` block is re-cancelled immediately on most loop states
+        # and the DELETE never goes out. `BaseException`, not `Exception`,
+        # because the shield itself re-raises `CancelledError`.
+        try:
+            await asyncio.shield(
+                asyncio.wait_for(_cancel_render(render_id), CANCEL_RENDER_TIMEOUT_S)
             )
-        pr.raise_for_status()
-        pv = pr.json()
-        if pv.get("pending") is True:
-            iteration += 1
-            if ctx is not None:
-                # Best-effort: a missing progressToken or any reporting hiccup
-                # must never break the render.
-                try:
-                    await ctx.report_progress(progress=float(iteration), total=None)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("progress report skipped: %s", _explain_exc(e))
-            continue
-        return pv
+        except BaseException as e:  # noqa: BLE001
+            log.debug("render cancel cleanup: %s", _explain_exc(e))
+        raise
 
 
 def _session_origin() -> str:
