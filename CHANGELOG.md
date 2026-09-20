@@ -39,6 +39,36 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Mermaid flowchart node labels rendered empty.** Mermaid 11 puts
+  flowchart labels in HTML inside `<foreignObject>`, and the sanitiser runs
+  with `USE_PROFILES: { svg, svgFilters }` — a DOMPurify *profile* replaces
+  the allow-list rather than adding to it, and `foreignobject` is both
+  outside the svg profile and in `DEFAULT_FORBID_CONTENTS`, so the element
+  and its text were stripped. Diagrams came out as boxes with nothing in
+  them. The v0.4.38 change that dropped `foreignObject` from `FORBID_TAGS`
+  was therefore a no-op — nothing it forbade was reachable anyway — and
+  the regression it was written to fix stayed broken.
+  Fixed at the source: `htmlLabels: false` keeps labels in `<text>` /
+  `<tspan>`, which the svg profile does allow. Deliberately **not** fixed
+  by widening the sanitiser: admitting `<foreignObject>` means admitting
+  `<div>`, `<span>`, `<img>` and `<a href>` inside the SVG, for content an
+  agent supplied. Cost: long labels use Mermaid's own line-breaking rather
+  than HTML word-wrapping (`<br/>` still works), and FontAwesome `fa:fa-x`
+  substitution in labels stops resolving. Neither was documented (#189).
+- **A link in agent-supplied markdown destroyed the dialog.** A plain
+  `[text](https://…)` in a `markdown` field or a `compare` variant
+  survived sanitisation, as it should — but clicking it navigated the
+  **dialog window itself** away from `dialog.html`. The Svelte app was
+  gone, the dialog's `/render` hung until its two-hour TTL, and the user
+  was left with a web page in a frameless window and no way back. A
+  compromised remote host could aim that anywhere. The window now refuses
+  to navigate anywhere but its own app origin, and the frontend hands
+  `http(s)` links to the user's default browser instead — which is what
+  `skill.md` had been claiming all along (#189).
+- **Mermaid diagrams rendered twice on mount.** `onMount` and an
+  `initialised`-gated `$effect` both drove the first render, and the
+  effect's guard read a flag the render itself sets. The effect now owns
+  both the first render and later source changes (#189).
 - **A hung probe could park a tunnel task forever.** `ConnectTimeout=5`
   bounds the TCP connect only; authentication, a wedged remote shell or a
   stalled curl were unbounded after that, and the probe is awaited inside
@@ -221,6 +251,11 @@ All notable changes to this project are documented here.
 
 ### Security
 
+- **`<style>` is now forbidden in rendered Mermaid SVG.** Mermaid's
+  `classDef` directive turns caller-supplied text into emitted CSS, and
+  the svg profile does not exclude `<style>`. Attacker-controlled CSS in a
+  dialog window is UI redressing — these are the windows where the user
+  clicks Confirm on destructive actions (#189).
 - **The API token was readable from the remote host's process list.** The
   shared-forward probe interpolated the token into
   `curl -H "Authorization: Bearer $T"`, so the remote shell expanded it
