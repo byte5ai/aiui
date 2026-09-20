@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { _ } from "svelte-i18n";
   import { onMount } from "svelte";
@@ -179,6 +180,18 @@
 
     window.addEventListener("keydown", onKey);
 
+    // WebView liveness probe (#179). `/health` emits `ui:ping` to *this*
+    // window and waits for the `ui_pong` command to come back; the RTT is
+    // what tells support "the dialog opened but nothing happens" apart from
+    // "the dialog is open and the user hasn't answered". This listener is the
+    // return half — without it the probe can only ever time out, which is why
+    // the Rust side must never be repaired on its own.
+    const unPing = listen<string>("ui:ping", (e) => {
+      void invoke("ui_pong", { id: e.payload }).catch((err) => {
+        console.error(`[aiui] ui_pong failed: ${err}`);
+      });
+    });
+
     // Window-close (native red X / ⌘W) is owned by Rust (on_window_event):
     // it cancels THIS window's dialog by its id and lets the window close,
     // and the `/render` handler destroys the window on every terminal
@@ -189,6 +202,7 @@
     return () => {
       clearTtlTimers();
       window.removeEventListener("keydown", onKey);
+      void unPing.then((u) => u());
     };
   });
 

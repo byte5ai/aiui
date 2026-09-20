@@ -12,15 +12,22 @@ peer" — `str(e)` is empty, and the server passed that straight through. The
 fix is `_explain_exc`, which falls back to the exception class name when
 `str(e)` has nothing useful, plus extra `except` branches in `_preflight`
 that translate the protocol-level errors into actionable messages.
+
+Since #179 this module also covers the *status-code* half of the same
+contract: a degraded-but-serving companion (200 + `ready: false`) must not
+block an unrelated session's render, and a companion that really is down must
+surface its own `hint` instead of a status code and half a JSON blob.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
 import pytest
 
+import aiui_mcp.server as server
 from aiui_mcp.server import _explain_exc, _preflight, aiui_health
 
 
@@ -138,3 +145,175 @@ def test_preflight_catches_generic_http_error_with_class_name_fallback(
     msg = str(exc_info.value)
     assert "WriteError" in msg
     assert "aiui.app" in msg
+
+
+# ----- #179: degraded-but-serving must not block, and 503 must carry its hint -----
+
+
+class _FakeHealthResp:
+    """Minimal stand-in for the httpx response `/health` returns."""
+
+    def __init__(self, status_code: int, payload: Any = None, text: str | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text is not None else json.dumps(payload)
+
+    def json(self) -> Any:
+        if self._payload is None:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+def _serve_health(
+    monkeypatch: pytest.MonkeyPatch, resp: _FakeHealthResp
+) -> None:
+    """Answer every GET with `resp`, and short-circuit the wire-compat check
+    that `_preflight` runs afterwards so the test isolates the health branch."""
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        return resp
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(server, "_wire_checked", True)
+
+
+def test_preflight_allows_degraded_ready_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A full dialog registry is degraded, not down.
+
+    One session accumulating 16 unanswered dialogs used to 503 `/health`, and
+    `_preflight` treated any non-200 as fatal — so every *other* session on the
+    same companion lost `/render` and `upload` too, even with nothing pending
+    of its own. The companion now answers 200 + `ready: false`; preflight must
+    carry on.
+    """
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(
+        monkeypatch,
+        _FakeHealthResp(
+            200,
+            {
+                "version": "0.5.0",
+                "ready": False,
+                "reason": "dialog_registry_full",
+                "hint": "16 unanswered dialogs are open (cap 16)",
+            },
+        ),
+    )
+
+    asyncio.run(_preflight())  # must not raise
+
+
+def test_preflight_raises_with_hint_on_webview_unresponsive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A 503 is reserved for a frozen WebView — and the companion's own `hint`
+    goes into the error verbatim, replacing the old `r.text[:200]` blob."""
+    _setup_token(monkeypatch, tmp_path)
+    hint = "the open dialog window did not answer a liveness ping within 750 ms"
+    _serve_health(
+        monkeypatch,
+        _FakeHealthResp(
+            503,
+            {"version": "0.5.0", "ready": False, "reason": "webview_unresponsive", "hint": hint},
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(_preflight())
+
+    msg = str(exc_info.value)
+    assert hint in msg
+    assert '{"version"' not in msg, "the raw JSON blob must not be the message"
+
+
+def test_preflight_still_fatal_on_401(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Token mismatch stays fatal — the 401 branch is untouched by #179."""
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(monkeypatch, _FakeHealthResp(401, {"error": "unauthorized"}))
+
+    with pytest.raises(RuntimeError, match="401"):
+        asyncio.run(_preflight())
+
+
+def test_preflight_rejects_unparseable_200_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A 200 that isn't JSON means something other than the companion is
+    answering on this port — still fatal."""
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(monkeypatch, _FakeHealthResp(200, None, text="<html>nginx</html>"))
+
+    with pytest.raises(RuntimeError, match="unparseable"):
+        asyncio.run(_preflight())
+
+
+def test_aiui_health_returns_body_on_non_200(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """`raise_for_status()` used to discard the composite response — the very
+    thing the tool exists to report — and return only the status line."""
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(
+        monkeypatch,
+        _FakeHealthResp(
+            503,
+            {
+                "version": "0.5.0",
+                "ready": False,
+                "reason": "webview_unresponsive",
+                "hint": "close that dialog window on the Mac",
+                "pending": 3,
+                "oldest_age_secs": 1200,
+                "lifecycle_phase": "Serving",
+            },
+        ),
+    )
+
+    result = asyncio.run(aiui_health())
+
+    assert result["ok"] is False
+    assert result["ready"] is False
+    assert result["reason"] == "webview_unresponsive"
+    assert result["hint"] == "close that dialog window on the Mac"
+    assert result["pending"] == 3
+    assert result["oldest_age_secs"] == 1200
+    assert result["lifecycle_phase"] == "Serving"
+    # The status is no longer the whole answer, but it stays legible.
+    assert result["http_status"] == 503
+
+
+def test_aiui_health_ok_true_for_degraded_200(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """`ok` tracks "the companion answered", `ready` tracks "it is healthy" —
+    a degraded-but-serving companion is `ok: true` / `ready: false`."""
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(
+        monkeypatch,
+        _FakeHealthResp(200, {"ready": False, "reason": "too_many_children"}),
+    )
+
+    result = asyncio.run(aiui_health())
+
+    assert result["ok"] is True
+    assert result["ready"] is False
+    assert result["reason"] == "too_many_children"
+
+
+def test_aiui_health_reports_non_json_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Dropping `raise_for_status()` must not turn a rogue process on :7777
+    into a silent success — a non-JSON body keeps the `{ok: false, error}`
+    shape."""
+    _setup_token(monkeypatch, tmp_path)
+    _serve_health(monkeypatch, _FakeHealthResp(200, None, text="<html>not aiui</html>"))
+
+    result = asyncio.run(aiui_health())
+
+    assert result["ok"] is False
+    assert "not aiui" in result["error"]

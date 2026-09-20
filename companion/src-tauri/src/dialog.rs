@@ -509,6 +509,24 @@ impl DialogState {
         ids
     }
 
+    /// Id of the most recently registered pending dialog — which, since the
+    /// Step-4 multi-window rewrite, is also its window's Tauri label. `/health`
+    /// uses it to pick the WebView it pings.
+    ///
+    /// Ordered by `created_at` on purpose: the obvious alternative, taking the
+    /// first entry of `app.webview_windows()`, is a `HashMap` iteration-order
+    /// pick, so consecutive probes would flap between windows and an RTT
+    /// series would measure nothing in particular. `None` when nothing is
+    /// pending. Issue #179.
+    pub fn newest_id(&self) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .max_by_key(|(_, e)| e.created_at)
+            .map(|(id, _)| id.clone())
+    }
+
     /// Snapshot for `/health` / diagnostics. Cheap: one mutex acquire.
     pub fn stats(&self) -> DialogStats {
         let map = self.pending.lock().unwrap();
@@ -572,6 +590,34 @@ mod tests {
         let (_b, _rb) = reg(&s);
         let (_c, _rc) = reg(&s);
         assert_eq!(s.stats().orphan_count, 3);
+    }
+
+    #[test]
+    fn newest_id_returns_most_recent() {
+        // /health probes the newest dialog window (#179): an empty registry
+        // means "no window to ping", and with several open the pick must be
+        // the last one registered, not an arbitrary HashMap entry.
+        let s = DialogState::new();
+        assert!(s.newest_id().is_none());
+        let (a, _ra) = reg(&s);
+        let (b, _rb) = reg(&s);
+        let (c, _rc) = reg(&s);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_eq!(s.newest_id().as_deref(), Some(c.as_str()));
+    }
+
+    #[test]
+    fn newest_id_skips_resolved_entries() {
+        // A dialog the user just answered is gone from the registry, so the
+        // probe must fall back to the one still on screen.
+        let s = DialogState::new();
+        let (a, _ra) = reg(&s);
+        let (b, _rb) = reg(&s);
+        s.complete(&b, serde_json::json!({}));
+        assert_eq!(s.newest_id().as_deref(), Some(a.as_str()));
+        s.cancel(&a);
+        assert!(s.newest_id().is_none());
     }
 
     #[test]

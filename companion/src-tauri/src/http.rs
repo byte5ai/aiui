@@ -22,7 +22,21 @@ use tauri_plugin_updater::UpdaterExt;
 
 /// How long `/health` waits for a `ui:ping` round-trip from the frontend
 /// before concluding the WebView is unresponsive.
-const UI_PING_TIMEOUT: Duration = Duration::from_millis(100);
+///
+/// 750 ms, raised from 100 ms in #179. A freshly mounted WebView is still
+/// doing layout well past 100 ms, so the old budget called a merely busy
+/// dialog frozen — harmless while the probe was inert, a false 503 now that
+/// it actually fires. The ceiling is the Python bridge's whole `/health`
+/// budget (`HEALTH_TIMEOUT_S = 3`), so stay at or under ~1 s.
+const UI_PING_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// `/health` reasons for `ready: false`, in the precedence order
+/// [`readiness`] applies. Only [`REASON_WEBVIEW_UNRESPONSIVE`] is a genuine
+/// "cannot serve" and therefore the only one that answers 503; the other two
+/// are degraded-but-serving and answer 200 (#179).
+const REASON_WEBVIEW_UNRESPONSIVE: &str = "webview_unresponsive";
+const REASON_DIALOG_REGISTRY_FULL: &str = "dialog_registry_full";
+const REASON_TOO_MANY_CHILDREN: &str = "too_many_children";
 
 /// Header a bridge sets to opt into async `/render` (Step 3). Present →
 /// `POST /render` registers + surfaces the dialog, returns `{id, ttl}`
@@ -108,14 +122,41 @@ struct HealthResponse {
     /// Current host lifetime phase (Starting/Serving/GracePending/Exiting) —
     /// issue #137 lifecycle state machine, surfaced for diagnostics.
     lifecycle_phase: String,
+    /// Machine-readable cause when `ready` is false — one of
+    /// `webview_unresponsive`, `dialog_registry_full`, `too_many_children`.
+    /// `None` while healthy. Additive field (#179): both bridges parse the
+    /// body generically, so no `WIRE_VERSION` bump.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Human-readable one-liner for the same cause, with the live numbers
+    /// filled in. Bridges relay it verbatim instead of guessing from a status
+    /// code, which is how a busy companion used to be reported as
+    /// `/health returned 503: {"version":…`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 #[derive(Serialize)]
 struct WebviewHealth {
     /// `true` if the Svelte app answered a `ui:ping` within the timeout.
     responsive: bool,
-    /// Round-trip duration in milliseconds; `None` if the ping timed out.
+    /// Round-trip duration in milliseconds; `None` if the ping timed out —
+    /// and `None`, not `Some(0)`, when there was no dialog window to ping
+    /// at all (#179).
     rtt_ms: Option<u64>,
+}
+
+impl WebviewHealth {
+    /// Verdict for "no dialog window is open": responsive, because there is
+    /// genuinely nothing to be unresponsive *about*, but with **no** RTT.
+    /// The old `Some(0)` was a fabricated measurement, indistinguishable in a
+    /// log or a support thread from a real sub-millisecond round trip.
+    fn no_dialog_window() -> Self {
+        Self {
+            responsive: true,
+            rtt_ms: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -703,18 +744,8 @@ async fn health(
     };
     let children = ChildrenHealth { attached };
 
-    // Ready criterion: WebView answers, room left in the dialog
-    // registry, and we aren't drowning in attached children.
-    //
-    // The dialog check uses *strict* less-than because `register()`
-    // evicts an existing pending dialog when `len() >= HARD_CAP`. If we
-    // reported ready at exactly the cap, the very next /render would
-    // silently cancel an in-flight dialog while /health still claimed
-    // healthy — readiness must lead the eviction signal, not coincide
-    // with it.
-    let ready = webview.responsive
-        && dialog_stats.orphan_count < crate::dialog::DIALOG_HARD_CAP
-        && attached < 32;
+    let (ready, reason) = readiness(webview.responsive, dialog_stats.orphan_count, attached);
+    let hint = reason.map(|r| health_hint(r, dialog_stats.orphan_count, attached));
 
     let body = HealthResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -723,40 +754,113 @@ async fn health(
         dialogs,
         children,
         lifecycle_phase: format!("{:?}", crate::lifecycle_log::current_phase()),
+        reason,
+        hint,
     };
 
-    let status = if ready {
-        StatusCode::OK
+    (health_status(reason), Json(body)).into_response()
+}
+
+/// Readiness verdict as a pure function of the three sub-checks, so it is
+/// testable without a live `AppHandle` (`health()` needs one; `http.rs` had no
+/// tests at all before #179).
+///
+/// Precedence is fixed — WebView → dialog registry → children — so a
+/// multiply-degraded companion always reports the same, most severe cause
+/// rather than whichever check happened to be written first.
+///
+/// The dialog check uses *strict* less-than because `register_dialog()` evicts
+/// an existing pending dialog when `len() >= HARD_CAP`. If we reported ready at
+/// exactly the cap, the very next `/render` would silently cancel an in-flight
+/// dialog while `/health` still claimed healthy — readiness must lead the
+/// eviction signal, not coincide with it.
+fn readiness(webview_ok: bool, pending: usize, attached: usize) -> (bool, Option<&'static str>) {
+    if !webview_ok {
+        (false, Some(REASON_WEBVIEW_UNRESPONSIVE))
+    } else if pending >= crate::dialog::DIALOG_HARD_CAP {
+        (false, Some(REASON_DIALOG_REGISTRY_FULL))
+    } else if attached >= crate::lifetime::CHILD_SOFT_CAP {
+        (false, Some(REASON_TOO_MANY_CHILDREN))
     } else {
+        (true, None)
+    }
+}
+
+/// HTTP status for a readiness verdict.
+///
+/// Only a dead WebView is a real "cannot serve". A full dialog registry or a
+/// crowd of attached children is degraded-but-serving: `register_dialog()`
+/// sweeps TTL-expired entries and evicts the single oldest at the cap, so the
+/// next render costs someone their oldest dialog — it does not fail. 503-ing
+/// those states made one session's 16 unanswered dialogs take `/render` and
+/// `upload` down for every other session sharing the companion, because the
+/// Python bridge's preflight treats any non-200 as fatal (#179).
+fn health_status(reason: Option<&str>) -> StatusCode {
+    if reason == Some(REASON_WEBVIEW_UNRESPONSIVE) {
         StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(body)).into_response()
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// One-line explanation for a `reason`, with the live numbers filled in.
+/// Bridges relay this verbatim, so it names both the cause and the one-step
+/// fix — and, for the serving states, says outright that work continues.
+fn health_hint(reason: &str, pending: usize, attached: usize) -> String {
+    if reason == REASON_WEBVIEW_UNRESPONSIVE {
+        format!(
+            "the open dialog window did not answer a liveness ping within {} ms — its \
+             WebView is frozen; close that dialog window on the Mac, or restart aiui",
+            UI_PING_TIMEOUT.as_millis()
+        )
+    } else if reason == REASON_DIALOG_REGISTRY_FULL {
+        format!(
+            "{pending} unanswered dialogs are open (cap {}) — rendering still works, but \
+             the next one evicts the oldest; answer or close some dialog windows on the Mac",
+            crate::dialog::DIALOG_HARD_CAP
+        )
+    } else if reason == REASON_TOO_MANY_CHILDREN {
+        format!(
+            "{attached} agent sessions are attached (cap {}) — rendering still works; close \
+             unused sessions, or restart aiui if they are stale",
+            crate::lifetime::CHILD_SOFT_CAP
+        )
+    } else {
+        reason.to_string()
+    }
 }
 
 /// Round-trip a `ui:ping` event through the frontend and back via the
 /// `ui_pong` Tauri command. Returns the observed RTT, or `None` on timeout.
+///
+/// Which window? The newest live dialog, taken from the registry's
+/// `created_at` ordering. Until #179 this looked the window up by the fixed
+/// label `"dialog"`, which the Step-4 multi-window rewrite had already
+/// retired — every dialog window's label is its dialog id now, so the lookup
+/// always missed and the probe always took its "nothing to ping" branch. The
+/// alternative of grabbing the first entry of `app.webview_windows()` is a
+/// `HashMap` iteration-order pick and would make the probe flap between
+/// windows; `DialogState::newest_id()` is deterministic.
 async fn probe_webview(state: &AppState) -> WebviewHealth {
+    // Probe a dialog window's webview specifically — the setup window is
+    // user-driven and irrelevant for render-pipeline health.
+    let Some(label) = state
+        .dialog
+        .newest_id()
+        .filter(|l| crate::is_dialog_window_label(l.as_str()))
+    else {
+        return WebviewHealth::no_dialog_window();
+    };
+    // Registered but the window is already gone (mid-teardown, or it never
+    // built) — again nothing to be unresponsive about.
+    if state.app.get_webview_window(&label).is_none() {
+        trace(&format!("health: dialog {label} has no live window; skipping probe"));
+        return WebviewHealth::no_dialog_window();
+    }
+
     let (id, rx) = state.ui_acks.register();
     let started = std::time::Instant::now();
-    // Probe the dialog window's webview specifically — the setup
-    // window is user-driven and irrelevant for render-pipeline health.
-    // If no dialog window exists yet, we report `responsive: true`
-    // because there's nothing to be unresponsive *about*.
-    if state
-        .app
-        .get_webview_window(crate::DIALOG_WINDOW_LABEL)
-        .is_none()
-    {
-        state.ui_acks.forget(&id);
-        return WebviewHealth {
-            responsive: true,
-            rtt_ms: Some(0),
-        };
-    }
-    if let Err(e) = state
-        .app
-        .emit_to(crate::DIALOG_WINDOW_LABEL, "ui:ping", &id)
-    {
+    if let Err(e) = state.app.emit_to(label.as_str(), "ui:ping", &id) {
         trace(&format!("health: emit ui:ping failed: {e}"));
         state.ui_acks.forget(&id);
         return WebviewHealth {
@@ -2030,5 +2134,99 @@ mod spec_summary_tests {
         let out = spec_summary(&json!({"kind": "confirm", "title": "x"}));
         assert!(out.contains("kind=confirm"));
         assert!(out.contains("fields=0"));
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use crate::dialog::DIALOG_HARD_CAP;
+    use crate::lifetime::CHILD_SOFT_CAP;
+
+    #[test]
+    fn readiness_ok_below_caps() {
+        assert_eq!(readiness(true, 0, 0), (true, None));
+        assert_eq!(health_status(None), StatusCode::OK);
+        // One short of either cap is still fully ready.
+        assert_eq!(
+            readiness(true, DIALOG_HARD_CAP - 1, CHILD_SOFT_CAP - 1),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn readiness_flags_webview_unresponsive() {
+        let (ready, reason) = readiness(false, 0, 0);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_WEBVIEW_UNRESPONSIVE));
+        // ...and it is the *only* reason that still answers 503.
+        assert_eq!(health_status(reason), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn readiness_flags_dialog_registry_full() {
+        // A full registry is degraded, not down: `register_dialog` evicts the
+        // oldest and keeps serving, so this must stay a 200 — otherwise one
+        // session's backlog blocks every other session's render (#179).
+        let (ready, reason) = readiness(true, DIALOG_HARD_CAP, 0);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_DIALOG_REGISTRY_FULL));
+        assert_eq!(health_status(reason), StatusCode::OK);
+    }
+
+    #[test]
+    fn readiness_flags_too_many_children() {
+        let (ready, reason) = readiness(true, 0, CHILD_SOFT_CAP);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_TOO_MANY_CHILDREN));
+        assert_eq!(health_status(reason), StatusCode::OK);
+    }
+
+    #[test]
+    fn readiness_precedence_webview_wins() {
+        // Fixed precedence webview → registry → children, so a multiply
+        // degraded companion reports deterministically.
+        assert_eq!(
+            readiness(false, DIALOG_HARD_CAP, CHILD_SOFT_CAP).1,
+            Some(REASON_WEBVIEW_UNRESPONSIVE)
+        );
+        assert_eq!(
+            readiness(true, DIALOG_HARD_CAP, CHILD_SOFT_CAP).1,
+            Some(REASON_DIALOG_REGISTRY_FULL)
+        );
+    }
+
+    #[test]
+    fn probe_reports_none_rtt_when_no_dialog_window() {
+        // The old branch returned a fabricated `Some(0)`, indistinguishable
+        // from a real measurement in a log or a support thread.
+        let h = WebviewHealth::no_dialog_window();
+        assert!(h.responsive);
+        assert_eq!(h.rtt_ms, None);
+    }
+
+    #[test]
+    fn ui_ping_timeout_fits_the_bridge_budget() {
+        // Must clear a freshly mounted WebView's layout work, but stay well
+        // inside the Python bridge's 3 s /health budget.
+        assert!(UI_PING_TIMEOUT > Duration::from_millis(100));
+        assert!(UI_PING_TIMEOUT <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn hints_name_the_cause_and_the_numbers() {
+        let full = health_hint(REASON_DIALOG_REGISTRY_FULL, DIALOG_HARD_CAP, 0);
+        assert!(full.contains(&DIALOG_HARD_CAP.to_string()), "{full}");
+        assert!(full.contains("still works"), "{full}");
+
+        let kids = health_hint(REASON_TOO_MANY_CHILDREN, 0, CHILD_SOFT_CAP);
+        assert!(kids.contains(&CHILD_SOFT_CAP.to_string()), "{kids}");
+
+        let dead = health_hint(REASON_WEBVIEW_UNRESPONSIVE, 1, 1);
+        assert!(dead.contains("frozen"), "{dead}");
+        assert!(
+            dead.contains(&UI_PING_TIMEOUT.as_millis().to_string()),
+            "{dead}"
+        );
     }
 }

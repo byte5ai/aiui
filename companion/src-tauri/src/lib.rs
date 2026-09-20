@@ -20,15 +20,22 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_notification::NotificationExt;
 
-/// Tauri window labels. Setup and dialog live in *separate* windows so:
+/// Tauri window label of the settings window. Setup and dialogs live in
+/// *separate* windows so:
 ///  • the agent's dialog never visually overlaps the user's settings,
 ///  • neither window can hide behind the other in macOS' z-stack,
 ///  • each gets its own movable title bar without weird re-layout
 ///    artefacts when the content kind changes.
 /// See the v0.4.25 multi-window refactor in lib.rs for the lifecycle
 /// rules that govern when each is created and torn down.
+///
+/// There is deliberately no `DIALOG_WINDOW_LABEL` counterpart: since the
+/// Step-4 multi-window rewrite a dialog window's label IS its dialog id, so
+/// "is this a dialog window?" is `is_dialog_window_label` and "which dialog
+/// window?" is `DialogState::newest_id()`. The stale constant outlived the
+/// rewrite by one release and silently made `/health`'s WebView probe
+/// unreachable (#179).
 pub const SETUP_WINDOW_LABEL: &str = "setup";
-pub const DIALOG_WINDOW_LABEL: &str = "dialog";
 
 /// Text of the "an update is available" system notification (#188).
 ///
@@ -302,8 +309,8 @@ fn ui_pong(
 
 /// A dialog window's label IS its dialog id (Step 4 multi-window): any window
 /// that isn't the setup window is a dialog window. There is no longer a single
-/// reused `DIALOG_WINDOW_LABEL` window.
-fn is_dialog_window_label(label: &str) -> bool {
+/// reused dialog window with a fixed label.
+pub(crate) fn is_dialog_window_label(label: &str) -> bool {
     label != SETUP_WINDOW_LABEL
 }
 
