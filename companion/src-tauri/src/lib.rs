@@ -935,6 +935,15 @@ async fn add_remote(
         list.push(host_alias.clone());
         let _ = setup::save_remotes(&list);
     }
+    // #184: remember the absolute uvx path the probe just found. Without
+    // this it was discovered, pinned once, and then thrown away — so the
+    // next launch's resync passed `None`, rewrote the entry down to the
+    // bare name, and reported success while breaking the host. Written on
+    // every add (not only the first) so a re-add refreshes a moved uvx.
+    let _ = setup::save_remote_uvx(
+        &host_alias,
+        uvx_loc.as_ref().map(|l| l.uvx_path.as_str()),
+    );
     tm.ensure(host_alias).await;
     Ok(results)
 }
@@ -966,14 +975,36 @@ async fn resync_remote(
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
     let our_version = env!("CARGO_PKG_VERSION");
+    // #184: use the uvx path discovered when this host was added. Passing
+    // `None` here is what rewrote a pinned absolute path back down to the
+    // bare name — which then depends on Claude Code's PATH at spawn time,
+    // the exact fragility the probe exists to avoid.
+    let mut results = Vec::new();
+    let mut uvx = setup::load_remote_uvx(&host_alias);
+    if uvx.is_none() {
+        // Self-heal a host registered by an older build, which has no
+        // persisted path. `check_remote_aiui_mcp` is a cheap, idempotent
+        // `uvx --version` probe, and running it here also restores the
+        // pre-flight guarantee this button never had. Deliberately NOT on
+        // the startup path: that would be an extra SSH round-trip per
+        // remote on every launch, and the persisted path covers the
+        // steady state.
+        let (reach_step, uvx_loc) = setup::check_remote_aiui_mcp(&host_alias);
+        uvx = uvx_loc.as_ref().map(|l| l.uvx_path.clone());
+        if uvx.is_some() {
+            let _ = setup::save_remote_uvx(&host_alias, uvx.as_deref());
+        }
+        results.push(reach_step);
+    }
     // Re-pin in `~/.claude.json` on the remote (idempotent — if already
     // pinned, no rewrite, returns AlreadyCurrent).
     let (pin_step, _patch) = setup::patch_claude_code_config_remote(
         &host_alias,
-        None,
+        uvx.as_deref(),
         our_version,
     );
-    Ok(vec![pin_step])
+    results.push(pin_step);
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1003,6 +1034,9 @@ async fn remove_remote(
         .filter(|h| h != &host_alias)
         .collect();
     let _ = setup::save_remotes(&list);
+    // #184: forget the host's uvx path too, so a later re-add starts from a
+    // fresh probe rather than a stale path to a uvx that may have moved.
+    let _ = setup::save_remote_uvx(&host_alias, None);
     Ok(results)
 }
 
@@ -1050,6 +1084,9 @@ async fn uninstall_all(
     let _ = std::fs::remove_file(&cfg.token_path);
     let _ = std::fs::remove_file(cfg.config_dir.join("first_run_done"));
     let _ = setup::save_remotes(&[]);
+    // #184: the uvx sidecar is local state too — uninstall must not leave
+    // it behind.
+    let _ = std::fs::remove_file(cfg.config_dir.join("remote-uvx.json"));
     results.push(setup::StepResult {
         ok: true,
         message: format!(
@@ -1708,9 +1745,14 @@ pub fn run() {
                     // SSH/Python pipeline is sync. Ordering across
                     // hosts is irrelevant; pin-syncs are independent.
                     tokio::task::spawn_blocking(move || {
+                        // #184: the persisted path, not `None`. This task
+                        // runs for every remote on every launch, so passing
+                        // `None` downgraded a working absolute path to the
+                        // bare name once per start.
+                        let uvx = setup::load_remote_uvx(&host_for_task);
                         let (step, patch) = setup::patch_claude_code_config_remote(
                             &host_for_task,
-                            None,
+                            uvx.as_deref(),
                             &our_version_owned,
                         );
                         if step.ok {
