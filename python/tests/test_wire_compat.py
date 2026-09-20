@@ -116,10 +116,16 @@ def test_spec_above_the_old_2mib_body_limit_round_trips(
     async def noop(*args: Any, **kwargs: Any) -> None:
         return None
 
+    async def no_media(*args: Any, **kwargs: Any) -> list[str]:
+        return []
+
     monkeypatch.setattr(server, "_wait_for_aiui", noop)
     monkeypatch.setattr(server, "_preflight", noop)
-    monkeypatch.setattr(server, "_upload_local_videos", noop)
-    monkeypatch.setattr(server, "_upload_local_audios", noop)
+    # These return `list[str]` of media warnings — the render flow does
+    # `media_warnings += _upload_local_audios(...)`, so the mock must honour
+    # the list contract, not return None.
+    monkeypatch.setattr(server, "_upload_local_videos", no_media)
+    monkeypatch.setattr(server, "_upload_local_audios", no_media)
 
     sent: dict[str, Any] = {}
 
