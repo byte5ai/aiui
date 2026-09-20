@@ -6,6 +6,41 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **A release published a macOS-only update feed, breaking every Windows
+  client's update check.** `releases/latest/download/latest.json` is what
+  every installed aiui polls, and `release-macos.yml` published one
+  carrying only `darwin-aarch64` — the `windows-x86_64` entry was added
+  later by a second, manually dispatched workflow. In between, a Windows
+  update check did not report "up to date"; it failed
+  (`tauri-plugin-updater` raises `TargetsNotFound` for a missing target),
+  and if the second dispatch was forgotten it failed permanently. That is
+  what shipped in v0.10.1.
+
+  The release is now created as a **draft**, which
+  `releases/latest/download/…` does not serve, so clients keep resolving
+  the previous complete feed until both platforms are in. The Windows
+  workflow is dispatched automatically, validates the assembled feed, and
+  only then publishes the release. A Windows failure therefore holds back
+  the whole release rather than shipping half of one — the correct
+  coupling for a two-platform product.
+
+  Deliberately **not** fixed by carrying the previous release's Windows
+  entry forward: that feed would advertise the new version while pointing
+  at the old installer, which verifies and installs cleanly and leaves the
+  client on the old version — a silent reinstall loop, with `/update`
+  reporting success for a version the machine never reached (#190).
+
+### Added
+
+- **`scripts/check-updater-feed.sh`** — refuses a `latest.json` that is
+  missing a shipped platform, carries an empty signature or url, points an
+  entry at another release's artifact, or advertises the wrong version. It
+  runs in the release path before anything becomes visible, and
+  `scripts/test-check-updater-feed.sh` exercises it against fixtures on
+  every PR so the guard cannot quietly stop guarding (#190).
+
+### Fixed
+
 - **`release-windows.yml` attached no artifacts.** Its first ever run —
   the v0.10.1 release — failed at the artifact lookup. Tauri signs the
   NSIS installer in place (`…-setup.exe` plus `…-setup.exe.sig`); the

@@ -52,6 +52,7 @@ on:
 
 permissions:
   contents: write # tag push + release creation
+  actions: write # dispatch release-windows.yml (#190)
 
 concurrency:
   group: release-macos
@@ -286,6 +287,16 @@ jobs:
           if gh release view "$TAG" --repo byte5ai/aiui >/dev/null 2>&1; then
             echo "release $TAG already exists — skipping create; PyPI step still runs"
           else
+            # DRAFT on purpose (#190). `releases/latest/download/latest.json`
+            # is what every installed aiui polls, and a draft is not served
+            # there — so clients keep resolving the previous COMPLETE feed
+            # while this release is still missing its Windows half. The
+            # release-windows run validates the assembled feed and un-drafts
+            # it; until then nothing is advertised to anyone.
+            #
+            # v0.10.1 is why: it published a darwin-only feed immediately, and
+            # every Windows client's update check went into the error path
+            # until a human remembered to dispatch the second workflow.
             gh release create "$TAG" \
               "aiui-${VERSION}-arm64.dmg" \
               "aiui-${VERSION}-arm64.zip" \
@@ -294,6 +305,7 @@ jobs:
               --repo byte5ai/aiui \
               --title "aiui ${TAG}" \
               --notes-file notes.md \
+              --draft \
               $PRERELEASE_FLAG
           fi
 
@@ -308,6 +320,33 @@ jobs:
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: uv publish
+
+      # #190: the release is a DRAFT until the Windows half lands, so the
+      # second workflow is no longer something a human has to remember —
+      # forgetting it would now leave the whole release invisible, not just
+      # Windows clients broken. Dispatched last, so a failure here does not
+      # roll back a good macOS build; the run can be re-dispatched by hand
+      # (the workflow is idempotent and `gh release upload --clobber`s).
+      - name: Dispatch the Windows release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "dispatching release-windows.yml for $TAG (release is a draft until it completes)"
+          gh workflow run release-windows.yml \
+            -f tag="$TAG" \
+            --repo byte5ai/aiui
+          {
+            echo "### Release $TAG is a DRAFT"
+            echo ""
+            echo "\`release-windows.yml\` has been dispatched. It attaches the"
+            echo "Windows installer, completes \`latest.json\`, validates the feed"
+            echo "and publishes the release."
+            echo ""
+            echo "If that run fails, the release stays a draft and **no client sees"
+            echo "this version** — which is the intended behaviour: a half-published"
+            echo "feed breaks update checks on the missing platform."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up keychain
         if: always()
