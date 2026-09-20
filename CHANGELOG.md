@@ -51,8 +51,61 @@ All notable changes to this project are documented here.
   agent-facing path guidance no longer says "the user's Mac" — an agent
   reading that could reasonably assume POSIX paths on a Windows user's
   machine.
+- **`remotes.json` now lives in the same config directory as everything
+  else aiui owns.** `config_dir()` resolves `%APPDATA%\aiui` on Windows and
+  `~/.config/aiui` elsewhere, and the token, `first_run_done` and `gui.lock`
+  all follow it — but the remotes helper built `~/.config/aiui/remotes.json`
+  from the home directory whatever the OS. On Windows that made
+  `%USERPROFILE%\.config\aiui\` a second state directory, holding the list
+  of every dev host the user had registered, that no aiui surface, the
+  README or either bridge ever named. The path now follows `config_dir()`,
+  and an existing file is moved there once at startup — deliberately not
+  from `load_remotes`, which runs on every 2 s status tick and in the tunnel
+  loops. Repointing without the migration would have silently emptied the
+  remotes list of every install since v0.10.1. No-op on macOS and Linux,
+  where both paths are the same file (#196).
 
 ### Fixed
+
+- **Uninstall reported that it had removed the local files, and had not.**
+  It deleted `token` and `first_run_done`, each behind a `let _ =`, then
+  rendered a green "Lokale Dateien entfernt" naming the config directory.
+  What survived: `remotes.json`, `gui.lock`, `gui.sock`, and the media cache
+  — bounded at 1 GiB of the video the user had aiui show them, and living
+  outside the config directory, so the message named neither the files nor
+  the place. Worse, the `save_remotes(&[])` call meant to clear the host
+  list went through `atomic_write`'s `create_dir_all` and therefore *created*
+  `remotes.json`, on Windows inside the stray directory above, during the
+  very operation that claimed to have removed it. The sweep now names every
+  file explicitly, deletes the media cache too, and reports per path what
+  actually happened — a failure reads as a failure and says which path and
+  why. The `.bak.<ts>` copies aiui made of the user's *own* config files are
+  still deliberately left alone; the hint now says so (#196).
+- **Any `gui.lock` failure was reported as "another aiui-GUI holds the
+  lock", and the process exited silently.** `try_acquire` fails for two
+  unrelated reasons — contention, and any filesystem problem — and the
+  caller collapsed both into one trace line plus `exit(0)`: no window, no
+  banner, exit code 0. When the cause was not contention (a backup or
+  antivirus agent holding the file with a deny-share mode, `LockFileEx`
+  failing on a network-redirected roaming `%APPDATA%`, a deny rule on
+  `gui.lock`, a leftover `gui.lock` that is a directory) aiui never started,
+  the one line a support engineer would read named a second GUI that does
+  not exist, and `mcp_attach` respawned the doomed process roughly every
+  20 s for the whole session. Contention still exits exactly as before.
+  Everything else keeps running *without* the lock and says so in a Settings
+  banner — the lock guards the v0.4.43 two-GUIs-in-one-millisecond bind
+  race, it is not the last line of defence, and a filesystem error is no
+  evidence at all that a second GUI exists. The auto-resurrect spawn now
+  backs off (5 s → 30 s → 120 s) instead of firing once per attach cycle
+  forever (#196).
+- **Dismissing the welcome wizard brought it back two seconds later.**
+  `mark_first_run_done` was a bare `let _ = std::fs::write(…)` and
+  `dismiss_welcome` returned `Ok(())` regardless, so the frontend hid the
+  banner optimistically while `is_first_run` still reported true — and the
+  2 s status tick re-opened the whole wizard, on every launch, with the
+  error surfaced nowhere. The write is propagated, and the frontend hides
+  the section only once it is persisted; a failure is logged once instead
+  (#196).
 
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so

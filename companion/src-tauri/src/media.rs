@@ -56,13 +56,21 @@ pub const MEDIA_TOTAL_CAP: u64 = 1024 * 1024 * 1024;
 /// `DefaultBodyLimit`; duplicated here as the documented contract.
 pub const MEDIA_FILE_CAP: u64 = 512 * 1024 * 1024;
 
-/// The cache directory: `<app-cache-dir>/media`, created if absent.
-pub fn media_dir(app: &AppHandle) -> std::io::Result<PathBuf> {
+/// Where the cache directory would be: `<app-cache-dir>/media`, without
+/// creating anything. Used by the uninstall sweep (#196), which must be able
+/// to name and remove the directory without conjuring it into existence
+/// first.
+pub fn media_dir_path(app: &AppHandle) -> std::io::Result<PathBuf> {
     let base = app
         .path()
         .app_cache_dir()
         .map_err(|e| std::io::Error::other(format!("no app cache dir: {e}")))?;
-    let dir = base.join("media");
+    Ok(base.join("media"))
+}
+
+/// The cache directory: `<app-cache-dir>/media`, created if absent.
+pub fn media_dir(app: &AppHandle) -> std::io::Result<PathBuf> {
+    let dir = media_dir_path(app)?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

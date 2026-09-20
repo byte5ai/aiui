@@ -1633,8 +1633,9 @@ _REMOTES_PROMPT = """\
 Show the user a quick rundown of their registered aiui remotes — same set \
 the Settings window's "Eingerichtete Remote-Hosts" section shows, but in \
 chat. Call `aiui_health` first to confirm aiui is up; if it isn't, just \
-tell the user that and stop. Otherwise read \
-`~/.config/aiui/remotes.json` (JSON array of host strings) and present \
+tell the user that and stop. Otherwise read `remotes.json` from aiui's \
+config directory — `~/.config/aiui/` on macOS and Linux, \
+`%APPDATA%\\aiui\\` on Windows (JSON array of host strings) — and present \
 the entries in a compact list. If the file is missing or empty, say "no \
 remotes registered yet — open Settings to add one".
 """

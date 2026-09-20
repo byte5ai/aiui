@@ -137,6 +137,10 @@ back in chat — without it, the agent might forget aiui exists.
 aiui runs purely locally on your own machine. No telemetry, no usage data, no
 content leaves your system. A local auth token lives in the per-user config
 directory and is only scp'd to hosts you explicitly register in settings.
+That directory — `~/.config/aiui/` on macOS and Linux, `%APPDATA%\aiui\` on
+Windows — also holds the list of registered hosts (`remotes.json`) and the
+first-run flag; uninstall removes all of it, together with the cached
+review media.
 
 | | Token location | Protection |
 |---|---|---|
@@ -160,7 +164,8 @@ it precisely.
 
 **Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
 Developer-ID signed and notarized. It never phones home. The auth token
-stays under `~/.config/aiui/` on your machine and is only copied to
+stays in aiui's config directory on your machine — `~/.config/aiui/` on
+macOS and Linux, `%APPDATA%\aiui\` on Windows — and is only copied to
 hosts you explicitly register in settings.
 
 **Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships

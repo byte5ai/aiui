@@ -1810,8 +1810,58 @@ pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
     }
 }
 
-fn remotes_path() -> PathBuf {
+/// `remotes.json` inside a given config dir. Pure, so the mapping can be
+/// asserted without touching `$HOME` — and so nothing here can re-derive a
+/// path of its own (#196).
+pub(crate) fn remotes_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("remotes.json")
+}
+
+/// Where `remotes.json` lived before #196: always `~/.config/aiui`, whatever
+/// the OS. Identical to the new path on macOS/Linux; on Windows it is
+/// `%USERPROFILE%\.config\aiui` — a second state directory no aiui surface
+/// ever named, while the token, `first_run_done` and `gui.lock` sat in
+/// `%APPDATA%\aiui`.
+fn legacy_remotes_path() -> PathBuf {
     home().join(".config").join("aiui").join("remotes.json")
+}
+
+/// The per-OS config dir, falling back to the legacy layout if it cannot be
+/// resolved — `load_remotes`/`save_remotes` have no error channel of their
+/// own, and the fallback is exactly what the old code did unconditionally.
+fn config_dir_or_legacy() -> PathBuf {
+    crate::config::config_dir().unwrap_or_else(|_| home().join(".config").join("aiui"))
+}
+
+fn remotes_path() -> PathBuf {
+    remotes_path_in(&config_dir_or_legacy())
+}
+
+/// Move a pre-#196 `remotes.json` into the per-OS config dir, once.
+///
+/// Called exactly once from `run()`, before the first `load_remotes()` —
+/// deliberately **not** from `load_remotes` itself, which runs on every 2 s
+/// status tick and in the tunnel loops. Repointing the path without this
+/// would silently empty the remotes list of every Windows install from
+/// v0.10.1 onwards, and the tunnel `ensure` loops would stop reconnecting
+/// registered hosts. On macOS/Linux both paths are the same file, so it is a
+/// no-op by construction.
+pub fn migrate_remotes_if_needed(config_dir: &Path) -> std::io::Result<bool> {
+    migrate_remotes_from(&legacy_remotes_path(), &remotes_path_in(config_dir))
+}
+
+/// The testable core of [`migrate_remotes_if_needed`]: move `legacy` to
+/// `new`, but only when `new` does not exist yet. An existing `new` always
+/// wins — it is the file the running build reads and writes, and overwriting
+/// it with older content would lose hosts rather than rescue them.
+pub(crate) fn migrate_remotes_from(legacy: &Path, new: &Path) -> std::io::Result<bool> {
+    if legacy == new || new.exists() || !legacy.exists() {
+        return Ok(false);
+    }
+    let content = fs::read(legacy)?;
+    atomic_write(new, &content)?;
+    fs::remove_file(legacy)?;
+    Ok(true)
 }
 
 pub fn load_remotes() -> Vec<String> {
@@ -1885,6 +1935,81 @@ mod tests {
     #[test]
     fn classify_none() {
         assert!(classify_aiui_entry(None).is_none());
+    }
+
+    /// Temp dir for the remotes-migration tests, in the house style
+    /// (`temp_dir()` + a pid-suffixed name, removed at the end of the test).
+    fn migration_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("aiui-test-remotes-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn remotes_path_follows_config_dir() {
+        // #196: the helper maps the config dir it is given and nothing else.
+        // Before the fix it rebuilt `~/.config/aiui/remotes.json` from $HOME,
+        // which on Windows is a different directory than the one holding the
+        // token, `first_run_done` and `gui.lock`.
+        let base = Path::new("/x/aiui");
+        assert_eq!(remotes_path_in(base), base.join("remotes.json"));
+        let home_remotes = home().join(".config").join("aiui").join("remotes.json");
+        assert_ne!(
+            remotes_path_in(base),
+            home_remotes,
+            "must not re-derive a path from $HOME"
+        );
+    }
+
+    #[test]
+    fn migrate_remotes_moves_legacy_file_once() {
+        let dir = migration_test_dir("move");
+        let legacy = dir.join("legacy/remotes.json");
+        let new = dir.join("config/remotes.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, br#"["dev@devhost"]"#).unwrap();
+
+        assert!(migrate_remotes_from(&legacy, &new).unwrap(), "first call migrates");
+        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@devhost"]"#);
+        assert!(!legacy.exists(), "legacy file is moved, not copied");
+
+        // Second call is a no-op: nothing left to move, nothing rewritten.
+        assert!(!migrate_remotes_from(&legacy, &new).unwrap());
+        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@devhost"]"#);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_remotes_never_overwrites_new_file() {
+        let dir = migration_test_dir("no-overwrite");
+        let legacy = dir.join("legacy/remotes.json");
+        let new = dir.join("config/remotes.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&legacy, br#"["stale@host"]"#).unwrap();
+        fs::write(&new, br#"["current@host"]"#).unwrap();
+
+        assert!(
+            !migrate_remotes_from(&legacy, &new).unwrap(),
+            "an existing file at the new path always wins"
+        );
+        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["current@host"]"#);
+        assert!(legacy.exists(), "nothing is removed when nothing moved");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_remotes_is_a_noop_when_both_paths_are_the_same_file() {
+        // macOS/Linux: legacy and new resolve to the identical path, so the
+        // migration must not read-write-delete its own file.
+        let dir = migration_test_dir("same-path");
+        let p = dir.join("remotes.json");
+        fs::write(&p, br#"["dev@devhost"]"#).unwrap();
+        assert!(!migrate_remotes_from(&p, &p).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), r#"["dev@devhost"]"#);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

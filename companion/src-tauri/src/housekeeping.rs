@@ -126,6 +126,37 @@ impl Drop for ProcessLock {
     }
 }
 
+/// Windows' `ERROR_LOCK_VIOLATION`: what `LockFileEx` reports with
+/// `LOCKFILE_FAIL_IMMEDIATELY` when someone else holds the range. `std`
+/// leaves it uncategorised, so the raw code is the only reliable signal
+/// there — on Unix the same situation arrives as `EWOULDBLOCK`/`EAGAIN`,
+/// which `std` does map to [`io::ErrorKind::WouldBlock`].
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Does this `try_acquire` error mean "another process holds the lock"?
+///
+/// #196: [`ProcessLock::try_acquire`] fails for two unrelated reasons, and
+/// the caller used to collapse both into "another aiui-GUI is running" and
+/// exit silently. Contention is the benign one. Everything else — a
+/// deny-share handle from a backup/AV agent, `LockFileEx` refusing a
+/// network-redirected roaming `%APPDATA%`, a deny-ACL or read-only attribute
+/// on `gui.lock`, a leftover `gui.lock` that is a *directory* — is no
+/// evidence at all that a second GUI exists, and must not be reported as
+/// one.
+pub fn is_lock_contention(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -1102,6 +1133,57 @@ mod tests {
         let lock = ProcessLock::try_acquire(&path).expect("must create parent dir");
         assert!(path.exists());
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_contention_is_classified_as_contention() {
+        // The benign case: someone else holds the lock.
+        assert!(is_lock_contention(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "already locked"
+        )));
+        #[cfg(windows)]
+        assert!(is_lock_contention(&io::Error::from_raw_os_error(
+            ERROR_LOCK_VIOLATION
+        )));
+
+        // Everything else is a filesystem problem, not a second GUI.
+        // (`ErrorKind::IsADirectory` would say the third case more plainly,
+        // but it is newer than this crate's declared MSRV.)
+        for e in [
+            io::Error::new(io::ErrorKind::PermissionDenied, "deny ACL on gui.lock"),
+            io::Error::new(io::ErrorKind::NotFound, "config dir vanished"),
+            io::Error::other("gui.lock is a directory"),
+        ] {
+            assert!(
+                !is_lock_contention(&e),
+                "{e} must not read as lock contention"
+            );
+        }
+    }
+
+    #[test]
+    fn try_acquire_on_a_directory_is_not_contention() {
+        // The concrete case the caller used to mislabel: a leftover
+        // `gui.lock` that is a directory. Opening it fails, and reporting
+        // that as "another aiui-GUI holds the lock" sends the support path
+        // after a process that does not exist.
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-test-lock-isdir-{}",
+            std::process::id()
+        ));
+        let path = dir.join("gui.lock");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = match ProcessLock::try_acquire(&path) {
+            Ok(_) => panic!("acquiring a directory as a lock file must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            !is_lock_contention(&err),
+            "a directory where the lock file belongs is a filesystem error ({err}), not contention"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

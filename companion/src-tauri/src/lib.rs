@@ -16,6 +16,7 @@ mod setup;
 mod skill;
 mod tunnel;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_notification::NotificationExt;
@@ -464,6 +465,14 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
 #[derive(Default)]
 pub struct PendingUpdate(pub std::sync::Mutex<Option<String>>);
 
+/// Non-contention `gui.lock` failure (#196). `Some(message)` when
+/// `ProcessLock::try_acquire` failed for a reason that is *not* another GUI
+/// holding the lock — we keep running without the lock and this drives the
+/// Settings banner that says so. Newtype for the same reason as
+/// [`PendingUpdate`]: Tauri resolves managed state by type.
+#[derive(Default)]
+pub struct LockError(pub std::sync::Mutex<Option<String>>);
+
 #[tauri::command]
 async fn set_pending_update(
     app: tauri::AppHandle,
@@ -531,6 +540,11 @@ struct StatusReport {
     /// red banner in Settings so the user knows why dialogs aren't
     /// landing.
     http_error: Option<String>,
+    /// `Some(message)` when `gui.lock` could not be acquired for a reason
+    /// other than another GUI holding it (#196). aiui keeps running without
+    /// the lock; the banner tells the user what failed instead of leaving a
+    /// silent exit and a wrong trace line behind.
+    lock_error: Option<String>,
     /// Live result of a TCP self-probe to `localhost:http_port`. The Rust
     /// side does this for us because a WebView `fetch()` would be blocked
     /// by macOS App Transport Security (ATS) on plaintext localhost
@@ -567,6 +581,7 @@ async fn status(
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
     pending_update: tauri::State<'_, Arc<PendingUpdate>>,
+    lock_err: tauri::State<'_, Arc<LockError>>,
 ) -> Result<StatusReport, String> {
     let bin = setup::app_binary_path();
     let http_alive = probe_http_self(&cfg).await;
@@ -583,6 +598,7 @@ async fn status(
         build_info: logging::BUILD_INFO,
         welcome_pending: is_first_run(&cfg),
         http_error: http_err.lock().ok().and_then(|s| s.clone()),
+        lock_error: lock_err.0.lock().ok().and_then(|s| s.clone()),
         http_alive,
         os: current_os(),
         pending_update: pending_update.0.lock().ok().and_then(|s| s.clone()),
@@ -628,10 +644,13 @@ async fn probe_http_self(cfg: &config::AppConfig) -> bool {
 /// Marks the welcome banner as dismissed so it doesn't reappear on the
 /// next launch. Frontend calls this when the user clicks "Got it" on the
 /// first-run welcome section.
+///
+/// Returns the write error rather than swallowing it (#196): the flag is
+/// what `is_first_run` reads on every 2 s status tick, so a silent failure
+/// means the wizard reappears seconds later and nobody learns why.
 #[tauri::command]
 fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), String> {
-    mark_first_run_done(&cfg);
-    Ok(())
+    mark_first_run_done(&cfg).map_err(|e| format!("could not persist first_run_done: {e}"))
 }
 
 /// Re-installs the local skill file. Bound to the "Skill reparieren" button
@@ -1097,24 +1116,126 @@ async fn remove_remote(
 
 /// Uninstall hint shown after the cleanup sweep — tells the user how to
 /// remove the app bundle itself, which aiui can't do for itself
-/// (a running process can't delete its own binary on either OS).
-fn uninstall_app_removal_hint() -> &'static str {
+/// (a running process can't delete its own binary on either OS), and that
+/// the `.bak.<ts>` copies aiui made of *their* config files are deliberately
+/// left in place (#196).
+fn uninstall_app_removal_hint() -> String {
     #[cfg(target_os = "macos")]
-    {
-        "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen."
-    }
+    let app = "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen.";
     #[cfg(target_os = "windows")]
-    {
-        "Deinstalliere aiui über \"Apps & Features\" in den Windows-Einstellungen, um auch die App zu entfernen."
-    }
+    let app = "Deinstalliere aiui über \"Apps & Features\" in den Windows-Einstellungen, um auch die App zu entfernen.";
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        "Entferne das aiui-Binary manuell, um auch die App zu entfernen."
+    let app = "Entferne das aiui-Binary manuell, um auch die App zu entfernen.";
+    format!(
+        "{app} Die Sicherungskopien `.bak.<ts>` neben deinen eigenen Config-Dateien \
+         (Claude-Desktop-Config, ~/.claude.json, ~/.codex/config.toml) bleiben absichtlich \
+         liegen — es sind Backups deiner Dateien, nicht aiui-State. Lösche sie selbst, \
+         wenn du sie nicht mehr brauchst."
+    )
+}
+
+/// The local state aiui owns inside its config dir, in removal order. The
+/// media cache lives outside it (under the Tauri app-cache dir) and is
+/// handled separately.
+const LOCAL_STATE_FILES: [&str; 6] = [
+    "token",
+    "first_run_done",
+    "remotes.json",
+    // #184: the uvx sidecar is local state too.
+    "remote-uvx.json",
+    "gui.lock",
+    "gui.sock",
+];
+
+/// `remove_file`, with "was not there anyway" counting as success — the
+/// point of the sweep is the end state, not who did the removing.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_dir_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove every file aiui wrote for itself and report, per path, whether it
+/// worked (#196).
+///
+/// The previous sweep deleted two of them behind `let _ =` and then claimed
+/// `ok: true` for the whole config dir. `remotes.json`, `gui.lock`,
+/// `gui.sock` and up to 1 GiB of cached review media survived an operation
+/// that reported them gone — and `save_remotes(&[])`, which was meant to
+/// clear the list, went through `atomic_write`'s `create_dir_all` and so
+/// *created* `remotes.json` on machines that never had one.
+fn sweep_local_state(
+    config_dir: &Path,
+    media_dir: Option<&Path>,
+) -> Vec<(PathBuf, std::io::Result<()>)> {
+    let mut out: Vec<(PathBuf, std::io::Result<()>)> = LOCAL_STATE_FILES
+        .iter()
+        .map(|name| {
+            let p = config_dir.join(name);
+            let r = remove_if_present(&p);
+            (p, r)
+        })
+        .collect();
+    if let Some(dir) = media_dir {
+        let r = remove_dir_if_present(dir);
+        out.push((dir.to_path_buf(), r));
+    }
+    out
+}
+
+/// Turn a sweep into the log line the user reads. `ok` is true only when
+/// every entry succeeded; anything that could not be removed is named in
+/// `details`, with its reason.
+fn sweep_step_result(
+    config_dir: &Path,
+    media_dir: Option<&Path>,
+    sweep: &[(PathBuf, std::io::Result<()>)],
+) -> setup::StepResult {
+    let failures: Vec<String> = sweep
+        .iter()
+        .filter_map(|(p, r)| r.as_ref().err().map(|e| format!("{}: {e}", p.display())))
+        .collect();
+    let removed_from = match media_dir {
+        Some(m) => format!("{} und {}", config_dir.display(), m.display()),
+        None => config_dir.display().to_string(),
+    };
+    let hint = uninstall_app_removal_hint();
+    if failures.is_empty() {
+        setup::StepResult {
+            ok: true,
+            message: format!("Lokale Dateien entfernt: {removed_from}"),
+            details: Some(hint),
+        }
+    } else {
+        setup::StepResult {
+            ok: false,
+            message: format!(
+                "Lokale Dateien nur teilweise entfernt: {removed_from} — \
+                 {} Eintrag/Einträge blieben liegen",
+                failures.len()
+            ),
+            details: Some(format!(
+                "Nicht entfernt:\n{}\n\n(gui.lock/gui.sock hält dieser Prozess noch offen — \
+                 sie verschwinden spätestens beim Beenden.)\n\n{hint}",
+                failures.join("\n")
+            )),
+        }
     }
 }
 
 #[tauri::command]
 async fn uninstall_all(
+    app: tauri::AppHandle,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
@@ -1136,20 +1257,25 @@ async fn uninstall_all(
         }
     }
     results.push(skill::remove_locally());
-    let _ = std::fs::remove_file(&cfg.token_path);
-    let _ = std::fs::remove_file(cfg.config_dir.join("first_run_done"));
-    let _ = setup::save_remotes(&[]);
-    // #184: the uvx sidecar is local state too — uninstall must not leave
-    // it behind.
-    let _ = std::fs::remove_file(cfg.config_dir.join("remote-uvx.json"));
-    results.push(setup::StepResult {
-        ok: true,
-        message: format!(
-            "Lokale Dateien entfernt: {}",
-            cfg.config_dir.display()
-        ),
-        details: Some(uninstall_app_removal_hint().into()),
-    });
+    // #196: sweep every file we own and report what actually happened. The
+    // media cache is the big one — `MEDIA_TOTAL_CAP` bounds it at 1 GiB of
+    // clips the user had aiui show them, and it lives outside the config
+    // dir, so the old message named neither the files nor the directory.
+    let media_dir = media::media_dir_path(&app).ok();
+    let sweep = sweep_local_state(&cfg.config_dir, media_dir.as_deref());
+    for (path, result) in &sweep {
+        if let Err(e) = result {
+            logging::trace(&format!(
+                "uninstall: could not remove {}: {e}",
+                path.display()
+            ));
+        }
+    }
+    results.push(sweep_step_result(
+        &cfg.config_dir,
+        media_dir.as_deref(),
+        &sweep,
+    ));
     Ok(results)
 }
 
@@ -1157,8 +1283,15 @@ fn is_first_run(cfg: &config::AppConfig) -> bool {
     !cfg.config_dir.join("first_run_done").exists()
 }
 
-fn mark_first_run_done(cfg: &config::AppConfig) {
-    let _ = std::fs::write(cfg.config_dir.join("first_run_done"), b"");
+/// Persist the "welcome dismissed" flag.
+///
+/// #196: this used to be `let _ = std::fs::write(…)`. A failed write left
+/// `is_first_run` reporting true, so the 2 s status tick brought the whole
+/// welcome wizard back about two seconds after the user dismissed it — on
+/// every launch, with the error visible nowhere. The caller now propagates
+/// it. Written through `atomic_write`, like the token in `config.rs`.
+fn mark_first_run_done(cfg: &config::AppConfig) -> std::io::Result<()> {
+    fsutil::atomic_write(&cfg.config_dir.join("first_run_done"), b"")
 }
 
 fn show_settings_window(app: &tauri::AppHandle) {
@@ -1461,10 +1594,24 @@ pub fn run() {
     // Drop is bound to process death via `mem::forget` further down —
     // we don't want it released while the GUI is still alive on a
     // panic-unwind path.
+    //
+    // #196: `try_acquire` fails for two unrelated reasons and only one of
+    // them is "a second GUI". Contention keeps today's silent exit(0).
+    // Anything else — a deny-share handle from an AV/backup agent, a
+    // network-redirected roaming `%APPDATA%`, a `gui.lock` that is a
+    // directory — is no evidence that another GUI exists, and exiting on it
+    // made aiui unstartable while `mcp_attach` respawned it every ~20 s for
+    // the whole session. So we keep running without the lock and say so in
+    // the UI. That trade is sound: the lock is a fast-path guard against the
+    // v0.4.43 two-GUIs-in-the-same-millisecond bind race, not the last line
+    // of defence — `tauri_plugin_single_instance` still covers the
+    // second-launch case, and an HTTP bind collision already degrades
+    // instead of exiting.
     let lock_path = cfg.config_dir.join("gui.lock");
+    let mut lock_error_message: Option<String> = None;
     let gui_lock = match housekeeping::ProcessLock::try_acquire(&lock_path) {
-        Ok(g) => g,
-        Err(e) => {
+        Ok(g) => Some(g),
+        Err(e) if housekeeping::is_lock_contention(&e) => {
             // Another aiui-GUI is alive and holds the lock. Exit
             // immediately, traced so the post-mortem in the trace log
             // explains the silent disappearance.
@@ -1477,11 +1624,40 @@ pub fn run() {
             // mounted the HTTP server, so there's nothing to sweep.
             std::process::exit(0);
         }
+        Err(e) => {
+            logging::trace(&format!(
+                "[aiui] gui-lock-error on {} (kind={:?}): {e} — not lock contention, \
+                 continuing without the lock",
+                lock_path.display(),
+                e.kind()
+            ));
+            lock_error_message = Some(format!(
+                "Konnte {} nicht sperren — aiui läuft ohne diese Absicherung weiter. {e}",
+                lock_path.display()
+            ));
+            None
+        }
     };
-    logging::trace(&format!(
-        "[aiui] gui-lock acquired: {}",
-        gui_lock.path().display()
-    ));
+    match &gui_lock {
+        Some(g) => logging::trace(&format!(
+            "[aiui] gui-lock acquired: {}",
+            g.path().display()
+        )),
+        None => logging::trace("[aiui] running without gui-lock (see gui-lock-error above)"),
+    }
+
+    // #196: `remotes.json` moved into the per-OS config dir. One-shot, here
+    // rather than inside `load_remotes` — that one runs on every status tick
+    // and in the tunnel loops. No-op on macOS/Linux, where both paths are
+    // the same file.
+    match setup::migrate_remotes_if_needed(&cfg.config_dir) {
+        Ok(true) => logging::trace(&format!(
+            "[aiui] migrated remotes.json into {}",
+            cfg.config_dir.display()
+        )),
+        Ok(false) => {}
+        Err(e) => logging::trace(&format!("[aiui] remotes.json migration failed: {e}")),
+    }
 
     // Pre-GUI sweep (v0.4.43, Codex review P2a): now that we hold the
     // exclusive GUI lock, kill any aiui-mcp-stdio children that started
@@ -1520,6 +1696,16 @@ pub fn run() {
     // later while the window kept *looking* alive.
     let http_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // #196: same idea for a non-contention `gui.lock` failure recorded
+    // above — we are running without the lock and the user should be told,
+    // rather than aiui vanishing with exit code 0.
+    let lock_error = Arc::new(LockError::default());
+    let lock_error_at_startup = lock_error_message.is_some();
+    if let Some(msg) = lock_error_message {
+        if let Ok(mut slot) = lock_error.0.lock() {
+            *slot = Some(msg);
+        }
+    }
 
     // Pending-update state (v0.4.44). Set by the silent updater path
     // in `updater.ts` whenever the periodic auto-check finds a newer
@@ -1596,6 +1782,7 @@ pub fn run() {
         .manage(exit_authority.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
+        .manage(lock_error.clone())
         .manage(pending_update.clone())
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
@@ -1929,6 +2116,13 @@ pub fn run() {
                     tokio::time::sleep(CHECK_INTERVAL).await;
                 }
             });
+
+            if lock_error_at_startup {
+                // #196: same treatment as the degraded HTTP mode — a failure
+                // the user cannot otherwise see gets a window and a banner
+                // instead of a silent exit.
+                show_settings_window(&app_handle);
+            }
 
             if is_first_run(&cfg) {
                 // First-ever launch: surface the settings window so the user
@@ -2313,5 +2507,153 @@ mod tests {
     fn collect_target_fields_empty_when_no_targets() {
         let spec = json!({"kind": "form", "fields": [{"kind": "text", "name": "x"}]});
         assert!(collect_target_fields(&spec).is_empty());
+    }
+
+    // ---------- #196: uninstall sweep + first_run_done ----------
+
+    use std::path::{Path, PathBuf};
+
+    /// Temp config dir in the house style (`temp_dir()` + a pid-suffixed
+    /// name), cleaned up by the test that made it.
+    fn sweep_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("aiui-test-sweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A config dir carrying every file aiui writes for itself.
+    fn seed_local_state(config_dir: &Path) {
+        for name in LOCAL_STATE_FILES {
+            std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn sweep_local_state_removes_every_known_file() {
+        // The old sweep deleted `token` and `first_run_done` and reported
+        // the whole config dir as cleaned. `remotes.json`, `gui.lock`,
+        // `gui.sock` and up to 1 GiB of cached media stayed behind.
+        let base = sweep_test_dir("removes");
+        let config_dir = base.join("config");
+        let media_dir = base.join("cache/media");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&media_dir).unwrap();
+        seed_local_state(&config_dir);
+        std::fs::write(media_dir.join("clip.mp4"), b"video").unwrap();
+
+        let sweep = sweep_local_state(&config_dir, Some(&media_dir));
+        for (path, result) in &sweep {
+            assert!(result.is_ok(), "{} should be removable", path.display());
+            assert!(!path.exists(), "{} should be gone", path.display());
+        }
+        for name in LOCAL_STATE_FILES {
+            assert!(
+                sweep
+                    .iter()
+                    .any(|(p, _)| p.file_name() == Some(std::ffi::OsStr::new(name))),
+                "{name} must be part of the sweep"
+            );
+        }
+        assert!(
+            sweep.iter().any(|(p, _)| p.as_path() == media_dir.as_path()),
+            "media cache is swept too"
+        );
+
+        let step = sweep_step_result(&config_dir, Some(&media_dir), &sweep);
+        assert!(step.ok);
+        assert!(step.message.contains(&config_dir.display().to_string()));
+        assert!(
+            step.message.contains(&media_dir.display().to_string()),
+            "the message must name the media dir, which is outside the config dir"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sweep_local_state_treats_absent_files_as_success() {
+        // Uninstalling twice, or before a file was ever written, is not a
+        // failure — the sweep is about the end state.
+        let config_dir = sweep_test_dir("absent");
+        let sweep = sweep_local_state(&config_dir, None);
+        assert!(sweep.iter().all(|(_, r)| r.is_ok()));
+        assert!(sweep_step_result(&config_dir, None, &sweep).ok);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn sweep_local_state_reports_failure_instead_of_claiming_success() {
+        // A non-empty directory where a file belongs cannot be removed with
+        // `remove_file`. The whole point of #196 is that this surfaces
+        // instead of rendering as a green "Lokale Dateien entfernt".
+        let config_dir = sweep_test_dir("failure");
+        let stuck = config_dir.join("remotes.json");
+        std::fs::create_dir_all(stuck.join("not-a-file")).unwrap();
+
+        let sweep = sweep_local_state(&config_dir, None);
+        let entry = sweep
+            .iter()
+            .find(|(p, _)| p.as_path() == stuck.as_path())
+            .expect("the stuck path is part of the sweep");
+        assert!(entry.1.is_err(), "a directory here must not report success");
+
+        let step = sweep_step_result(&config_dir, None, &sweep);
+        assert!(!step.ok, "one failure makes the whole step a failure");
+        let details = step.details.expect("failures are always explained");
+        assert!(
+            details.contains(&stuck.display().to_string()),
+            "details must name what was left behind: {details}"
+        );
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn uninstall_never_recreates_remotes_json() {
+        // Regression guard against `save_remotes(&[])`: it went through
+        // `atomic_write`'s `create_dir_all` and so *created* the file — and
+        // on Windows the stray directory holding it — during an uninstall
+        // that claimed to have removed it.
+        let config_dir = sweep_test_dir("no-recreate");
+        seed_local_state(&config_dir);
+        let remotes = setup::remotes_path_in(&config_dir);
+
+        let sweep = sweep_local_state(&config_dir, None);
+        assert!(sweep.iter().all(|(_, r)| r.is_ok()));
+        assert!(!remotes.exists(), "remotes.json must be gone, not rewritten");
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    fn test_config(config_dir: &Path) -> config::AppConfig {
+        config::AppConfig {
+            token: "0".repeat(64),
+            config_dir: config_dir.to_path_buf(),
+            token_path: config_dir.join("token"),
+            http_port: 7777,
+        }
+    }
+
+    #[test]
+    fn mark_first_run_done_propagates_write_error() {
+        // Happy path: the flag lands and `is_first_run` flips.
+        let dir = sweep_test_dir("first-run-ok");
+        let cfg = test_config(&dir);
+        assert!(is_first_run(&cfg));
+        mark_first_run_done(&cfg).expect("writing the flag must succeed");
+        assert!(!is_first_run(&cfg));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Failure path: a directory in the flag's place. The write used to
+        // be `let _ =`, so the frontend hid the banner, the next 2 s tick
+        // reported `welcome_pending: true`, and the wizard came back.
+        let dir = sweep_test_dir("first-run-err");
+        let cfg = test_config(&dir);
+        std::fs::create_dir_all(dir.join("first_run_done").join("blocker")).unwrap();
+        let err = mark_first_run_done(&cfg).expect_err("a directory must fail the write");
+        // What `dismiss_welcome` hands the frontend: a non-empty reason,
+        // where it previously returned `Ok(())` regardless.
+        let surfaced = format!("could not persist first_run_done: {err}");
+        assert!(surfaced.len() > "could not persist first_run_done: ".len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

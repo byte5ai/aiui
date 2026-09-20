@@ -636,17 +636,35 @@ pub async fn mcp_attach(sock: PathBuf) {
         );
     }
 
+    // #196: how many attach cycles in a row have failed. A GUI that cannot
+    // start (say, a `gui.lock` failure that is not contention) used to be
+    // respawned once per cycle — roughly every 20 s — for the entire life of
+    // the Claude Desktop / Claude Code session.
+    let mut consecutive_failures: u32 = 0;
+    let mut capped_traced = false;
+
     loop {
         let mut attached = false;
         for attempt in 1..=30u32 {
             match try_attach(&sock).await {
                 Ok(()) => {
                     attached = true;
+                    consecutive_failures = 0;
+                    capped_traced = false;
                     trace("lifetime: mcp socket closed — GUI is gone, will relaunch");
                     break;
                 }
                 Err(e) => {
                     if attempt == 1 && interactive {
+                        let backoff = resurrect_delay(consecutive_failures);
+                        if !backoff.is_zero() {
+                            trace(&format!(
+                                "lifetime: {consecutive_failures} failed attach cycle(s) — \
+                                 waiting {}s before launching the GUI again",
+                                backoff.as_secs()
+                            ));
+                            tokio::time::sleep(backoff).await;
+                        }
                         trace(&format!(
                             "lifetime: gui channel not ready ({e}), launching GUI"
                         ));
@@ -663,6 +681,19 @@ pub async fn mcp_attach(sock: PathBuf) {
             }
         }
         if !attached {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if interactive
+                && resurrect_delay(consecutive_failures) >= RESURRECT_DELAY_CAP
+                && !capped_traced
+            {
+                capped_traced = true;
+                trace(&format!(
+                    "lifetime: {consecutive_failures} attach cycles failed in a row — \
+                     auto-resurrect backoff is at its {}s ceiling; the GUI is not coming up, \
+                     check the aiui trace log for a gui-lock-error or http-bind-error",
+                    RESURRECT_DELAY_CAP.as_secs()
+                ));
+            }
             trace(
                 "lifetime: mcp gave up waiting for gui channel after 30 attempts; retrying in 5s",
             );
@@ -670,6 +701,27 @@ pub async fn mcp_attach(sock: PathBuf) {
         }
         // GUI was connected and has now closed; loop back to resurrect it
         // (or wait + retry if launch failed / suppressed).
+    }
+}
+
+/// Ceiling for the auto-resurrect backoff. Two minutes between spawn
+/// attempts is still responsive when the GUI merely needed a moment, and it
+/// turns a permanently-unstartable GUI from ~180 doomed launches an hour
+/// into 30.
+pub const RESURRECT_DELAY_CAP: Duration = Duration::from_secs(120);
+
+/// How long to wait before spawning the GUI again, after
+/// `consecutive_failures` attach cycles that never got a channel (#196).
+///
+/// The first attempt is immediate — the overwhelmingly common case is "the
+/// GUI simply isn't running yet", and making that user wait would be a
+/// regression. Monotonic from there, clamped at [`RESURRECT_DELAY_CAP`].
+pub fn resurrect_delay(consecutive_failures: u32) -> Duration {
+    match consecutive_failures {
+        0 => Duration::from_secs(0),
+        1 => Duration::from_secs(5),
+        2 => Duration::from_secs(30),
+        _ => RESURRECT_DELAY_CAP,
     }
 }
 
@@ -795,6 +847,22 @@ fn spawn_gui_detached() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resurrect_delay_grows_and_caps() {
+        // #196: the first failure still spawns immediately — the usual case
+        // is "the GUI just isn't up yet". After that the wait grows, so a
+        // GUI that can never start is not relaunched every ~20 s forever.
+        assert_eq!(resurrect_delay(0), Duration::from_secs(0));
+        let series: Vec<Duration> = (0..8).map(resurrect_delay).collect();
+        for pair in series.windows(2) {
+            assert!(pair[1] >= pair[0], "backoff must be monotonic: {series:?}");
+        }
+        assert!(resurrect_delay(1) > resurrect_delay(0));
+        assert_eq!(resurrect_delay(5), RESURRECT_DELAY_CAP);
+        assert_eq!(resurrect_delay(100), RESURRECT_DELAY_CAP);
+        assert_eq!(resurrect_delay(u32::MAX), RESURRECT_DELAY_CAP);
+    }
 
     #[test]
     fn ssh_connection_signals_non_interactive() {
