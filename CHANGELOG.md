@@ -54,6 +54,59 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **An answered dialog could be accepted and then reported as never having
+  existed.** `GET /render/{id}` removed the result slot *before* the HTTP
+  response reached the wire, so a tunnel blip while the body was being written
+  destroyed the user's answer and the retry got `404 unknown_render_id` — which
+  both bridges render as "aiui lost track of render … Restart the dialog". The
+  user was told to re-type something they had in fact already submitted,
+  including a value typed into a `password` field. Delivery is now idempotent:
+  the result is cloned, the slot stays readable for five minutes after the
+  first collection, and the bridges retry a transport error on the poll GET
+  (never a `404` — that one is terminal) (#193).
+- **A dialog nobody was waiting for stayed on the desktop for two hours.**
+  Nothing tied a dialog's lifetime to the agent that asked for it: once
+  `POST /render` answered `202` the cancellation guard was disarmed and no
+  record of "someone is still polling this" existed. Kill the session, drop the
+  tunnel or press Ctrl-C and the window sat there until the 2 h TTL — and
+  because zombies accumulate, sixteen of them start evicting live dialogs and
+  flip `/health` to `503`, which locks out every *other* remote session. The
+  result slot is now the dialog's lifetime record, and a background reaper
+  cancels a dialog whose caller has not polled for 90 seconds (#193).
+- **A clean TTL expiry could be turned into the same misleading 404.** The
+  sweep retained slots by `created_at` against the very deadline the resolver
+  task uses, and removed them regardless of whether that task had finished, so
+  a concurrent render at the boundary could sweep the slot first and the
+  documented terminal `{cancelled: true, reason: "ttl_expired"}` silently
+  became "the render never existed". The reaper now consults a `done` flag the
+  resolver sets, which makes the decision correct rather than merely less
+  likely to be wrong (#193).
+- **A dialog the user never saw still hung the agent for two hours.** If the
+  window failed to build — a label collision behind a not-yet-completed
+  `destroy()`, a broken WebView2 runtime on Windows — the error was written to
+  the trace log and discarded; `/render` returned `202` as if a window existed
+  and both bridges polled in an unbounded loop. Nothing appeared on screen and
+  the tool call simply never returned. A deterministic build failure now
+  answers `500 {"error": "window_failed", "detail": …}`. A *timeout* waiting on
+  a busy main thread is not treated as failure — a false `window_failed` would
+  abort a dialog that is about to appear (#193).
+- **Pressing Esc in Claude Code did not close the dialog.** The Rust bridge
+  dropped every message without an `id` before dispatch, so
+  `notifications/cancelled` — the MCP spec's only way to abort an in-flight
+  request — was a no-op: the bridge kept polling and kept emitting progress for
+  a token the client had already forgotten. Both bridges now retract the dialog
+  through the new `DELETE /render/{id}` when their caller is cancelled. The
+  route is purely additive, so the wire version stays 1 and an older companion
+  simply 404s the call (#193).
+- **Quitting the MCP host left the child process alive.** On stdin EOF the
+  bridge dropped its writer channel and awaited the writer task — but every
+  dispatch task and every progress task held a clone of the sender, and the
+  channel only closes when the last one is gone, so the drain waited for as
+  long as any tool call was outstanding. With a dialog open that is up to two
+  hours, with `lifetime::mcp_attach` still attached and a stale binary in RAM
+  answering tool calls. In-flight tasks are now aborted at EOF (their dialogs
+  retracted on the way out), progress loops die with their parent, and the
+  drain itself is bounded at two seconds (#193).
 - **A pull request based on another branch got no CI checks at all.** The
   workflow's `pull_request.branches: [main]` filter matches the *base*, so
   a stacked PR — the normal shape of a multi-step change — produced no

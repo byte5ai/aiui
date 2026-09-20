@@ -17,8 +17,9 @@
 use crate::config::AppConfig;
 use crate::logging::trace;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 /// How often the companion fires `notifications/progress` while a
@@ -27,6 +28,103 @@ use tokio::sync::mpsc;
 /// Claude Code ≈ 120 s) so the notification clearly signals "still
 /// alive" before any client-side give-up. v0.4.40.
 const PROGRESS_NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Budget for a best-effort `DELETE /render/{id}` when a request is cancelled
+/// or the host quits (#193). Short on purpose: retracting a dialog must never
+/// be what keeps this process alive.
+const CANCEL_RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Upper bound on draining the stdout writer at EOF (#193). Belt-and-braces —
+/// a stuck writer must never pin the process, which is exactly the stale
+/// `--mcp-stdio` child class this codebase has fought repeatedly.
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Where an in-flight tool call publishes the companion-side render id, as soon
+/// as the async `202` is parsed. `notifications/cancelled` and stdin EOF read it
+/// to issue `DELETE /render/{id}`, so a dialog is never left on the user's Mac
+/// waiting for an agent that is gone. `None` until a dialog is registered — a
+/// tool call that never rendered has nothing to retract.
+type RenderSink = Arc<Mutex<Option<String>>>;
+
+fn new_render_sink() -> RenderSink {
+    Arc::new(Mutex::new(None))
+}
+
+/// One dispatched JSON-RPC request, keyed by `id.to_string()`.
+///
+/// The key is the *stringified* `Value`: `serde_json::Value` is not `Hash`, and
+/// `to_string()` canonicalises both the string and the integer id forms the
+/// spec allows, so the registration and the later `notifications/cancelled`
+/// lookup agree.
+struct InFlight {
+    task: tokio::task::JoinHandle<()>,
+    render_id: RenderSink,
+}
+
+type InFlightMap = Arc<Mutex<HashMap<String, InFlight>>>;
+
+/// Aborts the wrapped task when dropped.
+///
+/// The progress loop is spawned inside `tools_call` and was only aborted on the
+/// explicit success/error paths — so aborting a dispatch task left its progress
+/// loop running, still holding a clone of the writer channel's sender, and the
+/// EOF drain then waited forever on it (#193). Owned by `tools_call`, it dies
+/// with its parent however the parent ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Best-effort `DELETE /render/{id}` — ask the companion to retract a dialog
+/// this bridge no longer has a caller for. Every failure is swallowed: an older
+/// companion has no such route (404/405), and a companion that is already gone
+/// has no dialog to retract either.
+async fn cancel_render(http: reqwest::Client, cfg: Arc<AppConfig>, render_id: String) {
+    let Ok(token) = load_token(&cfg) else {
+        return;
+    };
+    let url = format!("{}/render/{}", base_url(&cfg), render_id);
+    match http
+        .delete(&url)
+        .bearer_auth(token)
+        .timeout(CANCEL_RENDER_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) => trace(&format!(
+            "mcp-stdio: DELETE /render/{render_id} → {}",
+            r.status()
+        )),
+        Err(e) => trace(&format!("mcp-stdio: DELETE /render/{render_id} failed: {e}")),
+    }
+}
+
+/// Handle a `notifications/cancelled`: abort the dispatch task for
+/// `params.requestId` and hand back its published render id, if any, so the
+/// caller can retract the dialog.
+///
+/// An unknown `requestId` is a no-op — a cancel that races the response is
+/// normal and must not disturb the other in-flight entries. Split out of the
+/// run loop so the abort semantics are unit-testable.
+fn handle_cancelled(in_flight: &mut HashMap<String, InFlight>, params: &Value) -> Option<String> {
+    let key = params.get("requestId")?.to_string();
+    let entry = in_flight.remove(&key)?;
+    entry.task.abort();
+    let render_id = entry.render_id.lock().unwrap().clone();
+    trace(&format!(
+        "mcp-stdio: cancelled request {key}, render_id={render_id:?}"
+    ));
+    render_id
+}
 
 const SKILL_MD: &str = include_str!("../../../docs/skill.md");
 
@@ -140,8 +238,24 @@ add one\".
 /// onto the wire from a side-task without racing for the stdout lock.
 /// v0.4.40.
 pub async fn run_stdio(cfg: Arc<AppConfig>) {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
+    run_stdio_io(
+        cfg,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        Arc::new(Mutex::new(HashMap::new())),
+    )
+    .await
+}
+
+/// `run_stdio` over injectable transports and an injectable in-flight map, so
+/// the cancellation and EOF paths can be driven in tests without touching the
+/// process's real stdio.
+async fn run_stdio_io<R, W>(cfg: Arc<AppConfig>, input: R, output: W, in_flight: InFlightMap)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(input).lines();
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -152,7 +266,7 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
     // notifications per minute per active tool call.
     let (tx, mut rx) = mpsc::channel::<Value>(128);
     let writer_task = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
+        let mut stdout = output;
         while let Some(msg) = rx.recv().await {
             if stdout
                 .write_all(format!("{msg}\n").as_bytes())
@@ -190,9 +304,21 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
         let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
-        // Notifications (no id) — we only care about "initialized"; everything
-        // else is silently dropped per JSON-RPC spec.
+        // Notifications (no id). `notifications/cancelled` is the MCP spec's
+        // only way to abort an in-flight request — Esc in Claude Code — and
+        // dropping it here (#193) meant the bridge kept polling, kept emitting
+        // progress for a token the client had already forgotten, and the dialog
+        // stayed on the user's Mac until answered or the 2 h TTL fired.
+        // Everything else is still silently dropped per JSON-RPC spec.
         let Some(id) = id_opt else {
+            if method == "notifications/cancelled" {
+                let render_id = handle_cancelled(&mut in_flight.lock().unwrap(), &params);
+                if let Some(render_id) = render_id {
+                    let http_for_cancel = http.clone();
+                    let cfg_for_cancel = cfg.clone();
+                    tokio::spawn(cancel_render(http_for_cancel, cfg_for_cancel, render_id));
+                }
+            }
             continue;
         };
 
@@ -204,13 +330,23 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
         let http_for_task = http.clone();
         let tx_for_task = tx.clone();
         let method_owned = method.to_string();
-        tokio::spawn(async move {
+        let key = id.to_string();
+        let render_sink = new_render_sink();
+        let sink_for_task = render_sink.clone();
+        let in_flight_for_task = in_flight.clone();
+        let key_for_task = key.clone();
+        // Spawn and register under one lock: the task removes its own entry
+        // through this same mutex, so it cannot finish and remove *before* the
+        // registration lands and leave a stale handle behind.
+        let mut registry = in_flight.lock().unwrap();
+        let task = tokio::spawn(async move {
             let response = match dispatch(
                 &method_owned,
                 params,
                 &cfg_for_task,
                 &http_for_task,
                 &tx_for_task,
+                &sink_for_task,
             )
             .await
             {
@@ -222,13 +358,47 @@ pub async fn run_stdio(cfg: Arc<AppConfig>) {
                 }),
             };
             let _ = tx_for_task.send(response).await;
+            in_flight_for_task.lock().unwrap().remove(&key_for_task);
         });
+        registry.insert(
+            key,
+            InFlight {
+                task,
+                render_id: render_sink,
+            },
+        );
+        drop(registry);
+    }
+
+    // EOF — the parent is gone. Abort every in-flight dispatch task first: each
+    // holds a clone of `tx`, and `rx.recv()` only ends when *all* senders are
+    // dropped, so without this the drain below waited for as long as any tool
+    // call was outstanding — which for a dialog is up to the 2 h TTL, leaving a
+    // stale child alive with `lifetime::mcp_attach` still attached (#193).
+    // Retract their dialogs on the way out so quitting the host doesn't leave a
+    // window on the user's Mac.
+    let entries: Vec<InFlight> = in_flight.lock().unwrap().drain().map(|(_, v)| v).collect();
+    let mut cancels = Vec::new();
+    for entry in entries {
+        entry.task.abort();
+        let render_id = entry.render_id.lock().unwrap().clone();
+        if let Some(render_id) = render_id {
+            cancels.push(tokio::spawn(cancel_render(
+                http.clone(),
+                cfg.clone(),
+                render_id,
+            )));
+        }
+    }
+    for handle in cancels {
+        let _ = tokio::time::timeout(CANCEL_RENDER_TIMEOUT, handle).await;
     }
 
     // Close the channel so the writer task drains and exits. Without
-    // this, exit waits forever on the still-open sender.
+    // this, exit waits forever on the still-open sender. Bounded either way:
+    // a stuck writer must never be what keeps this process in RAM.
     drop(tx);
-    let _ = writer_task.await;
+    let _ = tokio::time::timeout(WRITER_DRAIN_TIMEOUT, writer_task).await;
 }
 
 #[derive(Debug)]
@@ -243,6 +413,7 @@ async fn dispatch(
     cfg: &Arc<AppConfig>,
     http: &reqwest::Client,
     tx: &mpsc::Sender<Value>,
+    render_sink: &RenderSink,
 ) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
@@ -265,7 +436,7 @@ async fn dispatch(
             "instructions": INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({ "tools": tools_list() })),
-        "tools/call" => tools_call(params, cfg, http, tx).await,
+        "tools/call" => tools_call(params, cfg, http, tx, render_sink).await,
         "prompts/list" => Ok(json!({ "prompts": prompts_list() })),
         "prompts/get" => prompts_get(params),
         _ => Err(RpcError {
@@ -608,6 +779,7 @@ async fn tools_call(
     cfg: &Arc<AppConfig>,
     http: &reqwest::Client,
     tx: &mpsc::Sender<Value>,
+    render_sink: &RenderSink,
 ) -> Result<Value, RpcError> {
     let name = params
         .get("name")
@@ -626,9 +798,13 @@ async fn tools_call(
         .get("_meta")
         .and_then(|m| m.get("progressToken"))
         .cloned();
+    // Wrapped in `AbortOnDrop` (#193): if *this* call's task is aborted — the
+    // client cancelled the request, or the host quit — the progress loop must
+    // die with it. It holds a clone of the writer channel's sender, and a
+    // surviving clone is exactly what used to keep the process alive past EOF.
     let progress_handle = if let Some(token) = progress_token {
         let tx_clone = tx.clone();
-        Some(tokio::spawn(async move {
+        Some(AbortOnDrop(tokio::spawn(async move {
             let mut elapsed_secs: u64 = 0;
             loop {
                 tokio::time::sleep(PROGRESS_NOTIFY_INTERVAL).await;
@@ -646,7 +822,7 @@ async fn tools_call(
                     break;
                 }
             }
-        }))
+        })))
     } else {
         None
     };
@@ -656,7 +832,7 @@ async fn tools_call(
     // refused error the moment we get one — that masks the auto-resurrect
     // path's startup window cleanly.
     if !wait_for_aiui(http, cfg).await {
-        if let Some(h) = progress_handle {
+        if let Some(h) = &progress_handle {
             h.abort();
         }
         return Ok(aiui_unreachable_result());
@@ -678,6 +854,7 @@ async fn tools_call(
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
+                render_sink,
             )
             .await,
             format_confirm_result,
@@ -696,6 +873,7 @@ async fn tools_call(
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
+                render_sink,
             )
             .await,
             format_dialog_result,
@@ -720,6 +898,7 @@ async fn tools_call(
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
+                render_sink,
             )
             .await,
             format_dialog_result,
@@ -745,6 +924,7 @@ async fn tools_call(
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
+                render_sink,
             )
             .await,
             format_dialog_result,
@@ -771,6 +951,7 @@ async fn tools_call(
                 args.get("session").and_then(|v| v.as_str()).map(String::from),
                 cfg,
                 http,
+                render_sink,
             )
             .await,
             format_dialog_result,
@@ -797,7 +978,7 @@ async fn tools_call(
             .map(value_to_tool_text),
 
         _ => {
-            if let Some(h) = progress_handle {
+            if let Some(h) = &progress_handle {
                 h.abort();
             }
             return Ok(json!({
@@ -807,7 +988,7 @@ async fn tools_call(
         }
     };
 
-    if let Some(h) = progress_handle {
+    if let Some(h) = &progress_handle {
         h.abort();
     }
 
@@ -1074,6 +1255,7 @@ async fn render_dialog(
     session: Option<String>,
     cfg: &AppConfig,
     http: &reqwest::Client,
+    render_sink: &RenderSink,
 ) -> Result<Value, RenderError> {
     let token = load_token(cfg).map_err(RenderError::Transport)?;
     let url = format!("{}/render", base_url(cfg));
@@ -1210,6 +1392,10 @@ async fn render_dialog(
             ))
         }
     };
+    // Publish the id the moment it exists (#193). From here a
+    // `notifications/cancelled` or stdin EOF can retract the dialog with
+    // `DELETE /render/{id}` instead of leaving it on the user's Mac.
+    *render_sink.lock().unwrap() = Some(id.clone());
     let poll_url = format!("{}/render/{}", base_url(cfg), id);
     loop {
         let pr = http
@@ -1258,8 +1444,10 @@ fn aiui_busy_result(pending_count: u64, oldest_age_secs: u64) -> Value {
             call. Do not retry rapidly.\n\
          2. **A stale dialog window from an earlier session** that the \
             user never answered. Tell the user: \"please answer or close \
-            the leftover aiui dialog on your Mac, then I'll retry.\" The \
-            companion will sweep it automatically after 5 minutes.\n\
+            the leftover aiui dialog on your Mac, then I'll retry.\" Do not \
+            promise it clears itself shortly: a dialog whose caller is still \
+            polling lives until its 2-hour TTL, and only one whose caller \
+            has vanished is reaped (within ~2 minutes).\n\
          3. **A parallel Claude session is currently using aiui.** Either \
             wait briefly and retry, or tell the user the other session \
             holds the dialog right now.\n\
@@ -1586,6 +1774,7 @@ mod tests {
             &test_cfg(),
             &reqwest::Client::new(),
             &tx,
+            &new_render_sink(),
         )
         .await
         .expect_err("server/discover must be rejected, not answered");
@@ -1605,10 +1794,110 @@ mod tests {
             &test_cfg(),
             &reqwest::Client::new(),
             &tx,
+            &new_render_sink(),
         )
         .await
         .expect("initialize must succeed");
         assert_eq!(res["protocolVersion"], "2025-06-18");
         assert!(!res["instructions"].as_str().unwrap_or("").is_empty());
+    }
+
+    // ---------- #193: cancellation + EOF ----------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Flips its flag when dropped — which for a spawned task means "aborted".
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A dispatch task that never finishes on its own, plus the flag that says
+    /// whether it was torn down.
+    fn parked_entry(render_id: Option<&str>) -> (InFlight, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_task = flag.clone();
+        let task = tokio::spawn(async move {
+            let _guard = DropFlag(flag_for_task);
+            std::future::pending::<()>().await;
+        });
+        (
+            InFlight {
+                task,
+                render_id: Arc::new(Mutex::new(render_id.map(String::from))),
+            },
+            flag,
+        )
+    }
+
+    /// #193: `notifications/cancelled` — Esc in Claude Code — was dropped with
+    /// every other id-less message, so the bridge kept polling a dialog the
+    /// client had already forgotten and the window stayed up until the 2 h TTL.
+    #[tokio::test]
+    async fn cancelled_notification_aborts_in_flight_request() {
+        let mut in_flight: HashMap<String, InFlight> = HashMap::new();
+        let (one, one_aborted) = parked_entry(Some("render-1"));
+        let (two, two_aborted) = parked_entry(Some("render-2"));
+        in_flight.insert("1".into(), one);
+        in_flight.insert("2".into(), two);
+
+        let render_id = handle_cancelled(&mut in_flight, &json!({"requestId": 1}));
+
+        // The render id comes back so the caller can DELETE it on the companion.
+        assert_eq!(render_id.as_deref(), Some("render-1"));
+        assert!(!in_flight.contains_key("1"), "entry is deregistered");
+        // Let the aborted task actually unwind.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(one_aborted.load(Ordering::SeqCst), "task 1 was aborted");
+
+        // Everything else is untouched.
+        assert!(in_flight.contains_key("2"));
+        assert!(!two_aborted.load(Ordering::SeqCst), "task 2 still running");
+
+        // A cancel that races the response (unknown id) is a harmless no-op.
+        assert!(handle_cancelled(&mut in_flight, &json!({"requestId": 99})).is_none());
+        assert!(handle_cancelled(&mut in_flight, &json!({})).is_none());
+        assert!(in_flight.contains_key("2"));
+    }
+
+    /// String and integer request ids both canonicalise through
+    /// `Value::to_string()`, so a client that sends string ids is cancellable too.
+    #[tokio::test]
+    async fn cancelled_notification_matches_string_request_ids() {
+        let mut in_flight: HashMap<String, InFlight> = HashMap::new();
+        let (entry, _) = parked_entry(None);
+        in_flight.insert(json!("req-7").to_string(), entry);
+        assert!(handle_cancelled(&mut in_flight, &json!({"requestId": "req-7"})).is_none());
+        assert!(in_flight.is_empty(), "the entry was found and removed");
+    }
+
+    /// #193: every dispatch task holds a clone of the writer channel's sender,
+    /// so `rx.recv()` — and therefore `writer_task.await` — only ended once the
+    /// last tool call did. With a dialog outstanding that is up to the 2 h TTL,
+    /// and the process lingered with `lifetime::mcp_attach` still attached.
+    #[tokio::test]
+    async fn stdin_eof_returns_while_call_in_flight() {
+        let in_flight: InFlightMap = Arc::new(Mutex::new(HashMap::new()));
+        let (entry, aborted) = parked_entry(None);
+        in_flight.lock().unwrap().insert("1".into(), entry);
+
+        // An input that is already at EOF: the parent closed the pipe.
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+
+        let run = run_stdio_io(test_cfg(), server, tokio::io::sink(), in_flight.clone());
+        tokio::time::timeout(WRITER_DRAIN_TIMEOUT * 2, run)
+            .await
+            .expect("run_stdio must return promptly on EOF, not wait on the call");
+
+        assert!(in_flight.lock().unwrap().is_empty());
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(aborted.load(Ordering::SeqCst), "in-flight task was aborted");
     }
 }

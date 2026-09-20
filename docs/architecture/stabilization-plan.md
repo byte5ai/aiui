@@ -166,10 +166,37 @@ Files: `http.rs`, `dialog.rs`, `mcp.rs`, `python/.../server.py`.
 >   surfaces the dialog, hands resolution to a detached task that fills an
 >   `AsyncSlot`, and returns `202 {id, ttl_secs}`. New `GET /render/{id}`
 >   poll-loops (200 ms ticks, bounded by `ASYNC_POLL_WINDOW` = 25 s) returning
->   the terminal result (drained once) / `{pending:true}` / `404`. Without the
->   header, the legacy synchronous path runs untouched. Resolution + window
->   teardown are shared by both via `resolve_dialog`. Resolved-but-uncollected
->   slots are swept at `DIALOG_TTL`.
+>   the terminal result / `{pending:true}` / `404`. Without the header, the
+>   legacy synchronous path runs untouched. Resolution + window teardown are
+>   shared by both via `resolve_dialog`.
+> - **Slot lifecycle (#193, superseding the first cut).** Delivery is
+>   **idempotent**: a GET clones the terminal result and leaves the slot in
+>   place, so a retry after a transport blip gets the same answer instead of
+>   `404 unknown_render_id` — the earlier drain-and-remove destroyed a submitted
+>   answer whenever the tunnel blipped while the response was being written. The
+>   `AsyncSlot` is now the dialog's lifetime record (`last_polled`,
+>   `delivered_at`, `done`), and a **background reaper** ticks every 15 s (not
+>   opportunistically from the next POST, which is useless when the failure is
+>   "no further renders arrive") applying one verdict per slot: drop a delivered
+>   slot `SLOT_GRACE` = 5 min after delivery; drop a finished-but-uncollected
+>   one after `DIALOG_TTL + SLOT_GRACE`; **abandon** — cancel the dialog, which
+>   tears the window down — one whose caller has not polled for
+>   `SLOT_ABANDONED_AFTER` = 90 s (≈3 missed poll windows); keep everything
+>   else. The `done` flag is what makes the finished case correct rather than
+>   merely less racy: a slot swept while its resolver still runs swallows the
+>   documented `{cancelled:true, reason:"ttl_expired"}`. Past `ASYNC_SLOT_CAP` =
+>   64 the oldest are evicted the same way.
+> - **`DELETE /render/{id}` (#193)** — token-authenticated, cancels the dialog,
+>   removes the slot, and answers `204` for a known *and* an unknown id, so the
+>   bridges' cleanup paths are retry-safe. Additive, so `WIRE_VERSION` stays 1;
+>   an older companion 404/405s and the bridge ignores it. Both bridges call it
+>   when their caller is cancelled (`notifications/cancelled` / `CancelledError`)
+>   and when the MCP host quits.
+> - **`POST /render` confirms the window build (#193)** and answers `500
+>   {"error":"window_failed","detail":…}` on a deterministic failure instead of
+>   returning `202` for a dialog the user will never see. A *timeout* waiting for
+>   a busy main thread is not treated as failure — the abandoned-caller reap and
+>   the TTL remain the backstop.
 > - **Both bridges (`mcp.rs`, `server.py`):** POST with the header, then loop
 >   `GET /render/{id}` until terminal; each GET is bounded (40 s > server
 >   window) so a blip costs one poll, never a held connection. Both fall back to

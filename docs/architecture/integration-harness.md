@@ -69,6 +69,19 @@ Mirrors the spec's required scenarios:
 - **cancellation-safety**: start a render, drop the client connection
   mid-poll → assert the registry slot frees and the window is destroyed (no
   2 h leak / 409 on the next render).
+- **explicit retraction (#193)**: `POST /render` (`x-aiui-async`) → 202 `{id}`
+  → `DELETE /render/{id}` → assert `204`, the dialog window for `id` is gone,
+  the `AsyncSlot` is gone (a following `GET /render/{id}` is `404`), and the
+  registry slot is free. Repeat the `DELETE` for an unknown id → still `204`,
+  nothing else disturbed. This is the path both bridges take when the MCP
+  client cancels a request (Esc in Claude Code) or the host quits.
+- **abandoned caller (#193)**: `POST /render` (`x-aiui-async`) → 202, then stop
+  polling → assert that within ~2 minutes (`SLOT_ABANDONED_AFTER` + a reaper
+  tick) the window is gone and the slot is reaped, instead of the dialog living
+  to the 2 h TTL.
+- **idempotent delivery (#193)**: answer a render, `GET /render/{id}` twice →
+  assert both return the same terminal result (a retry after a transport blip
+  must not be told the render never existed).
 - **TTL / channel-drop / Claude-Desktop-quit / restart** — the remaining spec
   scenarios, each asserting a clean terminal outcome.
 

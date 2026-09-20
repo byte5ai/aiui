@@ -39,18 +39,61 @@ const ASYNC_RENDER_HEADER: &str = "x-aiui-async";
 /// held connection (the remote ReadError class this closes).
 const ASYNC_POLL_WINDOW: Duration = Duration::from_secs(25);
 
-/// Buffered terminal result for an async render, keyed by dialog id. The
-/// `POST /render` async branch spawns a task that awaits the user's answer and
-/// fills this; `GET /render/{id}` drains it. Decouples the dialog's lifetime
-/// from any single HTTP connection.
+/// How long a *delivered* result stays readable before the reaper drops its
+/// slot (#193). Delivery is idempotent: the first `GET /render/{id}` stamps
+/// `delivered_at` and every repeat inside this window returns the same result.
+/// Without it, a tunnel blip while axum wrote the response body destroyed the
+/// user's answer and the retry got `404 unknown_render_id` — "the render never
+/// existed" — asking them to re-type something they had already submitted.
+const SLOT_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// How long a slot may go unpolled before its caller counts as gone (#193).
+/// Both bridges re-poll every ≤40 s, so ~3 missed windows is unambiguous. On
+/// expiry the reaper cancels the dialog, which tears the window down — the fix
+/// for "the agent was killed and the dialog sat on the desktop for two hours".
+const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(90);
+
+/// Upper bound on buffered async-render slots. Past this the reaper evicts the
+/// oldest by `created_at` (cancelling their dialogs), so a pathological caller
+/// cannot grow the map without bound.
+const ASYNC_SLOT_CAP: usize = 64;
+
+/// How often the background reaper sweeps `async_slots`. The sweep used to run
+/// only from the async POST path, which is useless for the failure it has to
+/// catch: "the caller died and no further renders arrive".
+const SLOT_REAP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long `POST /render` waits for the main thread to report the dialog
+/// window built. A *definite* failure inside the window becomes `500
+/// window_failed`; a timeout is not proof of failure and only traces (a busy
+/// main thread must not abort a dialog that is about to appear).
+const WINDOW_BUILD_WAIT: Duration = Duration::from_secs(5);
+
+/// Buffered terminal result for an async render, keyed by dialog id. Also the
+/// dialog's *lifetime record* (#193): who last polled it, whether anyone has
+/// collected the answer, and whether the resolver task is finished. Those three
+/// are what let the reaper tell "nobody is waiting for this any more" apart
+/// from "the user is still filling the form".
 struct AsyncSlot {
-    /// `Some` once the dialog reached a terminal outcome; drained by the first
-    /// successful GET. A `GET /render/{id}` poll-loops (cheap 200 ms ticks,
-    /// bounded by `ASYNC_POLL_WINDOW`) reading this — no cross-task notifier to
-    /// reason about, and a missed tick costs at most 200 ms, never correctness.
+    /// `Some` once the dialog reached a terminal outcome. Read — not taken — by
+    /// `GET /render/{id}`, which poll-loops (cheap 200 ms ticks, bounded by
+    /// `ASYNC_POLL_WINDOW`) reading this; a missed tick costs at most 200 ms,
+    /// never correctness.
     result: Option<crate::dialog::DialogResult>,
-    /// For the opportunistic sweep of resolved-but-never-collected slots.
+    /// When the slot was registered. Bounds the undelivered-but-finished case
+    /// and orders the `ASYNC_SLOT_CAP` eviction.
     created_at: Instant,
+    /// Stamped at insert and on *every* `GET /render/{id}`, `{pending:true}`
+    /// included. A caller that stops polling stops refreshing this.
+    last_polled: Instant,
+    /// Stamped by the first successful drain. Starts the `SLOT_GRACE` window in
+    /// which repeat GETs get the same answer back.
+    delivered_at: Option<Instant>,
+    /// Set by the resolver task once it has written the terminal result back.
+    /// The reaper needs this rather than a bare `created_at` deadline: a slot
+    /// swept while its resolver is still running swallows the documented
+    /// `{cancelled:true, reason:"ttl_expired"}` and turns it into a 404.
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -222,10 +265,28 @@ pub async fn serve(
         crate::media::MEDIA_TOTAL_CAP,
     );
 
+    // Async-render reaper (#193). Cloned *before* the state moves into the
+    // router. A dialog whose caller was killed leaves a live registry entry and
+    // a window on screen that nothing else reaps — `sweep_orphan_dialog_window`
+    // only catches windows whose dialog is already deregistered — so the sweep
+    // has to run on a timer, not opportunistically from the next POST.
+    {
+        let reaper_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SLOT_REAP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                sweep_async_slots(&reaper_state);
+            }
+        });
+    }
+
     let router = Router::new()
         .route("/health", get(health))
         .route("/render", post(render))
-        .route("/render/:id", get(render_poll))
+        // GET polls an async render; DELETE retracts it (#193) — the route a
+        // bridge needs to close the dialog when its caller is cancelled.
+        .route("/render/:id", get(render_poll).delete(render_cancel))
         .route("/notify", post(notify))
         .route("/version", get(version))
         .route("/update", post(update))
@@ -1168,54 +1229,166 @@ async fn resolve_dialog(
     result
 }
 
-/// Drop async-render result slots older than `DIALOG_TTL` — covers the case
-/// where a caller posts an async render, the dialog resolves, but the caller
-/// never collects the result via GET (process died after POST). Called
-/// opportunistically on each new async render; no background reaper.
+/// What the reaper should do with one async-render slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotVerdict {
+    /// Leave it alone.
+    Keep,
+    /// Nobody needs it any more — remove it. The dialog is already terminal.
+    Drop,
+    /// The caller vanished while the dialog is still live — cancel the dialog
+    /// (which tears the window down via `resolve_dialog`) and remove the slot.
+    Abandon,
+}
+
+/// Decide one slot's fate. Pure over `(slot, now)` so the reaper's policy is
+/// unit-testable without a Tauri app — same split as `drain_async_slot` /
+/// `validate_spec`.
+///
+/// Order matters. A delivered result is finished business regardless of
+/// anything else; a finished-but-uncollected one is held for the full dialog
+/// TTL *plus* the grace (never on `created_at` alone, which raced the
+/// resolver's write-back and turned a clean `ttl_expired` into a 404); and only
+/// a slot whose resolver is still running can be "abandoned", because only then
+/// is there a live dialog left to cancel.
+fn slot_verdict(slot: &AsyncSlot, now: Instant) -> SlotVerdict {
+    if let Some(delivered) = slot.delivered_at {
+        return if now.duration_since(delivered) > SLOT_GRACE {
+            SlotVerdict::Drop
+        } else {
+            SlotVerdict::Keep
+        };
+    }
+    if slot.done.load(std::sync::atomic::Ordering::SeqCst) {
+        return if now.duration_since(slot.created_at) > DIALOG_TTL + SLOT_GRACE {
+            SlotVerdict::Drop
+        } else {
+            SlotVerdict::Keep
+        };
+    }
+    if now.duration_since(slot.last_polled) > SLOT_ABANDONED_AFTER {
+        SlotVerdict::Abandon
+    } else {
+        SlotVerdict::Keep
+    }
+}
+
+/// Ids to evict when the map is over `cap`, oldest `created_at` first. Pure so
+/// the cap policy is testable; the caller cancels each evicted dialog.
+fn slots_over_cap(
+    slots: &std::collections::HashMap<String, AsyncSlot>,
+    cap: usize,
+) -> Vec<String> {
+    if slots.len() <= cap {
+        return Vec::new();
+    }
+    let mut by_age: Vec<(&String, Instant)> =
+        slots.iter().map(|(id, s)| (id, s.created_at)).collect();
+    by_age.sort_by_key(|(_, t)| *t);
+    by_age
+        .into_iter()
+        .take(slots.len() - cap)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Reap async-render slots (#193). Run every `SLOT_REAP_INTERVAL` by the
+/// background task `serve` spawns — *not* opportunistically from the async POST
+/// path, because the failure it exists to catch is precisely "the caller died
+/// and no further renders arrive".
+///
+/// Verdicts are collected **under the lock**, the lock is released, and only
+/// then does anything happen: `dialog.cancel` resolves the oneshot, so
+/// `resolve_dialog` runs its authoritative window teardown, and neither
+/// `run_on_main_thread` nor an `.await` may ever be reached while holding the
+/// `std::sync::Mutex`.
 fn sweep_async_slots(state: &AppState) {
     let now = Instant::now();
-    state
-        .async_slots
-        .lock()
-        .unwrap()
-        .retain(|_, s| now.duration_since(s.created_at) <= DIALOG_TTL);
+    let mut abandoned: Vec<String> = Vec::new();
+    let evicted: Vec<String>;
+    {
+        let mut slots = state.async_slots.lock().unwrap();
+        let mut dropped: Vec<String> = Vec::new();
+        for (id, slot) in slots.iter() {
+            match slot_verdict(slot, now) {
+                SlotVerdict::Keep => {}
+                SlotVerdict::Drop => dropped.push(id.clone()),
+                SlotVerdict::Abandon => abandoned.push(id.clone()),
+            }
+        }
+        for id in dropped.iter().chain(abandoned.iter()) {
+            slots.remove(id);
+        }
+        evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        for id in &evicted {
+            slots.remove(id);
+        }
+    }
+    for id in abandoned {
+        trace(&format!(
+            "sweep_async_slots: caller stopped polling id={id} — cancelling the dialog"
+        ));
+        state.dialog.cancel(&id);
+    }
+    for id in evicted {
+        trace(&format!(
+            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting oldest id={id}"
+        ));
+        state.dialog.cancel(&id);
+    }
 }
 
 /// Outcome of looking up an async-render slot by id.
 enum SlotLook {
-    /// Resolved — the terminal result (already removed from the map).
+    /// Resolved — a *clone* of the terminal result. The slot stays in the map
+    /// so a retried GET gets the same answer (see `SLOT_GRACE`).
     Ready(crate::dialog::DialogResult),
     /// Registered but not yet resolved.
     Pending,
-    /// No such id — never an async render, or already collected.
+    /// No such id — never an async render, or already reaped.
     Gone,
 }
 
-/// Drain an async-render slot: if resolved, take its result and remove the slot
-/// (`Ready`); if still in flight, `Pending`; if absent, `Gone`. Pure over the
-/// map so the `/render/{id}` branching is unit-testable without a Tauri app.
+/// Look at an async-render slot, stamping its liveness: `last_polled` on every
+/// hit (that is what tells the reaper someone is still waiting) and
+/// `delivered_at` on the first read of a terminal result.
+///
+/// Delivery is **idempotent** (#193): the result is cloned, not taken, and the
+/// slot is left in the map for the reaper to drop after `SLOT_GRACE`. The old
+/// take-and-remove was at-most-once and removed the slot *before* the response
+/// reached the wire, so a blip on the way out destroyed the answer and the
+/// retry was told the render never existed. Pure over the map so the
+/// `/render/{id}` branching is unit-testable without a Tauri app.
 fn drain_async_slot(
     slots: &mut std::collections::HashMap<String, AsyncSlot>,
     id: &str,
 ) -> SlotLook {
-    let taken = match slots.get_mut(id) {
-        Some(slot) => slot.result.take(),
-        None => return SlotLook::Gone,
+    let now = Instant::now();
+    let Some(slot) = slots.get_mut(id) else {
+        return SlotLook::Gone;
     };
-    match taken {
+    slot.last_polled = now;
+    match &slot.result {
         Some(result) => {
-            slots.remove(id);
-            SlotLook::Ready(result)
+            if slot.delivered_at.is_none() {
+                slot.delivered_at = Some(now);
+            }
+            SlotLook::Ready(result.clone())
         }
         None => SlotLook::Pending,
     }
 }
 
 /// GET `/render/{id}` — bounded long-poll for an async render's result (Step
-/// 3). Returns the terminal `{id, cancelled, result, reason}` once available
-/// (and drains the slot), `{pending: true}` after one `ASYNC_POLL_WINDOW` so
-/// the caller re-polls, or 404 for an unknown id (never an async render, or
-/// already collected). The caller loops GET until terminal or it gives up.
+/// 3). Returns the terminal `{id, cancelled, result, reason}` once available,
+/// `{pending: true}` after one `ASYNC_POLL_WINDOW` so the caller re-polls, or
+/// 404 for an unknown id (never an async render, or already reaped). The caller
+/// loops GET until terminal or it gives up.
+///
+/// Repeatable (#193): a terminal result stays readable for `SLOT_GRACE` after
+/// the first delivery, so a retry after a transport blip gets the same answer
+/// instead of a 404. Every hit — `{pending:true}` included — refreshes the
+/// slot's `last_polled`, which is how the reaper knows a caller is still there.
 async fn render_poll(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1260,6 +1433,38 @@ async fn render_poll(
             }
         }
     }
+}
+
+/// DELETE `/render/{id}` — retract a render the caller no longer wants (#193).
+///
+/// The bridges call this when the MCP client cancels an in-flight request (Esc
+/// in Claude Code → `notifications/cancelled`) or when the host quits, so the
+/// dialog does not sit on the user's desktop waiting for an agent that is gone.
+///
+/// Cancel first, then remove the slot: removing without cancelling would leave
+/// the window on screen, cancelling without removing would leak a result nobody
+/// will ever collect. `dialog.cancel` resolves the oneshot, so `resolve_dialog`
+/// runs its authoritative window teardown.
+///
+/// Always `204`, including for an unknown id — cancelling something that is
+/// already gone is a no-op success, which keeps the bridges' cleanup paths
+/// retry-safe. Additive route, so `WIRE_VERSION` stays 1.
+async fn render_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    trace(&format!("render_cancel: id={id}"));
+    state.dialog.cancel(&id);
+    state.async_slots.lock().unwrap().remove(&id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn render(
@@ -1354,19 +1559,64 @@ async fn render(
     // timeout, and no reload-retry, because the frontend initiates and so
     // can't race an event it isn't listening for yet. Window ops are
     // main-thread-only.
+    //
+    // The build is *confirmed*, not fired and forgotten (#193). A failure here
+    // — a label collision behind a not-yet-completed `destroy()`, a broken
+    // WebView2 runtime on Windows, `run_on_main_thread` erroring during
+    // shutdown — used to be written to the trace log and discarded: `/render`
+    // answered as if a window existed, and the caller then polled for two hours
+    // for a dialog the user never saw. Now a definite failure becomes `500
+    // window_failed` and the agent learns the real reason immediately.
     {
         let app_for_build = state.app.clone();
         let id_for_build = id.clone();
         let title_for_build = window_title;
-        let _ = state.app.run_on_main_thread(move || {
-            if let Err(e) =
+        let (built_tx, built_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let dispatched = state.app.run_on_main_thread(move || {
+            let outcome =
                 crate::build_dialog_window(&app_for_build, &id_for_build, size, &title_for_build)
-            {
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            if let Err(e) = &outcome {
                 trace(&format!(
                     "render: build_dialog_window failed id={id_for_build}: {e}"
                 ));
             }
+            let _ = built_tx.send(outcome);
         });
+        // A definite failure returns early. `guard` is still armed, so the
+        // early return runs exactly the cleanup it was written for (free the
+        // registry slot, destroy any window) — no hand-rolled teardown here.
+        let failure: Option<String> = match dispatched {
+            Err(e) => Some(format!("run_on_main_thread: {e}")),
+            Ok(()) => match tokio::time::timeout(WINDOW_BUILD_WAIT, built_rx).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(detail))) => Some(detail),
+                Ok(Err(_)) => Some("window builder dropped without answering".into()),
+                // A busy main thread is not proof of failure, and a false
+                // `window_failed` would abort a dialog that is about to appear.
+                // The abandoned-caller reap and the TTL stay the backstop for
+                // "the window never came up".
+                Err(_) => {
+                    trace(&format!(
+                        "render: window build still pending after {}s id={id} — proceeding",
+                        WINDOW_BUILD_WAIT.as_secs()
+                    ));
+                    None
+                }
+            },
+        };
+        if let Some(detail) = failure {
+            trace(&format!("render: window_failed id={id}: {detail}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "window_failed",
+                    "detail": detail,
+                })),
+            )
+                .into_response();
+        }
     }
 
     // ── Async branch (Step 3) ───────────────────────────────────────────
@@ -1376,23 +1626,45 @@ async fn render(
     // connection that a tunnel/GUI blip turns into a remote ReadError —
     // resolution now lives in a task, not on the wire.
     if headers.contains_key(ASYNC_RENDER_HEADER) {
-        // The detached task owns resolution + window teardown from here.
+        // The detached task owns resolution + window teardown from here; the
+        // slot below is what keeps the dialog tied to its caller (#193) — the
+        // background reaper cancels it if nobody polls any more.
         guard.disarm();
-        sweep_async_slots(&state);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
+            let now = Instant::now();
             let mut slots = state.async_slots.lock().unwrap();
             slots.insert(
                 id.clone(),
-                AsyncSlot { result: None, created_at: Instant::now() },
+                AsyncSlot {
+                    result: None,
+                    created_at: now,
+                    last_polled: now,
+                    delivered_at: None,
+                    done: done.clone(),
+                },
             );
         }
+        sweep_async_slots(&state);
         let task_state = state.clone();
         let task_id = id.clone();
         tokio::spawn(async move {
             let result = resolve_dialog(task_state.clone(), task_id.clone(), result_rx).await;
-            if let Some(slot) = task_state.async_slots.lock().unwrap().get_mut(&task_id) {
-                slot.result = Some(result);
+            // Write-back and `done` under one lock, so the reaper can never
+            // observe a slot that holds the result but still looks unresolved.
+            let mut slots = task_state.async_slots.lock().unwrap();
+            match slots.get_mut(&task_id) {
+                Some(slot) => slot.result = Some(result),
+                // Reaped from under us (abandoned caller, or DELETE). Traced,
+                // not silent: a dropped terminal result must be visible in the
+                // log rather than resurfacing later as "unknown render id".
+                None => trace(&format!(
+                    "render: async slot already gone at write-back id={task_id} \
+                     cancelled={} — result dropped",
+                    result.cancelled
+                )),
             }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         trace(&format!("render: async accepted id={}", id));
         return (
@@ -1835,19 +2107,44 @@ mod notify_tests {
 
 #[cfg(test)]
 mod async_render_tests {
-    use super::{drain_async_slot, AsyncSlot, SlotLook};
+    use super::{
+        drain_async_slot, slot_verdict, slots_over_cap, AsyncSlot, SlotLook, SlotVerdict,
+        ASYNC_SLOT_CAP, SLOT_ABANDONED_AFTER, SLOT_GRACE,
+    };
+    use crate::dialog::DIALOG_TTL;
     use std::collections::HashMap;
-    use std::time::Instant;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    // Step 3: the GET /render/{id} branching — pending → ready (drained once)
-    // → gone — without a Tauri app.
+    /// A slot as `POST /render`'s async branch inserts one. Times are built by
+    /// adding to `base` rather than subtracting from `Instant::now()`, because
+    /// `Instant` has no guaranteed room below "now" on a freshly booted host.
+    fn slot(base: Instant, done: bool) -> AsyncSlot {
+        AsyncSlot {
+            result: None,
+            created_at: base,
+            last_polled: base,
+            delivered_at: None,
+            done: Arc::new(AtomicBool::new(done)),
+        }
+    }
+
+    fn terminal(id: &str) -> crate::dialog::DialogResult {
+        crate::dialog::DialogResult {
+            id: id.into(),
+            cancelled: true,
+            result: serde_json::Value::Null,
+            reason: Some("window_closed".into()),
+        }
+    }
+
+    // Step 3: the GET /render/{id} branching — pending → ready → still ready
+    // (#193 made delivery idempotent) — without a Tauri app.
     #[test]
-    fn slot_lifecycle_pending_ready_gone() {
+    fn slot_lifecycle_pending_ready_repeatable() {
         let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
-        slots.insert(
-            "x".into(),
-            AsyncSlot { result: None, created_at: Instant::now() },
-        );
+        slots.insert("x".into(), slot(Instant::now(), false));
 
         // Registered, not resolved → Pending.
         assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Pending));
@@ -1855,14 +2152,8 @@ mod async_render_tests {
         assert!(matches!(drain_async_slot(&mut slots, "nope"), SlotLook::Gone));
 
         // Resolve it.
-        slots.get_mut("x").unwrap().result = Some(crate::dialog::DialogResult {
-            id: "x".into(),
-            cancelled: true,
-            result: serde_json::Value::Null,
-            reason: Some("window_closed".into()),
-        });
+        slots.get_mut("x").unwrap().result = Some(terminal("x"));
 
-        // First drain delivers the terminal result.
         match drain_async_slot(&mut slots, "x") {
             SlotLook::Ready(r) => {
                 assert!(r.cancelled);
@@ -1870,9 +2161,140 @@ mod async_render_tests {
             }
             _ => panic!("expected Ready"),
         }
-        // Slot was removed → a second drain is Gone (no double-delivery).
-        assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Gone));
-        assert!(slots.is_empty());
+        // The slot survives delivery — dropping it is the reaper's job alone.
+        assert!(slots.contains_key("x"));
+    }
+
+    // #193 regression: the answer must survive a blip on the way out. The old
+    // drain removed the slot before the response reached the wire, so a retry
+    // got `404 unknown_render_id` and the user was told to re-type a secret
+    // they had in fact already submitted.
+    #[test]
+    fn slot_redelivers_within_grace_window() {
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        let base = Instant::now();
+        let mut s = slot(base, true);
+        s.result = Some(terminal("x"));
+        slots.insert("x".into(), s);
+
+        let first = match drain_async_slot(&mut slots, "x") {
+            SlotLook::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        let stamped = slots["x"].delivered_at.expect("first drain stamps delivery");
+
+        let second = match drain_async_slot(&mut slots, "x") {
+            SlotLook::Ready(r) => r,
+            _ => panic!("a retried GET must get the same answer, not a 404"),
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.cancelled, second.cancelled);
+        assert_eq!(first.reason, second.reason);
+        // Only the *first* delivery starts the grace clock.
+        assert_eq!(slots["x"].delivered_at, Some(stamped));
+        assert!(slots.contains_key("x"));
+    }
+
+    #[test]
+    fn sweep_drops_delivered_slot_after_grace() {
+        let base = Instant::now();
+        let mut s = slot(base, true);
+        s.result = Some(terminal("x"));
+        s.delivered_at = Some(base);
+
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_GRACE - Duration::from_secs(1)),
+            SlotVerdict::Keep,
+            "inside the grace window the result stays collectable"
+        );
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_GRACE + Duration::from_secs(1)),
+            SlotVerdict::Drop
+        );
+    }
+
+    // #193 finding 16: sweeping on `created_at` alone raced the resolver, which
+    // then found no slot to write to — and the documented terminal
+    // `{cancelled:true, reason:"ttl_expired"}` became "the render never
+    // existed". An unfinished resolver must keep its slot.
+    #[test]
+    fn sweep_keeps_unresolved_slot_past_dialog_ttl() {
+        let base = Instant::now();
+        let s = slot(base, false);
+        let now = base + DIALOG_TTL + Duration::from_secs(1);
+        // Someone is still polling, so "abandoned" does not apply either.
+        let mut polled = slot(base, false);
+        polled.last_polled = now;
+        assert_eq!(slot_verdict(&polled, now), SlotVerdict::Keep);
+        // And even unpolled it is Abandon (cancel the dialog), never Drop —
+        // the resolver's write-back still has somewhere to land.
+        assert_eq!(slot_verdict(&s, now), SlotVerdict::Abandon);
+
+        // Once the resolver *is* done, the slot is held for TTL + grace.
+        let finished = slot(base, true);
+        assert_eq!(slot_verdict(&finished, now), SlotVerdict::Keep);
+        assert_eq!(
+            slot_verdict(&finished, base + DIALOG_TTL + SLOT_GRACE + Duration::from_secs(1)),
+            SlotVerdict::Drop
+        );
+    }
+
+    // #193 finding 1: the agent is killed, nobody polls, and the dialog window
+    // sat on the user's desktop for the full 2 h TTL.
+    #[test]
+    fn sweep_abandons_slot_whose_caller_stopped_polling() {
+        let base = Instant::now();
+        let s = slot(base, false);
+        assert_eq!(
+            slot_verdict(&s, base + Duration::from_secs(10)),
+            SlotVerdict::Keep,
+            "a caller polling 10 s ago is very much alive"
+        );
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_ABANDONED_AFTER + Duration::from_secs(1)),
+            SlotVerdict::Abandon
+        );
+    }
+
+    #[test]
+    fn slot_cap_evicts_oldest() {
+        let base = Instant::now();
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        for i in 0..ASYNC_SLOT_CAP + 2 {
+            slots.insert(
+                format!("d{i}"),
+                slot(base + Duration::from_secs(i as u64), false),
+            );
+        }
+        let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&"d0".to_string()));
+        assert!(evicted.contains(&"d1".to_string()));
+
+        // At or below the cap nothing is evicted.
+        slots.remove("d0");
+        slots.remove("d1");
+        assert!(slots_over_cap(&slots, ASYNC_SLOT_CAP).is_empty());
+    }
+
+    // The DELETE /render/{id} contract at `DialogState` level: cancelling
+    // resolves the caller's receiver with a terminal `cancelled` result (which
+    // is what runs `resolve_dialog`'s window teardown), and the slot goes.
+    #[test]
+    fn cancel_resolves_slot_and_frees_window() {
+        let ds = crate::dialog::DialogState::new();
+        let (id, result_rx) =
+            ds.register_dialog(serde_json::json!({"kind": "confirm"}), None, None, 0);
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        slots.insert(id.clone(), slot(Instant::now(), false));
+
+        ds.cancel(&id);
+        slots.remove(&id);
+
+        let r = result_rx.blocking_recv().expect("cancel resolves the oneshot");
+        assert!(r.cancelled);
+        assert_eq!(ds.stats().orphan_count, 0, "registry slot freed");
+        assert!(matches!(drain_async_slot(&mut slots, &id), SlotLook::Gone));
     }
 }
 
