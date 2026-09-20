@@ -138,6 +138,15 @@ jobs:
       - name: Check skill.md copies are in sync
         run: ./scripts/check-skill-drift.sh
 
+      # #190: the updater-feed guard is what stops a half-published
+      # `latest.json` from reaching users — a feed missing a platform sends
+      # that platform's update check into TargetsNotFound rather than
+      # "up to date". A guard that silently stopped guarding would be worse
+      # than none, so it is exercised against fixtures on every PR, including
+      # the exact shape that shipped in v0.10.1.
+      - name: Self-test the updater-feed guard
+        run: ./scripts/test-check-updater-feed.sh
+
   mcp:
     name: aiui-mcp (Python)
     runs-on: ubuntu-latest
