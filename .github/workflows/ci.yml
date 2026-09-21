@@ -36,24 +36,24 @@ jobs:
             build_bundle: false
             # Tested in the profile the shipped bundle is built from.
             test_profile: "--release"
+            test_rustflags: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows x86_64
             build_bundle: true
-            # #210: Windows EXECUTES its tests. It used to compile them with
-            # `--no-run` because the release-profile `aiui_lib` test binary
-            # crashed at *load* with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)
-            # on this runner (#141) — so the platform that uploads the
-            # installer had zero executed assertions, and every
-            # `#[cfg(windows)]` branch was verified by the compiler alone.
-            # The loader crash was a property of that binary's layout, not of
-            # any logic, so the test step drops `--release` here: the debug
-            # test binary links differently and does not trip the loader.
-            # (If it ever returns, the next levers are
-            # `RUSTFLAGS=-C target-feature=+crt-static` and `-C debuginfo=0` —
-            # NOT going back to `--no-run`, which proves nothing the `cargo
-            # check` step below does not already prove.)
+            # #210: Windows EXECUTES its tests — the platform with the most
+            # `#[cfg(windows)]` host-registration branching must run more than
+            # the compiler. The `aiui_lib` test binary crashed at *load* with
+            # STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on this runner (#141);
+            # dropping `--release` alone did NOT settle it, so we statically
+            # link the CRT (`+crt-static`), the next lever #210 called out — the
+            # missing entry point was the dynamically-loaded MSVC runtime. Debug
+            # profile is kept (a release test binary is not what ships anyway).
+            # `--no-run` stays off the table: it asserts nothing `cargo check`
+            # does not. If the crash ever returns, the remaining lever is
+            # `-C debuginfo=0`.
             test_profile: ""
+            test_rustflags: "-C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -126,6 +126,11 @@ jobs:
 
       - name: Cargo test
         working-directory: companion/src-tauri
+        # `test_rustflags` statically links the CRT on Windows so the test
+        # binary loads (#141 / #210); empty elsewhere. Set here, not globally,
+        # so `cargo check`/`clippy` keep their own cache.
+        env:
+          RUSTFLAGS: ${{ matrix.test_rustflags }}
         run: cargo test --lib ${{ matrix.test_profile }} --target ${{ matrix.target }}
 
       - name: Cargo clippy

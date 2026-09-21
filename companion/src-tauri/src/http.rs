@@ -1562,7 +1562,7 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 .map(|t| t.get("label").and_then(|v| v.as_str()).unwrap_or("")),
         )?;
     }
-    for f in fields.iter().copied() {
+    for &f in &fields {
         let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if !KNOWN_FIELD_KINDS.contains(&fk) {
             let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");

@@ -901,6 +901,10 @@ const fn current_os() -> &'static str {
 }
 
 #[tauri::command]
+// A Tauri command whose arguments are injected State handles + the window;
+// each is load-bearing (privileged-window check, expensive-probe cache, lock
+// and update state), so the count is inherent, not a design smell.
+#[allow(clippy::too_many_arguments)]
 async fn status(
     window: tauri::WebviewWindow,
     // `force: true` bypasses the expensive-probe cache. The frontend passes
