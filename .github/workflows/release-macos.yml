@@ -321,10 +321,14 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf dist
-          # --locked: the published wheel is built from the same resolution
-          # CI tested, and a lock left stale by a dependency edit stops the
-          # release here rather than shipping an unrecorded one (#210).
-          uv build --locked
+          # The published wheel must come from the same resolution CI tested.
+          # `uv build` takes no --locked (that flag is only for the resolving
+          # commands — run/sync/lock), so verify the lock is current FIRST:
+          # `uv lock --check` fails if a dependency edit left uv.lock stale,
+          # stopping the release here rather than shipping an unrecorded one
+          # (#210) — then build.
+          uv lock --check
+          uv build
           ls dist/aiui_mcp-${VERSION}-*.whl dist/aiui_mcp-${VERSION}.tar.gz
 
       # #191: PyPI BEFORE the release, not after.
