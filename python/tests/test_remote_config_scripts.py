@@ -11,6 +11,7 @@ both scripts against a temporary HOME. It is a contract test across the
 language boundary: if someone edits the preamble, this fails here rather
 than on someone's dev box.
 """
+
 from __future__ import annotations
 
 import json
@@ -23,13 +24,8 @@ from typing import Any
 
 import pytest
 
-SETUP_RS = (
-    Path(__file__).resolve().parents[2]
-    / "companion"
-    / "src-tauri"
-    / "src"
-    / "setup.rs"
-)
+SETUP_RS = Path(__file__).resolve().parents[2] / "companion" / "src-tauri" / "src" / "setup.rs"
+
 
 def patch_body(uvx_path: str | None = None, version: str = "9.9.9") -> str:
     """The patch script as `setup.rs` renders it, for a given probe result.
@@ -86,9 +82,7 @@ def _preamble() -> str:
     """The `REMOTE_JSON_PREAMBLE` constant, read from the Rust source."""
     if not SETUP_RS.exists():  # installed wheel, no repo checkout
         pytest.skip("setup.rs not available outside the repo")
-    m = re.search(
-        r'const REMOTE_JSON_PREAMBLE: &str = r#"(.*?)"#;', SETUP_RS.read_text(), re.S
-    )
+    m = re.search(r'const REMOTE_JSON_PREAMBLE: &str = r#"(.*?)"#;', SETUP_RS.read_text(), re.S)
     assert m, "REMOTE_JSON_PREAMBLE not found — did the constant get renamed?"
     return m.group(1)
 
@@ -98,7 +92,7 @@ def _run(body: str, home: Path) -> subprocess.CompletedProcess[str]:
         [sys.executable, "-c", _preamble() + body],
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
     )
 
 

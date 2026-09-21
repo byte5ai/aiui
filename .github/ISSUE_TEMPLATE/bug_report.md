@@ -6,10 +6,10 @@ labels: bug
 
 **aiui version** (visible as the chip in Settings, e.g. `v0.2.2 (build … sha:…)`):
 
-**macOS version**:
+**OS and version** (macOS / Windows — e.g. `macOS 15.3` or `Windows 11 23H2`):
 
 **Setup** (pick one):
-- [ ] Local only — Claude Code runs on my Mac
+- [ ] Local only — Claude Code runs on the same machine as aiui
 - [ ] Remote — Claude Code runs on a remote host I registered in aiui
 - [ ] Both
 

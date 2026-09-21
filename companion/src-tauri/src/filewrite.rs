@@ -25,6 +25,24 @@
 //! - `create` — write the raw value; refuse to clobber unless `overwrite`.
 //! - `substitute` — replace a `placeholder` that occurs exactly once in an
 //!   existing file (0 or >1 → error, never a partial write). Format-agnostic.
+//!
+//! Contract shared with the Python bridge's `_write_local_target` (issue
+//! #199 — the two used to disagree, which meant the same spec did different
+//! things depending on which module served the session):
+//! - **Path rule.** `path` must be absolute or `~/`-rooted. A relative path
+//!   has no stable cwd to resolve against (the Finder-launched app's is `/`,
+//!   the bridge's is the agent's), and `~user/` is not portable across the
+//!   two implementations — both are rejected rather than written somewhere
+//!   unpredictable. Same rule `upload`'s `target_dir` already enforces.
+//! - **Symlinks are followed.** The parent is canonicalised and an existing
+//!   final symlink is resolved, so `substitute` edits the file the link
+//!   points at instead of replacing the link with a regular file. The
+//!   outcome reports that resolved path.
+//! - **Permissions.** `create` defaults to `0600` (tight by default — a
+//!   credential must never land world-readable). `substitute` is *editing a
+//!   file the user already owns*, so it keeps that file's existing mode; an
+//!   explicit `perm` wins in both modes. The applied mode is reported back
+//!   in [`WriteOutcome::mode`] so a permission change is never invisible.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -41,8 +59,9 @@ pub enum WriteMode {
 pub struct Target {
     pub mode: WriteMode,
     pub path: String,
-    /// Octal string like "0600". Defaults to 0600 when unset (tight by
-    /// default; harmless for non-secret values too).
+    /// Octal string like "0600". When unset, `create` defaults to 0600
+    /// (tight by default; harmless for non-secret values too) and
+    /// `substitute` keeps the destination's existing mode (#199).
     #[serde(default)]
     pub perm: Option<String>,
     /// `create` only: permit clobbering an existing file.
@@ -61,21 +80,26 @@ pub struct WriteOutcome {
     /// Human-legible resolved destination (the absolute local path written).
     pub target: String,
     pub bytes: usize,
+    /// The octal mode actually applied ("0644"), so a permission change is
+    /// never invisible (#199). Absent on non-POSIX hosts, where mode bits
+    /// are meaningless and the file inherits default ACLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl WriteOutcome {
-    fn ok(target: String, bytes: usize) -> Self {
-        Self { written: true, target, bytes, error: None }
+    fn ok(target: String, bytes: usize, mode: Option<String>) -> Self {
+        Self { written: true, target, bytes, mode, error: None }
     }
     fn fail(target: String, error: String) -> Self {
-        Self { written: false, target, bytes: 0, error: Some(error) }
+        Self { written: false, target, bytes: 0, mode: None, error: Some(error) }
     }
     /// A field whose `target` spec couldn't even be parsed — no destination to
     /// name yet.
     pub fn invalid(error: String) -> Self {
-        Self { written: false, target: String::new(), bytes: 0, error: Some(error) }
+        Self { written: false, target: String::new(), bytes: 0, mode: None, error: Some(error) }
     }
 }
 
@@ -85,21 +109,110 @@ fn parse_perm(s: &str) -> Option<u32> {
     u32::from_str_radix(t, 8).ok()
 }
 
-/// Reject obviously-unsafe target paths (NULs, control chars, empty). The
-/// local write goes through `std::fs`, not a shell, so this is a sanity guard
-/// rather than an injection defense — but it keeps the approval string the
-/// user sees unambiguous.
-pub fn is_sane_target_path(p: &str) -> bool {
-    !p.is_empty() && p.len() <= 4096 && p.bytes().all(|b| b >= 0x20 && b != 0x7f)
+/// Why a target path is unusable, or `None` when it is fine. Two concerns:
+/// obviously-unsafe strings (NULs, control chars, empty) — the local write
+/// goes through `std::fs`, not a shell, so that half is a sanity guard rather
+/// than an injection defense — and the #199 path rule, which keeps the
+/// approval string the user sees an actual destination.
+pub fn target_path_error(p: &str) -> Option<String> {
+    if p.is_empty() || p.len() > 4096 || !p.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return Some("invalid target path".into());
+    }
+    // `has_root` in addition to `is_absolute` so a POSIX-style "/etc/x" is
+    // accepted identically on Windows, where `is_absolute` also wants a
+    // drive prefix — the two bridges must agree on what they accept.
+    let path = Path::new(p);
+    if p.starts_with("~/") || path.is_absolute() || path.has_root() {
+        return None;
+    }
+    Some(format!(
+        "target path must be an absolute or ~/-rooted path, got '{p}'"
+    ))
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
+/// Resolve a leading `~/` against this machine's home. Public since #207:
+/// `resolve_dialog_targets` shows the user the destination the write will
+/// actually use, and re-implementing `~` expansion in TypeScript would let
+/// the two drift.
+pub fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
     }
     PathBuf::from(p)
+}
+
+/// Resolve the destination a write will really land on (#199).
+///
+/// `fs::canonicalize` on the whole path is wrong here: for `create` the file
+/// does not exist yet and it would fail with ENOENT. So canonicalise the
+/// *parent* and re-join the file name, then follow the final component while
+/// it is an existing symlink. That way `substitute` reads and rewrites the
+/// file the link points at, instead of `rename`-ing a fresh regular file over
+/// the link and leaving the real config untouched.
+fn resolve_target(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    // Bounded, so a symlink cycle can't spin here.
+    for _ in 0..32 {
+        let base = match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => match parent.canonicalize() {
+                Ok(c) => c.join(name),
+                // Parent doesn't exist yet (the normal `create`-into-a-fresh-
+                // tree case): nothing to resolve, use the path as given.
+                Err(_) => cur.clone(),
+            },
+            _ => cur.clone(),
+        };
+        let is_link = std::fs::symlink_metadata(&base)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return base;
+        }
+        match std::fs::read_link(&base) {
+            Ok(dest) if dest.is_absolute() => cur = dest,
+            Ok(dest) => match base.parent() {
+                Some(p) => cur = p.join(dest),
+                None => return base,
+            },
+            Err(_) => return base,
+        }
+    }
+    cur
+}
+
+/// The destination string a `target.path` resolves to on THIS host — what the
+/// approval line should show, and what the outcome later reports (#199).
+pub fn resolve_display(raw_path: &str) -> String {
+    resolve_target(&expand_tilde(raw_path)).display().to_string()
+}
+
+/// The destination's current mode bits, or `None` where they don't exist
+/// (non-POSIX host, or no such file).
+#[cfg(unix)]
+fn existing_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn existing_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Render the applied mode for the outcome. `None` off Unix, mirroring the
+/// `#[cfg(unix)]` guard on the chmod itself.
+#[cfg(unix)]
+fn mode_str(perm: Option<u32>) -> Option<String> {
+    perm.map(|m| format!("{:04o}", m & 0o7777))
+}
+
+#[cfg(not(unix))]
+fn mode_str(_perm: Option<u32>) -> Option<String> {
+    None
 }
 
 /// Atomically write `bytes` to `path` (tmp in the same dir + rename), applying
@@ -152,10 +265,12 @@ pub fn substitute_once(haystack: &str, placeholder: &str, value: &str) -> Result
 /// `value`. Returns the [`WriteOutcome`] (the only thing that may reach the
 /// agent for a secret).
 pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
-    if !is_sane_target_path(&target.path) {
-        return WriteOutcome::fail(target.path.clone(), "invalid target path".into());
+    if let Some(why) = target_path_error(&target.path) {
+        return WriteOutcome::fail(target.path.clone(), why);
     }
-    let path = expand_tilde(&target.path);
+    // Resolve before anything else, so the read, the rename and the reported
+    // destination all name the same real file even when `path` is a symlink.
+    let path = resolve_target(&expand_tilde(&target.path));
     let display = path.display().to_string();
     // An empty credential is never a legitimate write, and truncating the
     // user's file is not a dialog's job (issue #177). Refusing here, before
@@ -165,7 +280,21 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
     if value.is_empty() {
         return WriteOutcome::fail(display, "refusing to write an empty value".into());
     }
-    let perm = target.perm.as_deref().and_then(parse_perm).or(Some(0o600));
+    // #199: one default per mode. `create` is tight by default — dropping
+    // that would hand the process umask (0644/0664) a fresh credential file.
+    // `substitute` is editing a file the user already owns, so silently
+    // re-chmod'ing it to 0600 broke the very service the write was for; it
+    // inherits the destination's mode instead. An explicit `perm` wins.
+    let perm = target
+        .perm
+        .as_deref()
+        .and_then(parse_perm)
+        .or_else(|| match target.mode {
+            WriteMode::Create => Some(0o600),
+            // The 0600 fallback only bites when the file is unreadable — in
+            // which case `substitute` fails at the read below and never writes.
+            WriteMode::Substitute => existing_mode(&path).or(Some(0o600)),
+        });
     match target.mode {
         WriteMode::Create => {
             if path.exists() && !target.overwrite {
@@ -175,7 +304,7 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
                 );
             }
             match atomic_write(&path, value.as_bytes(), perm) {
-                Ok(()) => WriteOutcome::ok(display, value.len()),
+                Ok(()) => WriteOutcome::ok(display, value.len(), mode_str(perm)),
                 Err(e) => WriteOutcome::fail(display, e),
             }
         }
@@ -197,7 +326,7 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
                 Ok(updated) => {
                     let bytes = updated.len();
                     match atomic_write(&path, updated.as_bytes(), perm) {
-                        Ok(()) => WriteOutcome::ok(display, bytes),
+                        Ok(()) => WriteOutcome::ok(display, bytes, mode_str(perm)),
                         Err(e) => WriteOutcome::fail(display, e),
                     }
                 }
@@ -210,6 +339,11 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Readable predicate over [`target_path_error`] for the path tests.
+    fn is_sane_target_path(p: &str) -> bool {
+        target_path_error(p).is_none()
+    }
 
     #[test]
     fn parse_perm_octal() {
@@ -225,6 +359,35 @@ mod tests {
         assert!(!is_sane_target_path(""));
         assert!(!is_sane_target_path("a\nb"));
         assert!(!is_sane_target_path("a\0b"));
+    }
+
+    #[test]
+    fn target_path_must_be_absolute_or_tilde_rooted() {
+        // #199: the two bridges resolved these differently — the Python one
+        // against the agent's cwd / `~alice`, the companion against the GUI's
+        // cwd (typically `/` for a Finder launch) / a literal `~alice` dir.
+        // Neither destination is what the user approved, so both are out.
+        assert!(is_sane_target_path("/abs/x"));
+        assert!(is_sane_target_path("~/x"));
+        assert!(!is_sane_target_path("notes/key"));
+        assert!(!is_sane_target_path("~alice/key"));
+        assert!(!is_sane_target_path("./key"));
+        let why = target_path_error("notes/key").unwrap();
+        assert!(why.contains("absolute or ~/-rooted"), "{why}");
+        assert!(why.contains("notes/key"), "names the offending path: {why}");
+        // And it comes back as a structured outcome, not a surprise write.
+        let out = write_local(
+            "v",
+            &Target {
+                mode: WriteMode::Create,
+                path: "notes/key".into(),
+                perm: None,
+                overwrite: false,
+                placeholder: None,
+            },
+        );
+        assert!(!out.written);
+        assert!(out.error.unwrap().contains("absolute or ~/-rooted"));
     }
 
     #[test]
@@ -254,6 +417,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "perm applied");
+        }
+        #[cfg(windows)]
+        {
+            // #210: `perm` is deliberately a no-op here — Windows has no mode
+            // bits and the file inherits the directory's ACLs. Assert that
+            // outcome explicitly rather than leaving the Windows behaviour of
+            // the secret-writing path unasserted: supplying `perm` must still
+            // produce a readable file, never a failed write.
+            assert!(path.is_file(), "created even though perm is ignored");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cr3t");
         }
         let out2 = write_local("other", &target);
         assert!(!out2.written && out2.error.is_some(), "refuses clobber");
@@ -336,6 +509,119 @@ mod tests {
         let out = write_local("ghp_xxx", &target);
         assert!(out.written, "{:?}", out.error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "token: ghp_xxx\nother: 1\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- issue #199: the two writers must agree, and never surprise the user
+
+    #[test]
+    #[cfg(unix)]
+    fn substitute_preserves_existing_mode() {
+        // The headline: a 0644 compose file read by a container running as
+        // another uid came back 0600 and the service stopped starting — with
+        // nothing in the outcome to connect it to the aiui write.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("docker-compose.yml");
+        std::fs::write(&path, "token: __PAT__\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let target = Target {
+            mode: WriteMode::Substitute,
+            path: path.to_string_lossy().into_owned(),
+            perm: None,
+            overwrite: false,
+            placeholder: Some("__PAT__".into()),
+        };
+        let out = write_local("ghp_x", &target);
+        assert!(out.written, "{:?}", out.error);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "substitute keeps the file's own mode");
+        assert_eq!(out.mode.as_deref(), Some("0644"), "and says so");
+
+        // An explicit `perm` still wins.
+        std::fs::write(&path, "token: __PAT__\n").unwrap();
+        let target_perm = Target { perm: Some("0640".into()), ..target };
+        let out2 = write_local("ghp_y", &target_perm);
+        assert!(out2.written, "{:?}", out2.error);
+        let mode2 = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode2, 0o640);
+        assert_eq!(out2.mode.as_deref(), Some("0640"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_defaults_to_0600_without_perm() {
+        // Pins the tight-by-default guarantee against a naive "just drop the
+        // 0600 default" fix for the substitute bug — that would hand a fresh
+        // credential file the process umask (0644/0664).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("token");
+        let target = Target {
+            mode: WriteMode::Create,
+            path: path.to_string_lossy().into_owned(),
+            perm: None,
+            overwrite: false,
+            placeholder: None,
+        };
+        let out = write_local("ghp_secret", &target);
+        assert!(out.written, "{:?}", out.error);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "create stays tight by default");
+        assert_eq!(out.mode.as_deref(), Some("0600"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn substitute_writes_through_symlink() {
+        // Before: the read followed the link but the rename landed ON it, so
+        // the link became a regular file holding the secret and the real
+        // config kept its untouched placeholder — reported as `written: true`.
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.yml");
+        let link = dir.join("link.yml");
+        std::fs::write(&real, "token: __PAT__\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let target = Target {
+            mode: WriteMode::Substitute,
+            path: link.to_string_lossy().into_owned(),
+            perm: None,
+            overwrite: false,
+            placeholder: Some("__PAT__".into()),
+        };
+        let out = write_local("ghp_x", &target);
+        assert!(out.written, "{:?}", out.error);
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link must survive as a link"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "token: ghp_x\n");
+        let resolved = real.canonicalize().unwrap().display().to_string();
+        assert_eq!(out.target, resolved, "the outcome names the real destination");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn outcome_reports_applied_mode() {
+        let dir = std::env::temp_dir().join(format!("aiui-fw-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("token");
+        let target = Target {
+            mode: WriteMode::Create,
+            path: path.to_string_lossy().into_owned(),
+            perm: Some("0640".into()),
+            overwrite: false,
+            placeholder: None,
+        };
+        let out = write_local("v", &target);
+        assert!(out.written, "{:?}", out.error);
+        #[cfg(unix)]
+        assert_eq!(out.mode.as_deref(), Some("0640"), "the octal actually applied");
+        #[cfg(not(unix))]
+        assert!(out.mode.is_none(), "mode bits are meaningless off POSIX");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

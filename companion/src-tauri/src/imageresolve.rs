@@ -23,24 +23,42 @@
 //! `data:` URL. The WebView only ever sees `data:` URLs — CSP stays
 //! strict, the agent gets to use plain HTTP URLs.
 //!
+//! ## Where the fetch may go
+//!
+//! Only to publicly-routable addresses. This is the one place in aiui
+//! where an agent-supplied string turns into I/O originating on the
+//! user's machine, and the far end of the bridge (a registered remote
+//! dev host) is explicitly untrusted. Loopback, RFC1918, link-local,
+//! CGNAT, ULA and friends are refused before a socket is opened, the
+//! resolved addresses are pinned onto the client so a second DNS answer
+//! cannot slip past the check, and redirects are not followed. See
+//! [`destination_allowed`] (#201).
+//!
 //! ## Failure mode
 //!
-//! Fail-soft. If a fetch errors out (timeout, 404, oversized, network
-//! down), the original URL is left in place and the WebView will show
-//! a broken image. The agent will see this through the user, not via
-//! a structured error — that's acceptable for v1; surfacing image
-//! warnings into the tool response is a separate concern.
+//! Fail-soft. If a fetch errors out (timeout, 404, oversized, refused
+//! destination, network down), the original URL is left in place and
+//! the WebView will show a broken image. The agent will see this
+//! through the user, not via a structured error — that's acceptable for
+//! v1; surfacing image warnings into the tool response is a separate
+//! concern.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
+use futures::StreamExt;
 use serde_json::Value;
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const SRC_KEYS: &[&str] = &["src", "thumbnail"];
+/// Most image fetches in flight at once. A spec may legitimately carry
+/// dozens of URLs (an `image_grid`); an unbounded fan-out would open one
+/// socket per URL and buffer one body per URL at the same time.
+const MAX_CONCURRENT_FETCHES: usize = 4;
 
 /// Walk the spec JSON tree and replace `http(s)://...` values found in
 /// `src` or `thumbnail` properties with `data:` URLs by fetching them
@@ -55,18 +73,49 @@ pub async fn resolve_image_srcs(spec: &mut Value) {
         return;
     }
 
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    // Vet every destination *before* a socket is opened, and remember the
+    // addresses we vetted (#201). Bounded like the fetches themselves: a
+    // 50-image grid must not fire 50 concurrent resolver calls either.
+    let vetted = run_bounded(
+        urls.into_iter()
+            .map(|url| async move {
+                let outcome = vet_destination(&url).await;
+                (url, outcome)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
+    let mut fetchable = Vec::<String>::new();
+    let mut pinned = Vec::<(String, Vec<SocketAddr>)>::new();
+    for (url, outcome) in vetted {
+        match outcome {
+            Ok(Destination::Literal) => fetchable.push(url),
+            Ok(Destination::Pinned { host, addrs }) => {
+                if !pinned.iter().any(|(h, _)| *h == host) {
+                    pinned.push((host, addrs));
+                }
+                fetchable.push(url);
+            }
+            Err(e) => eprintln!("imageresolve: refused {url}: {e}"),
+        }
+    }
+    if fetchable.is_empty() {
+        return;
+    }
+
+    let client = match build_client(&pinned) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("imageresolve: client build failed: {e}");
+            eprintln!("imageresolve: {e}");
             return;
         }
     };
 
     // Fetch in parallel — each image is independent and the natural
     // unit of latency. Sequential would multiply latency by N for a
-    // multi-image grid.
-    let fetches = urls
+    // multi-image grid. Capped, see `MAX_CONCURRENT_FETCHES`.
+    let fetches = fetchable
         .into_iter()
         .map(|url| {
             let client = client.clone();
@@ -76,7 +125,7 @@ pub async fn resolve_image_srcs(spec: &mut Value) {
             }
         })
         .collect::<Vec<_>>();
-    let results = futures::future::join_all(fetches).await;
+    let results = run_bounded(fetches).await;
 
     let mut resolved = HashMap::<String, String>::new();
     for (url, result) in results {
@@ -95,6 +144,230 @@ pub async fn resolve_image_srcs(spec: &mut Value) {
     }
     rewrite_urls(spec, &resolved);
 }
+
+/// Run `tasks` with at most [`MAX_CONCURRENT_FETCHES`] of them in flight.
+///
+/// Its own function so the cap is exercised by a test instead of being an
+/// integer buried in a combinator chain.
+async fn run_bounded<F>(tasks: Vec<F>) -> Vec<F::Output>
+where
+    F: std::future::Future,
+{
+    futures::stream::iter(tasks)
+        .buffer_unordered(MAX_CONCURRENT_FETCHES)
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// What a vetted URL needs from the client before it may be fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Destination {
+    /// The URL carries a literal IP, already checked. Nothing to pin —
+    /// hyper connects to it directly without consulting a resolver.
+    Literal,
+    /// A hostname whose every resolved address passed the check. Pinned onto
+    /// the client so the connect lands on exactly what we vetted, closing the
+    /// DNS-rebinding window between check and connect.
+    Pinned { host: String, addrs: Vec<SocketAddr> },
+}
+
+/// True when `ip` is a destination aiui is willing to fetch an image from:
+/// a publicly-routable unicast address, and nothing else.
+///
+/// The companion is the LAN-side end of a channel whose far end — a
+/// registered remote dev host holding the bridge token — is explicitly
+/// untrusted. Without this filter any token holder can make the user's
+/// machine `GET` an arbitrary router, IoT panel or metadata endpoint, and
+/// time the response as a port-scan oracle (#201).
+///
+/// Implemented by hand on the octets rather than through `Ipv4Addr::is_global`
+/// and friends: `is_global`, `is_shared`, `is_benchmarking`,
+/// `Ipv6Addr::is_unique_local` and `is_unicast_link_local` are all still
+/// nightly-only, and this is not worth a new dependency.
+fn destination_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_allowed(v4),
+        IpAddr::V6(v6) => match unwrap_mapped_v4(v6) {
+            Some(v4) => ipv4_allowed(v4),
+            None => ipv6_allowed(v6),
+        },
+    }
+}
+
+/// `::ffff:a.b.c.d` (IPv4-mapped) and `::a.b.c.d` (IPv4-compatible) reach the
+/// same host as `a.b.c.d` — unwrap before judging, or `[::ffff:127.0.0.1]`
+/// walks straight through the IPv6 rules.
+fn unwrap_mapped_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    // `::1` and `::` are not IPv4-compatible addresses; let the IPv6 rules
+    // reject them rather than mapping them to 0.0.0.1 / 0.0.0.0.
+    if v6.is_loopback() || v6.is_unspecified() {
+        return None;
+    }
+    let s = v6.segments();
+    if s[0..5] != [0u16; 5] {
+        return None;
+    }
+    match s[5] {
+        0xffff | 0 => Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        )),
+        _ => None,
+    }
+}
+
+fn ipv4_allowed(ip: Ipv4Addr) -> bool {
+    // 127.0.0.0/8; 10/8 + 172.16/12 + 192.168/16; 169.254/16 (the metadata
+    // endpoint lives here); 224/4; 255.255.255.255; 0.0.0.0; and the three
+    // documentation ranges.
+    if ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    let o = ip.octets();
+    if o[0] == 0 {
+        return false; // 0.0.0.0/8 "this network"
+    }
+    if o[0] == 100 && (o[1] & 0b1100_0000) == 64 {
+        return false; // 100.64.0.0/10 carrier-grade NAT
+    }
+    if o[0] == 198 && (o[1] & 0b1111_1110) == 18 {
+        return false; // 198.18.0.0/15 benchmarking
+    }
+    if o[0] >= 240 {
+        return false; // 240.0.0.0/4 reserved
+    }
+    true
+}
+
+fn ipv6_allowed(ip: Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    let s = ip.segments();
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return false; // fc00::/7 unique-local
+    }
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return false; // fe80::/10 link-local
+    }
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return false; // 2001:db8::/32 documentation
+    }
+    true
+}
+
+/// An IP literal spelled in the URL's host position, or `None` for a name.
+///
+/// Deliberately reads the *parsed* host rather than the raw URL text: `Url`
+/// has already normalised the exotic spellings, so `http://2130706433/` and
+/// `http://127.1/` both arrive here as `127.0.0.1`. String-matching the URL
+/// for `localhost` / `127.` / `10.` would miss every one of them.
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6);
+    }
+    host.parse::<IpAddr>().ok()
+}
+
+/// Decide whether `url` may be fetched, resolving its host if needed.
+///
+/// `Err` means "do not fetch": the caller logs it and leaves the original
+/// URL in the spec, exactly like any other fetch failure.
+async fn vet_destination(url: &str) -> Result<Destination, String> {
+    record_fetch_attempt();
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("unsupported scheme: {other}")),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "no host in url".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+
+    // A literal IP never reaches a resolver — hyper connects to it directly —
+    // so the check has to happen here as well as on resolved names.
+    if let Some(ip) = parse_host_ip(host) {
+        return if destination_allowed(ip) {
+            Ok(Destination::Literal)
+        } else {
+            Err(format!("destination not publicly routable: {ip}"))
+        };
+    }
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .collect::<Vec<SocketAddr>>();
+    if addrs.is_empty() {
+        return Err(format!("resolve {host}: no addresses"));
+    }
+    // Every answer, not just the first: a hostname with one public and one
+    // RFC1918 A record must not be fetchable at all.
+    for addr in &addrs {
+        if !destination_allowed(addr.ip()) {
+            return Err(format!(
+                "destination not publicly routable: {host} → {}",
+                addr.ip()
+            ));
+        }
+    }
+    Ok(Destination::Pinned {
+        host: host.to_string(),
+        addrs,
+    })
+}
+
+/// Build the fetch client, pinning each vetted hostname to the addresses we
+/// checked so the client cannot re-resolve it to a different answer.
+fn build_client(pinned: &[(String, Vec<SocketAddr>)]) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        // No redirects. Even with a filtered resolver, an allowed public host
+        // can bounce us to http://169.254.169.254/, and each hop re-opens the
+        // gap between the address we vetted and the one we connect to. Nobody
+        // has yet named an image URL that needs a hop.
+        .redirect(reqwest::redirect::Policy::none());
+    for (host, addrs) in pinned {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Destination-guard entries made on this thread. Thread-local rather
+    /// than a global counter so tests running in parallel cannot see each
+    /// other's fetches.
+    static FETCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many URLs this thread has put through the destination
+/// guard. Used by the `/render` ordering test in `http.rs` to prove an
+/// invalid spec never reaches the network (#201).
+#[cfg(test)]
+pub(crate) fn fetch_attempts() -> usize {
+    FETCH_ATTEMPTS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn record_fetch_attempt() {
+    FETCH_ATTEMPTS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_fetch_attempt() {}
 
 fn collect_external_urls(spec: &Value) -> Vec<String> {
     let mut out = Vec::<String>::new();
@@ -169,7 +442,14 @@ pub fn resolve_local_paths(spec: &mut Value) {
     });
 }
 
-fn looks_like_local_path(s: &str) -> bool {
+/// Platform-parameterised core of [`looks_like_local_path`].
+///
+/// `windows` is a parameter rather than `cfg!(windows)` on purpose: CI
+/// compiles but does not *run* the unit tests on the Windows leg
+/// (`.github/workflows/ci.yml`), so a `#[cfg(windows)]` test would never
+/// execute. Taking the platform as an argument means the Windows branch is
+/// covered on the macOS runner, where tests do run (#201).
+fn looks_like_local_path_on(s: &str, windows: bool) -> bool {
     if s.starts_with("data:") || s.starts_with("http://") || s.starts_with("https://") {
         return false;
     }
@@ -180,7 +460,7 @@ fn looks_like_local_path(s: &str) -> bool {
     // long-path prefixes `\\?\C:\…` and UNC `\\server\share\…`. Strict
     // enough to avoid catching strings like `data:image/...` which never
     // reach here anyway because of the early `data:` exit above.
-    if cfg!(windows) {
+    if windows {
         let bytes = s.as_bytes();
         if bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
@@ -196,19 +476,46 @@ fn looks_like_local_path(s: &str) -> bool {
     false
 }
 
-fn expand_tilde(s: &str) -> Option<PathBuf> {
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = dirs::home_dir()?;
-        Some(home.join(rest))
-    } else if s == "~" {
-        dirs::home_dir()
-    } else {
-        Some(PathBuf::from(s))
+fn looks_like_local_path(s: &str) -> bool {
+    looks_like_local_path_on(s, cfg!(windows))
+}
+
+/// Platform-parameterised core of [`expand_tilde`], with `home` injected so
+/// the whole thing is a pure function of its arguments.
+///
+/// Accepts `~`, `~/rest` and — when `windows` — `~\rest`. A `~someone/rest`
+/// path is `None`: other users' home directories are not something we can
+/// expand, and handing the literal string to `stat` reports a missing file
+/// for a path that was never meant to be literal.
+fn expand_tilde_with(s: &str, home: &Path, windows: bool) -> Option<PathBuf> {
+    if s == "~" {
+        return Some(home.to_path_buf());
     }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return Some(home.join(rest));
+    }
+    if windows {
+        if let Some(rest) = s.strip_prefix(r"~\") {
+            return Some(home.join(rest));
+        }
+    }
+    if s.starts_with('~') {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+fn expand_tilde(s: &str) -> Option<PathBuf> {
+    if !s.starts_with('~') {
+        return Some(PathBuf::from(s));
+    }
+    let home = dirs::home_dir()?;
+    expand_tilde_with(s, &home, cfg!(windows))
 }
 
 fn read_path_as_data_url(raw: &str) -> Result<String, String> {
-    let path = expand_tilde(raw).ok_or_else(|| "no $HOME for ~ expansion".to_string())?;
+    let path = expand_tilde(raw)
+        .ok_or_else(|| "cannot expand ~user paths (or no home directory)".to_string())?;
     let metadata =
         std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if !metadata.is_file() {
@@ -271,7 +578,13 @@ fn guess_mime_from_extension(path: &Path) -> &'static str {
 /// the (10 MB-capped, base64-bloating) `data:` inliner. Mirrors the
 /// `isVideo` extension check in `Gallery.svelte` and the Python bridge.
 pub fn is_local_video_path(s: &str) -> bool {
-    if !looks_like_local_path(s) {
+    is_local_video_path_on(s, cfg!(windows))
+}
+
+/// Platform-parameterised core of [`is_local_video_path`] — see
+/// [`looks_like_local_path_on`] for why the platform is a parameter.
+fn is_local_video_path_on(s: &str, windows: bool) -> bool {
+    if !looks_like_local_path_on(s, windows) {
         return false;
     }
     let lower = s.to_ascii_lowercase();
@@ -319,7 +632,13 @@ pub fn collect_local_video_paths(spec: &Value) -> Vec<String> {
 /// Covers the common lossy/lossless formats a TTS sample, voice memo, or
 /// generated sound clip is likely to arrive in (#25).
 pub fn is_local_audio_path(s: &str) -> bool {
-    if !looks_like_local_path(s) {
+    is_local_audio_path_on(s, cfg!(windows))
+}
+
+/// Platform-parameterised core of [`is_local_audio_path`] — see
+/// [`looks_like_local_path_on`] for why the platform is a parameter.
+fn is_local_audio_path_on(s: &str, windows: bool) -> bool {
+    if !looks_like_local_path_on(s, windows) {
         return false;
     }
     let lower = s.to_ascii_lowercase();
@@ -421,13 +740,20 @@ fn walk_mut(value: &mut Value, f: &mut impl FnMut(&str, &mut Value)) {
 }
 
 async fn fetch_as_data_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
         .map_err(|e| format!("send: {e}"))?
         .error_for_status()
         .map_err(|e| format!("status: {e}"))?;
+
+    // The client follows no redirects (see `build_client`), so a 3xx arrives
+    // here as a normal response with an empty body. Fail it rather than
+    // inlining nothing and calling it an image.
+    if resp.status().is_redirection() {
+        return Err(format!("redirect not followed: {}", resp.status()));
+    }
 
     let mime = resp
         .headers()
@@ -450,13 +776,18 @@ async fn fetch_as_data_url(client: &reqwest::Client, url: &str) -> Result<String
         }
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("read body: {e}"))?;
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(format!("too large after read: {} bytes", bytes.len()));
+    // Stream, and hang up the moment the cap is passed. `Content-Length` is
+    // absent on a chunked response, so buffering first and checking after
+    // let any server grow the companion's RSS for the whole timeout window,
+    // once per URL, on every render (#201).
+    let mut buf = Vec::<u8>::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read body: {e}"))? {
+        if buf.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return Err(format!("too large: >{MAX_IMAGE_BYTES} bytes"));
+        }
+        buf.extend_from_slice(&chunk);
     }
+    let bytes = buf;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{};base64,{}", mime, b64))
@@ -466,6 +797,7 @@ async fn fetch_as_data_url(client: &reqwest::Client, url: &str) -> Result<String
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn is_local_video_path_classifies_correctly() {
@@ -654,6 +986,302 @@ mod tests {
         assert!(!looks_like_local_path("./relative.png"));
         assert!(!looks_like_local_path("relative.png"));
         assert!(!looks_like_local_path(""));
+
+        // Platform-independent on both settings.
+        for windows in [true, false] {
+            assert!(looks_like_local_path_on("/Users/me/foo.png", windows));
+            assert!(looks_like_local_path_on("~/Pictures/foo.png", windows));
+            assert!(looks_like_local_path_on(r"~\Pictures\foo.png", windows));
+            assert!(!looks_like_local_path_on("data:image/png;base64,AAAA", windows));
+            assert!(!looks_like_local_path_on("https://a.test/x.png", windows));
+            assert!(!looks_like_local_path_on("relative.png", windows));
+            assert!(!looks_like_local_path_on("", windows));
+        }
+
+        // Windows-only shapes. CI compiles but does not run the tests on the
+        // Windows leg, so these have to go through the parameterised helper
+        // to be exercised at all (#201).
+        assert!(looks_like_local_path_on(r"C:\Users\me\x.png", true));
+        assert!(looks_like_local_path_on("D:/renders/x.png", true));
+        assert!(looks_like_local_path_on(r"\\?\C:\Users\me\x.png", true));
+        assert!(looks_like_local_path_on(r"\\srv\share\x.png", true));
+        // …and the matching counter-cases: on POSIX none of them is a path.
+        assert!(!looks_like_local_path_on(r"C:\Users\me\x.png", false));
+        assert!(!looks_like_local_path_on("D:/renders/x.png", false));
+        assert!(!looks_like_local_path_on(r"\\?\C:\Users\me\x.png", false));
+        assert!(!looks_like_local_path_on(r"\\srv\share\x.png", false));
+    }
+
+    #[test]
+    fn expand_tilde_handles_windows_separator() {
+        let home = Path::new("/home/me");
+
+        // `~\…` is a home-relative path on Windows — before #201 it fell
+        // through unexpanded and was stat'd against the process cwd.
+        let got = expand_tilde_with(r"~\Pictures\x.png", home, true).unwrap();
+        assert!(got.starts_with(home), "not under home: {}", got.display());
+        assert!(got.to_string_lossy().contains("Pictures"));
+
+        // The POSIX spelling keeps working on Windows too.
+        let got = expand_tilde_with("~/Pictures/x.png", home, true).unwrap();
+        assert_eq!(got, home.join("Pictures/x.png"));
+
+        // Bare `~` is the home directory itself, on either platform.
+        assert_eq!(expand_tilde_with("~", home, false).unwrap(), home);
+        assert_eq!(expand_tilde_with("~", home, true).unwrap(), home);
+
+        // `~user` is not expandable — explicit `None` rather than a literal
+        // path that then fails `stat` with a misleading message.
+        assert_eq!(expand_tilde_with("~alice/x.png", home, false), None);
+        assert_eq!(expand_tilde_with("~alice/x.png", home, true), None);
+        // `~\…` on POSIX is not a home-relative path either.
+        assert_eq!(expand_tilde_with(r"~\Pictures\x.png", home, false), None);
+
+        // Non-tilde input passes through verbatim — that is how the Windows
+        // drive-letter and UNC shapes reach the filesystem.
+        assert_eq!(
+            expand_tilde_with(r"C:\Users\me\x.png", home, true).unwrap(),
+            PathBuf::from(r"C:\Users\me\x.png")
+        );
+        assert_eq!(
+            expand_tilde_with("/Users/me/x.png", home, false).unwrap(),
+            PathBuf::from("/Users/me/x.png")
+        );
+    }
+
+    #[test]
+    fn windows_paths_route_video_and_audio_to_media() {
+        // Under `windows = true` these are local media and must be collected
+        // for the `/media` upload instead of falling through to the image
+        // inliner (which would then fail to read them).
+        assert!(is_local_video_path_on(r"C:\Users\me\clip.mp4", true));
+        assert!(is_local_video_path_on(r"~\Movies\take.MOV", true));
+        assert!(is_local_audio_path_on(r"~\Music\memo.m4a", true));
+        assert!(is_local_audio_path_on(r"D:/audio/voice.wav", true));
+        // On POSIX a drive letter is not a path — and must not be treated
+        // as one, or garbage gets pushed at the file reader.
+        assert!(!is_local_video_path_on(r"C:\Users\me\clip.mp4", false));
+        assert!(!is_local_audio_path_on(r"D:/audio/voice.wav", false));
+        // Still not media, on either platform.
+        assert!(!is_local_video_path_on(r"C:\Users\me\photo.png", true));
+        assert!(!is_local_audio_path_on(r"C:\Users\me\clip.mp4", true));
+    }
+
+    #[test]
+    fn destination_predicate_rejects_non_public_ips() {
+        let blocked = [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "fd00::1",
+            "fe80::1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            // Extras the acceptance list implies: mapped private v4, the
+            // documentation ranges, and reserved space.
+            "::ffff:10.0.0.1",
+            "192.0.2.1",
+            "2001:db8::1",
+            "240.0.0.1",
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!destination_allowed(ip), "should be refused: {s}");
+        }
+
+        let allowed = ["93.184.216.34", "2606:2800:220:1::248:1893", "8.8.8.8"];
+        for s in allowed {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(destination_allowed(ip), "should be allowed: {s}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ip_literal_urls_are_checked_without_dns() {
+        // The guard runs on the parsed host, not on the URL text — so the
+        // decimal, dotted-short and IPv4-mapped spellings of loopback /
+        // RFC1918 are all refused, and none of them needs a resolver.
+        for url in [
+            "http://2130706433/x.png",
+            "http://127.1/x.png",
+            "http://[::ffff:10.0.0.1]/x.png",
+            "http://[::1]:8080/x.png",
+            "http://192.168.1.1/cgi-bin/reboot",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = vet_destination(url).await.unwrap_err();
+            assert!(
+                err.contains("not publicly routable"),
+                "{url}: unexpected error {err}"
+            );
+        }
+
+        // A public literal passes the guard with nothing to pin.
+        assert_eq!(
+            vet_destination("http://93.184.216.34/x.png").await.unwrap(),
+            Destination::Literal
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_destinations_leave_the_spec_untouched() {
+        // End to end through the real entry point: a LAN URL is not fetched
+        // and the original value survives, fail-soft like any other failure.
+        let mut spec = json!({
+            "kind": "ask",
+            "question": "x",
+            "options": [
+                {"label": "a", "value": "a", "thumbnail": "http://192.168.1.1/cgi-bin/reboot"}
+            ]
+        });
+        resolve_image_srcs(&mut spec).await;
+        assert_eq!(
+            spec["options"][0]["thumbnail"].as_str(),
+            Some("http://192.168.1.1/cgi-bin/reboot")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_does_not_follow_redirects() {
+        // Serve a canned 302 from loopback and call the fetch layer directly,
+        // below the destination guard — the guard would (correctly) refuse a
+        // loopback listener, and what's under test here is the client policy.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let _ = sock.flush().await;
+        });
+
+        let client = build_client(&[]).unwrap();
+        let err = fetch_as_data_url(&client, &format!("http://{addr}/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("redirect not followed"), "got: {err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_response_without_content_length_is_capped() {
+        // No Content-Length, so the pre-flight cap cannot fire. The read has
+        // to abort mid-body, not buffer the whole thing and check after.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let written_srv = written.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            if sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // 64 KiB chunks, four times the cap in total — or until the
+            // client hangs up, which is the behaviour under test.
+            let payload = vec![b'a'; 64 * 1024];
+            let header = format!("{:x}\r\n", payload.len());
+            let total = MAX_IMAGE_BYTES * 4;
+            while written_srv.load(std::sync::atomic::Ordering::SeqCst) < total {
+                if sock.write_all(header.as_bytes()).await.is_err()
+                    || sock.write_all(&payload).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                written_srv.fetch_add(payload.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+
+        let client = build_client(&[]).unwrap();
+        let err = fetch_as_data_url(&client, &format!("http://{addr}/big.png"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+        server.abort();
+        let _ = server.await;
+
+        // The whole payload was never buffered: the server got to write only
+        // a little past the cap before the client dropped the connection.
+        let wrote = written.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            wrote < MAX_IMAGE_BYTES * 2,
+            "server wrote {wrote} bytes — body was not capped while streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_respect_concurrency_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..50)
+            .map(|i| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Yield so the executor has every chance to start more.
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    i
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let out = run_bounded(tasks).await;
+        assert_eq!(out.len(), 50);
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= MAX_CONCURRENT_FETCHES,
+            "peak in-flight {observed} exceeds cap {MAX_CONCURRENT_FETCHES}"
+        );
+    }
+
+    /// #210: the drive-letter and UNC arms are `cfg!(windows)`-gated, so they
+    /// are dead code on the macOS leg and were compile-checked only until the
+    /// Windows leg started executing its tests. Losing them turns an absolute
+    /// `C:\…` image path into "not local", which the resolver then leaves for
+    /// the WebView to fetch as if it were a remote URL — a silently broken
+    /// image rather than an error.
+    #[cfg(windows)]
+    #[test]
+    fn looks_like_local_path_windows_absolute_forms() {
+        assert!(looks_like_local_path(r"C:\foo\bar.png"));
+        assert!(looks_like_local_path("D:/bar.png"));
+        assert!(looks_like_local_path(r"\\?\C:\x.png"));
+        assert!(looks_like_local_path(r"\\server\share\x.png"));
+        // The early exits still win over the drive-letter shape.
+        assert!(!looks_like_local_path("data:image/png;base64,AAA"));
+        assert!(!looks_like_local_path("https://a.test/x.png"));
+        // A relative Windows path is no more local than a relative Unix one.
+        assert!(!looks_like_local_path(r"sub\x.png"));
     }
 
     #[test]

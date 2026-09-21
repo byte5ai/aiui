@@ -11,7 +11,8 @@ indefinitely with no automatic recovery.
 1. Failure modes that today require a manual GUI restart should self-heal.
 2. No background polling. Idle companion = zero load except the OS-level
    event loop and the TCP listener. Every health/cleanup action must be
-   triggered by a real cause.
+   triggered by a real cause. *A visible Settings window is a real cause;
+   a hidden one is not* — see "The Settings status poll" below.
 3. `/health` must reflect actual usability, not just "axum is up".
 
 ## Non-goals
@@ -67,8 +68,13 @@ dialog to show.
 
 `/health` is a question, not a maintained state. On request:
 
-- Synchronous mini-roundtrip to the frontend (`invoke("ui_ping")`,
-  100 ms timeout).
+- Synchronous mini-roundtrip to the frontend: the backend emits a `ui:ping`
+  **event** to the newest open dialog window (its Tauri label is that
+  dialog's id — `DialogState::newest_id()`), and the Svelte side answers by
+  invoking the `ui_pong` **command**, which fulfils the ack registry.
+  750 ms timeout. With no dialog window open there is nothing to be
+  unresponsive about: `responsive: true`, `rtt_ms: null` — never a
+  fabricated `0`.
 - Read live counters from the dialog registry (orphan count, oldest age).
 - Read mcp-stdio child count from the lifetime tracker.
 
@@ -76,6 +82,31 @@ Returned status is `ready` only if all three are sane. "Health green while
 app is dead" becomes structurally impossible.
 
 No background task maintains this. If nobody calls `/health`, nothing runs.
+
+#### `reason`, `hint`, and the 200-vs-503 rule
+
+When `ready` is false the body names the cause, so no caller has to guess it
+from a status code. `reason` is one of `webview_unresponsive`,
+`dialog_registry_full`, `too_many_children`, evaluated in exactly that
+precedence so a multiply-degraded companion reports deterministically;
+`hint` is the same cause as one human-readable line, with the live numbers
+filled in. Both bridges relay the `hint` rather than inventing a diagnosis.
+
+The status code splits "cannot serve" from "degraded but serving":
+
+| `reason` | status | why |
+| --- | --- | --- |
+| `webview_unresponsive` | **503** | a frozen WebView cannot show a dialog |
+| `dialog_registry_full` | **200** | `register_dialog()` sweeps and evicts the oldest — the next render still works, it just costs someone their oldest dialog |
+| `too_many_children` | **200** | rendering is unaffected; this is a leak signal |
+
+This matters because the Python bridge preflights `/health` before every
+render and every upload, and treats a non-200 as fatal. 503-ing a full
+registry meant one session's 16 unanswered dialogs took `/render` down for
+every *other* session sharing the companion (#179).
+
+Both fields are additive; bridges parse the body generically, so no
+`WIRE_VERSION` bump.
 
 ### 4. Opportunistic registry sweep
 
@@ -119,18 +150,52 @@ Replace the recurring poll with checks at:
 These cluster around real user activity. A companion that sits unused for a
 week does no update polling — which is fine, because nobody is using it.
 
+### 8. The Settings status poll (#208)
+
+The one `setInterval` that survives, and the conditions under which it is
+allowed to. `Settings.svelte` polls the `status` command every 2 s so the
+pane shows live tunnel state — but the setup window is *hidden* on close,
+never destroyed (Invariant I2 in `lib.rs`), so its Svelte component stays
+mounted for the life of the process and `onDestroy` never runs. Until #208
+that meant one interval ticking forever: ~43k HTTP self-probes and
+`pgrep`/`tasklist` child spawns per idle day, for a window nobody was
+looking at. The principle above and the code said opposite things.
+
+Two gates, so they now agree:
+
+- **Visibility.** The poll runs only while the pane can be seen. It stops
+  on `visibilitychange → hidden` and on window blur, and — because a
+  hidden WKWebView can keep reporting `visibilityState: "visible"` — on a
+  `setup:visibility` event Rust emits from the `CloseRequested` hide path
+  and from every path that surfaces the window again. Reopening refreshes
+  once immediately, then resumes ticking. An uninstall stops it for good.
+- **A server-side TTL.** The two expensive halves of `status` — the
+  authenticated HTTP self-probe and `is_claude_desktop_running()` (which
+  spawns `pgrep` on macOS, `tasklist` on Windows) — sit behind a 15 s
+  cache in `ExpensiveStatusCache`. A visible window therefore spawns at
+  most four child processes a minute, while the cheap half (config flags,
+  skill stat, remotes, tunnels, pending update) still answers every tick.
+  User-triggered refreshes pass `force: true` and bypass the TTL, so a
+  button never looks like it did nothing.
+
+Note what was *not* done: the window is still hidden rather than
+destroyed. Destroying it would unmount the component and make the symptom
+disappear, at the cost of Invariant I2 — the process must keep serving the
+HTTP endpoint and the lifetime socket after the window goes away.
+
 ## What this removes
 
 - `setInterval(..., 6 * 60 * 60 * 1000)` for update polling.
 - Any future temptation to add a `setInterval` for liveness, registry GC,
-  or child sweeping.
+  or child sweeping. The Settings status poll is the single exception and
+  is gated as described in §8; anything new needs the same two gates.
 - The need for a manual "restart aiui" instruction in user-facing
   troubleshooting.
 
 ## What this adds
 
 - `dialog_received(id)` Tauri command + per-render ack wait.
-- `ui_ping` Tauri command for `/health`'s live probe.
+- `ui:ping` event + `ui_pong` Tauri command for `/health`'s live probe.
 - `WebviewWindowBuilder`-based recreate path on the main thread.
 - TTL field + opportunistic sweep in `dialog::DialogState`.
 - Socket-disconnect listener + sweep-on-attach in the lifetime tracker.
@@ -155,3 +220,43 @@ Implementable in two PRs without breaking the wire format:
   Candidate: 60s, with the client looping until `deadline`.
 - `NSWorkspaceDidWakeNotification` requires Tauri's macOS plugin or a
   small Objective-C bridge — verify which is lighter to maintain.
+
+## Invariants for the setup machinery (#198)
+
+Self-healing only works if the signals it heals on are honest. Five steps in
+the setup/uninstall path reported green for work they had not done, and all
+five reduced to one of these two rules being broken. Both are cheap to hold
+and expensive to rediscover.
+
+**1. A `StepResult` asserts the outcome it verified, never the action it
+attempted.** `ok: true` is a claim about the world after the step, not about
+the step having been reached. Concretely: don't `let _ =` a filesystem
+result and then return `ok: true`; don't word a message from a `changed`
+flag the write path ignores; don't inspect a subprocess's exit status only
+on the branch where it started. A green line over a broken state is the
+worst possible input for a support conversation — the user sees "connected"
+in aiui and a failing MCP server in Claude, and neither side points at the
+cause. A red line the user can act on is strictly better than a green one
+they cannot.
+
+**2. An `is_*_current` predicate must compare exactly what its patcher
+writes — because the predicate is also the repair gate.** The setup closure
+patches a host only when its predicate says the config is stale, so anything
+the predicate accepts can never be healed. `is_claude_config_current`
+stopped at `command` while the patcher wrote `command` *and* `args`: an
+entry missing `--mcp-stdio` read as current forever, and the binary it
+pointed at started the Tauri GUI instead of speaking MCP on stdio. Predicate
+and patcher now share one definition (`aiui_entry_is_current`).
+
+The corollary is the other half of the same rule: compare **only** the keys
+aiui owns, and merge rather than replace. Strict whole-entry equality plus
+wholesale replacement is the mirror-image bug — a user's hand-added `env`
+block gets clobbered and a fresh `.bak.<ts>` dropped on every single launch.
+Compare what we own, preserve what we don't.
+
+A third rule falls out of the two: **never register a path that won't exist
+next launch.** `current_exe()` under Gatekeeper App Translocation is a
+throwaway mount with a fresh UUID per launch; writing it into a host config
+guarantees both a dead `command` and a rewrite loop. The right answer is to
+refuse and tell the user, not to substitute a canonical path the binary is
+not actually at.

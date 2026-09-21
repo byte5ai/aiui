@@ -9,7 +9,8 @@ aiui exposes MCP tools that render native dialogs on the user's machine, plus
 one that doesn't wait for the user at all:
 
 - `confirm` — irreversible yes/no
-- `ask` — single- or multi-choice with descriptions and optional free-text fallback
+- `ask` — single- or multi-choice with descriptions and an optional
+  free-text fallback (`allow_other`, default off)
 - `form` — composite window with typed fields and multiple action buttons
 - `gallery` — batch review of images/videos with a per-item verdict
 - `compare` — side-by-side A/B (or A/B/C) content compare, pick one
@@ -72,9 +73,43 @@ Skip the dialog for content the user reads, doesn't answer:
 | Per-item verdict on a *batch* of images/videos ("approve/revise/skip each") | `gallery` |
 | Pick one of 2–3 full variants shown side by side (drafts, headlines, before/after) | `compare` |
 | Mark *where* on an image (point / region) | `form` with `annotated_image` |
+| Pick from a nested structure (file subtree, config namespaces, org chart) | `form` with a `tree` field |
 | Async-completion signal, no reply needed, user may not be watching | `notify` |
 | Single free-text answer | just ask in chat |
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
+
+Every dialog must have something to answer: an `ask` needs at least one
+option carrying a `label` (or a `value`), a `form` at least one field.
+An empty one is rejected up front rather than opened as a window the
+user can only cancel.
+
+## Reading the result: `cancelled` and `reason`
+
+Every dialog tool returns `cancelled` plus that tool's own keys — on a
+submit *and* on a cancel, so you can read a key without guarding for it:
+
+| Tool | On submit | On cancel |
+|---|---|---|
+| `confirm` | `{cancelled: false, confirmed}` | `{cancelled: true, confirmed: false}` |
+| `ask` | `{cancelled: false, answers, other?}` | `{cancelled: true, answers: []}` |
+| `form` | `{cancelled: false, action?, values}` | `{cancelled: true, values: {}}` |
+| `gallery` | `{cancelled: false, decisions}` | `{cancelled: true, decisions: {}}` |
+| `compare` | `{cancelled: false, selected}` | `{cancelled: true}` — `selected` is *absent*, never a falsy stand-in |
+
+**`cancelled: true` does not mean the user said no.** When the dialog ended
+without anyone answering it, aiui adds a `reason`:
+
+| `reason` | What happened | What to do |
+|---|---|---|
+| *(absent)* | The user actively cancelled — Escape or the Cancel button. | A real decision. Treat it as "no" and do not re-ask. |
+| `ttl_expired` | Nobody answered within the dialog's TTL (2 h). | Nobody saw the question. Safe to re-ask later, or say the request timed out. |
+| `evicted` | aiui dropped this dialog to stay under its 16-dialog cap — usually your own later dialogs pushed it out. | Do **not** re-ask blindly; you are probably opening too many dialogs at once. |
+| `channel_dropped` | Internal: the result channel closed (companion restart, WebView reload). | A transient failure, not an answer. Retry once. |
+| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's Mac is back. |
+
+Never report a `reason`-carrying cancel as a user decision. "You declined
+the migration" after a `ttl_expired` is a decision the user never made.
+Treat an unknown `reason` as "we gave up", not as a user answer.
 
 ## Fire-and-forget: `notify`
 
@@ -124,6 +159,30 @@ notification-permission prompt; a denied permission comes back as
   An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 
+## What the dialog enforces before it submits
+
+Declared constraints are checked in the dialog, not just handed to the
+widget — an affirmative action only fires once they hold:
+
+- `required` — blank, whitespace-only, a half-set `date_range`, or an empty
+  `table` / `image_grid` / `annotated_image` selection blocks the submit.
+- `min` / `max` on `number` and `slider` — a value outside the interval
+  blocks it too, including one typed straight into the box.
+- Pressing the action anyway is never a silent no-op: the dialog switches
+  to the offending tab, shows a footer message and marks the fields.
+  `skip_validation: True` is the way past all of it.
+
+Two normalisations happen before the user sees the form, so what comes
+back is what was on screen:
+
+- A `select` without a `default` resolves to its **first option**, not `""`.
+- A `default` the native control cannot represent is normalised or cleared
+  instead of round-tripped: `date` / `datetime` must be ISO
+  (`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`), `color` must be `#rrggbb`, and a
+  `number` / `slider` default outside `[min, max]` is clamped.
+
+It is a UI guard, not a security control — still validate what you get.
+
 ## The `list` field — one widget, four modes
 
 | `selectable` | `multi_select` | `sortable` | Mode |
@@ -134,8 +193,13 @@ notification-permission prompt; a denied permission comes back as
 | – | – | ✓ | Ordering via drag handles |
 | ✓ | ✓ | ✓ | Pick-and-order |
 
+Every mode is fully keyboard-operable: Tab to an item, Enter or Space to
+select, Alt+↑/↓ (Cmd+↑/↓ also works) to reorder a sortable one.
+
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state. Items can carry a
+drag changes, `selected` reflects checkbox state. Each item's `value` must
+be non-empty and unique — it keys the result, and a duplicate is rejected.
+Items can carry a
 `thumbnail` (data: URL or path) — perfect for shotlists, mood boards,
 carousel slides where the visual anchor matters more than the label.
 
@@ -144,7 +208,10 @@ carousel slides where the visual anchor matters more than the label.
 When you'd otherwise dump 30 branches / 50 search results / 20 stale
 files into chat, hand it as a `table` instead. Columns carry the context
 (date, size, owner) that `list` can't, rows are clickable for selection,
-and the agent gets back the picked rows by their `value`.
+and the agent gets back the picked rows by their `value`. Keyboard works
+too: a `multi_select` table gives every row a real checkbox, a
+single-select row is focusable (Enter/Space picks it), and sortable column
+headers are buttons reachable by Tab.
 
 ```
 columns: [{key, label, align?: "left"|"right"|"center"}]
@@ -155,7 +222,61 @@ sortable_by_column?: true   # click headers to sort
 
 Result: `{selected: [values], order: [values], sort: {column, dir}}`. The
 order field reflects user-driven sorts so you can preserve their view if
-you reopen the form.
+you reopen the form. Each row's `value` must be non-empty and unique —
+two rows both called `config.yaml` (from different directories, say) are
+rejected; disambiguate with the full path.
+
+**Uniqueness is enforced across every collection**, not just here: `list`
+items, `table` rows, `image_grid` images, `tree` nodes (the whole forest,
+not just siblings), `gallery` items, `compare` variants, plus `form`
+field `name`s and tab `label`s. A repeat keys two things the same, which
+either blanks the dialog or silently collapses two entries into one
+result — so aiui refuses the spec instead of rendering it.
+
+## Hierarchical picker: `tree`
+
+For options with real parent/child structure the user needs to see — a
+file subtree, config namespaces, monorepo packages, an org chart. Flat
+set where ordering matters → `list`. Flat one-of-N → `select`. Structure
+the user has to navigate → `tree`.
+
+```
+{kind: "tree", name, label?, items: [{label, value, description?, children?: [...]}],
+ multi_select?, default_selected?: [values], default_expanded?: [values]}
+```
+
+Result: `{selected: [values]}` — nothing else. Expand/collapse is the
+user's view, not an answer; it is stripped at submit.
+
+- **Omitting `default_expanded` expands every node** — on a large tree
+  that's a wall of rows. Pass the values you want open (usually the
+  roots).
+- **`required` is not enforced for `tree`** (same as `list`): handle an
+  empty `selected` instead of assuming a pick.
+- Parents and children select independently — picking a parent does not
+  pick its children.
+
+```
+{
+  "kind": "tree",
+  "name": "namespaces",
+  "label": "Which config namespaces should migrate?",
+  "multi_select": true,
+  "default_expanded": ["app"],
+  "items": [
+    {"label": "app", "value": "app", "children": [
+      {"label": "auth", "value": "app/auth", "description": "12 keys"},
+      {"label": "cache", "value": "app/cache", "description": "7 keys"}
+    ]},
+    {"label": "legacy", "value": "legacy", "description": "deprecated, 41 keys"}
+  ]
+}
+```
+
+Anti-pattern: faking the hierarchy with indented labels in a `select` or
+`list` (`"  └ auth"`) — the user can't collapse a picture, and the values
+come back with the structure lost. Equally wrong: a `tree` for a flat set
+because it looks fancier.
 
 ## Inline-context fields: `markdown`, `image`, `static_text`
 
@@ -246,8 +367,8 @@ directly instead of describing it in words. A `form` field. Spec:
   rectangle), or `"both"` (a Point/Region toggle; both are returned).
 - `default` — seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized
   units to pre-place a marker the user then nudges.
-- `required` — submit stays disabled until the user has marked what the
-  mode calls for.
+- `required` — submitting before the user has marked what the mode calls
+  for highlights the field and says what is missing instead.
 
 Result under the field `name`:
 `{point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null}`.
@@ -276,7 +397,8 @@ instead of firing `confirm` once per asset.
 Spec: `items: [{value, src?, label?, detail?, max_height?}]`,
 `actions?` (per-item buttons, default Approve / Revise / Skip),
 `comment?` (free-text per item), `columns?`. Each item's `value` must be
-non-empty and unique — it keys the result. `src` follows the standard
+non-empty and unique — it keys the result, and a duplicate is rejected
+(as in every value-keyed collection). `src` follows the standard
 image rules; **videos** (`data:video/` URL, `http(s)://` URL, or a local
 `.mp4`/`.mov`/`.m4v`/`.webm` path) render with native controls. Local
 videos of any size work — the bridge pushes them to aiui's media cache on
@@ -302,9 +424,16 @@ a **native file picker on the user's machine**; the chosen file is written to
 - Don't ask which file or where — the user picks in the dialog, you infer
   the target. Deterministic: lands at exactly `target_dir/<filename>`, no
   staging path. Existing files are never overwritten (a clash errors).
+- One picker at a time: a second `upload` while another is waiting errors
+  with "another upload is already waiting for the user" — two stacked system
+  panels are indistinguishable to the user. Let the first finish, then retry.
+- Optional `session` (e.g. `billing-migration`) titles the picker window, so
+  a user running several agents can tell which one is asking.
 - Returns `{status:"ok", path, filename, bytes}` or `{status:"error", error}`
-  (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir).
-  Blocks until pick/cancel; progress fires every ~10 s meanwhile.
+  (cancelled picker, unreadable file, >512 MB cap, missing/unwritable dir,
+  another upload in flight, picker never answered). Blocks until pick/cancel;
+  progress fires every ~10 s meanwhile. The picker may take a moment to come
+  forward, and an unanswered one times out with an error rather than hanging.
 
 ## Side-by-side compare: `compare`
 
@@ -360,12 +489,17 @@ Three input formats render correctly:
   file and inlines it as a `data:` URL before the spec leaves your host.
   **The path must exist on the host *you*, the agent, run on** — for an
   SSH-tunneled session that's the remote, not the user's machine. Absolute or
-  `~/`-rooted only; relative paths are not resolved (no stable `cwd`
-  contract on MCP bridges). 10 MB cap.
+  `~`-rooted only; relative paths are not resolved (no stable `cwd`
+  contract on MCP bridges). On a Windows host `C:\…`, `\\?\C:\…`,
+  `\\server\share\…` and `~\…` count as absolute too. `~someuser/…` is
+  not expanded. 10 MB cap.
 - **`http(s)://` URL** — fetched on the user's machine and inlined (5 s
   timeout, 10 MB cap, parallel for grids). Use when the image already
   lives on a reachable server; the user's machine contacts the URL, aiui never phones
-  home.
+  home. **Public destinations only:** a URL resolving to loopback, a
+  private/LAN range, link-local, CGNAT or an IPv6 ULA is refused and
+  renders broken — the user's LAN is not yours to reach. Redirects are
+  not followed, so link to the image itself, not to a redirector.
 - **`data:` URL** (`data:image/png;base64,…`) — the fallback when neither
   path nor URL fits (e.g. bytes generated in-memory). Embed the encoded
   bytes directly in the tool-call `src` — never roundtrip through a shell
@@ -374,6 +508,13 @@ Three input formats render correctly:
 
 **Pick the simplest one that works:** path if the file's on disk, then URL
 if reachable, `data:` only as last resort.
+
+**When a clip doesn't make it:** a local video or audio file that can't be
+pushed to the `/media` cache — missing, unreadable, or over the 512 MB
+per-file cap — never fails the render. The dialog opens with a broken
+player where that clip should be, and the result carries a
+`media_warnings: [...]` list naming each path and why. Read it: without it
+you'd believe the user saw something they didn't.
 
 Known footguns: **relative paths** (`./foo.png`, `../x.png` — resolved
 against an undefined `cwd`; use absolute / `~/`); **cross-host paths** (a
@@ -410,8 +551,9 @@ validation. Native `<input type="datetime-local">`, returns ISO
 ## Tabs — long forms without scroll fatigue
 
 Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
-One submit covers all tabs; validation jumps to the first invalid tab
-automatically. Tabs are *display structure*, not a wizard — no per-tab
+One submit covers all tabs; pressing it with something invalid switches to
+the first invalid tab, names it in a footer message and marks the offending
+fields — it never submits silently. Tabs are *display structure*, not a wizard — no per-tab
 confirmation, no per-tab actions, all values land in one response.
 
 Use when a single dialog naturally falls into 2-4 distinct topical
@@ -437,7 +579,7 @@ When a value must NOT pass through this conversation — a credential the
 user pastes that should land in a file, not your transcript — use a
 `secret` field with a `target`. Any input field may carry `target`; for a
 `secret` field the value is **write-only** (result: `{written, target,
-bytes}`, never the value).
+bytes, mode}`, never the value).
 
 ```json
 { "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
@@ -453,8 +595,19 @@ bytes}`, never the value).
 - Destination is always your own host: the aiui module there (native app
   locally, bridge on a remote SSH host) writes it as a LOCAL file op, so
   `create` and `substitute` both work identically local and remote — no
-  foreign host. The user sees the path and approves by submitting. Errors:
-  `{written:false, error}`.
+  foreign host. The user sees the destination and approves by submitting —
+  a local session shows the resolved absolute path, a bridge-served one the
+  path as you wrote it plus the host it lands on (the companion must not
+  expand `~` for a remote write; that home is a different machine's).
+  Errors: `{written:false, error}`.
+- `path` must be absolute or `~/`-rooted; relative (`notes/key`) and
+  `~user/` (`~alice/key`) are rejected — neither names a stable
+  destination, same rule as `upload`'s `target_dir`. Symlinks are followed:
+  `substitute` edits the file the link points at, the link stays a link,
+  and the reported `target` is that resolved path.
+- `substitute` keeps the file's existing mode unless you pass `perm` (it
+  edits a file the user owns — a 0644 config stays 0644); `create` defaults
+  to 0600. The outcome reports the octal `mode` applied.
 - A `secret` field MUST carry a `target` — the write-only promise is what
   the kind means, so a target-less `secret` is rejected (`invalid_spec`)
   instead of returning the plaintext. Want the value back? Use `password`.

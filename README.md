@@ -67,7 +67,11 @@ No Terminal. No Homebrew. No Python. No `uv`.
 
 1. **[Download aiui.app](https://github.com/byte5ai/aiui/releases/latest)**
    (DMG, Apple Silicon).
-2. Drag into `Applications`.
+2. Drag into `Applications`. This step is not optional: launched straight
+   off the mounted DMG or out of `~/Downloads`, macOS runs aiui from a
+   throwaway copy that disappears when you quit it. aiui notices, refuses
+   to register itself with Claude, and shows you a banner saying so —
+   rather than writing a path that is dead by the next tool call.
 3. Launch it once from Finder.
 
 ### Windows (x64)
@@ -112,7 +116,7 @@ normal message:
 
 That's the whole idea. The agent picks the right kind of dialog —
 yes/no, pick-from-options, or a multi-field form — opens it on your
-Mac, you click, it carries on with your answer.
+machine, you click, it carries on with your answer.
 
 The first time you do this in a fresh project, run `/aiui:teach` once.
 That briefs the agent on *when* to reach for aiui versus just typing
@@ -134,9 +138,19 @@ back in chat — without it, the agent might forget aiui exists.
 
 ## Privacy
 
-aiui runs purely locally on your own machine. No telemetry, no usage data, no
-content leaves your system. A local auth token lives in the per-user config
-directory and is only scp'd to hosts you explicitly register in settings.
+aiui runs purely locally on your own machine. No telemetry, no usage data: no
+dialog content and no answer you give ever leaves your system. A local auth
+token lives in the per-user config directory and is only scp'd to hosts you
+explicitly register in settings. That directory — `~/.config/aiui/` on macOS
+and Linux, `%APPDATA%\aiui\` on Windows — also holds the list of registered
+hosts (`remotes.json`) and the first-run flag; uninstall removes all of it,
+together with the cached review media.
+
+The one outbound request aiui makes on a spec's behalf is a `GET` for an
+`http(s)://` image `src`, fetched on your machine so the dialog can show it —
+publicly routable destinations only, never your LAN (see
+[SECURITY.md](SECURITY.md)). Beyond that and the GitHub-hosted updater feed,
+aiui does not phone anywhere.
 
 | | Token location | Protection |
 |---|---|---|
@@ -153,15 +167,24 @@ it precisely.
 | Command | What it does |
 |---|---|
 | `/aiui:teach` | Briefs the agent on aiui — loads the full widget catalog and design rules into the session. Run once per project. |
-| `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, silently installs any available update, and reports the version delta back. Responds before the background relaunch, so the agent always gets the answer. |
+| `/aiui:update` | Agent calls the `update` tool; aiui checks the release feed, installs any available update, and reports the version delta back. It always answers before the restart, on macOS and on Windows alike. If a dialog is still waiting for you, nothing is installed — you get back "update deferred", because restarting would throw away what you had typed. |
 | `/aiui:version` | Reports the currently installed aiui version in one line. |
+| `/aiui:health` | One-line health check: WebView responsive, no dialog backlog, no child-process flood. |
+| `/aiui:test-dialog` | Pops a tiny demo dialog so you can verify aiui is wired up end to end. |
+| `/aiui:remotes` | Lists your registered remote hosts in chat — the same set the settings window shows. |
+| `/aiui:upload` | Hands a file from your machine to the agent session: a native file picker opens, the file you choose lands on the agent's host. |
 
 ## FAQ
 
-**Is it safe?** aiui is open source (MIT), builds reproducibly, is Apple
-Developer-ID signed and notarized. It never phones home. The auth token
-stays under `~/.config/aiui/` on your machine and is only copied to
-hosts you explicitly register in settings.
+**Is it safe?** aiui is open source (MIT), built only in public GitHub
+Actions — never on a maintainer's machine — from third-party actions pinned
+to commit SHAs and a Rust compiler pinned in `rust-toolchain.toml`. The
+macOS build is Apple Developer-ID signed and notarized; the Windows
+installer carries no Authenticode signature yet (see [Install](#install)),
+but its updater artifacts are signature-verified. It never phones home.
+The auth token stays in aiui's config directory on your machine —
+`~/.config/aiui/` on macOS and Linux, `%APPDATA%\aiui\` on Windows — and
+is only copied to hosts you explicitly register in settings.
 
 **Do I need `uv` or Python?** No. Since v0.3.0 the MCP server ships
 inside the aiui.app bundle as native Rust code — drag-and-drop install
@@ -237,6 +260,8 @@ Follow [#158](https://github.com/byte5ai/aiui/issues/158) for status.
 | "aiui companion not reachable" in chat | Claude Desktop isn't running, or your machine is asleep. |
 | "Windows protected your PC" when installing | Expected — the installer isn't Authenticode-signed. "More info" → "Run anyway". See [Install](#install). |
 | "token rejected (401)" | An old aiui process is holding the port on the remote. `pkill -f aiui` on the remote, then "Remove" and "Add" that remote again in aiui settings. |
+| "aiui runs from a temporary location" | You launched aiui from the DMG, `~/Downloads`, or a temp folder, so macOS runs it from a copy that won't exist next time. Quit aiui, move `aiui.app` into `Applications`, and launch it from there. |
+| Status dot red although aiui is running | The `aiui` entry in your Claude config is stale or incomplete (e.g. missing the `--mcp-stdio` argument). Click **Repair config** next to the dot, then restart Claude Desktop. |
 
 Bugs or feature requests → [open an issue](https://github.com/byte5ai/aiui/issues/new).
 The "Report issue" button in settings pre-fills version and build SHA.

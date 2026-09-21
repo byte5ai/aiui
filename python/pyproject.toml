@@ -1,23 +1,31 @@
 [project]
 name = "aiui-mcp"
-version = "0.10.1"
-description = "MCP server for aiui — native macOS dialogs from any Claude Code session, local or remote."
+version = "0.11.0"
+description = "MCP server for aiui — native desktop dialogs on macOS and Windows from any Claude Code session, local or remote."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "byte5 GmbH", email = "cwendler@byte5.de" },
 ]
-keywords = ["mcp", "claude", "ui", "dialog", "macos", "tauri"]
+keywords = ["mcp", "claude", "ui", "dialog", "macos", "windows", "remote", "ssh", "tauri"]
+# The three OS classifiers are listed explicitly rather than as
+# "OS Independent": this package has per-platform code (the token path), and
+# its commonest home is a Linux SSH remote that tunnels dialogs back to a Mac
+# or Windows companion — the macOS-only listing said the opposite (#210).
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: User Interfaces",
 ]
 dependencies = [
@@ -28,6 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "ruff>=0.6",
 ]
 
 [project.urls]
@@ -37,6 +46,32 @@ Issues = "https://github.com/byte5ai/aiui/issues"
 
 [project.scripts]
 aiui-mcp = "aiui_mcp.__main__:main"
+
+# The source was already written as if ruff were configured — the `# noqa`
+# codes scattered through `server.py` and the tests name BLE001, A001 and
+# N802 — but nothing enforced them, so they were decoration (#210). The rule
+# set below is exactly what those suppressions assume, plus the defaults.
+# `target-version` repeats the `requires-python` floor so the linter rejects
+# syntax that 3.10 cannot parse.
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Markdown is out of scope. `ruff format` reformats fenced Python blocks, and
+# `src/aiui_mcp/skill.md` is a shipped *document* whose examples are kept in
+# step with `docs/skill.md` — which lives outside this tree and would never be
+# reformatted with it. Linting the docs here would therefore manufacture the
+# drift `scripts/check-skill-drift.sh` exists to prevent.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "BLE", "UP", "A", "N"]
+# E501 is off, and only E501: the MCP tool docstrings are the agent-facing
+# contract — one line per field kind, kept byte-identical to `docs/skill.md`
+# by `scripts/check-skill-drift.sh`. Reflowing them to fit a column budget
+# would change what the model reads and break that guard, and `ruff format`
+# leaves strings alone anyway, so the rule could only ever be satisfied by
+# damaging the text it flags.
+ignore = ["E501"]
 
 [build-system]
 requires = ["hatchling"]

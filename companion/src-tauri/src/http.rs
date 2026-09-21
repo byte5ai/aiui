@@ -22,7 +22,21 @@ use tauri_plugin_updater::UpdaterExt;
 
 /// How long `/health` waits for a `ui:ping` round-trip from the frontend
 /// before concluding the WebView is unresponsive.
-const UI_PING_TIMEOUT: Duration = Duration::from_millis(100);
+///
+/// 750 ms, raised from 100 ms in #179. A freshly mounted WebView is still
+/// doing layout well past 100 ms, so the old budget called a merely busy
+/// dialog frozen — harmless while the probe was inert, a false 503 now that
+/// it actually fires. The ceiling is the Python bridge's whole `/health`
+/// budget (`HEALTH_TIMEOUT_S = 3`), so stay at or under ~1 s.
+const UI_PING_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// `/health` reasons for `ready: false`, in the precedence order
+/// [`readiness`] applies. Only [`REASON_WEBVIEW_UNRESPONSIVE`] is a genuine
+/// "cannot serve" and therefore the only one that answers 503; the other two
+/// are degraded-but-serving and answer 200 (#179).
+const REASON_WEBVIEW_UNRESPONSIVE: &str = "webview_unresponsive";
+const REASON_DIALOG_REGISTRY_FULL: &str = "dialog_registry_full";
+const REASON_TOO_MANY_CHILDREN: &str = "too_many_children";
 
 /// Header a bridge sets to opt into async `/render` (Step 3). Present →
 /// `POST /render` registers + surfaces the dialog, returns `{id, ttl}`
@@ -39,18 +53,61 @@ const ASYNC_RENDER_HEADER: &str = "x-aiui-async";
 /// held connection (the remote ReadError class this closes).
 const ASYNC_POLL_WINDOW: Duration = Duration::from_secs(25);
 
-/// Buffered terminal result for an async render, keyed by dialog id. The
-/// `POST /render` async branch spawns a task that awaits the user's answer and
-/// fills this; `GET /render/{id}` drains it. Decouples the dialog's lifetime
-/// from any single HTTP connection.
+/// How long a *delivered* result stays readable before the reaper drops its
+/// slot (#193). Delivery is idempotent: the first `GET /render/{id}` stamps
+/// `delivered_at` and every repeat inside this window returns the same result.
+/// Without it, a tunnel blip while axum wrote the response body destroyed the
+/// user's answer and the retry got `404 unknown_render_id` — "the render never
+/// existed" — asking them to re-type something they had already submitted.
+const SLOT_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// How long a slot may go unpolled before its caller counts as gone (#193).
+/// Both bridges re-poll every ≤40 s, so ~3 missed windows is unambiguous. On
+/// expiry the reaper cancels the dialog, which tears the window down — the fix
+/// for "the agent was killed and the dialog sat on the desktop for two hours".
+const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(90);
+
+/// Upper bound on buffered async-render slots. Past this the reaper evicts the
+/// oldest by `created_at` (cancelling their dialogs), so a pathological caller
+/// cannot grow the map without bound.
+const ASYNC_SLOT_CAP: usize = 64;
+
+/// How often the background reaper sweeps `async_slots`. The sweep used to run
+/// only from the async POST path, which is useless for the failure it has to
+/// catch: "the caller died and no further renders arrive".
+const SLOT_REAP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long `POST /render` waits for the main thread to report the dialog
+/// window built. A *definite* failure inside the window becomes `500
+/// window_failed`; a timeout is not proof of failure and only traces (a busy
+/// main thread must not abort a dialog that is about to appear).
+const WINDOW_BUILD_WAIT: Duration = Duration::from_secs(5);
+
+/// Buffered terminal result for an async render, keyed by dialog id. Also the
+/// dialog's *lifetime record* (#193): who last polled it, whether anyone has
+/// collected the answer, and whether the resolver task is finished. Those three
+/// are what let the reaper tell "nobody is waiting for this any more" apart
+/// from "the user is still filling the form".
 struct AsyncSlot {
-    /// `Some` once the dialog reached a terminal outcome; drained by the first
-    /// successful GET. A `GET /render/{id}` poll-loops (cheap 200 ms ticks,
-    /// bounded by `ASYNC_POLL_WINDOW`) reading this — no cross-task notifier to
-    /// reason about, and a missed tick costs at most 200 ms, never correctness.
+    /// `Some` once the dialog reached a terminal outcome. Read — not taken — by
+    /// `GET /render/{id}`, which poll-loops (cheap 200 ms ticks, bounded by
+    /// `ASYNC_POLL_WINDOW`) reading this; a missed tick costs at most 200 ms,
+    /// never correctness.
     result: Option<crate::dialog::DialogResult>,
-    /// For the opportunistic sweep of resolved-but-never-collected slots.
+    /// When the slot was registered. Bounds the undelivered-but-finished case
+    /// and orders the `ASYNC_SLOT_CAP` eviction.
     created_at: Instant,
+    /// Stamped at insert and on *every* `GET /render/{id}`, `{pending:true}`
+    /// included. A caller that stops polling stops refreshing this.
+    last_polled: Instant,
+    /// Stamped by the first successful drain. Starts the `SLOT_GRACE` window in
+    /// which repeat GETs get the same answer back.
+    delivered_at: Option<Instant>,
+    /// Set by the resolver task once it has written the terminal result back.
+    /// The reaper needs this rather than a bare `created_at` deadline: a slot
+    /// swept while its resolver is still running swallows the documented
+    /// `{cancelled:true, reason:"ttl_expired"}` and turns it into a 404.
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -108,14 +165,41 @@ struct HealthResponse {
     /// Current host lifetime phase (Starting/Serving/GracePending/Exiting) —
     /// issue #137 lifecycle state machine, surfaced for diagnostics.
     lifecycle_phase: String,
+    /// Machine-readable cause when `ready` is false — one of
+    /// `webview_unresponsive`, `dialog_registry_full`, `too_many_children`.
+    /// `None` while healthy. Additive field (#179): both bridges parse the
+    /// body generically, so no `WIRE_VERSION` bump.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Human-readable one-liner for the same cause, with the live numbers
+    /// filled in. Bridges relay it verbatim instead of guessing from a status
+    /// code, which is how a busy companion used to be reported as
+    /// `/health returned 503: {"version":…`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 #[derive(Serialize)]
 struct WebviewHealth {
     /// `true` if the Svelte app answered a `ui:ping` within the timeout.
     responsive: bool,
-    /// Round-trip duration in milliseconds; `None` if the ping timed out.
+    /// Round-trip duration in milliseconds; `None` if the ping timed out —
+    /// and `None`, not `Some(0)`, when there was no dialog window to ping
+    /// at all (#179).
     rtt_ms: Option<u64>,
+}
+
+impl WebviewHealth {
+    /// Verdict for "no dialog window is open": responsive, because there is
+    /// genuinely nothing to be unresponsive *about*, but with **no** RTT.
+    /// The old `Some(0)` was a fabricated measurement, indistinguishable in a
+    /// log or a support thread from a real sub-millisecond round trip.
+    fn no_dialog_window() -> Self {
+        Self {
+            responsive: true,
+            rtt_ms: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -169,11 +253,18 @@ struct UpdateResponse {
 /// required (empty `title` is rejected below, mirroring the `confirm`
 /// tool's requirement); `subtitle` and `sound` are optional and silently
 /// ignored on platforms/notification backends that don't support them.
+///
+/// `title` and `body` tolerate an explicit `null` as well as an absent key
+/// (#203): `#[serde(default)]` alone fires only for an absent key, so a
+/// caller that posted `"body": null` was rejected by axum's `Json` extractor
+/// with a plain-text serde dump — before the handler's own structured
+/// `invalid_request` 422 could ever run. A null is treated as "not given",
+/// which is what the caller meant.
 #[derive(Deserialize)]
 struct NotifyRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     body: String,
     #[serde(default)]
     subtitle: Option<String>,
@@ -182,6 +273,15 @@ struct NotifyRequest {
     /// name is swallowed by the OS rather than erroring the call.
     #[serde(default)]
     sound: Option<String>,
+}
+
+/// Deserialize a string field that may arrive as JSON `null`, mapping the
+/// null to `""`. See `NotifyRequest` for why (#203).
+fn null_to_empty_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Serialize)]
@@ -222,10 +322,53 @@ pub async fn serve(
         crate::media::MEDIA_TOTAL_CAP,
     );
 
+    // Async-render reaper (#193). Cloned *before* the state moves into the
+    // router. A dialog whose caller was killed leaves a live registry entry and
+    // a window on screen that nothing else reaps — `sweep_orphan_dialog_window`
+    // only catches windows whose dialog is already deregistered — so the sweep
+    // has to run on a timer, not opportunistically from the next POST.
+    {
+        let reaper_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SLOT_REAP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                sweep_async_slots(&reaper_state);
+            }
+        });
+    }
+
+    // The hardened blob service (#194), built with explicit `Layer::layer`
+    // calls rather than a `ServiceBuilder` — same composition, no extra
+    // import at module scope.
+    let blob_service = {
+        use tower::Layer as _;
+        let sandboxed = tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox"),
+        )
+        .layer(tower_http::services::ServeDir::new(&media_path));
+        tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        )
+        .layer(sandboxed)
+    };
+
     let router = Router::new()
         .route("/health", get(health))
-        .route("/render", post(render))
-        .route("/render/:id", get(render_poll))
+        // #178: without this layer axum's 2 MiB default applied, so a routine
+        // 2 MB screenshot inlined as base64 died *before* the handler with an
+        // opaque 413 — six times below the 10 MB per-image ceiling the docs
+        // promise. Capped well above the handler's own `RENDER_SPEC_SOFT_CAP`
+        // guard so the 413 the agent sees is ours, structured and actionable.
+        .route(
+            "/render",
+            post(render).layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP)),
+        )
+        // GET polls an async render; DELETE retracts it (#193) — the route a
+        // bridge needs to close the dialog when its caller is cancelled.
+        .route("/render/:id", get(render_poll).delete(render_cancel))
         .route("/notify", post(notify))
         .route("/version", get(version))
         .route("/update", post(update))
@@ -247,10 +390,14 @@ pub async fn serve(
         .route("/upload", post(upload_pick))
         // Capability-URL playback: unauthenticated (filename is a UUID),
         // range-capable for video seeking via tower-http's ServeDir.
-        .nest_service(
-            "/media/blob",
-            tower_http::services::ServeDir::new(&media_path),
-        )
+        //
+        // #194: belt-and-braces over `media::sanitize_ext`'s allowlist. Even
+        // if some future extension slipped through, `nosniff` stops the
+        // browser from second-guessing the type and `sandbox` denies the
+        // response script execution and same-origin privileges — so nothing
+        // served out of the media cache can act inside the API's own
+        // `127.0.0.1:<port>` origin.
+        .nest_service("/media/blob", blob_service)
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -539,7 +686,10 @@ const UPLOAD_FILENAME_HEADER: &str = "x-aiui-filename";
 /// Percent-encode a filename for transport in an ASCII HTTP header. Encodes
 /// every byte that isn't an RFC-3986 unreserved char, so UTF-8 names, spaces,
 /// and control bytes all survive the round-trip and the header stays valid.
-fn pct_encode_filename(s: &str) -> String {
+///
+/// `pub(crate)` so `mcp::pct_decode_bytes` — the other half of that round
+/// trip — can be tested against the real encoder instead of a re-typed one.
+pub(crate) fn pct_encode_filename(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -555,10 +705,46 @@ fn pct_encode_filename(s: &str) -> String {
     out
 }
 
-/// `POST /upload` — open a native file picker on the Mac and stream the picked
-/// file's bytes back to the caller (#146). This is the reverse of
-/// `POST /media`: bytes flow Mac → agent-host, over the same authenticated
-/// :7777 channel (loopback locally, the SSH reverse-tunnel remotely).
+/// How long the companion itself waits for the user to answer the picker
+/// before giving up and returning `504` (#194).
+///
+/// Sits deliberately *under* both bridges' 900 s `POST /upload` timeout, so
+/// when a picker is never answered the companion's own diagnosis wins the
+/// race and the agent learns "the picker timed out" instead of a generic
+/// transport error. Without any bound at all the tokio task outlived every
+/// client timeout and leaked for the life of the process.
+const UPLOAD_PICK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Optional body of `POST /upload` (#194). Additive in both directions: an
+/// old bridge sends no body (axum 0.7's blanket `Option<T: FromRequest>`
+/// yields `None` on any rejection, a missing `Content-Type` included), and an
+/// old companion ignores a body it never reads.
+#[derive(Deserialize)]
+struct UploadRequest {
+    /// Human-legible session label, same one the dialog tools forward. Shown
+    /// in the picker's title bar so a user facing several agents can tell
+    /// which one asked for a file.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Title for the native picker: the session label when the caller sent one,
+/// plain `aiui` otherwise. Split out so the composition is unit-testable
+/// without an `AppHandle`.
+fn picker_title(session: Option<&str>) -> String {
+    match session.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => format!("aiui — {s}"),
+        None => "aiui".to_string(),
+    }
+}
+
+/// `POST /upload` — open a native file picker on the user's machine and stream
+/// the picked file's bytes back to the caller (#146). This is the reverse of
+/// `POST /media`: bytes flow user-machine → agent-host, over the same
+/// authenticated :7777 channel (loopback locally, the SSH reverse-tunnel
+/// remotely).
+///
+/// Optional JSON body: `{"session": "<label>"}` — titles the panel.
 ///
 /// Responses:
 /// - `200 OK` — body is the raw file bytes; `x-aiui-filename` header carries
@@ -567,7 +753,10 @@ fn pct_encode_filename(s: &str) -> String {
 ///   filename header present — distinct from the cancel case below.
 /// - `204 No Content` — the user dismissed the picker without choosing a file.
 ///   No body, no filename header.
+/// - `409 Conflict` — another `/upload` already has a picker open (#194).
 /// - `413 Payload Too Large` — the picked file exceeds `UPLOAD_FILE_CAP`.
+/// - `504 Gateway Timeout` — nobody answered the picker within
+///   `UPLOAD_PICK_TIMEOUT` (#194).
 /// - `500` — the file could not be read, or the picker failed unexpectedly.
 ///
 /// The handler blocks until the user picks or cancels; the caller's MCP
@@ -576,24 +765,64 @@ fn pct_encode_filename(s: &str) -> String {
 async fn upload_pick(
     State(state): State<AppState>,
     headers: HeaderMap,
+    // Body extractor last — axum requires it, and the `Option` makes the body
+    // genuinely optional for older bridges.
+    body: Option<Json<UploadRequest>>,
 ) -> impl IntoResponse {
     if !auth_ok(&headers, &state.cfg.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
+    // #194: promote out of Accessory mode (macOS) so the panel is reachable,
+    // and serialise — a second concurrent picker is a stack of identical
+    // system panels the user cannot tell apart. Dropping the guard demotes
+    // again on every path below, including the timeout and the 413.
+    let Some(_picker) = crate::surface_for_native_picker(&state.app) else {
+        trace("upload_pick: rejected — a picker is already open");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "picker_busy"})),
+        )
+            .into_response();
+    };
+
+    let session = body.and_then(|Json(b)| b.session);
     // The native picker is callback-based; bridge it to async via a oneshot.
     // `pick_file` dispatches to the main thread internally (rfd requirement on
     // macOS), so calling it from this tokio task is safe.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.app.dialog().file().pick_file(move |picked| {
+    let mut builder = state
+        .app
+        .dialog()
+        .file()
+        .set_title(picker_title(session.as_deref()));
+    // Parent to a *visible* window when there is one: on Windows that keeps
+    // the dialog owned (an unowned one can land behind the foreground app).
+    // A hidden parent would make the panel a sheet on an invisible window —
+    // worse than no parent — hence the visibility test in the helper.
+    if let Some(win) = crate::visible_window_for_picker(&state.app) {
+        builder = builder.set_parent(&win);
+    }
+    builder.pick_file(move |picked| {
         let _ = tx.send(picked);
     });
 
-    let picked = match rx.await {
-        Ok(p) => p,
-        Err(_) => {
+    let picked = match tokio::time::timeout(UPLOAD_PICK_TIMEOUT, rx).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
             trace("upload_pick: picker channel dropped");
             return (StatusCode::INTERNAL_SERVER_ERROR, "picker closed unexpectedly")
+                .into_response();
+        }
+        Err(_) => {
+            trace("upload_pick: no answer within the picker timeout");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "no file was picked within {} s — the picker was never answered",
+                    UPLOAD_PICK_TIMEOUT.as_secs()
+                ),
+            )
                 .into_response();
         }
     };
@@ -703,18 +932,8 @@ async fn health(
     };
     let children = ChildrenHealth { attached };
 
-    // Ready criterion: WebView answers, room left in the dialog
-    // registry, and we aren't drowning in attached children.
-    //
-    // The dialog check uses *strict* less-than because `register()`
-    // evicts an existing pending dialog when `len() >= HARD_CAP`. If we
-    // reported ready at exactly the cap, the very next /render would
-    // silently cancel an in-flight dialog while /health still claimed
-    // healthy — readiness must lead the eviction signal, not coincide
-    // with it.
-    let ready = webview.responsive
-        && dialog_stats.orphan_count < crate::dialog::DIALOG_HARD_CAP
-        && attached < 32;
+    let (ready, reason) = readiness(webview.responsive, dialog_stats.orphan_count, attached);
+    let hint = reason.map(|r| health_hint(r, dialog_stats.orphan_count, attached));
 
     let body = HealthResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -723,40 +942,113 @@ async fn health(
         dialogs,
         children,
         lifecycle_phase: format!("{:?}", crate::lifecycle_log::current_phase()),
+        reason,
+        hint,
     };
 
-    let status = if ready {
-        StatusCode::OK
+    (health_status(reason), Json(body)).into_response()
+}
+
+/// Readiness verdict as a pure function of the three sub-checks, so it is
+/// testable without a live `AppHandle` (`health()` needs one; `http.rs` had no
+/// tests at all before #179).
+///
+/// Precedence is fixed — WebView → dialog registry → children — so a
+/// multiply-degraded companion always reports the same, most severe cause
+/// rather than whichever check happened to be written first.
+///
+/// The dialog check uses *strict* less-than because `register_dialog()` evicts
+/// an existing pending dialog when `len() >= HARD_CAP`. If we reported ready at
+/// exactly the cap, the very next `/render` would silently cancel an in-flight
+/// dialog while `/health` still claimed healthy — readiness must lead the
+/// eviction signal, not coincide with it.
+fn readiness(webview_ok: bool, pending: usize, attached: usize) -> (bool, Option<&'static str>) {
+    if !webview_ok {
+        (false, Some(REASON_WEBVIEW_UNRESPONSIVE))
+    } else if pending >= crate::dialog::DIALOG_HARD_CAP {
+        (false, Some(REASON_DIALOG_REGISTRY_FULL))
+    } else if attached >= crate::lifetime::CHILD_SOFT_CAP {
+        (false, Some(REASON_TOO_MANY_CHILDREN))
     } else {
+        (true, None)
+    }
+}
+
+/// HTTP status for a readiness verdict.
+///
+/// Only a dead WebView is a real "cannot serve". A full dialog registry or a
+/// crowd of attached children is degraded-but-serving: `register_dialog()`
+/// sweeps TTL-expired entries and evicts the single oldest at the cap, so the
+/// next render costs someone their oldest dialog — it does not fail. 503-ing
+/// those states made one session's 16 unanswered dialogs take `/render` and
+/// `upload` down for every other session sharing the companion, because the
+/// Python bridge's preflight treats any non-200 as fatal (#179).
+fn health_status(reason: Option<&str>) -> StatusCode {
+    if reason == Some(REASON_WEBVIEW_UNRESPONSIVE) {
         StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(body)).into_response()
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// One-line explanation for a `reason`, with the live numbers filled in.
+/// Bridges relay this verbatim, so it names both the cause and the one-step
+/// fix — and, for the serving states, says outright that work continues.
+fn health_hint(reason: &str, pending: usize, attached: usize) -> String {
+    if reason == REASON_WEBVIEW_UNRESPONSIVE {
+        format!(
+            "the open dialog window did not answer a liveness ping within {} ms — its \
+             WebView is frozen; close that dialog window on the Mac, or restart aiui",
+            UI_PING_TIMEOUT.as_millis()
+        )
+    } else if reason == REASON_DIALOG_REGISTRY_FULL {
+        format!(
+            "{pending} unanswered dialogs are open (cap {}) — rendering still works, but \
+             the next one evicts the oldest; answer or close some dialog windows on the Mac",
+            crate::dialog::DIALOG_HARD_CAP
+        )
+    } else if reason == REASON_TOO_MANY_CHILDREN {
+        format!(
+            "{attached} agent sessions are attached (cap {}) — rendering still works; close \
+             unused sessions, or restart aiui if they are stale",
+            crate::lifetime::CHILD_SOFT_CAP
+        )
+    } else {
+        reason.to_string()
+    }
 }
 
 /// Round-trip a `ui:ping` event through the frontend and back via the
 /// `ui_pong` Tauri command. Returns the observed RTT, or `None` on timeout.
+///
+/// Which window? The newest live dialog, taken from the registry's
+/// `created_at` ordering. Until #179 this looked the window up by the fixed
+/// label `"dialog"`, which the Step-4 multi-window rewrite had already
+/// retired — every dialog window's label is its dialog id now, so the lookup
+/// always missed and the probe always took its "nothing to ping" branch. The
+/// alternative of grabbing the first entry of `app.webview_windows()` is a
+/// `HashMap` iteration-order pick and would make the probe flap between
+/// windows; `DialogState::newest_id()` is deterministic.
 async fn probe_webview(state: &AppState) -> WebviewHealth {
+    // Probe a dialog window's webview specifically — the setup window is
+    // user-driven and irrelevant for render-pipeline health.
+    let Some(label) = state
+        .dialog
+        .newest_id()
+        .filter(|l| crate::is_dialog_window_label(l.as_str()))
+    else {
+        return WebviewHealth::no_dialog_window();
+    };
+    // Registered but the window is already gone (mid-teardown, or it never
+    // built) — again nothing to be unresponsive about.
+    if state.app.get_webview_window(&label).is_none() {
+        trace(&format!("health: dialog {label} has no live window; skipping probe"));
+        return WebviewHealth::no_dialog_window();
+    }
+
     let (id, rx) = state.ui_acks.register();
     let started = std::time::Instant::now();
-    // Probe the dialog window's webview specifically — the setup
-    // window is user-driven and irrelevant for render-pipeline health.
-    // If no dialog window exists yet, we report `responsive: true`
-    // because there's nothing to be unresponsive *about*.
-    if state
-        .app
-        .get_webview_window(crate::DIALOG_WINDOW_LABEL)
-        .is_none()
-    {
-        state.ui_acks.forget(&id);
-        return WebviewHealth {
-            responsive: true,
-            rtt_ms: Some(0),
-        };
-    }
-    if let Err(e) = state
-        .app
-        .emit_to(crate::DIALOG_WINDOW_LABEL, "ui:ping", &id)
-    {
+    if let Err(e) = state.app.emit_to(label.as_str(), "ui:ping", &id) {
         trace(&format!("health: emit ui:ping failed: {e}"));
         state.ui_acks.forget(&id);
         return WebviewHealth {
@@ -796,11 +1088,17 @@ async fn version(
     }))
 }
 
-/// Check for an aiui update, download-and-install it if present, and answer
-/// the caller *before* scheduling the relaunch. The 500ms delay between
-/// returning the response and calling `app.restart()` gives Axum time to
-/// finalize the wire response so the MCP client receives `{updated: true,
-/// from, to}` even though the process exits shortly after.
+/// Check for an aiui update, install it if present, and answer the caller
+/// *before* the process goes away. The 500 ms delay in front of
+/// `app.restart()` gives Axum time to finalize the wire response so the MCP
+/// client receives `{updated, current, available}` even though the process
+/// exits shortly after.
+///
+/// #197 added two things: the install is deferred while a dialog is pending
+/// (Invariant I5, same gate as the Settings path), and on Windows the
+/// response is built *before* `download_and_install` rather than after —
+/// there the plugin exits the process inside that call, so "after" meant
+/// never. See the comments inline.
 async fn update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -860,8 +1158,69 @@ async fn update(
     };
 
     let to_version = update.version.clone();
+
+    // #197: same Invariant I5 gate the Settings install path applies. An
+    // install means a relaunch, and a relaunch under a pending dialog tears
+    // the window down mid-`/render`: the user's half-filled form is gone and
+    // the agent that opened it gets a cancelled result. Wire-compatible —
+    // `updated: false` plus a `note` is a shape every bridge already handles.
+    let pending_dialogs = state.dialog.stats().orphan_count;
+    if !crate::lifetime::update_install_is_safe(pending_dialogs) {
+        trace(&format!(
+            "update: {pending_dialogs} dialog(s) in flight — deferring install of {to_version}"
+        ));
+        return Ok(Json(UpdateResponse {
+            updated: false,
+            current,
+            available: Some(to_version),
+            error: None,
+            note: Some("dialog in flight — update deferred".into()),
+        }));
+    }
+
     trace(&format!("update: installing {current} -> {to_version}"));
 
+    // #197: on Windows the updater plugin hands the NSIS installer to
+    // `ShellExecuteW` and then calls `std::process::exit(0)` — the process
+    // dies *inside* `download_and_install`, so nothing after it ever runs.
+    // Building the response afterwards meant the `{updated, current,
+    // available}` JSON was never flushed and `aiui-mcp`'s `update_tool`
+    // raised a transport error instead of reporting the version delta —
+    // `/aiui:update` was structurally broken there. So on Windows: answer
+    // first, install after the same 500 ms settle delay the macOS restart
+    // path uses. Exit-time cleanup (latching `ExitAuthority`, sweeping the
+    // ssh-NTR children) is covered by the updater plugin's `on_before_exit`
+    // hook in `lib.rs`, which the plugin invokes only on that branch.
+    //
+    // `cfg!` rather than `#[cfg]` on purpose: both arms then type-check on
+    // every target, so the Windows path is compiled — and reviewed — by the
+    // macOS CI leg too.
+    if cfg!(windows) {
+        let version_for_task = to_version.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            trace(&format!(
+                "update: launching installer for {version_for_task} (response already flushed)"
+            ));
+            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+                // Only reachable if the download or the signature check
+                // fails — a successful Windows install never returns.
+                trace(&format!("update: install failed: {e}"));
+            }
+        });
+
+        return Ok(Json(UpdateResponse {
+            updated: true,
+            current,
+            available: Some(to_version),
+            error: None,
+            note: Some("installer launched — aiui restarts into the new version".into()),
+        }));
+    }
+
+    // macOS/Linux: `install_inner` returns normally, so we install first and
+    // report the real outcome — including a failure, which the Windows
+    // branch structurally cannot.
     if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
         trace(&format!("update: install failed: {e}"));
         return Ok(Json(UpdateResponse {
@@ -922,6 +1281,117 @@ const KNOWN_FIELD_KINDS: &[&str] = &[
     "list", "table", "tree",
 ];
 
+/// Field `kind`s that carry no answer — `Form.svelte`'s `valueFields()`
+/// filters exactly these out of the `values` state map, so they never key
+/// anything and two of them may legitimately share a `name`.
+const DISPLAY_ONLY_FIELD_KINDS: &[&str] = &[
+    "static_text", "markdown", "image", "audio", "mermaid", "wireframe",
+];
+
+/// Hard ceiling enforced by axum (route layer) before `render` runs. Four
+/// images at the documented 10 MB per-image cap, plus room for the rest of
+/// the spec. (#178)
+const RENDER_BODY_HARD_CAP: usize = 64 * 1024 * 1024;
+
+/// Soft ceiling checked *inside* `render`, deliberately below the hard cap so
+/// an oversized spec gets our structured `spec_too_large` 413 — with a hint —
+/// instead of axum's opaque "Failed to buffer the request body". (#178)
+const RENDER_SPEC_SOFT_CAP: usize = 48 * 1024 * 1024;
+
+/// `true` when a `/render` body is past the soft cap and must be refused by
+/// the handler. Split out so the ceiling is unit-testable without a router.
+fn render_body_too_large(body_len: usize) -> bool {
+    body_len > RENDER_SPEC_SOFT_CAP
+}
+
+/// Reject a collection whose agent-supplied keys repeat.
+///
+/// #178: every collection surface renders through a keyed `{#each}` whose key
+/// is agent data. Svelte throws `each_key_duplicate` on a repeat — in prod
+/// builds too — which tears down the whole mount: the user gets an empty,
+/// always-on-top window and the agent's call hangs until the 2 h TTL. Where
+/// it does not throw it corrupts quietly instead: `gallery` builds
+/// `out[item.value]`, `list`/`table` resolve rows by `.find(…)`, so two
+/// entries collapse into one result. Reject before any window exists.
+fn reject_duplicate_keys<'a>(
+    what: &str,
+    key: &str,
+    values: impl Iterator<Item = &'a str>,
+) -> Result<(), (String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    for v in values {
+        if !seen.insert(v) {
+            return Err((
+                format!("{what} has a duplicate '{key}': {v:?}"),
+                format!(
+                    "Each {what}'s '{key}' must be unique — it keys the rendered \
+                     list and the returned result."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The key of one collection entry. `list` items are documented as
+/// `{label, value}` but `Form.svelte` also accepts a bare string (and then
+/// uses it as both), so accept the same two shapes here.
+fn entry_value(v: &serde_json::Value) -> Option<&str> {
+    v.as_str()
+        .or_else(|| v.get("value").and_then(|x| x.as_str()))
+}
+
+/// Flatten a `tree` field's forest into every `value` it contains.
+///
+/// One flat pass covers both failure modes: repeated *siblings* crash
+/// `TreeNode.svelte`'s keyed `{#each}`, while a value repeated across
+/// branches renders fine but cross-links state — `expanded` is a
+/// `Set<string>` and `selected` a `string[]`, both keyed by value, so
+/// toggling one node silently toggles its namesake elsewhere.
+fn collect_tree_values<'a>(items: &'a [serde_json::Value], out: &mut Vec<&'a str>) {
+    for it in items {
+        if let Some(v) = entry_value(it) {
+            out.push(v);
+        }
+        if let Some(children) = it.get("children").and_then(|c| c.as_array()) {
+            collect_tree_values(children, out);
+        }
+    }
+}
+
+/// Stamp every `target`-carrying field with `target.resolved_path` — the
+/// absolute destination `filewrite::write_local` would write on THIS host —
+/// so the dialog's approval line names the file the value lands in rather
+/// than the raw spec string (#199).
+///
+/// Only meaningful for a **local** (native-app) session, where this process
+/// is the writer. For a bridge-served session the write happens on the
+/// bridge's host, so the bridge does its own resolution before the spec gets
+/// here and this must not overwrite it.
+fn annotate_target_paths(spec: &mut serde_json::Value) {
+    fn walk(fields: Option<&mut serde_json::Value>) {
+        let Some(serde_json::Value::Array(items)) = fields else {
+            return;
+        };
+        for f in items {
+            let Some(t) = f.get_mut("target").and_then(|t| t.as_object_mut()) else {
+                continue;
+            };
+            let Some(raw) = t.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
+                continue;
+            };
+            let resolved = crate::filewrite::resolve_display(&raw);
+            t.insert("resolved_path".into(), serde_json::Value::String(resolved));
+        }
+    }
+    walk(spec.get_mut("fields"));
+    if let Some(serde_json::Value::Array(tabs)) = spec.get_mut("tabs") {
+        for tab in tabs {
+            walk(tab.get_mut("fields"));
+        }
+    }
+}
+
 /// Validate a dialog spec *before* any window is created (v0.4.46,
 /// Bug B+). On failure returns `(detail, hint)` describing precisely
 /// what's wrong; the caller turns that into a structured `invalid_spec`
@@ -953,34 +1423,28 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 ));
             }
             Some(arr) => {
-                let mut seen = std::collections::HashSet::new();
                 for (i, it) in arr.iter().enumerate() {
-                    let value = it
+                    let has_value = it
                         .get("value")
                         .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty());
-                    match value {
-                        None => {
-                            return Err((
-                                format!("compare variant #{i} is missing a non-empty 'value'"),
-                                "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
-                                    .into(),
-                            ));
-                        }
-                        // Duplicate values collide as the keyed-`{#each}` key and
-                        // as the returned `selected`, making two options
-                        // indistinguishable — reject before render (codex review P2).
-                        Some(v) => {
-                            if !seen.insert(v) {
-                                return Err((
-                                    format!("compare has a duplicate variant 'value': {v:?}"),
-                                    "Each variant's 'value' must be unique — it keys the rendered list and the returned selection."
-                                        .into(),
-                                ));
-                            }
-                        }
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !has_value {
+                        return Err((
+                            format!("compare variant #{i} is missing a non-empty 'value'"),
+                            "Each variant needs a stable 'value' string — it's returned as 'selected' when picked."
+                                .into(),
+                        ));
                     }
                 }
+                // Duplicate values collide as the keyed-`{#each}` key and
+                // as the returned `selected`, making two options
+                // indistinguishable — reject before render (codex review P2).
+                reject_duplicate_keys(
+                    "compare variant",
+                    "value",
+                    arr.iter().filter_map(entry_value),
+                )?;
             }
         }
         return Ok(());
@@ -1014,6 +1478,53 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                         ));
                     }
                 }
+                // #178: two items sharing a value collapse in `out[it.value]`,
+                // so one asset's verdict silently overwrites the other's.
+                reject_duplicate_keys(
+                    "gallery item",
+                    "value",
+                    arr.iter().filter_map(entry_value),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    // #178: an `ask` with no options opens a window carrying the question and
+    // nothing but Cancel — the user can't answer and the agent gets a bare
+    // `{cancelled: true}`. `options: null` is literally what the Rust bridge
+    // emits when the argument is omitted, and Svelte renders it like `[]`.
+    if kind == "ask" {
+        match spec.get("options").and_then(|v| v.as_array()) {
+            None => {
+                return Err((
+                    "ask spec is missing the 'options' array".into(),
+                    "Provide options: [{label, value?, description?, thumbnail?}, …] — at least one. For yes/no use confirm."
+                        .into(),
+                ));
+            }
+            Some(arr) if arr.is_empty() => {
+                return Err((
+                    "ask 'options' is empty".into(),
+                    "An ask with no options has nothing to pick — give it at least one, or use confirm for yes/no."
+                        .into(),
+                ));
+            }
+            Some(arr) => {
+                for (i, opt) in arr.iter().enumerate() {
+                    let labelled = ["label", "value"].into_iter().any(|k| {
+                        opt.get(k)
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    });
+                    if !labelled {
+                        return Err((
+                            format!("ask option #{i} has neither a non-empty 'label' nor 'value'"),
+                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A bare 'description' renders as a blank button."
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
         return Ok(());
@@ -1029,7 +1540,29 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
     if let Some(fs) = spec.get("fields").and_then(|v| v.as_array()) {
         fields.extend(fs.iter());
     }
-    for f in fields {
+    // #178: `fields` and `tabs` are both optional, so `form(title="x")` used
+    // to open a window with nothing but Submit/Cancel — the agent then got
+    // `{cancelled: true}` with no reason. (`confirm` has no fields by design
+    // and never reaches this guard.)
+    if kind == "form" && fields.is_empty() {
+        return Err((
+            "form spec has no fields (neither 'fields' nor 'tabs[].fields')".into(),
+            "A form with no fields has nothing to answer — use `confirm` for yes/no."
+                .into(),
+        ));
+    }
+    // #178: tab labels key `{#each spec.tabs as t, i (t.label)}` — a repeat
+    // (including two tabs that both omit the label) throws during render and
+    // blanks the whole window.
+    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
+        reject_duplicate_keys(
+            "form tab",
+            "label",
+            tabs.iter()
+                .map(|t| t.get("label").and_then(|v| v.as_str()).unwrap_or("")),
+        )?;
+    }
+    for &f in &fields {
         let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if !KNOWN_FIELD_KINDS.contains(&fk) {
             let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
@@ -1055,7 +1588,130 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                     .into(),
             ));
         }
+        // #178: every collection field renders through a keyed `{#each}` over
+        // agent data and resolves its result by that same key.
+        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+        match fk {
+            "list" => {
+                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("list field '{name}' item"),
+                        "value",
+                        items.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "table" => {
+                if let Some(rows) = f.get("rows").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("table field '{name}' row"),
+                        "value",
+                        rows.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "image_grid" => {
+                if let Some(images) = f.get("images").and_then(|v| v.as_array()) {
+                    reject_duplicate_keys(
+                        &format!("image_grid field '{name}' image"),
+                        "value",
+                        images.iter().filter_map(entry_value),
+                    )?;
+                }
+            }
+            "tree" => {
+                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
+                    let mut values = Vec::new();
+                    collect_tree_values(items, &mut values);
+                    reject_duplicate_keys(
+                        &format!("tree field '{name}' node"),
+                        "value",
+                        values.into_iter(),
+                    )?;
+                }
+            }
+            _ => {}
+        }
+
+        // #199: a malformed `target` used to survive all the way past submit
+        // — the Python bridge then died on `'str' object has no attribute
+        // 'get'` *after* the user had typed (and lost) a credential. Check
+        // the shape here, before any window opens, so the agent fixes the
+        // spec instead of the user re-entering a secret.
+        if let Some(t) = f.get("target").filter(|t| !t.is_null()) {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+            let hint = "`target` is an object: {\"mode\": \"create\"|\"substitute\", \
+                        \"path\": \"~/…\" or \"/…\", perm?, overwrite?, placeholder?}. \
+                        The path must be absolute or `~/`-rooted — a relative or \
+                        `~user/` path has no stable destination."
+                .to_string();
+            let Some(obj) = t.as_object() else {
+                return Err((
+                    format!("form field '{name}' has a 'target' that is not an object"),
+                    hint,
+                ));
+            };
+            match obj.get("mode").and_then(|v| v.as_str()) {
+                Some("create") | Some("substitute") => {}
+                other => {
+                    return Err((
+                        format!(
+                            "form field '{name}' has target.mode '{}' — must be 'create' or 'substitute'",
+                            other.unwrap_or("<missing>")
+                        ),
+                        hint,
+                    ));
+                }
+            }
+            let Some(path) = obj.get("path").and_then(|v| v.as_str()) else {
+                return Err((
+                    format!("form field '{name}' has a 'target' without a string 'path'"),
+                    hint,
+                ));
+            };
+            if let Some(why) = crate::filewrite::target_path_error(path) {
+                return Err((format!("form field '{name}': {why}"), hint));
+            }
+        }
     }
+    // #178: `Form.svelte` keys its state by `values[f.name]`, so two
+    // answerable fields sharing a name share one slot — one of the two values
+    // is silently missing from the result. Display-only kinds carry no value
+    // (`valueFields()` filters them out) and may repeat a name harmlessly.
+    reject_duplicate_keys(
+        "form field",
+        "name",
+        fields
+            .iter()
+            .copied()
+            .filter(|f| {
+                let fk = f.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                !DISPLAY_ONLY_FIELD_KINDS.contains(&fk)
+            })
+            .filter_map(|f| {
+                f.get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            }),
+    )?;
+    Ok(())
+}
+
+/// Validate a render spec, then resolve its `http(s)://` image sources to
+/// `data:` URLs (the WebView's CSP only permits `data:` for `img-src`, so
+/// without this pass an agent's plain URL renders as a broken image — see
+/// `companion/src-tauri/src/imageresolve.rs` for the failure modes).
+///
+/// The ordering is the point of this helper, not an implementation detail.
+/// Resolving first meant a spec the user would never see — one rejected as
+/// `invalid_spec` — still made the user's machine `GET` every URL in it,
+/// turning `/render` into a network probe that leaves nothing on screen.
+/// Validating first means a probe costs the prober a real dialog (#201).
+async fn validate_then_resolve(
+    spec: &mut serde_json::Value,
+) -> Result<(), (String, String)> {
+    validate_spec(spec)?;
+    crate::imageresolve::resolve_image_srcs(spec).await;
     Ok(())
 }
 
@@ -1157,6 +1813,20 @@ async fn resolve_dialog(
         "render: got response id={} cancelled={}",
         result.id, result.cancelled
     ));
+    // Lifecycle-driven update check (#42): fire once after every render, so
+    // update checks cluster around actual aiui use. The frontend gates with
+    // the 6 h cooldown in `lifecycle.ts`, so this is never noisier than the
+    // Rust headless timer, and costs nothing when nobody is talking to aiui.
+    //
+    // #197: this emit used to sit in the *synchronous* POST branch, past the
+    // async branch's `return` — and both shipping bridges set
+    // `x-aiui-async: "1"` unconditionally, so in production it never fired
+    // once. `resolve_dialog` is the single point both paths run through,
+    // which makes it the only place the trigger behaves identically for
+    // every caller. Keep it here; do not move it back up into a branch.
+    if let Err(e) = state.app.emit("update:check", "post-render") {
+        trace(&format!("render: emit update:check failed: {e}"));
+    }
     // Authoritative window teardown (v0.4.46, Bug B): single point that
     // guarantees a dialog window never outlives its dialog. Idempotent —
     // a no-op on the submit/cancel paths where the window is already gone.
@@ -1168,54 +1838,166 @@ async fn resolve_dialog(
     result
 }
 
-/// Drop async-render result slots older than `DIALOG_TTL` — covers the case
-/// where a caller posts an async render, the dialog resolves, but the caller
-/// never collects the result via GET (process died after POST). Called
-/// opportunistically on each new async render; no background reaper.
+/// What the reaper should do with one async-render slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotVerdict {
+    /// Leave it alone.
+    Keep,
+    /// Nobody needs it any more — remove it. The dialog is already terminal.
+    Drop,
+    /// The caller vanished while the dialog is still live — cancel the dialog
+    /// (which tears the window down via `resolve_dialog`) and remove the slot.
+    Abandon,
+}
+
+/// Decide one slot's fate. Pure over `(slot, now)` so the reaper's policy is
+/// unit-testable without a Tauri app — same split as `drain_async_slot` /
+/// `validate_spec`.
+///
+/// Order matters. A delivered result is finished business regardless of
+/// anything else; a finished-but-uncollected one is held for the full dialog
+/// TTL *plus* the grace (never on `created_at` alone, which raced the
+/// resolver's write-back and turned a clean `ttl_expired` into a 404); and only
+/// a slot whose resolver is still running can be "abandoned", because only then
+/// is there a live dialog left to cancel.
+fn slot_verdict(slot: &AsyncSlot, now: Instant) -> SlotVerdict {
+    if let Some(delivered) = slot.delivered_at {
+        return if now.duration_since(delivered) > SLOT_GRACE {
+            SlotVerdict::Drop
+        } else {
+            SlotVerdict::Keep
+        };
+    }
+    if slot.done.load(std::sync::atomic::Ordering::SeqCst) {
+        return if now.duration_since(slot.created_at) > DIALOG_TTL + SLOT_GRACE {
+            SlotVerdict::Drop
+        } else {
+            SlotVerdict::Keep
+        };
+    }
+    if now.duration_since(slot.last_polled) > SLOT_ABANDONED_AFTER {
+        SlotVerdict::Abandon
+    } else {
+        SlotVerdict::Keep
+    }
+}
+
+/// Ids to evict when the map is over `cap`, oldest `created_at` first. Pure so
+/// the cap policy is testable; the caller cancels each evicted dialog.
+fn slots_over_cap(
+    slots: &std::collections::HashMap<String, AsyncSlot>,
+    cap: usize,
+) -> Vec<String> {
+    if slots.len() <= cap {
+        return Vec::new();
+    }
+    let mut by_age: Vec<(&String, Instant)> =
+        slots.iter().map(|(id, s)| (id, s.created_at)).collect();
+    by_age.sort_by_key(|(_, t)| *t);
+    by_age
+        .into_iter()
+        .take(slots.len() - cap)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Reap async-render slots (#193). Run every `SLOT_REAP_INTERVAL` by the
+/// background task `serve` spawns — *not* opportunistically from the async POST
+/// path, because the failure it exists to catch is precisely "the caller died
+/// and no further renders arrive".
+///
+/// Verdicts are collected **under the lock**, the lock is released, and only
+/// then does anything happen: `dialog.cancel` resolves the oneshot, so
+/// `resolve_dialog` runs its authoritative window teardown, and neither
+/// `run_on_main_thread` nor an `.await` may ever be reached while holding the
+/// `std::sync::Mutex`.
 fn sweep_async_slots(state: &AppState) {
     let now = Instant::now();
-    state
-        .async_slots
-        .lock()
-        .unwrap()
-        .retain(|_, s| now.duration_since(s.created_at) <= DIALOG_TTL);
+    let mut abandoned: Vec<String> = Vec::new();
+    let evicted: Vec<String>;
+    {
+        let mut slots = state.async_slots.lock().unwrap();
+        let mut dropped: Vec<String> = Vec::new();
+        for (id, slot) in slots.iter() {
+            match slot_verdict(slot, now) {
+                SlotVerdict::Keep => {}
+                SlotVerdict::Drop => dropped.push(id.clone()),
+                SlotVerdict::Abandon => abandoned.push(id.clone()),
+            }
+        }
+        for id in dropped.iter().chain(abandoned.iter()) {
+            slots.remove(id);
+        }
+        evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        for id in &evicted {
+            slots.remove(id);
+        }
+    }
+    for id in abandoned {
+        trace(&format!(
+            "sweep_async_slots: caller stopped polling id={id} — cancelling the dialog"
+        ));
+        state.dialog.cancel(&id);
+    }
+    for id in evicted {
+        trace(&format!(
+            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting oldest id={id}"
+        ));
+        state.dialog.cancel(&id);
+    }
 }
 
 /// Outcome of looking up an async-render slot by id.
 enum SlotLook {
-    /// Resolved — the terminal result (already removed from the map).
+    /// Resolved — a *clone* of the terminal result. The slot stays in the map
+    /// so a retried GET gets the same answer (see `SLOT_GRACE`).
     Ready(crate::dialog::DialogResult),
     /// Registered but not yet resolved.
     Pending,
-    /// No such id — never an async render, or already collected.
+    /// No such id — never an async render, or already reaped.
     Gone,
 }
 
-/// Drain an async-render slot: if resolved, take its result and remove the slot
-/// (`Ready`); if still in flight, `Pending`; if absent, `Gone`. Pure over the
-/// map so the `/render/{id}` branching is unit-testable without a Tauri app.
+/// Look at an async-render slot, stamping its liveness: `last_polled` on every
+/// hit (that is what tells the reaper someone is still waiting) and
+/// `delivered_at` on the first read of a terminal result.
+///
+/// Delivery is **idempotent** (#193): the result is cloned, not taken, and the
+/// slot is left in the map for the reaper to drop after `SLOT_GRACE`. The old
+/// take-and-remove was at-most-once and removed the slot *before* the response
+/// reached the wire, so a blip on the way out destroyed the answer and the
+/// retry was told the render never existed. Pure over the map so the
+/// `/render/{id}` branching is unit-testable without a Tauri app.
 fn drain_async_slot(
     slots: &mut std::collections::HashMap<String, AsyncSlot>,
     id: &str,
 ) -> SlotLook {
-    let taken = match slots.get_mut(id) {
-        Some(slot) => slot.result.take(),
-        None => return SlotLook::Gone,
+    let now = Instant::now();
+    let Some(slot) = slots.get_mut(id) else {
+        return SlotLook::Gone;
     };
-    match taken {
+    slot.last_polled = now;
+    match &slot.result {
         Some(result) => {
-            slots.remove(id);
-            SlotLook::Ready(result)
+            if slot.delivered_at.is_none() {
+                slot.delivered_at = Some(now);
+            }
+            SlotLook::Ready(result.clone())
         }
         None => SlotLook::Pending,
     }
 }
 
 /// GET `/render/{id}` — bounded long-poll for an async render's result (Step
-/// 3). Returns the terminal `{id, cancelled, result, reason}` once available
-/// (and drains the slot), `{pending: true}` after one `ASYNC_POLL_WINDOW` so
-/// the caller re-polls, or 404 for an unknown id (never an async render, or
-/// already collected). The caller loops GET until terminal or it gives up.
+/// 3). Returns the terminal `{id, cancelled, result, reason}` once available,
+/// `{pending: true}` after one `ASYNC_POLL_WINDOW` so the caller re-polls, or
+/// 404 for an unknown id (never an async render, or already reaped). The caller
+/// loops GET until terminal or it gives up.
+///
+/// Repeatable (#193): a terminal result stays readable for `SLOT_GRACE` after
+/// the first delivery, so a retry after a transport blip gets the same answer
+/// instead of a 404. Every hit — `{pending:true}` included — refreshes the
+/// slot's `last_polled`, which is how the reaper knows a caller is still there.
 async fn render_poll(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1262,6 +2044,38 @@ async fn render_poll(
     }
 }
 
+/// DELETE `/render/{id}` — retract a render the caller no longer wants (#193).
+///
+/// The bridges call this when the MCP client cancels an in-flight request (Esc
+/// in Claude Code → `notifications/cancelled`) or when the host quits, so the
+/// dialog does not sit on the user's desktop waiting for an agent that is gone.
+///
+/// Cancel first, then remove the slot: removing without cancelling would leave
+/// the window on screen, cancelling without removing would leak a result nobody
+/// will ever collect. `dialog.cancel` resolves the oneshot, so `resolve_dialog`
+/// runs its authoritative window teardown.
+///
+/// Always `204`, including for an unknown id — cancelling something that is
+/// already gone is a no-op success, which keeps the bridges' cleanup paths
+/// retry-safe. Additive route, so `WIRE_VERSION` stays 1.
+async fn render_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    trace(&format!("render_cancel: id={id}"));
+    state.dialog.cancel(&id);
+    state.async_slots.lock().unwrap().remove(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn render(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1272,6 +2086,31 @@ async fn render(
         trace("render: auth FAILED");
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
     }
+    // #178: the route layer caps the body at `RENDER_BODY_HARD_CAP`; this
+    // guard sits strictly below it so an oversized spec gets a structured
+    // 413 naming the likely cause (inlined images) instead of axum's opaque
+    // "Failed to buffer the request body" — which never even reaches the
+    // trace log, making the whole thing undiagnosable from a bug report.
+    if render_body_too_large(body.len()) {
+        trace(&format!(
+            "render: rejected — spec_too_large: body_len={} (max {})",
+            body.len(),
+            RENDER_SPEC_SOFT_CAP
+        ));
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "spec_too_large",
+                "detail": format!(
+                    "dialog spec is {} bytes (max {})",
+                    body.len(),
+                    RENDER_SPEC_SOFT_CAP
+                ),
+                "hint": "Inlined images dominate the spec — shrink the image, send fewer at once, or pass an http(s):// src instead of a local path.",
+            })),
+        )
+            .into_response();
+    }
     let mut req: RenderRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -1281,20 +2120,13 @@ async fn render(
     };
     trace(&format!("render: auth ok, {}", spec_summary(&req.spec)));
 
-    // Resolve any http(s):// values in `src` / `thumbnail` fields to
-    // `data:` URLs before the spec hits the WebView. The WebView's
-    // CSP only permits `data:` for img-src; without this pass an
-    // agent's plain URL would silently render as a broken image.
-    // See companion/src-tauri/src/imageresolve.rs for failure modes.
-    crate::imageresolve::resolve_image_srcs(&mut req.spec).await;
-
     // Spec validation (v0.4.46, Bug B+): reject anything the frontend
     // can't render *before* creating a window, and tell the agent
     // exactly what to fix. Without this, a bad `kind` opened a window
     // showing the "unknown_kind" placeholder — a confusing surface the
     // user had to dismiss. Now the agent gets `invalid_spec` + detail
     // and can correct the call; nothing is shown to the user.
-    if let Err((detail, hint)) = validate_spec(&req.spec) {
+    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec).await {
         trace(&format!("render: rejected — invalid_spec: {detail}"));
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1305,6 +2137,13 @@ async fn render(
             })),
         )
             .into_response();
+    }
+
+    // #199: show the user the destination, not the spec string. A bridge
+    // session already carries its own host's resolution — the write happens
+    // there, so that one is the truthful one; don't overwrite it with ours.
+    if req.session_origin.as_deref().unwrap_or("").is_empty() {
+        annotate_target_paths(&mut req.spec);
     }
 
     // Multi-window (Step 4, I8): N dialogs may be in flight at once — the
@@ -1354,19 +2193,64 @@ async fn render(
     // timeout, and no reload-retry, because the frontend initiates and so
     // can't race an event it isn't listening for yet. Window ops are
     // main-thread-only.
+    //
+    // The build is *confirmed*, not fired and forgotten (#193). A failure here
+    // — a label collision behind a not-yet-completed `destroy()`, a broken
+    // WebView2 runtime on Windows, `run_on_main_thread` erroring during
+    // shutdown — used to be written to the trace log and discarded: `/render`
+    // answered as if a window existed, and the caller then polled for two hours
+    // for a dialog the user never saw. Now a definite failure becomes `500
+    // window_failed` and the agent learns the real reason immediately.
     {
         let app_for_build = state.app.clone();
         let id_for_build = id.clone();
         let title_for_build = window_title;
-        let _ = state.app.run_on_main_thread(move || {
-            if let Err(e) =
+        let (built_tx, built_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let dispatched = state.app.run_on_main_thread(move || {
+            let outcome =
                 crate::build_dialog_window(&app_for_build, &id_for_build, size, &title_for_build)
-            {
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            if let Err(e) = &outcome {
                 trace(&format!(
                     "render: build_dialog_window failed id={id_for_build}: {e}"
                 ));
             }
+            let _ = built_tx.send(outcome);
         });
+        // A definite failure returns early. `guard` is still armed, so the
+        // early return runs exactly the cleanup it was written for (free the
+        // registry slot, destroy any window) — no hand-rolled teardown here.
+        let failure: Option<String> = match dispatched {
+            Err(e) => Some(format!("run_on_main_thread: {e}")),
+            Ok(()) => match tokio::time::timeout(WINDOW_BUILD_WAIT, built_rx).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(detail))) => Some(detail),
+                Ok(Err(_)) => Some("window builder dropped without answering".into()),
+                // A busy main thread is not proof of failure, and a false
+                // `window_failed` would abort a dialog that is about to appear.
+                // The abandoned-caller reap and the TTL stay the backstop for
+                // "the window never came up".
+                Err(_) => {
+                    trace(&format!(
+                        "render: window build still pending after {}s id={id} — proceeding",
+                        WINDOW_BUILD_WAIT.as_secs()
+                    ));
+                    None
+                }
+            },
+        };
+        if let Some(detail) = failure {
+            trace(&format!("render: window_failed id={id}: {detail}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "window_failed",
+                    "detail": detail,
+                })),
+            )
+                .into_response();
+        }
     }
 
     // ── Async branch (Step 3) ───────────────────────────────────────────
@@ -1376,23 +2260,45 @@ async fn render(
     // connection that a tunnel/GUI blip turns into a remote ReadError —
     // resolution now lives in a task, not on the wire.
     if headers.contains_key(ASYNC_RENDER_HEADER) {
-        // The detached task owns resolution + window teardown from here.
+        // The detached task owns resolution + window teardown from here; the
+        // slot below is what keeps the dialog tied to its caller (#193) — the
+        // background reaper cancels it if nobody polls any more.
         guard.disarm();
-        sweep_async_slots(&state);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
+            let now = Instant::now();
             let mut slots = state.async_slots.lock().unwrap();
             slots.insert(
                 id.clone(),
-                AsyncSlot { result: None, created_at: Instant::now() },
+                AsyncSlot {
+                    result: None,
+                    created_at: now,
+                    last_polled: now,
+                    delivered_at: None,
+                    done: done.clone(),
+                },
             );
         }
+        sweep_async_slots(&state);
         let task_state = state.clone();
         let task_id = id.clone();
         tokio::spawn(async move {
             let result = resolve_dialog(task_state.clone(), task_id.clone(), result_rx).await;
-            if let Some(slot) = task_state.async_slots.lock().unwrap().get_mut(&task_id) {
-                slot.result = Some(result);
+            // Write-back and `done` under one lock, so the reaper can never
+            // observe a slot that holds the result but still looks unresolved.
+            let mut slots = task_state.async_slots.lock().unwrap();
+            match slots.get_mut(&task_id) {
+                Some(slot) => slot.result = Some(result),
+                // Reaped from under us (abandoned caller, or DELETE). Traced,
+                // not silent: a dropped terminal result must be visible in the
+                // log rather than resurfacing later as "unknown render id".
+                None => trace(&format!(
+                    "render: async slot already gone at write-back id={task_id} \
+                     cancelled={} — result dropped",
+                    result.cancelled
+                )),
             }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         trace(&format!("render: async accepted id={}", id));
         return (
@@ -1408,14 +2314,6 @@ async fn render(
     // connection still cleans up; `resolve_dialog` runs the terminal teardown.
     let result = resolve_dialog(state.clone(), id.clone(), result_rx).await;
     guard.disarm();
-
-    // Lifecycle-driven update check (#42): fire once after every
-    // successful render. Frontend gates with a 30-min cooldown so this is
-    // never noisier than the old 6h timer in active use, and zero load
-    // when nobody is talking to aiui.
-    if let Err(e) = state.app.emit("update:check", "post-render") {
-        trace(&format!("render: emit update:check failed: {e}"));
-    }
 
     Json(RenderResponse {
         id: result.id,
@@ -1515,8 +2413,33 @@ async fn notify(
 
 #[cfg(test)]
 mod validate_tests {
-    use super::validate_spec;
+    use super::{validate_spec, validate_then_resolve};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_spec_is_rejected_before_any_fetch() {
+        // #201: `resolve_image_srcs` used to run first, so a spec that was
+        // then rejected as `invalid_spec` — and therefore never shown to the
+        // user — had already made this machine GET every URL in it. That is
+        // a silent network probe with no dialog on screen.
+        let before = crate::imageresolve::fetch_attempts();
+        let mut spec = json!({
+            "kind": "not-a-real-kind",
+            "image": {"src": "http://93.184.216.34/probe.png"}
+        });
+        let (detail, _hint) = validate_then_resolve(&mut spec).await.unwrap_err();
+        assert!(detail.contains("top-level 'kind'"), "got: {detail}");
+        assert_eq!(
+            crate::imageresolve::fetch_attempts(),
+            before,
+            "an invalid spec reached the network"
+        );
+        // The URL is still there — nothing was resolved.
+        assert_eq!(
+            spec["image"]["src"].as_str(),
+            Some("http://93.184.216.34/probe.png")
+        );
+    }
 
     #[test]
     fn accepts_confirm() {
@@ -1561,6 +2484,77 @@ mod validate_tests {
         // `password` is the documented alternative and stays valid bare.
         let pw = json!({"kind":"form","fields":[{"kind":"password","name":"pw"}]});
         assert!(validate_spec(&pw).is_ok());
+    }
+
+    #[test]
+    fn validate_spec_rejects_non_object_target() {
+        // #199: `"target": "~/x"` (a bare string, the shape an agent reaches
+        // for first) used to reach the Python bridge's post-submit write and
+        // die there on `.get()` — after the user had typed a credential.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":"~/.github_tokens/byte5ai"}
+        ]});
+        let (detail, hint) = validate_spec(&spec).unwrap_err();
+        assert!(detail.contains("pat"), "names the offending field: {detail}");
+        assert!(detail.contains("target") && detail.contains("object"), "{detail}");
+        assert!(hint.contains("mode"), "shows the right shape: {hint}");
+
+        // A missing or bogus mode is the same class of spec bug.
+        let bad_mode = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"path":"~/x"}}
+        ]});
+        assert!(validate_spec(&bad_mode).is_err(), "mode is required");
+        let bad_mode2 = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"append","path":"~/x"}}
+        ]});
+        assert!(validate_spec(&bad_mode2).is_err(), "only create|substitute");
+
+        // …as is a path that names no stable destination.
+        let relative = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"notes/key"}}
+        ]});
+        let (detail, _) = validate_spec(&relative).unwrap_err();
+        assert!(detail.contains("absolute or ~/-rooted"), "{detail}");
+        let tilde_user = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~alice/key"}}
+        ]});
+        assert!(validate_spec(&tilde_user).is_err(), "~user/ is not portable");
+
+        // A well-formed target still validates, in a tab too.
+        let good = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat",
+             "target":{"mode":"create","path":"~/.github_tokens/byte5ai","perm":"0600"}},
+            {"kind":"text","name":"note",
+             "target":{"mode":"substitute","path":"/etc/app.yml","placeholder":"__X__"}}
+        ]});
+        assert!(validate_spec(&good).is_ok());
+        let tabbed = json!({"kind":"form","tabs":[{"label":"T","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~/x"}}
+        ]}]});
+        assert!(validate_spec(&tabbed).is_ok());
+    }
+
+    #[test]
+    fn annotate_target_paths_stamps_the_destination() {
+        // #199: the approval line showed the raw spec string. It now shows
+        // what this host will actually write.
+        let mut spec = json!({"kind":"form","fields":[
+            {"kind":"secret","name":"pat","target":{"mode":"create","path":"~/x"}},
+            {"kind":"text","name":"plain"}
+        ],"tabs":[{"label":"T","fields":[
+            {"kind":"text","name":"b","target":{"mode":"create","path":"/tmp/aiui-annotate"}}
+        ]}]});
+        super::annotate_target_paths(&mut spec);
+        let flat = &spec["fields"][0]["target"]["resolved_path"];
+        assert!(flat.is_string(), "flat field annotated: {flat}");
+        if dirs::home_dir().is_some() {
+            assert!(!flat.as_str().unwrap().starts_with('~'), "tilde expanded: {flat}");
+        }
+        assert!(
+            spec["tabs"][0]["fields"][0]["target"]["resolved_path"].is_string(),
+            "tab fields are covered too"
+        );
+        assert!(spec["fields"][1].get("target").is_none(), "untargeted field untouched");
     }
 
     #[test]
@@ -1713,6 +2707,244 @@ mod validate_tests {
         ]});
         assert!(validate_spec(&spec).is_err());
     }
+
+    // --- #178: duplicate keys in every value-keyed collection -------------
+
+    #[test]
+    fn rejects_gallery_with_duplicate_values() {
+        // Two items sharing a value collapse into one `out[it.value]` entry,
+        // so the agent gets a verdict for one asset and none for the other.
+        let spec = json!({"kind":"gallery","items":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"a","src":"data:image/png;base64,BBBB"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_gallery_with_unique_values() {
+        let spec = json!({"kind":"gallery","items":[
+            {"value":"a","src":"data:image/png;base64,AAAA"},
+            {"value":"b","src":"data:image/png;base64,BBBB"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_list_field_with_duplicate_item_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"list","name":"files","items":[
+                {"label":"config.yaml (app)","value":"config.yaml"},
+                {"label":"config.yaml (worker)","value":"config.yaml"}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("files"), "names the field: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_list_field_with_duplicate_string_items() {
+        // Form.svelte accepts bare strings as list items (label == value),
+        // so the shorthand shape has to be deduped too.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"list","name":"l","items":["A","A"]}
+        ]});
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_table_field_with_duplicate_row_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"table","name":"stale","columns":[{"key":"c","label":"C"}],"rows":[
+                {"value":"config.yaml","values":{"c":"app"}},
+                {"value":"config.yaml","values":{"c":"worker"}}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_image_grid_with_duplicate_values() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"image_grid","name":"shots","images":[
+                {"value":"hero","src":"data:image/png;base64,AAAA"},
+                {"value":"hero","src":"data:image/png;base64,BBBB"}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_tree_with_duplicate_sibling_values() {
+        // Sibling duplicates crash TreeNode.svelte's keyed `{#each}`.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"root","label":"root","children":[
+                    {"value":"kid","label":"a"},
+                    {"value":"kid","label":"b"}
+                ]}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_tree_with_value_repeated_across_branches() {
+        // Cross-branch repeats render, but `expanded`/`selected` are keyed by
+        // value — the two nodes toggle each other and the result is ambiguous.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"a","label":"A","children":[{"value":"dup","label":"x"}]},
+                {"value":"b","label":"B","children":[{"value":"dup","label":"y"}]}
+            ]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_tree_with_unique_values_across_branches() {
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"tree","name":"t","items":[
+                {"value":"a","label":"A","children":[{"value":"a1","label":"x"}]},
+                {"value":"b","label":"B","children":[{"value":"b1","label":"y"}]}
+            ]}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_tab_labels() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"Options","fields":[{"kind":"text","name":"a"}]},
+            {"label":"Options","fields":[{"kind":"text","name":"b"}]}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("label"), "got: {}", err.0);
+    }
+
+    // --- #178: dead `ask` / `form` surfaces --------------------------------
+
+    #[test]
+    fn rejects_ask_with_empty_options() {
+        let err = validate_spec(&json!({"kind":"ask","question":"q","options":[]})).unwrap_err();
+        assert!(err.0.contains("empty"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_ask_with_null_options() {
+        // Literally what the Rust bridge emits when `options` is omitted —
+        // Svelte renders `null` like `[]`, i.e. a window with only Cancel.
+        let err = validate_spec(&json!({"kind":"ask","question":"q","options":null})).unwrap_err();
+        assert!(err.0.contains("options"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn rejects_ask_option_without_label_or_value() {
+        // Ask.svelte renders `opt.label` and returns `value ?? label`, so a
+        // description-only option is a blank button returning `null`.
+        let spec = json!({"kind":"ask","question":"q","options":[
+            {"label":"Keep","value":"keep"},
+            {"description":"the other one"}
+        ]});
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.0.contains("label"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn accepts_ask_with_options() {
+        let spec = json!({"kind":"ask","question":"q","options":[
+            {"label":"Keep","value":"keep"},
+            {"label":"Drop"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_form_with_no_fields() {
+        let err = validate_spec(&json!({"kind":"form","title":"x"})).unwrap_err();
+        assert!(err.0.contains("no fields"), "got: {}", err.0);
+        assert!(err.1.contains("confirm"), "points at the alternative: {}", err.1);
+        // Empty containers are the same dead window.
+        assert!(validate_spec(&json!({"kind":"form","fields":[]})).is_err());
+        assert!(validate_spec(&json!({"kind":"form","tabs":[{"label":"T","fields":[]}]})).is_err());
+        // `confirm` legitimately has no fields and must stay valid.
+        assert!(validate_spec(&json!({"kind":"confirm","title":"ok?"})).is_ok());
+    }
+
+    #[test]
+    fn rejects_form_with_duplicate_field_names() {
+        // Form.svelte keys state by `values[f.name]` — the second field's
+        // value silently replaces the first's in the result.
+        let flat = json!({"kind":"form","fields":[
+            {"kind":"text","name":"who"},
+            {"kind":"number","name":"who"}
+        ]});
+        let err = validate_spec(&flat).unwrap_err();
+        assert!(err.0.contains("duplicate"), "got: {}", err.0);
+        assert!(err.0.contains("who"), "names the collision: {}", err.0);
+
+        // Same name, one flat and one via a tab.
+        let tabbed = json!({"kind":"form","fields":[{"kind":"text","name":"who"}],
+            "tabs":[{"label":"T","fields":[{"kind":"text","name":"who"}]}]});
+        assert!(validate_spec(&tabbed).is_err());
+    }
+
+    #[test]
+    fn accepts_form_with_unique_field_names_across_tabs() {
+        let spec = json!({"kind":"form","tabs":[
+            {"label":"A","fields":[{"kind":"text","name":"a"},{"kind":"static_text","text":"hi"}]},
+            {"label":"B","fields":[{"kind":"text","name":"b"},{"kind":"static_text","text":"ho"}]}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn accepts_repeated_names_on_display_only_fields() {
+        // `valueFields()` filters these out of the state map, so they key
+        // nothing — the dedup pass must not be over-strict about them.
+        let spec = json!({"kind":"form","fields":[
+            {"kind":"static_text","name":"note","text":"one"},
+            {"kind":"static_text","name":"note","text":"two"},
+            {"kind":"text","name":"answer"}
+        ]});
+        assert!(validate_spec(&spec).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod render_body_cap_tests {
+    use super::{render_body_too_large, RENDER_BODY_HARD_CAP, RENDER_SPEC_SOFT_CAP};
+
+    // #178: axum's 2 MiB default killed a routine 2 MB screenshot before the
+    // handler ever ran — a sixth of the 10 MB per-image cap the docs promise,
+    // with an opaque 413 and nothing in the trace log.
+
+    #[test]
+    fn soft_cap_is_strictly_below_the_hard_cap() {
+        // If they were equal (as on /media) axum would reject first and the
+        // structured `spec_too_large` body would be dead code.
+        assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
+    }
+
+    #[test]
+    fn accepts_a_spec_above_the_old_axum_default() {
+        // 3 MB: over axum's 2 MiB default, well under our cap — the exact
+        // shape of a base64-inlined Retina screenshot.
+        assert!(!render_body_too_large(3 * 1024 * 1024));
+        assert!(!render_body_too_large(RENDER_SPEC_SOFT_CAP));
+    }
+
+    #[test]
+    fn rejects_a_spec_past_the_soft_cap() {
+        assert!(render_body_too_large(RENDER_SPEC_SOFT_CAP + 1));
+    }
 }
 
 #[cfg(test)]
@@ -1775,7 +3007,46 @@ mod render_guard_tests {
 
 #[cfg(test)]
 mod notify_tests {
-    use super::{compose_notify_body, notify_title_is_valid};
+    use super::{compose_notify_body, notify_title_is_valid, NotifyRequest};
+    use serde_json::json;
+
+    /// #203: the Rust bridge posted every absent optional as an explicit
+    /// `null`. `#[serde(default)]` fires only for an *absent* key, so
+    /// `{"body": null}` was rejected by axum's `Json` extractor with a
+    /// plain-text serde dump — the agent never saw the companion's own
+    /// `invalid_request` message. A null now means "not given".
+    #[test]
+    fn notify_request_accepts_explicit_null_body() {
+        let req: NotifyRequest =
+            serde_json::from_value(json!({"title": "Tests green", "body": null}))
+                .expect("an explicit null body must deserialize");
+        assert_eq!(req.body, "");
+        assert_eq!(req.title, "Tests green");
+        assert!(notify_title_is_valid(&req.title));
+    }
+
+    /// A null `title` is tolerated by the extractor too — and then rejected
+    /// by the handler's own structured 422, which is the whole point: the
+    /// request has to *reach* the validation to be told what is wrong.
+    #[test]
+    fn notify_request_accepts_explicit_null_title_then_fails_validation() {
+        let req: NotifyRequest =
+            serde_json::from_value(json!({"title": null, "body": "whatever"}))
+                .expect("an explicit null title must deserialize");
+        assert_eq!(req.title, "");
+        assert!(!notify_title_is_valid(&req.title));
+    }
+
+    /// Absent keys keep working exactly as before — `#[serde(default)]`
+    /// still covers them.
+    #[test]
+    fn notify_request_still_accepts_absent_optionals() {
+        let req: NotifyRequest = serde_json::from_value(json!({"title": "Done"}))
+            .expect("an absent body must deserialize");
+        assert_eq!(req.body, "");
+        assert!(req.subtitle.is_none());
+        assert!(req.sound.is_none());
+    }
 
     #[test]
     fn title_must_be_non_empty() {
@@ -1835,19 +3106,44 @@ mod notify_tests {
 
 #[cfg(test)]
 mod async_render_tests {
-    use super::{drain_async_slot, AsyncSlot, SlotLook};
+    use super::{
+        drain_async_slot, slot_verdict, slots_over_cap, AsyncSlot, SlotLook, SlotVerdict,
+        ASYNC_SLOT_CAP, SLOT_ABANDONED_AFTER, SLOT_GRACE,
+    };
+    use crate::dialog::DIALOG_TTL;
     use std::collections::HashMap;
-    use std::time::Instant;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    // Step 3: the GET /render/{id} branching — pending → ready (drained once)
-    // → gone — without a Tauri app.
+    /// A slot as `POST /render`'s async branch inserts one. Times are built by
+    /// adding to `base` rather than subtracting from `Instant::now()`, because
+    /// `Instant` has no guaranteed room below "now" on a freshly booted host.
+    fn slot(base: Instant, done: bool) -> AsyncSlot {
+        AsyncSlot {
+            result: None,
+            created_at: base,
+            last_polled: base,
+            delivered_at: None,
+            done: Arc::new(AtomicBool::new(done)),
+        }
+    }
+
+    fn terminal(id: &str) -> crate::dialog::DialogResult {
+        crate::dialog::DialogResult {
+            id: id.into(),
+            cancelled: true,
+            result: serde_json::Value::Null,
+            reason: Some("window_closed".into()),
+        }
+    }
+
+    // Step 3: the GET /render/{id} branching — pending → ready → still ready
+    // (#193 made delivery idempotent) — without a Tauri app.
     #[test]
-    fn slot_lifecycle_pending_ready_gone() {
+    fn slot_lifecycle_pending_ready_repeatable() {
         let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
-        slots.insert(
-            "x".into(),
-            AsyncSlot { result: None, created_at: Instant::now() },
-        );
+        slots.insert("x".into(), slot(Instant::now(), false));
 
         // Registered, not resolved → Pending.
         assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Pending));
@@ -1855,14 +3151,8 @@ mod async_render_tests {
         assert!(matches!(drain_async_slot(&mut slots, "nope"), SlotLook::Gone));
 
         // Resolve it.
-        slots.get_mut("x").unwrap().result = Some(crate::dialog::DialogResult {
-            id: "x".into(),
-            cancelled: true,
-            result: serde_json::Value::Null,
-            reason: Some("window_closed".into()),
-        });
+        slots.get_mut("x").unwrap().result = Some(terminal("x"));
 
-        // First drain delivers the terminal result.
         match drain_async_slot(&mut slots, "x") {
             SlotLook::Ready(r) => {
                 assert!(r.cancelled);
@@ -1870,15 +3160,178 @@ mod async_render_tests {
             }
             _ => panic!("expected Ready"),
         }
-        // Slot was removed → a second drain is Gone (no double-delivery).
-        assert!(matches!(drain_async_slot(&mut slots, "x"), SlotLook::Gone));
-        assert!(slots.is_empty());
+        // The slot survives delivery — dropping it is the reaper's job alone.
+        assert!(slots.contains_key("x"));
+    }
+
+    // #193 regression: the answer must survive a blip on the way out. The old
+    // drain removed the slot before the response reached the wire, so a retry
+    // got `404 unknown_render_id` and the user was told to re-type a secret
+    // they had in fact already submitted.
+    #[test]
+    fn slot_redelivers_within_grace_window() {
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        let base = Instant::now();
+        let mut s = slot(base, true);
+        s.result = Some(terminal("x"));
+        slots.insert("x".into(), s);
+
+        let first = match drain_async_slot(&mut slots, "x") {
+            SlotLook::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        let stamped = slots["x"].delivered_at.expect("first drain stamps delivery");
+
+        let second = match drain_async_slot(&mut slots, "x") {
+            SlotLook::Ready(r) => r,
+            _ => panic!("a retried GET must get the same answer, not a 404"),
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.cancelled, second.cancelled);
+        assert_eq!(first.reason, second.reason);
+        // Only the *first* delivery starts the grace clock.
+        assert_eq!(slots["x"].delivered_at, Some(stamped));
+        assert!(slots.contains_key("x"));
+    }
+
+    #[test]
+    fn sweep_drops_delivered_slot_after_grace() {
+        let base = Instant::now();
+        let mut s = slot(base, true);
+        s.result = Some(terminal("x"));
+        s.delivered_at = Some(base);
+
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_GRACE - Duration::from_secs(1)),
+            SlotVerdict::Keep,
+            "inside the grace window the result stays collectable"
+        );
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_GRACE + Duration::from_secs(1)),
+            SlotVerdict::Drop
+        );
+    }
+
+    // #193 finding 16: sweeping on `created_at` alone raced the resolver, which
+    // then found no slot to write to — and the documented terminal
+    // `{cancelled:true, reason:"ttl_expired"}` became "the render never
+    // existed". An unfinished resolver must keep its slot.
+    #[test]
+    fn sweep_keeps_unresolved_slot_past_dialog_ttl() {
+        let base = Instant::now();
+        let s = slot(base, false);
+        let now = base + DIALOG_TTL + Duration::from_secs(1);
+        // Someone is still polling, so "abandoned" does not apply either.
+        let mut polled = slot(base, false);
+        polled.last_polled = now;
+        assert_eq!(slot_verdict(&polled, now), SlotVerdict::Keep);
+        // And even unpolled it is Abandon (cancel the dialog), never Drop —
+        // the resolver's write-back still has somewhere to land.
+        assert_eq!(slot_verdict(&s, now), SlotVerdict::Abandon);
+
+        // Once the resolver *is* done, the slot is held for TTL + grace.
+        let finished = slot(base, true);
+        assert_eq!(slot_verdict(&finished, now), SlotVerdict::Keep);
+        assert_eq!(
+            slot_verdict(&finished, base + DIALOG_TTL + SLOT_GRACE + Duration::from_secs(1)),
+            SlotVerdict::Drop
+        );
+    }
+
+    // #193 finding 1: the agent is killed, nobody polls, and the dialog window
+    // sat on the user's desktop for the full 2 h TTL.
+    #[test]
+    fn sweep_abandons_slot_whose_caller_stopped_polling() {
+        let base = Instant::now();
+        let s = slot(base, false);
+        assert_eq!(
+            slot_verdict(&s, base + Duration::from_secs(10)),
+            SlotVerdict::Keep,
+            "a caller polling 10 s ago is very much alive"
+        );
+        assert_eq!(
+            slot_verdict(&s, base + SLOT_ABANDONED_AFTER + Duration::from_secs(1)),
+            SlotVerdict::Abandon
+        );
+    }
+
+    #[test]
+    fn slot_cap_evicts_oldest() {
+        let base = Instant::now();
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        for i in 0..ASYNC_SLOT_CAP + 2 {
+            slots.insert(
+                format!("d{i}"),
+                slot(base + Duration::from_secs(i as u64), false),
+            );
+        }
+        let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&"d0".to_string()));
+        assert!(evicted.contains(&"d1".to_string()));
+
+        // At or below the cap nothing is evicted.
+        slots.remove("d0");
+        slots.remove("d1");
+        assert!(slots_over_cap(&slots, ASYNC_SLOT_CAP).is_empty());
+    }
+
+    // The DELETE /render/{id} contract at `DialogState` level: cancelling
+    // resolves the caller's receiver with a terminal `cancelled` result (which
+    // is what runs `resolve_dialog`'s window teardown), and the slot goes.
+    #[test]
+    fn cancel_resolves_slot_and_frees_window() {
+        let ds = crate::dialog::DialogState::new();
+        let (id, result_rx) =
+            ds.register_dialog(serde_json::json!({"kind": "confirm"}), None, None, 0);
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        slots.insert(id.clone(), slot(Instant::now(), false));
+
+        ds.cancel(&id);
+        slots.remove(&id);
+
+        let r = result_rx.blocking_recv().expect("cancel resolves the oneshot");
+        assert!(r.cancelled);
+        assert_eq!(ds.stats().orphan_count, 0, "registry slot freed");
+        assert!(matches!(drain_async_slot(&mut slots, &id), SlotLook::Gone));
     }
 }
 
 #[cfg(test)]
 mod upload_tests {
-    use super::pct_encode_filename;
+    use super::{pct_encode_filename, picker_title};
+    use crate::PickerGuard;
+
+    #[test]
+    fn second_concurrent_pick_is_rejected() {
+        // #194: two stacked system file panels give the user nothing to tell
+        // them apart — which agent asked for which file? The second
+        // `POST /upload` must be refused (409) while the first picker is up.
+        // The guard is tested directly: the handler itself needs an
+        // `AppHandle`, which no unit test has.
+        assert!(!PickerGuard::is_open(), "no picker open before the first claim");
+        let first = PickerGuard::try_claim().expect("first claim succeeds");
+        assert!(PickerGuard::is_open(), "the slot is held while the picker is up");
+        assert!(
+            PickerGuard::try_claim().is_none(),
+            "a second concurrent picker must be refused, not stacked"
+        );
+        drop(first);
+        assert!(!PickerGuard::is_open(), "dropping the guard releases the slot");
+        // And the slot is reusable — the refusal is not a one-way latch.
+        let again = PickerGuard::try_claim().expect("the slot is claimable again");
+        drop(again);
+    }
+
+    #[test]
+    fn picker_title_names_the_session_when_given() {
+        assert_eq!(picker_title(Some("billing-migration")), "aiui — billing-migration");
+        assert_eq!(picker_title(None), "aiui");
+        // Whitespace-only is the same as absent — an empty suffix after the
+        // dash reads like a bug to the user.
+        assert_eq!(picker_title(Some("   ")), "aiui");
+        assert_eq!(picker_title(Some(" api-work ")), "aiui — api-work");
+    }
 
     #[test]
     fn plain_ascii_name_is_unchanged() {
@@ -2030,5 +3483,99 @@ mod spec_summary_tests {
         let out = spec_summary(&json!({"kind": "confirm", "title": "x"}));
         assert!(out.contains("kind=confirm"));
         assert!(out.contains("fields=0"));
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use crate::dialog::DIALOG_HARD_CAP;
+    use crate::lifetime::CHILD_SOFT_CAP;
+
+    #[test]
+    fn readiness_ok_below_caps() {
+        assert_eq!(readiness(true, 0, 0), (true, None));
+        assert_eq!(health_status(None), StatusCode::OK);
+        // One short of either cap is still fully ready.
+        assert_eq!(
+            readiness(true, DIALOG_HARD_CAP - 1, CHILD_SOFT_CAP - 1),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn readiness_flags_webview_unresponsive() {
+        let (ready, reason) = readiness(false, 0, 0);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_WEBVIEW_UNRESPONSIVE));
+        // ...and it is the *only* reason that still answers 503.
+        assert_eq!(health_status(reason), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn readiness_flags_dialog_registry_full() {
+        // A full registry is degraded, not down: `register_dialog` evicts the
+        // oldest and keeps serving, so this must stay a 200 — otherwise one
+        // session's backlog blocks every other session's render (#179).
+        let (ready, reason) = readiness(true, DIALOG_HARD_CAP, 0);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_DIALOG_REGISTRY_FULL));
+        assert_eq!(health_status(reason), StatusCode::OK);
+    }
+
+    #[test]
+    fn readiness_flags_too_many_children() {
+        let (ready, reason) = readiness(true, 0, CHILD_SOFT_CAP);
+        assert!(!ready);
+        assert_eq!(reason, Some(REASON_TOO_MANY_CHILDREN));
+        assert_eq!(health_status(reason), StatusCode::OK);
+    }
+
+    #[test]
+    fn readiness_precedence_webview_wins() {
+        // Fixed precedence webview → registry → children, so a multiply
+        // degraded companion reports deterministically.
+        assert_eq!(
+            readiness(false, DIALOG_HARD_CAP, CHILD_SOFT_CAP).1,
+            Some(REASON_WEBVIEW_UNRESPONSIVE)
+        );
+        assert_eq!(
+            readiness(true, DIALOG_HARD_CAP, CHILD_SOFT_CAP).1,
+            Some(REASON_DIALOG_REGISTRY_FULL)
+        );
+    }
+
+    #[test]
+    fn probe_reports_none_rtt_when_no_dialog_window() {
+        // The old branch returned a fabricated `Some(0)`, indistinguishable
+        // from a real measurement in a log or a support thread.
+        let h = WebviewHealth::no_dialog_window();
+        assert!(h.responsive);
+        assert_eq!(h.rtt_ms, None);
+    }
+
+    #[test]
+    fn ui_ping_timeout_fits_the_bridge_budget() {
+        // Must clear a freshly mounted WebView's layout work, but stay well
+        // inside the Python bridge's 3 s /health budget.
+        assert!(UI_PING_TIMEOUT > Duration::from_millis(100));
+        assert!(UI_PING_TIMEOUT <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn hints_name_the_cause_and_the_numbers() {
+        let full = health_hint(REASON_DIALOG_REGISTRY_FULL, DIALOG_HARD_CAP, 0);
+        assert!(full.contains(&DIALOG_HARD_CAP.to_string()), "{full}");
+        assert!(full.contains("still works"), "{full}");
+
+        let kids = health_hint(REASON_TOO_MANY_CHILDREN, 0, CHILD_SOFT_CAP);
+        assert!(kids.contains(&CHILD_SOFT_CAP.to_string()), "{kids}");
+
+        let dead = health_hint(REASON_WEBVIEW_UNRESPONSIVE, 1, 1);
+        assert!(dead.contains("frozen"), "{dead}");
+        assert!(
+            dead.contains(&UI_PING_TIMEOUT.as_millis().to_string()),
+            "{dead}"
+        );
     }
 }

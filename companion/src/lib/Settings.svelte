@@ -25,16 +25,42 @@
     build_info: string;
     welcome_pending: boolean;
     http_error: string | null;
+    /** Set when `gui.lock` could not be acquired for a reason other than
+     * another aiui GUI holding it (#196). aiui keeps running without the
+     * lock — the banner explains why, instead of the process disappearing
+     * with exit code 0. */
+    lock_error: string | null;
     http_alive: boolean;
+    /** Why `http_alive` says what it says — `ProbeOutcome::as_str` on the
+     * Rust side (`alive`, `token_unreadable`, `unreachable`,
+     * `wrong_service`, `client_build_failed`). Issue #208. */
+    http_probe_reason: string;
+    /** The i18n key for the banner's hint line, picked in Rust by
+     * `health_hint_key` from the probe reason, `http_error` and the OS.
+     * Not assembled here: the mapping is the thing that was wrong (the
+     * pane claimed a port squatter for all four failure modes), so it
+     * lives where it can be unit-tested. Issue #208. */
+    http_hint_key: string;
     /** Lower-case OS identifier from the backend. Used to pick the right
      * variant of OS-specific UI copy (e.g. uninstall instructions). */
     os: "macos" | "windows" | "linux" | "other";
     /** When the periodic auto-check found a newer release (set by
      * `set_pending_update` in updater.ts silent path). Settings shows a
-     * non-modal banner with this version + an "Installieren" button.
+     * non-modal banner with this version + an Install button.
      * Cleared once the user installs (clear_pending_update) or once
-     * the on-disk version catches up. v0.4.44. */
+     * the on-disk version catches up. v0.4.44.
+     *
+     * #197 made the second half true — it was documented but implemented
+     * nowhere, so a yanked release left an undismissable banner. All four
+     * paths now retract it: a successful install, a manual check that finds
+     * nothing, the headless 6 h check's `Ok(None)` arm, and `status()`
+     * itself once `CARGO_PKG_VERSION` has caught up. */
     pending_update: string | null;
+    /** True when aiui runs from a location it won't still be at next
+     * launch (translocated off the DMG, ~/Downloads, a temp dir). Host
+     * registration is refused in that state — the banner asks the user to
+     * move the app and relaunch. #198. */
+    ephemeral_install: boolean;
   };
   let status = $state<Status | null>(null);
   let newHost = $state("");
@@ -43,19 +69,88 @@
   let confirmUninstall = $state(false);
   let uninstallDone = $state(false);
   let demoCopied = $state(false);
+  /** Both clipboard routes failed — the prompt is rendered inline in a
+   *  read-only textarea instead, so step 3 of the wizard always has a way
+   *  forward. Issue #208. */
+  let demoFallbackVisible = $state(false);
   let step1Expanded = $state(false);
+  /** The remote whose Remove button was clicked once. While set, that row
+   *  shows "Really remove <host>? [Back] [Remove]" instead of firing
+   *  `remove_remote` — which deletes the token, the MCP entry and the skill
+   *  directory on the host, with no undo. Issue #208. */
+  let confirmRemoveHost = $state<string | null>(null);
+  /** Consecutive `http_alive: false` samples. The banner waits for
+   *  {@link BANNER_MIN_CONSECUTIVE_FAILURES} of them so one slow probe
+   *  (machine under load, wake from sleep) can't flash a red port-conflict
+   *  claim. Reset by any success. Issue #208. */
+  let failedProbes = $state(0);
   /** When add_remote fails, we keep the input populated and surface the
    *  failure inline so the user can fix and retry without scrolling.
    *  Cleared on next attempt or successful add. */
   let addRemoteError = $state<{ message: string; details: string | null } | null>(null);
   let timer: number | undefined;
 
-  async function refresh() {
+  const POLL_INTERVAL_MS = 2000;
+  /** Three consecutive failures ≈ 6 s of a genuinely unreachable server —
+   *  short enough that a real outage still surfaces promptly, long enough
+   *  that one timed-out probe doesn't. Issue #208. */
+  const BANNER_MIN_CONSECUTIVE_FAILURES = 3;
+
+  /**
+   * Pull a fresh status report.
+   *
+   * `force` bypasses the Rust-side 15 s cache over the two expensive
+   * probes (the authenticated HTTP self-probe and the `pgrep`/`tasklist`
+   * spawn). The poll never forces; a user action that is supposed to
+   * change one of them does. Issue #208.
+   */
+  async function refresh(force = false) {
     // The status report carries `http_alive` from a Rust-side TCP
     // self-probe — WebView `fetch()` would be ATS-blocked on macOS for
     // plaintext localhost, which is how v0.4.8 ended up with a permanent
     // false-positive banner. Issue #77.
-    status = await invoke<Status>("status");
+    const next = await invoke<Status>("status", { force });
+    failedProbes = next.http_alive ? 0 : failedProbes + 1;
+    status = next;
+  }
+
+  /**
+   * Start the status poll, unless it is already running or there is
+   * nothing left to poll for.
+   *
+   * The setup window is hidden on close, never destroyed (Invariant I2 in
+   * `lib.rs`), so this component stays mounted for the life of the process
+   * and `onDestroy` never runs. Before #208 that meant one `setInterval`
+   * survived forever: ~43k HTTP round-trips and child-process spawns a day
+   * for a window nobody was looking at, against the project's own
+   * "no background polling" principle
+   * (`docs/architecture/self-healing.md`).
+   */
+  function startPolling() {
+    if (timer !== undefined || uninstallDone) return;
+    timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+  }
+
+  function stopPolling() {
+    if (timer !== undefined) {
+      window.clearInterval(timer);
+      timer = undefined;
+    }
+  }
+
+  function onWindowHidden() {
+    stopPolling();
+  }
+
+  function onWindowVisible() {
+    if (uninstallDone) return;
+    void refresh();
+    startPolling();
+  }
+
+  function onVisibilityChange() {
+    if (document.hidden) onWindowHidden();
+    else onWindowVisible();
   }
 
   function pushLog(results: StepResult[]) {
@@ -74,6 +169,7 @@
     busy = true;
     addRemoteError = null;
     try {
+      confirmRemoveHost = null;
       const results = await invoke<StepResult[]>("add_remote", { hostAlias: newHost.trim() });
       pushLog(results);
       // Clear the input only on full success — otherwise keep what the
@@ -85,19 +181,29 @@
       } else {
         newHost = "";
       }
-      await refresh();
+      await refresh(true);
     } finally {
       busy = false;
     }
   }
 
+  /**
+   * Second click on a remote's Remove button. The first click only arms
+   * `confirmRemoveHost` — this command stops the tunnel, strips the
+   * `RemoteForward` from `~/.ssh/config` and, when the host is reachable,
+   * deletes the auth token, the `aiui` MCP entry and the skill directory
+   * *on that host*. There is no undo and no UI path back short of a full
+   * re-setup, and the button used to sit flush against the ⟳ icon in a
+   * 520 px window. Issue #208.
+   */
   async function removeRemote(host: string) {
     busy = true;
     try {
       const results = await invoke<StepResult[]>("remove_remote", { hostAlias: host });
       pushLog(results);
-      await refresh();
+      await refresh(true);
     } finally {
+      confirmRemoveHost = null;
       busy = false;
     }
   }
@@ -107,7 +213,7 @@
     try {
       const results = await invoke<StepResult[]>("resync_remote", { hostAlias: host });
       pushLog(results);
-      await refresh();
+      await refresh(true);
     } finally {
       busy = false;
     }
@@ -120,6 +226,15 @@
       pushLog(results);
       confirmUninstall = false;
       uninstallDone = true;
+      // #208: uninstall deletes the token file and `first_run_done`. With
+      // the poll still running behind the done-modal, the next tick's probe
+      // failed on the token read and `welcome_pending` flipped back to
+      // true — so dismissing the modal greeted the user with a red "another
+      // process is holding port 7777" banner and a re-armed onboarding
+      // wizard, while aiui's server was in fact still listening. Both
+      // statements false, both deterministic. Nothing here is worth polling
+      // for any more.
+      stopPolling();
       await refresh();
     } finally {
       busy = false;
@@ -131,22 +246,62 @@
     try {
       const result = await invoke<StepResult>("repair_skill");
       pushSingle(result);
+      await refresh(true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Re-writes the aiui entry into every MCP host installed here. Only
+   *  surfaced when `claude_config_ok` is false — before #198 a stale entry
+   *  the health predicate had accepted could not be healed from the UI at
+   *  all, because the auto-patch on launch is gated by that same predicate. */
+  async function repairClaudeConfig() {
+    busy = true;
+    try {
+      const results = await invoke<StepResult[]>("repair_claude_config");
+      pushLog(results);
       await refresh();
     } finally {
       busy = false;
     }
   }
 
+  /**
+   * Copy the demo prompt, and if that is impossible, show it.
+   *
+   * #208: this is the only route to the prompt — the text is never
+   * rendered otherwise — and its old catch block did nothing at all, so a
+   * first-run user clicked the wizard's primary button twice, saw nothing
+   * happen either time, and had no way to reach step 3. The Rust command
+   * comes first because `navigator.clipboard` needs a secure context that
+   * WKWebView does not always grant; the inline textarea is what makes the
+   * failure recoverable rather than terminal.
+   */
   async function copyDemoPrompt() {
-    try {
-      await navigator.clipboard.writeText($_("settings.welcome.demo.prompt"));
-      demoCopied = true;
-      window.setTimeout(() => (demoCopied = false), 2000);
-    } catch {
-      // Clipboard API unavailable in some Tauri/macOS combinations — silent
-      // fallback so the UI doesn't lie about success.
-      demoCopied = false;
+    const text = $_("settings.welcome.demo.prompt");
+    const failures: string[] = [];
+    for (const attempt of [
+      () => invoke("copy_to_clipboard", { text }),
+      () => navigator.clipboard.writeText(text),
+    ]) {
+      try {
+        await attempt();
+        demoCopied = true;
+        demoFallbackVisible = false;
+        window.setTimeout(() => (demoCopied = false), 2000);
+        return;
+      } catch (e) {
+        failures.push(String(e));
+      }
     }
+    demoCopied = false;
+    demoFallbackVisible = true;
+    pushSingle({
+      ok: false,
+      message: $_("settings.welcome.demo.failed"),
+      details: failures.join(" · "),
+    });
   }
 
   async function quitApp() {
@@ -156,7 +311,7 @@
     } catch (e) {
       pushSingle({
         ok: false,
-        message: `Quit failed: ${String(e)}`,
+        message: $_("settings.quit.failed", { values: { error: String(e) } }),
         details: null,
       });
     }
@@ -167,7 +322,10 @@
     try {
       const result = await invoke<StepResult>("restart_claude_desktop");
       pushSingle(result);
-      await refresh();
+      // Forced: `claude_desktop_running` is one of the cached probes, and
+      // being told for another 15 s that Claude isn't running reads as the
+      // button not having worked (#208).
+      await refresh(true);
     } finally {
       busy = false;
     }
@@ -176,9 +334,16 @@
   async function dismissWelcome() {
     try {
       await invoke("dismiss_welcome");
-    } finally {
-      // Either way, hide locally — server-side state will catch up on next refresh.
+      // Hide only once the flag is actually persisted. Hiding optimistically
+      // meant a failed write brought the whole wizard back on the next 2 s
+      // status tick, with the error visible nowhere. Issue #196.
       if (status) status = { ...status, welcome_pending: false };
+    } catch (e) {
+      pushSingle({
+        ok: false,
+        message: $_("settings.welcome.dismiss_failed"),
+        details: String(e),
+      });
     }
   }
 
@@ -212,34 +377,68 @@
     }
   }
 
-  /** Triggered by the "Installieren" button on the pending-update
-   * banner. Routes through the manual `checkForUpdates` path so the
-   * user sees the native modal confirmation ("install v0.4.X?") and
-   * we don't bypass the explicit-consent step. v0.4.44. */
+  /** Triggered by the Install button on the pending-update banner, and
+   * by the footer "Check for updates" button. Routes through the manual
+   * `checkForUpdates` path so the user sees the native modal confirmation
+   * ("install v0.4.X?") and we don't bypass the explicit-consent step.
+   * v0.4.44.
+   *
+   * #197: this is the ONLY entry point for the manual path, and it is
+   * what makes `disabled={busy}` mean something. The footer button used
+   * to call `checkForUpdates` directly as a floating promise, so `busy`
+   * never latched and a double-click started two concurrent
+   * `downloadAndInstall()` calls racing over the same bundle. A failure
+   * also used to vanish into the `finally` — now it lands in the inline
+   * log, next to every other thing that went wrong in this window. */
   async function installPendingUpdate() {
     if (busy) return;
     busy = true;
     try {
-      await checkForUpdates({ silent: false });
+      const outcome = await checkForUpdates({ silent: false });
+      if (!outcome.ok) {
+        pushSingle({
+          ok: false,
+          message: $_("settings.updates.log_failed"),
+          details: outcome.error ?? null,
+        });
+      }
+      await refresh();
     } finally {
       busy = false;
     }
   }
 
   onMount(() => {
-    refresh();
-    timer = window.setInterval(refresh, 2000);
-    // Listen for the cross-window `update:available` broadcast from
-    // Rust so the banner refreshes immediately when the silent
-    // updater detects a new version, not only on the 2 s status poll.
+    void refresh(true);
+    startPolling();
+    // #208: gate the poll on whether anyone can actually see the pane.
+    // `visibilitychange` is the standard signal; the window-level
+    // focus/blur pair is the belt-and-braces path for a hidden WKWebView
+    // that keeps reporting `visibilityState: "visible"`.
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("blur", onWindowHidden);
+    window.addEventListener("focus", onWindowVisible);
     void import("@tauri-apps/api/event").then(({ listen }) => {
+      // Listen for the cross-window `update:available` broadcast from
+      // Rust so the banner refreshes immediately when the silent
+      // updater detects a new version, not only on the 2 s status poll.
       void listen<string | null>("update:available", (e) => {
         if (status) status = { ...status, pending_update: e.payload ?? null };
+      });
+      // #208: closing the setup window hides it rather than destroying it
+      // (Invariant I2), so the DOM never learns the window is gone. Rust
+      // says so explicitly from the `CloseRequested` and reopen paths.
+      void listen<boolean>("setup:visibility", (e) => {
+        if (e.payload) onWindowVisible();
+        else onWindowHidden();
       });
     });
   });
   onDestroy(() => {
-    if (timer) window.clearInterval(timer);
+    stopPolling();
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("blur", onWindowHidden);
+    window.removeEventListener("focus", onWindowVisible);
   });
 </script>
 
@@ -262,6 +461,18 @@
             {$_("app.status.connected", { values: { port: status.http_port } })}
           {:else}
             {$_("app.status.not_connected")}
+          {/if}
+          <!-- #198: the repair button mirrors the skill row below. It
+            matters most for the case that motivated the issue: an entry
+            with the right `command` but missing `--mcp-stdio` args, which
+            the launch-time auto-patch will never touch because its gate is
+            the very predicate that now reports it red. No point offering it
+            while the app runs from a temporary location — the banner above
+            names the only fix there. -->
+          {#if !status.claude_config_ok && !status.ephemeral_install}
+            <button class="header-action" onclick={repairClaudeConfig} disabled={busy}>
+              {$_("settings.config.repair")}
+            </button>
           {/if}
         </div>
         <!-- Skill status sits next to the connection status: both are
@@ -312,24 +523,62 @@
     {/if}
 
     <div class="window-scroll">
+    <!-- #198: aiui is running from a location it won't still be at on the
+      next launch — translocated off the DMG, out of ~/Downloads, or a temp
+      dir. Registering that path would make every tool call fail with "no
+      such file" and rewrite all three host configs on every launch, so
+      registration is refused until the user moves the app. This sits above
+      the HTTP banner because it invalidates everything below it. -->
+    {#if status.ephemeral_install}
+      <section class="http-error">
+        <strong>{$_("settings.ephemeral.title")}</strong>
+        <p>{$_(`settings.ephemeral.body.${status.os === "windows" ? "windows" : "macos"}`)}</p>
+        <p class="http-error-hint">{status.app_binary_path}</p>
+      </section>
+    {/if}
+
     <!-- Show the banner only when the live Rust-side TCP self-probe says
       the HTTP server isn't accepting connections. `status.http_error` is
       the explanatory text from the original bind-failure if any — but
       it's not the source of truth for whether to show the banner; that's
-      `http_alive`. Issue #77. -->
-    {#if !status.http_alive}
+      `http_alive`. Issue #77.
+
+      #208 adds two gates on *when*, not on *what decides*: three
+      consecutive failures (one slow probe during wake-from-sleep used to
+      flash the banner), and never after an uninstall — which deletes the
+      token file the probe reads, so every post-uninstall sample reports
+      dead while the server is still listening. -->
+    {#if !status.http_alive && !uninstallDone && failedProbes >= BANNER_MIN_CONSECUTIVE_FAILURES}
       <section class="http-error">
         <strong>{$_("settings.http_error.title")}</strong>
         {#if status.http_error}
           <p>{status.http_error}</p>
         {/if}
-        <!-- OS-specific because the diagnostic command differs: `lsof` on
+        <!-- Key chosen in Rust by `health_hint_key`: the OS-specific
+          port-squatter text only when a bind actually failed or a non-aiui
+          service answered, otherwise a hint that names the real cause.
+          OS-specific because the diagnostic command differs: `lsof` on
           macOS, `Get-NetTCPConnection` on Windows, `ss` on Linux. -->
-        <p class="http-error-hint">{$_(`settings.http_error.hint.${status.os}`, { values: { port: status.http_port } })}</p>
+        <p class="http-error-hint">{$_(status.http_hint_key, { values: { port: status.http_port } })}</p>
       </section>
     {/if}
 
-    {#if status.welcome_pending}
+    <!-- #196: `gui.lock` failed for a reason that is not another aiui GUI
+      holding it. aiui keeps running without the lock — say so, instead of
+      the old silent exit that also mislabelled the cause. -->
+    {#if status.lock_error}
+      <section class="http-error">
+        <strong>{$_("settings.lock_error.title")}</strong>
+        <p>{status.lock_error}</p>
+        <p class="http-error-hint">{$_("settings.lock_error.hint")}</p>
+      </section>
+    {/if}
+
+    <!-- `!uninstallDone` (#208): `uninstall_all` deletes `first_run_done`,
+      so `welcome_pending` flips back to true the moment the user removes
+      aiui — re-arming the onboarding wizard on a machine they are walking
+      away from. -->
+    {#if status.welcome_pending && !uninstallDone}
       <!-- Welcome banner is a 3-step wizard on a single pane. Each step
         is its own visually-distinct row with a numbered marker, a title,
         a one-line body, and (for steps 2-3) a primary CTA button.
@@ -423,6 +672,20 @@
             <button class="primary" onclick={copyDemoPrompt}>
               {demoCopied ? $_("settings.welcome.demo.copied") : $_("settings.welcome.demo.copy")}
             </button>
+            <!-- #208: when neither clipboard route works, the prompt itself
+              is the fallback. Without it a failed copy left the wizard with
+              no way forward at all — the text is rendered nowhere else. -->
+            {#if demoFallbackVisible}
+              <textarea
+                class="demo-fallback"
+                readonly
+                rows="6"
+                aria-label={$_("settings.welcome.demo.copy")}
+                onfocus={(e) => e.currentTarget.select()}
+                value={$_("settings.welcome.demo.prompt")}
+              ></textarea>
+              <p class="step-tail">{$_("settings.welcome.demo.manual")}</p>
+            {/if}
             <p class="step-tail">{$_("settings.welcome.step3.tail")}</p>
           </div>
         </div>
@@ -449,22 +712,43 @@
         <div class="stack" style="gap: 6px; margin-top: 6px;">
           {#each status.remotes as h}
             {@const tunnel = statusLabel(status.tunnels[h])}
+            <!-- #208: Remove is two-step, the same shape as the footer's
+              uninstall confirm. One click used to stop the tunnel, strip
+              the ssh forward and delete the token, the MCP entry and the
+              skill directory *on the host* — over the network, with no
+              undo — from a button sitting flush against the ⟳ icon in a
+              520 px window. The confirm takes over the whole row (the host
+              name is right there in the question) and `.button-gap` keeps a
+              mis-aimed resync click off the destructive button. -->
             <div class="remote-row">
               <span class="dot {tunnel.tone}"></span>
-              <div style="flex: 1; min-width: 0;">
-                <code>{h}</code>
-                <div class="tunnel-status {tunnel.tone}">{tunnel.text}</div>
-              </div>
-              <button
-                class="icon-button"
-                onclick={() => resyncRemote(h)}
-                disabled={busy}
-                title={$_("settings.remotes.resync.tooltip")}
-                aria-label={$_("settings.remotes.resync.tooltip")}
-              >⟳</button>
-              <button onclick={() => removeRemote(h)} disabled={busy}
-                >{$_("settings.remotes.remove")}</button
-              >
+              {#if confirmRemoveHost === h}
+                <span class="remote-confirm"
+                  >{$_("settings.remotes.remove.confirm", { values: { host: h } })}</span
+                >
+                <button onclick={() => (confirmRemoveHost = null)} disabled={busy}
+                  >{$_("settings.remotes.remove.back")}</button
+                >
+                <button class="danger" onclick={() => removeRemote(h)} disabled={busy}
+                  >{$_("settings.remotes.remove.do")}</button
+                >
+              {:else}
+                <div style="flex: 1; min-width: 0;">
+                  <code>{h}</code>
+                  <div class="tunnel-status {tunnel.tone}">{tunnel.text}</div>
+                </div>
+                <button
+                  class="icon-button"
+                  onclick={() => resyncRemote(h)}
+                  disabled={busy}
+                  title={$_("settings.remotes.resync.tooltip")}
+                  aria-label={$_("settings.remotes.resync.tooltip")}
+                >⟳</button>
+                <span class="button-gap"></span>
+                <button onclick={() => (confirmRemoveHost = h)} disabled={busy}
+                  >{$_("settings.remotes.remove")}</button
+                >
+              {/if}
             </div>
           {/each}
         </div>
@@ -497,7 +781,7 @@
           <button
             class="add-remote-error-dismiss"
             onclick={() => (addRemoteError = null)}
-            aria-label="Schließen">×</button>
+            aria-label={$_("settings.remotes.add.error_dismiss")}>×</button>
         </div>
       {/if}
       <p class="subtitle" style="margin: 6px 0 0 0; font-size: 11.5px;">
@@ -536,7 +820,10 @@
         <button onclick={openIssue} title={$_("settings.report.hint")}>
           {$_("settings.report.button")}
         </button>
-        <button onclick={() => checkForUpdates({ silent: false })} disabled={busy}>
+        <!-- #197: routed through installPendingUpdate, not a bare
+          `checkForUpdates(...)` floating promise — otherwise `busy` never
+          latches and `disabled={busy}` is decoration. -->
+        <button onclick={installPendingUpdate} disabled={busy}>
           {$_("settings.updates.check")}
         </button>
         <button onclick={() => (confirmUninstall = true)} disabled={busy}
@@ -583,7 +870,10 @@
     padding: 8px 12px;
     border: 1px solid color-mix(in srgb, var(--warning, #f3c623) 60%, var(--border));
     background: color-mix(in srgb, var(--warning, #f3c623) 18%, var(--bg, #fff));
-    color: color-mix(in srgb, var(--warning, #f3c623) 70%, var(--fg, #000));
+    /* 70% amber against the light wash measured ≈3.2:1 — under AA for
+       12.5px text. 35% keeps the warm tint while letting `--fg` carry the
+       legibility (#207). */
+    color: color-mix(in srgb, var(--warning, #f3c623) 35%, var(--fg, #000));
     border-radius: 8px;
     font-size: 12.5px;
     line-height: 1.4;
@@ -595,7 +885,10 @@
   .update-banner-button {
     flex: 0 0 auto;
     background: var(--warning, #f3c623);
-    color: var(--bg, #fff);
+    /* `var(--bg)` here painted near-white on amber in light mode: ≈2.06:1 on
+       the app's primary update CTA. `--warning-fg` is dark in both themes
+       (#207). */
+    color: var(--warning-fg, #1b1714);
     border: none;
     border-radius: 6px;
     padding: 4px 10px;
@@ -713,6 +1006,39 @@
     background: transparent;
     border: none;
     padding: 0;
+  }
+  /* Inline confirm for a remote removal (#208). Takes the place of the
+     host/tunnel column while armed, so the question has room in a 520 px
+     window without the row wrapping. */
+  .remote-confirm {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--danger);
+    line-height: 1.35;
+  }
+  /* Separates the ⟳ resync icon from the destructive Remove button. They
+     used to sit in the same 10 px flex gap, which is how a mis-aimed
+     resync click cost a full re-setup of a host (#208). */
+  .button-gap {
+    flex: 0 0 auto;
+    width: 12px;
+  }
+  /* Read-only copy of the demo prompt, revealed when both clipboard routes
+     fail (#208). Selectable, pre-selected on focus — the last resort that
+     keeps the welcome wizard from dead-ending. */
+  .demo-fallback {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--fg);
   }
   .tunnel-status {
     font-size: 11px;

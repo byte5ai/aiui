@@ -22,6 +22,11 @@ aiui/
 │   └── skill.md              Agent-facing widget catalog (shipped into
 │                             ~/.claude/skills/aiui/)
 ├── scripts/
+│   ├── check-release-ordering.sh   Guards the order of the release steps
+│   ├── check-skill-drift.sh        Keeps both skill.md copies in sync
+│   ├── check-updater-feed.sh       Validates a release's latest.json
+│   ├── diagnose-session-startup.sh Session-startup troubleshooting dump
+│   ├── test-check-updater-feed.sh  Fixtures for the feed guard
 │   └── release.sh            Stub that refuses to run — releases are CI-only
 ├── assets/                   Brand assets (icon, logo, dmg background)
 └── CHANGELOG.md
@@ -57,8 +62,24 @@ For the Python side:
 
 ```sh
 cd python
-uv build    # produces dist/aiui_mcp-*.whl + .tar.gz
+uv run --locked --extra dev pytest tests/ -v   # the suite CI runs
+uv run --locked --extra dev ruff check .       # lint (ruff format --check too)
+uv build --locked                              # dist/aiui_mcp-*.whl + .tar.gz
 ```
+
+### `python/uv.lock` is tracked
+
+Like `Cargo.lock` and `companion/package-lock.json`, the Python lock is
+committed and CI resolves nothing on its own: every step runs `--locked`, and
+so does the release. **Whenever you change a dependency in
+`python/pyproject.toml`, run `uv lock` and commit the result in the same
+change** — otherwise CI fails with "the lockfile is not up-to-date".
+
+The lock governs what *we* test; it is not what users get. `pyproject.toml`'s
+ranges stay the published contract, so `uvx aiui-mcp` on a remote host still
+resolves `mcp>=1.26.0,<2` fresh. `deps-refresh.yml` runs weekly against that
+freshly-resolved set, which is how an upstream break surfaces here instead of
+on someone's remote.
 
 ## Releasing
 
@@ -69,9 +90,30 @@ local keychain, never in the repo. `scripts/release.sh` is a stub that
 refuses to run; it exists only to stop anyone from reinventing a local
 build path. If Actions is down, wait for it.
 
-Before dispatching, bump the version in `companion/src-tauri/Cargo.toml`,
-`companion/src-tauri/tauri.conf.json`, and `python/pyproject.toml` so all
-three agree — the workflow's first step hard-fails on drift.
+Before dispatching, the bump PR has to do all of this:
+
+- bump the version in all **four** manifests —
+  `companion/src-tauri/Cargo.toml`, `companion/src-tauri/tauri.conf.json`,
+  `python/pyproject.toml` and `companion/package.json`;
+- rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] — <date>`, so
+  the version being released has a section.
+
+`scripts/check-release-preconditions.sh` is what enforces it, and it runs
+twice: in CI on every PR (no argument — the four manifests must agree with
+each other and with a CHANGELOG section), and as the release workflow's
+first step after checkout (`… X.Y.Z` — the manifests must additionally equal
+the dispatched version, and `vX.Y.Z` must not already be on the remote).
+Run it locally before opening the bump PR:
+
+```sh
+scripts/check-release-preconditions.sh          # the tree agrees with itself
+scripts/check-release-preconditions.sh 0.11.0   # …and with what you'll dispatch
+```
+
+Releases are cut **from `main` only** — the workflow's very first step
+refuses any other ref — and the run executes the drift guards, `pytest` and
+`cargo test --lib` *before* the Developer ID certificate is imported, so a
+red test never reaches the signing keychain.
 
 ### macOS — `release-macos.yml`
 
@@ -90,7 +132,12 @@ gh workflow run release-macos.yml -f version=X.Y.Z \
 
 PyPI runs last, after the GitHub release succeeded, because PyPI versions
 are permanent. The tag and release steps are idempotent, so a run that
-failed at PyPI can be re-dispatched with the same version to recover.
+failed at PyPI can be re-dispatched with the same version to recover — and
+since #209 that re-run also **re-uploads** what it just built
+(`gh release upload --clobber`), instead of building it and throwing it
+away. Its `latest.json` is merged into the published feed rather than
+replacing it, so re-dispatching macOS after the Windows run does not drop
+the `windows-x86_64` entry.
 
 **The release stays a draft until the Windows run completes.** A draft is
 not served by `releases/latest/download/latest.json`, which is what every

@@ -75,6 +75,25 @@ pub fn wirt_gone(cd_is_wirt: bool, cd_running: bool) -> bool {
     cd_is_wirt && !cd_running
 }
 
+/// May an update be installed right now?
+///
+/// Installing means `downloadAndInstall` + relaunch, which tears down every
+/// window — including a dialog the user is filling in, whose in-flight
+/// `/render` would come back to the agent as a cancelled transport result.
+/// That is the Invariant I5 case: never destroy a pending dialog to apply an
+/// update. `orphan_count` is `DialogState::stats().orphan_count`, i.e. the
+/// number of registered dialogs still waiting on a user response.
+///
+/// Settings being open is deliberately *not* part of the predicate — the user
+/// is standing there on purpose, so a restart is exactly what they asked for.
+///
+/// Pure so the semantics the gate depends on can be pinned in a unit test;
+/// the `is_update_safe_to_install` command and the agent-facing `/update`
+/// handler are the two callers.
+pub fn update_install_is_safe(orphan_count: usize) -> bool {
+    orphan_count == 0
+}
+
 /// Should this `RunEvent::ExitRequested` be honoured?
 ///
 /// #180: belt and braces on top of [`wirt_gone`]. Tauri fires
@@ -124,6 +143,60 @@ pub fn grace_outcome(
     } else {
         GraceOutcome::Exit
     }
+}
+
+/// First backoff step for a failing channel accept/connect.
+const ACCEPT_BACKOFF_BASE_MS: u64 = 100;
+
+/// Ceiling for that backoff. A degraded channel retries forever — it must
+/// never exit the process (I1 names exactly three exit causes) — so the cap
+/// is what keeps a permanently broken channel at a heartbeat instead of a
+/// spin.
+const ACCEPT_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// Consecutive failures after which the degraded channel is recorded as a
+/// named lifecycle event (once), not just as a trace line.
+pub const ACCEPT_FAILING_THRESHOLD: u32 = 5;
+
+/// Backoff for a failed channel accept/connect: 100 ms doubling to a 5 s cap.
+///
+/// Pure and platform-independent so both backends share it and it is testable
+/// on the one runner that actually executes tests (#141). `EMFILE`/`ENFILE`
+/// on the Unix side and a bad pipe handle on the Windows side both return
+/// *instantly and repeatedly*, so an unpaced retry is a 100 %-CPU spin plus
+/// an unbounded append to `/tmp/aiui-trace.log` (which cannot rotate
+/// mid-process). Applied only *after* a failure and reset on success, so a
+/// legitimate cold-start attach never pays for it.
+pub fn accept_backoff(consecutive_failures: u32) -> Duration {
+    let factor = 1u64 << consecutive_failures.min(20);
+    let ms = ACCEPT_BACKOFF_BASE_MS
+        .saturating_mul(factor)
+        .min(ACCEPT_BACKOFF_CAP_MS);
+    Duration::from_millis(ms)
+}
+
+/// True for errors where an immediate retry is correct: a signal-interrupted
+/// syscall and a spurious non-blocking wakeup are genuinely transient, and
+/// making them wait would add latency to the very attach the user is
+/// waiting on. Everything else — descriptor exhaustion above all — backs off.
+// Only the Unix-domain-socket accept loop (`#[cfg(unix)]`) calls this; on
+// Windows it is exercised by unit tests alone, which the release clippy build
+// does not compile — so it reads as dead there.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn accept_error_is_transient(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// True when `consecutive_failures` lands on a new backoff step — the
+/// rate-limit gate for the trace line, so a persistent failure logs ~once per
+/// doubling instead of once per iteration. Without it the flood overruns the
+/// 256-entry lifecycle ring in milliseconds and destroys the forensic trail
+/// that ring exists to provide.
+pub fn backoff_step_changed(consecutive_failures: u32) -> bool {
+    consecutive_failures.is_power_of_two()
 }
 
 /// The single terminal-exit path (#180).
@@ -238,6 +311,13 @@ pub fn socket_path(config_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Soft cap on concurrently-attached MCP-stdio children. Crossing it makes
+/// `/health` report `ready: false` with `reason: "too_many_children"` — a
+/// "something is leaking sessions" signal, not a refusal: rendering keeps
+/// working, which is why that state stays a 200 (#179). Previously an
+/// unnamed `32` literal inline in `http.rs`.
+pub const CHILD_SOFT_CAP: usize = 32;
+
 /// Live counter of currently-attached MCP-stdio children. Owned by the Tauri
 /// app via `manage()` and read by `/health` to surface child count in the
 /// composite-health response.
@@ -331,9 +411,11 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
 
     let wake = make_shutdown_watcher(conns.clone(), app.clone(), http_port);
 
+    let mut fails: u32 = 0;
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
+                fails = 0;
                 let n = conns.fetch_add(1, Ordering::SeqCst) + 1;
                 trace(&format!("lifetime: client connected, active={n}"));
                 crate::lifecycle_log::record(
@@ -359,8 +441,32 @@ async fn gui_serve_unix(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize>, 
                     }
                 });
             }
+            // Signal-interrupted or spuriously-woken: retry at once, no
+            // failure counted — the next child attach must not wait.
+            Err(e) if accept_error_is_transient(e.kind()) => continue,
+            // #181: everything else can be permanent (`EMFILE`/`ENFILE` in a
+            // process that opens descriptors per dialog window, per HTTP
+            // client and per attached child). `accept` then returns the same
+            // error instantly, forever, so an unpaced retry pins a tokio
+            // worker at 100 % CPU and grows the trace file without bound
+            // while no child can attach any more.
             Err(e) => {
-                trace(&format!("lifetime: accept error: {e}"));
+                let delay = accept_backoff(fails);
+                fails = fails.saturating_add(1);
+                if backoff_step_changed(fails) {
+                    trace(&format!(
+                        "lifetime: accept error: {e} — retry in {delay:?}"
+                    ));
+                }
+                if fails == ACCEPT_FAILING_THRESHOLD {
+                    crate::lifecycle_log::record(
+                        crate::lifecycle_log::LifecycleEvent::ChannelAcceptFailing {
+                            consecutive: fails,
+                            backoff_ms: delay.as_millis() as u64,
+                        },
+                    );
+                }
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -427,9 +533,54 @@ async fn gui_serve_windows(sock: PathBuf, app: AppHandle, conns: Arc<AtomicUsize
 
     let wake = make_shutdown_watcher(conns.clone(), app.clone(), http_port);
 
+    let mut fails: u32 = 0;
     loop {
-        if let Err(e) = next_server.connect().await {
-            trace(&format!("lifetime: pipe connect error: {e}"));
+        // #181: bind the result first — `connect()` borrows `next_server`
+        // for as long as the match scrutinee lives, and the Err arm has to
+        // replace it. Nothing below the match may run without an `Ok`: a
+        // failed connect used to fall through and be counted as a client,
+        // which spawned a reader on a pipe nobody connected to, fired an
+        // immediate phantom detach edge, and armed the grace — one failed
+        // `tasklist` during that edge is enough to quit the companion with
+        // Claude Desktop still on screen (I1).
+        let connected = next_server.connect().await;
+        match connected {
+            Ok(()) => fails = 0,
+            Err(e) => {
+                let delay = accept_backoff(fails);
+                fails = fails.saturating_add(1);
+                if backoff_step_changed(fails) {
+                    trace(&format!(
+                        "lifetime: pipe connect error: {e} — retry in {delay:?}"
+                    ));
+                }
+                if fails == ACCEPT_FAILING_THRESHOLD {
+                    crate::lifecycle_log::record(
+                        crate::lifecycle_log::LifecycleEvent::ChannelAcceptFailing {
+                            consecutive: fails,
+                            backoff_ms: delay.as_millis() as u64,
+                        },
+                    );
+                }
+                tokio::time::sleep(delay).await;
+                // The instance is not connected and may be in a bad state;
+                // replace it. A failing recreate is deliberately *not* an
+                // exit cause — I1 names exactly three, and a fourth one here
+                // would reintroduce the failure mode this module was
+                // rewritten to remove. Keep the old handle and let the next
+                // iteration back off further.
+                match ServerOptions::new().create(&pipe_name) {
+                    Ok(s) => next_server = s,
+                    Err(e2) => {
+                        if backoff_step_changed(fails) {
+                            trace(&format!(
+                                "lifetime: pipe recreate after connect error failed: {e2}"
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
         }
         let stream: NamedPipeServer = next_server;
 
@@ -636,17 +787,35 @@ pub async fn mcp_attach(sock: PathBuf) {
         );
     }
 
+    // #196: how many attach cycles in a row have failed. A GUI that cannot
+    // start (say, a `gui.lock` failure that is not contention) used to be
+    // respawned once per cycle — roughly every 20 s — for the entire life of
+    // the Claude Desktop / Claude Code session.
+    let mut consecutive_failures: u32 = 0;
+    let mut capped_traced = false;
+
     loop {
         let mut attached = false;
         for attempt in 1..=30u32 {
             match try_attach(&sock).await {
                 Ok(()) => {
                     attached = true;
+                    consecutive_failures = 0;
+                    capped_traced = false;
                     trace("lifetime: mcp socket closed — GUI is gone, will relaunch");
                     break;
                 }
                 Err(e) => {
                     if attempt == 1 && interactive {
+                        let backoff = resurrect_delay(consecutive_failures);
+                        if !backoff.is_zero() {
+                            trace(&format!(
+                                "lifetime: {consecutive_failures} failed attach cycle(s) — \
+                                 waiting {}s before launching the GUI again",
+                                backoff.as_secs()
+                            ));
+                            tokio::time::sleep(backoff).await;
+                        }
                         trace(&format!(
                             "lifetime: gui channel not ready ({e}), launching GUI"
                         ));
@@ -663,6 +832,19 @@ pub async fn mcp_attach(sock: PathBuf) {
             }
         }
         if !attached {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if interactive
+                && resurrect_delay(consecutive_failures) >= RESURRECT_DELAY_CAP
+                && !capped_traced
+            {
+                capped_traced = true;
+                trace(&format!(
+                    "lifetime: {consecutive_failures} attach cycles failed in a row — \
+                     auto-resurrect backoff is at its {}s ceiling; the GUI is not coming up, \
+                     check the aiui trace log for a gui-lock-error or http-bind-error",
+                    RESURRECT_DELAY_CAP.as_secs()
+                ));
+            }
             trace(
                 "lifetime: mcp gave up waiting for gui channel after 30 attempts; retrying in 5s",
             );
@@ -670,6 +852,27 @@ pub async fn mcp_attach(sock: PathBuf) {
         }
         // GUI was connected and has now closed; loop back to resurrect it
         // (or wait + retry if launch failed / suppressed).
+    }
+}
+
+/// Ceiling for the auto-resurrect backoff. Two minutes between spawn
+/// attempts is still responsive when the GUI merely needed a moment, and it
+/// turns a permanently-unstartable GUI from ~180 doomed launches an hour
+/// into 30.
+pub const RESURRECT_DELAY_CAP: Duration = Duration::from_secs(120);
+
+/// How long to wait before spawning the GUI again, after
+/// `consecutive_failures` attach cycles that never got a channel (#196).
+///
+/// The first attempt is immediate — the overwhelmingly common case is "the
+/// GUI simply isn't running yet", and making that user wait would be a
+/// regression. Monotonic from there, clamped at [`RESURRECT_DELAY_CAP`].
+pub fn resurrect_delay(consecutive_failures: u32) -> Duration {
+    match consecutive_failures {
+        0 => Duration::from_secs(0),
+        1 => Duration::from_secs(5),
+        2 => Duration::from_secs(30),
+        _ => RESURRECT_DELAY_CAP,
     }
 }
 
@@ -764,18 +967,29 @@ async fn rotate_pipe_with_retry(pipe_name: &str) -> std::io::Result<NamedPipeSer
 ///   because Windows does not propagate exit signals to children the way
 ///   macOS does. NSIS does not register an `aiui` LaunchServices-style
 ///   alias, so we identify the binary via `current_exe()`.
+///
+/// Every branch spawns through [`crate::proc_ext::spawn_detached`], never
+/// `Command::spawn` directly (#181). Our caller here is `aiui --mcp-stdio`,
+/// whose stdin/stdout *are* the host's JSON-RPC pipes, and
+/// `std::process::Command` inherits them by default — which put the GUI's
+/// log output into Claude Desktop's framing stream on every Windows cold
+/// start and kept the host from ever seeing EOF on teardown. macOS escaped
+/// it only because LaunchServices hands the new process fresh stdio;
+/// routing it through the same helper keeps the three branches uniform.
 fn spawn_gui_detached() {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .args(["-g", "-a", "aiui", "--args", "--auto"])
-            .spawn();
+        let _ = crate::proc_ext::spawn_detached(
+            std::process::Command::new("open").args(["-g", "-a", "aiui", "--args", "--auto"]),
+        );
     }
     #[cfg(target_os = "windows")]
     {
         match std::env::current_exe() {
             Ok(exe) => {
-                let _ = std::process::Command::new(exe).arg("--auto").spawn();
+                let _ = crate::proc_ext::spawn_detached(
+                    std::process::Command::new(exe).arg("--auto"),
+                );
             }
             Err(e) => {
                 trace(&format!(
@@ -787,7 +1001,9 @@ fn spawn_gui_detached() {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).arg("--auto").spawn();
+            let _ = crate::proc_ext::spawn_detached(
+                std::process::Command::new(exe).arg("--auto"),
+            );
         }
     }
 }
@@ -797,11 +1013,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resurrect_delay_grows_and_caps() {
+        // #196: the first failure still spawns immediately — the usual case
+        // is "the GUI just isn't up yet". After that the wait grows, so a
+        // GUI that can never start is not relaunched every ~20 s forever.
+        assert_eq!(resurrect_delay(0), Duration::from_secs(0));
+        let series: Vec<Duration> = (0..8).map(resurrect_delay).collect();
+        for pair in series.windows(2) {
+            assert!(pair[1] >= pair[0], "backoff must be monotonic: {series:?}");
+        }
+        assert!(resurrect_delay(1) > resurrect_delay(0));
+        assert_eq!(resurrect_delay(5), RESURRECT_DELAY_CAP);
+        assert_eq!(resurrect_delay(100), RESURRECT_DELAY_CAP);
+        assert_eq!(resurrect_delay(u32::MAX), RESURRECT_DELAY_CAP);
+    }
+
+    #[test]
     fn ssh_connection_signals_non_interactive() {
         // We can't safely flip global env in a parallel test runner, so
         // we just verify the env-lookup paths exist and the function is
         // pure. Real behavior is exercised in integration tests.
         let _ = is_interactive_session();
+    }
+
+    /// #210: the transport address is the one thing the GUI and every
+    /// MCP-stdio child must agree on byte for byte, and on Windows it is a
+    /// different kind of object entirely — a pipe namespace entry, not a file
+    /// under the config dir. Until the Windows CI leg executed its tests both
+    /// arms were checked by the compiler only, so a rename of the pipe would
+    /// have shipped green and left every child unable to connect.
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_is_a_socket_file_under_the_config_dir_on_unix() {
+        let p = socket_path(std::path::Path::new("/tmp/aiui-cfg"));
+        assert_eq!(p, PathBuf::from("/tmp/aiui-cfg/gui.sock"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn socket_path_is_named_pipe_on_windows() {
+        let p = socket_path(std::path::Path::new(r"C:\Users\me\AppData\Roaming\aiui"));
+        assert_eq!(p, PathBuf::from(r"\\.\pipe\aiui-gui"));
+        // The config dir must not leak into the pipe name — a per-install
+        // address would be unreachable for a child that only knows the
+        // constant.
+        assert_eq!(p, socket_path(std::path::Path::new(r"D:\elsewhere")));
     }
 
     // --- Step-1 verification mini-harness (stabilization-plan §Step 2) ---
@@ -827,6 +1083,22 @@ mod tests {
     fn wirt_gone_only_when_our_wirt_left() {
         assert!(wirt_gone(true, false), "CD is the Wirt and it quit");
         assert!(!wirt_gone(true, true), "CD is the Wirt and it runs");
+    }
+
+    #[test]
+    fn update_install_is_safe_only_with_empty_registry() {
+        // #197: the gate exists so an install never restarts the app out from
+        // under a dialog the user is filling in. One pending dialog is enough
+        // to defer — there is no "only one, that's fine" threshold.
+        assert!(
+            update_install_is_safe(0),
+            "no dialog pending — installing is safe"
+        );
+        assert!(
+            !update_install_is_safe(1),
+            "one dialog waiting on the user — installing would destroy it"
+        );
+        assert!(!update_install_is_safe(7));
     }
 
     #[test]
@@ -894,6 +1166,46 @@ mod tests {
         assert_eq!(grace_outcome(false, true, 7), GraceOutcome::Stay);
         // …and once it resolves, the original decision stands.
         assert_eq!(grace_outcome(false, true, 0), GraceOutcome::Exit);
+    }
+
+    #[test]
+    fn accept_backoff_starts_short_and_caps() {
+        // #181: the first retry must be near-instant so a one-off accept
+        // failure costs the user nothing…
+        assert_eq!(accept_backoff(0), Duration::from_millis(100));
+        // …and the schedule must never go backwards.
+        let waits: Vec<u128> = (0..24).map(|i| accept_backoff(i).as_millis()).collect();
+        assert!(
+            waits.windows(2).all(|w| w[0] <= w[1]),
+            "backoff is monotonically non-decreasing: {waits:?}"
+        );
+        // A permanently broken channel settles at a heartbeat, and a large
+        // counter neither overflows nor panics.
+        assert_eq!(accept_backoff(6), Duration::from_millis(5_000));
+        assert_eq!(accept_backoff(64), Duration::from_millis(5_000));
+        assert_eq!(accept_backoff(u32::MAX), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn transient_accept_errors_retry_immediately() {
+        use std::io::ErrorKind;
+        assert!(accept_error_is_transient(ErrorKind::Interrupted));
+        assert!(accept_error_is_transient(ErrorKind::WouldBlock));
+        // The EMFILE/ENFILE class: these repeat instantly and forever, so
+        // they must be paced, not retried in a tight loop.
+        assert!(!accept_error_is_transient(ErrorKind::Other));
+        assert!(!accept_error_is_transient(ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn backoff_trace_is_rate_limited() {
+        // A persistent failure must log ~once per doubling; logging per
+        // iteration is what overruns the 256-entry lifecycle ring.
+        let logged = (1..=64u32).filter(|n| backoff_step_changed(*n)).count();
+        assert!(logged < 10, "fired {logged} times over 64 failures");
+        // The very first failure is always visible.
+        assert!(backoff_step_changed(1));
+        assert!(!backoff_step_changed(3));
     }
 
     #[test]

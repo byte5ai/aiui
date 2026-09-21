@@ -6,6 +6,7 @@ notification. Unlike confirm/ask/form/gallery this never goes through
 These mock `httpx.AsyncClient.post` so they run without a live companion,
 mirroring the pattern in test_wire_compat.py / test_health_error_handling.py.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +31,9 @@ class _FakeResp:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise httpx.HTTPStatusError(
-                f"http {self.status_code}", request=None, response=None  # type: ignore[arg-type]
+                f"http {self.status_code}",
+                request=None,
+                response=None,  # type: ignore[arg-type]
             )
 
 
@@ -38,6 +41,10 @@ def _setup_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57de1e7e57")
     monkeypatch.setattr(server, "TOKEN_PATH", token_file)
+    # `notify` runs the cold-start gate since #203; these tests mock only
+    # `post`, so zero the budget rather than let the gate poll a real
+    # `/ping` for 30 s. The gate itself is covered in test_coldstart_gate.py.
+    monkeypatch.setattr(server, "COLDSTART_WAIT_S", 0.0)
 
 
 def test_notify_success_posts_expected_body_and_returns_ok(
@@ -119,9 +126,7 @@ def test_notify_422_invalid_request_raises_with_detail(
     _setup_token(monkeypatch, tmp_path)
 
     async def fake_post(self: Any, url: str, **kwargs: Any) -> Any:
-        return _FakeResp(
-            422, {"error": "invalid_request", "detail": "title must not be empty"}
-        )
+        return _FakeResp(422, {"error": "invalid_request", "detail": "title must not be empty"})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 

@@ -56,21 +56,47 @@ pub const MEDIA_TOTAL_CAP: u64 = 1024 * 1024 * 1024;
 /// `DefaultBodyLimit`; duplicated here as the documented contract.
 pub const MEDIA_FILE_CAP: u64 = 512 * 1024 * 1024;
 
-/// The cache directory: `<app-cache-dir>/media`, created if absent.
-pub fn media_dir(app: &AppHandle) -> std::io::Result<PathBuf> {
+/// Where the cache directory would be: `<app-cache-dir>/media`, without
+/// creating anything. Used by the uninstall sweep (#196), which must be able
+/// to name and remove the directory without conjuring it into existence
+/// first.
+pub fn media_dir_path(app: &AppHandle) -> std::io::Result<PathBuf> {
     let base = app
         .path()
         .app_cache_dir()
         .map_err(|e| std::io::Error::other(format!("no app cache dir: {e}")))?;
-    let dir = base.join("media");
+    Ok(base.join("media"))
+}
+
+/// The cache directory: `<app-cache-dir>/media`, created if absent.
+pub fn media_dir(app: &AppHandle) -> std::io::Result<PathBuf> {
+    let dir = media_dir_path(app)?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Keep only `[a-z0-9]`, lowercased, max 5 chars; fall back to `bin`. The
-/// extension is attacker-influenced (it comes off the wire), and it ends up
-/// in a filename *and* drives the served `Content-Type`, so it must not
-/// carry path separators, dots, or anything exotic.
+/// Every extension the media cache may store under — exactly the video and
+/// audio types the dialog widgets can play. Mirrors the extension sets in
+/// `imageresolve::video_ext` / `imageresolve::audio_ext`, which are the only
+/// producers that ever reach `POST /media`.
+const ALLOWED_EXTS: [&str; 10] = [
+    "mp4", "mov", "m4v", "webm", "mp3", "m4a", "wav", "aac", "ogg", "flac",
+];
+
+/// Normalise the extension to one of [`ALLOWED_EXTS`], or `bin`.
+///
+/// The extension is attacker-influenced (it comes off the wire), it ends up
+/// in a filename, and — because `/media/blob` is served by `ServeDir` — it
+/// *drives the served `Content-Type`*. Sanitising it to "lowercase
+/// alphanumerics" was not enough: `?ext=html` yielded a `text/html` document
+/// on `127.0.0.1:<port>`, the authenticated API's own origin, which a
+/// prompt-injected agent could hand the user as a link (#194). An allowlist
+/// closes that: anything that is not a playable media type becomes `bin`
+/// (`application/octet-stream`), which browsers download rather than render.
+///
+/// Non-breaking by construction — `video_ext`/`audio_ext` are only ever
+/// called on paths that already matched `is_local_video_path` /
+/// `is_local_audio_path`, whose extension sets are exactly this list.
 pub fn sanitize_ext(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
@@ -80,10 +106,10 @@ pub fn sanitize_ext(raw: &str) -> String {
         .take(5)
         .collect::<String>()
         .to_ascii_lowercase();
-    if cleaned.is_empty() {
-        "bin".to_string()
-    } else {
+    if ALLOWED_EXTS.contains(&cleaned.as_str()) {
         cleaned
+    } else {
+        "bin".to_string()
     }
 }
 
@@ -148,10 +174,33 @@ mod tests {
     fn sanitize_ext_strips_junk_and_caps_length() {
         assert_eq!(sanitize_ext("mp4"), "mp4");
         assert_eq!(sanitize_ext(".MOV"), "mov");
-        assert_eq!(sanitize_ext("../../etc/passwd"), "etcpa"); // separators gone, capped at 5
+        assert_eq!(sanitize_ext("../../etc/passwd"), "bin"); // separators gone, not a media type
         assert_eq!(sanitize_ext(""), "bin");
         assert_eq!(sanitize_ext("..."), "bin");
         assert_eq!(sanitize_ext("we!b@m#"), "webm");
+    }
+
+    #[test]
+    fn sanitize_ext_refuses_active_content_types() {
+        // #194: the served Content-Type comes straight off this extension,
+        // and `/media/blob` is the authenticated API's own origin. A cache
+        // that can mint text/html or image/svg+xml there is a script-
+        // execution primitive for a prompt-injected agent.
+        assert_eq!(sanitize_ext("html"), "bin");
+        assert_eq!(sanitize_ext("htm"), "bin");
+        assert_eq!(sanitize_ext("svg"), "bin");
+        assert_eq!(sanitize_ext("js"), "bin");
+        assert_eq!(sanitize_ext("xml"), "bin");
+        assert_eq!(sanitize_ext("HTML"), "bin", "case is no escape hatch");
+    }
+
+    #[test]
+    fn sanitize_ext_keeps_every_playable_type() {
+        // The allowlist must cover exactly what the widgets play — a type
+        // dropped from here silently downgrades a working clip to a download.
+        for ext in ["mp4", "mov", "m4v", "webm", "mp3", "m4a", "wav", "aac", "ogg", "flac"] {
+            assert_eq!(sanitize_ext(ext), ext, "{ext} must survive");
+        }
     }
 
     #[test]

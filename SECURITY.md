@@ -31,9 +31,17 @@ for high-severity issues.
 In scope:
 
 - `aiui.app` (Tauri companion) — signing/notarization, HTTP endpoint,
-  tunnel manager, lifetime socket, auto-updater trust chain
+  tunnel manager, lifetime socket, auto-updater trust chain,
+  render-time image resolver (the `http(s)://` `src` fetch)
 - `aiui-mcp` Python package — token handling, preflight, render call path
 - Release pipeline signing and notarisation
+
+The release workflows pin every third-party action to a full commit SHA
+and the Rust compiler to the channel in `rust-toolchain.toml`, so a moved
+upstream tag cannot reach the job that holds the Developer ID
+certificate, the notary key and the minisign updater key
+(`scripts/check-workflow-pins.sh` enforces this on every pull request).
+A floating ref that slips past that guard is in scope — please report it.
 
 Out of scope (report upstream instead):
 
@@ -47,5 +55,10 @@ Out of scope (report upstream instead):
   notarised by Apple.
 - Updater artifacts are signed with an Ed25519 key and verified on the
   client before installation.
-- No telemetry, no outbound calls other than the GitHub-hosted updater
-  feed.
+- No telemetry and no analytics. aiui makes exactly two kinds of
+  outbound request: the GitHub-hosted updater feed, and a `GET` for any
+  `http(s)://` image URL a dialog spec asks it to render — publicly
+  routable destinations only; loopback, private, link-local, CGNAT and
+  ULA targets are refused before a socket is opened, resolved addresses
+  are pinned so a second DNS answer cannot slip past that check, and
+  redirects are not followed. Nothing else leaves your machine.

@@ -1,6 +1,6 @@
 {
   "name": "aiui-companion",
-  "version": "0.4.5",
+  "version": "0.11.0",
   "description": "aiui companion — renders dialogs for remote Claude Code sessions",
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
@@ -15,23 +16,31 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tauri-apps/cli": "^2.10.1",
+    "@testing-library/svelte": "^5.4.2",
     "@tsconfig/svelte": "^5.0.8",
-    "svelte": "^5.55.4",
+    "jsdom": "^30.1.0",
+    "svelte": "^5.57.1",
     "svelte-check": "^4.4.6",
     "typescript": "^6.0.3",
-    "vite": "^8.0.9"
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
   },
   "optionalDependencies": {
     "appdmg": "^0.6.6"
+  },
+  "overrides": {
+    "svelte-i18n": {
+      "esbuild": "^0.25.0"
+    }
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
-    "dompurify": "^3.4.1",
+    "dompurify": "^3.4.15",
     "marked": "^18.0.2",
-    "mermaid": "^11.14.0",
+    "mermaid": "^11.17.2",
     "svelte-i18n": "^4.0.1"
   }
 }

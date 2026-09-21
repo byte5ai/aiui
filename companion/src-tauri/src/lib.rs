@@ -16,19 +16,33 @@ mod setup;
 mod skill;
 mod tunnel;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_notification::NotificationExt;
 
-/// Tauri window labels. Setup and dialog live in *separate* windows so:
+/// Tauri window label of the settings window. Setup and dialogs live in
+/// *separate* windows so:
 ///  • the agent's dialog never visually overlaps the user's settings,
 ///  • neither window can hide behind the other in macOS' z-stack,
 ///  • each gets its own movable title bar without weird re-layout
 ///    artefacts when the content kind changes.
 /// See the v0.4.25 multi-window refactor in lib.rs for the lifecycle
 /// rules that govern when each is created and torn down.
+///
+/// There is deliberately no `DIALOG_WINDOW_LABEL` counterpart: since the
+/// Step-4 multi-window rewrite a dialog window's label IS its dialog id, so
+/// "is this a dialog window?" is `is_dialog_window_label` and "which dialog
+/// window?" is `DialogState::newest_id()`. The stale constant outlived the
+/// rewrite by one release and silently made `/health`'s WebView probe
+/// unreachable (#179).
 pub const SETUP_WINDOW_LABEL: &str = "setup";
-pub const DIALOG_WINDOW_LABEL: &str = "dialog";
+
+/// Broadcast whenever the setup window is hidden (`false`) or surfaced again
+/// (`true`). Settings gates its status poll on it — the window is hidden, not
+/// destroyed (Invariant I2), so the frontend has no lifecycle hook of its own
+/// to hang that on. Issue #208.
+pub const SETUP_VISIBILITY_EVENT: &str = "setup:visibility";
 
 /// Text of the "an update is available" system notification (#188).
 ///
@@ -109,21 +123,28 @@ fn dialog_torn_down_recently() -> bool {
         .unwrap_or(false)
 }
 
+/// `window` is injected by Tauri, not passed by the frontend — see
+/// `dialog_command_allowed` for why every `id`-carrying dialog command needs
+/// it, and `close_window` for the pattern.
 #[tauri::command]
 fn dialog_submit(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     result: serde_json::Value,
 ) -> Result<(), String> {
+    require_own_dialog(&window, &id, "dialog_submit")?;
     state.complete(&id, result);
     Ok(())
 }
 
 #[tauri::command]
 fn dialog_cancel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<(), String> {
+    require_own_dialog(&window, &id, "dialog_cancel")?;
     state.cancel(&id);
     Ok(())
 }
@@ -144,11 +165,13 @@ fn dialog_cancel(
 /// field the outcome carries status only, never the value.
 #[tauri::command]
 fn write_dialog_targets(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
     values: std::collections::HashMap<String, String>,
     action: Option<String>,
 ) -> Result<std::collections::HashMap<String, filewrite::WriteOutcome>, String> {
+    require_own_dialog(&window, &id, "write_dialog_targets")?;
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
@@ -283,10 +306,63 @@ fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
 /// window closes itself.
 #[tauri::command]
 fn get_dialog_spec(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<Option<dialog::DialogRequest>, String> {
+    require_own_dialog(&window, &id, "get_dialog_spec")?;
     Ok(state.get_request(&id))
+}
+
+/// Seconds left before the backend sweeps this dialog, or `None` if it is
+/// already gone. The open window re-reads this every ~30 s and on
+/// `visibilitychange` to rebase its countdown deadline: the WebView's
+/// `Date.now()` and Rust's monotonic `Instant` disagree across a system
+/// sleep, and WebView timers are throttled in an occluded window, so a
+/// deadline derived once at mount drifts in both directions (#207).
+#[tauri::command]
+fn get_dialog_remaining(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<Option<u64>, String> {
+    Ok(state.remaining_secs(&id))
+}
+
+/// Absolute destination per `target`-carrying field, keyed by field name, so
+/// the approval line can show the path that will actually be written instead
+/// of the agent-supplied `~/`-form (`docs/skill.md` promises the resolved
+/// path). Only meaningful for a LOCAL session — for a bridge-served one the
+/// write happens on the agent's host with *that* host's `$HOME`, so the shell
+/// does not call this and keeps the raw form, qualified with the origin
+/// (#207).
+#[tauri::command]
+fn resolve_dialog_targets(
+    state: tauri::State<'_, Arc<dialog::DialogState>>,
+    id: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let req = state
+        .get_request(&id)
+        .ok_or_else(|| "dialog no longer active".to_string())?;
+    let mut out = std::collections::HashMap::new();
+    for field in collect_target_fields(&req.spec) {
+        let name = match field.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let path = match field
+            .get("target")
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        out.insert(
+            name,
+            filewrite::expand_tilde(path).to_string_lossy().into_owned(),
+        );
+    }
+    Ok(out)
 }
 
 /// Frontend response to a `ui:ping` event from `/health`. Same shape as
@@ -302,17 +378,97 @@ fn ui_pong(
 
 /// A dialog window's label IS its dialog id (Step 4 multi-window): any window
 /// that isn't the setup window is a dialog window. There is no longer a single
-/// reused `DIALOG_WINDOW_LABEL` window.
-fn is_dialog_window_label(label: &str) -> bool {
+/// reused dialog window with a fixed label.
+pub(crate) fn is_dialog_window_label(label: &str) -> bool {
     label != SETUP_WINDOW_LABEL
+}
+
+/// Message handed back to a window that tried a command it may not run.
+/// Deliberately terse and identical for every command — a caller that is not
+/// supposed to be here learns nothing from it.
+const NOT_ALLOWED_FROM_THIS_WINDOW: &str = "not allowed from this window";
+
+/// May this window run the privileged, Settings-side commands (#195)?
+///
+/// Only the setup window may. Everything else is a dialog window rendering
+/// markdown, mermaid and `compare` bodies that an agent on a remote host
+/// wrote — aiui's one untrusted-content surface.
+///
+/// This has to be a Rust check rather than a capability entry: Tauri only
+/// consults the ACL for `plugin:`-prefixed commands unless the app ships its
+/// own ACL manifest, and aiui ships none. So `capabilities/*.json` says
+/// nothing whatsoever about `uninstall_all`, `quit_app` or `add_remote`, and
+/// before this gate *any* window could invoke *any* of the 22 app commands.
+/// An app manifest would also work, but it would move a security boundary
+/// into generated JSON that no test reads; one line of Rust is greppable and
+/// unit-testable without a running app.
+///
+/// Pure, so the rule is testable without a window.
+pub(crate) fn is_privileged_window(label: &str) -> bool {
+    label == SETUP_WINDOW_LABEL
+}
+
+/// `Ok(())` iff `window` may run `command`; logs and refuses otherwise.
+fn require_privileged_window(window: &tauri::WebviewWindow, command: &str) -> Result<(), String> {
+    if is_privileged_window(window.label()) {
+        return Ok(());
+    }
+    log::warn!(
+        "[aiui] refusing privileged command {command} from window {}",
+        window.label()
+    );
+    Err(NOT_ALLOWED_FROM_THIS_WINDOW.to_string())
+}
+
+/// May the window labelled `window_label` act on dialog `id` (#195)?
+///
+/// A dialog window's label IS its dialog id, so the only legitimate answer is
+/// "its own dialog". The commands that take an `id` — `get_dialog_spec`,
+/// `dialog_submit`, `dialog_cancel`, `write_dialog_targets` — took it purely
+/// on trust, so with N concurrent dialogs open (the I8 multi-session case this
+/// window model exists for) one session's window could read or answer
+/// another's, including a `form` holding a secret.
+///
+/// The setup window is deliberately not exempt: it never renders a dialog.
+/// `ui_pong` is deliberately not covered: its `id` is an ack token, not a
+/// dialog id, and has no window to compare against.
+///
+/// Pure, so the rule is testable without a window.
+pub(crate) fn dialog_command_allowed(window_label: &str, id: &str) -> bool {
+    // The empty-string guard is not reachable through Tauri (a window always
+    // has a label), but it keeps the rule fail-closed rather than resting on
+    // `"" == ""` if it is ever called from somewhere else.
+    !window_label.is_empty() && window_label == id
+}
+
+/// `Ok(())` iff `window` owns dialog `id`; logs and refuses otherwise.
+fn require_own_dialog(window: &tauri::WebviewWindow, id: &str, command: &str) -> Result<(), String> {
+    if dialog_command_allowed(window.label(), id) {
+        return Ok(());
+    }
+    log::warn!(
+        "[aiui] refusing {command} for dialog {id} from window {}",
+        window.label()
+    );
+    Err(NOT_ALLOWED_FROM_THIS_WINDOW.to_string())
 }
 
 /// macOS: drop back to Accessory (no Dock icon) once no dialog window remains
 /// open *other than* `except` (the one currently being torn down — `destroy()`
-/// may not have removed it from the window list yet) and the setup window is
-/// hidden. Matches the Regular-mode promote in `build_dialog_window`.
+/// may not have removed it from the window list yet), the setup window is
+/// hidden, and no native file picker is open. Matches the Regular-mode
+/// promote in `build_dialog_window` and in [`surface_for_native_picker`].
+///
+/// #194: the picker check is not optional. A native `NSOpenPanel` is not a
+/// Tauri window, so it never shows up in `webview_windows()` — without the
+/// [`PickerGuard::is_open`] test, a dialog closing while an `upload` picker
+/// is on screen would demote out from under the picker and sink it behind
+/// whatever the user is looking at.
 #[cfg(target_os = "macos")]
 fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
+    if PickerGuard::is_open() {
+        return;
+    }
     let setup_open = app
         .get_webview_window(SETUP_WINDOW_LABEL)
         .and_then(|w| w.is_visible().ok())
@@ -324,6 +480,115 @@ fn demote_if_no_dialogs_except(app: &tauri::AppHandle, except: &str) {
     if !other_dialog_open && !setup_open {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
+}
+
+/// Set while a native file picker (`POST /upload`) is open. Process-global
+/// because the thing it guards is process-global: there is exactly one
+/// NSOpenPanel-capable app, and exactly one activation policy.
+static PICKER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII permit for opening the one native file picker (#194).
+///
+/// Does two jobs that `upload_pick`'s five early-return paths made
+/// unmaintainable by hand:
+///
+/// 1. **Serialises.** Only one picker may be open at a time — two stacked
+///    system panels give the user no way to tell which agent asked for
+///    which file. A second `POST /upload` gets `None` here and answers 409.
+/// 2. **Surfaces and un-surfaces.** On macOS the companion normally runs as
+///    an `LSUIElement` agent (no Dock icon, no Cmd-Tab entry) and macOS will
+///    not reliably bring an Accessory app's panels forward, so the picker is
+///    born behind the user's frontmost window with nothing to click to reach
+///    it. [`surface_for_native_picker`] promotes to `Regular` first; dropping
+///    the guard demotes again — on *every* exit path, including the timeout
+///    and the 413.
+pub(crate) struct PickerGuard {
+    /// Only read by the macOS demote-on-drop; the field does not exist on
+    /// other targets, where the activation policy is a no-op concept.
+    #[cfg(target_os = "macos")]
+    app: Option<tauri::AppHandle>,
+}
+
+impl PickerGuard {
+    /// Claim the single picker slot without touching the activation policy.
+    /// `None` means a picker is already open. Separate from
+    /// [`surface_for_native_picker`] so the serialisation half is testable
+    /// without an `AppHandle`.
+    pub(crate) fn try_claim() -> Option<Self> {
+        PICKER_OPEN
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| PickerGuard {
+                #[cfg(target_os = "macos")]
+                app: None,
+            })
+    }
+
+    /// Is a native picker open right now? Consulted by
+    /// `demote_if_no_dialogs_except` so an unrelated dialog closing cannot
+    /// demote the app while the picker is up — a macOS-only concern, hence
+    /// the dead-code exemption everywhere else (the tests use it on every
+    /// platform).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn is_open() -> bool {
+        PICKER_OPEN.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for PickerGuard {
+    fn drop(&mut self) {
+        // Release the slot *before* demoting, so the demote sees an
+        // accurate `is_open()`.
+        PICKER_OPEN.store(false, std::sync::atomic::Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Some(app) = self.app.take() {
+            // Not a blind demote: a dialog window may have opened while the
+            // picker was up, and it still needs Regular mode.
+            demote_if_no_dialogs_except(&app, "");
+        }
+    }
+}
+
+/// Claim the picker slot and make the app able to show a native panel the
+/// user can actually see. Returns `None` when another picker is already
+/// open (the caller answers 409).
+///
+/// Deliberately *not* `surface_for_dialog`: that is a `#[tauri::command]`
+/// invoked from the frontend, and it hunts for a window to show and focus —
+/// `upload_pick` has neither a frontend nor a window of its own. Opening a
+/// throwaway window just to have something to promote would flash an empty
+/// frame at the user and skew the dialog-count arithmetic
+/// `demote_if_no_dialogs_except` depends on.
+pub(crate) fn surface_for_native_picker(app: &tauri::AppHandle) -> Option<PickerGuard> {
+    let guard = PickerGuard::try_claim()?;
+    #[cfg(target_os = "macos")]
+    let guard = {
+        let mut guard = guard;
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        guard.app = Some(app.clone());
+        guard
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    Some(guard)
+}
+
+/// The window a native picker should be parented to, if any is *visible*.
+///
+/// Parenting matters on Windows, where an unowned dialog can land behind the
+/// foreground app. On macOS a parented panel becomes a window-modal sheet —
+/// which is why an invisible parent is worse than none at all: the sheet
+/// would be attached to a window nobody can see. Hence the visibility test,
+/// not merely "any window exists".
+pub(crate) fn visible_window_for_picker(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_visible().unwrap_or(false))
 }
 
 #[tauri::command]
@@ -405,27 +670,29 @@ pub(crate) fn sweep_orphan_dialog_window(app: &tauri::AppHandle) {
 /// Would installing + relaunching right now disrupt anything the user is
 /// looking at? `true` = safe.
 ///
-/// **Nothing calls this today.** #188: the doc here used to describe the
-/// v0.4.43 silent-install path in `updater.ts` as its caller. That path was
-/// removed in v0.4.44 — a transparent self-install left the user unaware
-/// their app had restarted — so this command has had no caller since, and
-/// the comment sent the next reader looking for an auto-install mechanism
-/// that does not exist.
+/// The caller is `checkForUpdates` in `companion/src/lib/updater.ts`: the
+/// manual install path invokes this after the user confirms the native
+/// prompt and *before* `downloadAndInstall()`. `false` means a dialog is
+/// still waiting on a user response, so the install is skipped and the
+/// pending-update banner stays where it is.
 ///
-/// Kept rather than deleted because it encodes the right predicate for the
-/// open question of whether aiui should install while idle: the dialog
-/// registry being empty, i.e. no pending render waiting on user input.
+/// #197 restored that wiring. Between v0.4.44 and this change the command
+/// had no caller at all: the v0.4.43 silent-install path it was written for
+/// was removed, and the manual path never picked the gate up — so clicking
+/// *Install* while a remote agent had a form open tore that window down
+/// mid-render, the exact Invariant I5 violation this exists to prevent.
+///
+/// The predicate itself lives in `lifetime::update_install_is_safe` so it is
+/// unit-testable; the agent-facing `/update` handler applies the same rule.
 /// Settings being open is deliberately *not* part of it — the user is there
-/// intentionally, so a restart is fine. If that question is ever answered
-/// "yes", the install belongs in the headless task in `run()` (never in a
-/// window), reading `dialog_state.stats()` directly, and this command
-/// should be deleted along with its registration rather than called from
-/// the frontend.
+/// intentionally, so a restart is fine.
 #[tauri::command]
 async fn is_update_safe_to_install(
     dialog_state: tauri::State<'_, Arc<dialog::DialogState>>,
 ) -> Result<bool, String> {
-    Ok(dialog_state.stats().orphan_count == 0)
+    Ok(lifetime::update_install_is_safe(
+        dialog_state.stats().orphan_count,
+    ))
 }
 
 /// Called from the frontend right before showing a modal update dialog.
@@ -433,7 +700,11 @@ async fn is_update_safe_to_install(
 /// won't reliably bring its dialogs to the foreground — we temporarily
 /// promote the app to Regular so the prompt actually becomes visible.
 #[tauri::command]
-async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
+async fn surface_for_dialog(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_privileged_window(&window, "surface_for_dialog")?;
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -452,6 +723,11 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = win {
         let _ = win.show();
         let _ = win.set_focus();
+        // #208: if that was the setup window, it may have been hidden with
+        // its status poll stopped — same signal as the Dock-click path.
+        if win.label() == SETUP_WINDOW_LABEL {
+            let _ = app.emit(SETUP_VISIBILITY_EVENT, true);
+        }
     }
     Ok(())
 }
@@ -464,12 +740,26 @@ async fn surface_for_dialog(app: tauri::AppHandle) -> Result<(), String> {
 #[derive(Default)]
 pub struct PendingUpdate(pub std::sync::Mutex<Option<String>>);
 
+/// Non-contention `gui.lock` failure (#196). `Some(message)` when
+/// `ProcessLock::try_acquire` failed for a reason that is *not* another GUI
+/// holding the lock — we keep running without the lock and this drives the
+/// Settings banner that says so. Newtype for the same reason as
+/// [`PendingUpdate`]: Tauri resolves managed state by type.
+#[derive(Default)]
+pub struct LockError(pub std::sync::Mutex<Option<String>>);
+
 #[tauri::command]
 async fn set_pending_update(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<PendingUpdate>>,
     version: String,
 ) -> Result<(), String> {
+    // #195: this emits `update:available` to every window, so an untrusted
+    // dialog window could otherwise forge an update banner in Settings —
+    // exactly what withholding `core:event:allow-emit` from `dialog.json`
+    // prevents on the plugin side.
+    require_privileged_window(&window, "set_pending_update")?;
     let trimmed = version.trim();
     let new_value = if trimmed.is_empty() {
         None
@@ -488,14 +778,42 @@ async fn set_pending_update(
 
 #[tauri::command]
 async fn clear_pending_update(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<PendingUpdate>>,
 ) -> Result<(), String> {
+    require_privileged_window(&window, "clear_pending_update")?;
     if let Ok(mut slot) = state.0.lock() {
         *slot = None;
     }
     let _ = app.emit("update:available", &None::<String>);
     Ok(())
+}
+
+/// Has the on-disk version caught up with the version the banner is
+/// advertising? `true` = drop the banner.
+///
+/// #197: the pending-update slot had no expiry. A release that was yanked,
+/// or a `latest.json` that stopped advertising this platform, left the
+/// banner announcing a version the updater would no longer offer — clicking
+/// *Install* answered "you are on the current version" and the banner came
+/// straight back, with no way to dismiss it. Comparing against our own
+/// `CARGO_PKG_VERSION` closes that loop for the case that matters most: the
+/// update already installed.
+///
+/// `semver` rather than string comparison, because `"0.10.2" <= "0.9.9"`
+/// lexically and that would hide a real update. Anything either side cannot
+/// parse (empty, `"v0.10.2"`, a date) is *not* stale: refusing to clear a
+/// banner we do not understand is the safe direction — the user still gets
+/// an install button, they just do not get it taken away by a parse slip.
+fn pending_update_is_stale(pending: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(pending.trim()),
+        semver::Version::parse(current.trim()),
+    ) {
+        (Ok(pending), Ok(current)) => pending <= current,
+        _ => false,
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -531,12 +849,26 @@ struct StatusReport {
     /// red banner in Settings so the user knows why dialogs aren't
     /// landing.
     http_error: Option<String>,
+    /// `Some(message)` when `gui.lock` could not be acquired for a reason
+    /// other than another GUI holding it (#196). aiui keeps running without
+    /// the lock; the banner tells the user what failed instead of leaving a
+    /// silent exit and a wrong trace line behind.
+    lock_error: Option<String>,
     /// Live result of a TCP self-probe to `localhost:http_port`. The Rust
     /// side does this for us because a WebView `fetch()` would be blocked
     /// by macOS App Transport Security (ATS) on plaintext localhost
     /// requests — that's how v0.4.8 ended up showing a permanent red
     /// banner on a perfectly healthy server. Issue #77.
     http_alive: bool,
+    /// Why `http_alive` is what it is — `ProbeOutcome::as_str`. #208: a
+    /// bare `false` was indistinguishable between "you just uninstalled
+    /// and the token is gone" and "another process owns the port", and
+    /// Settings claimed the latter for all of them.
+    http_probe_reason: &'static str,
+    /// The i18n key Settings renders as the banner's hint line, picked by
+    /// `health_hint_key` from the probe reason, `http_error` and the OS.
+    /// Computed here rather than in Svelte so the mapping is unit-tested.
+    http_hint_key: String,
     /// Lower-case OS identifier — `"macos"`, `"windows"`, `"linux"`, or
     /// `"other"`. Lets the Svelte side render OS-specific copy (e.g. the
     /// uninstall instructions: drag to Trash vs. Apps & Features) without
@@ -547,6 +879,13 @@ struct StatusReport {
     /// non-modal banner in Settings ("Update auf v0.4.X verfügbar —
     /// Installieren"). v0.4.44.
     pending_update: Option<String>,
+    /// True when this binary runs from a location it won't still be at on
+    /// the next launch — a translocated copy off the DMG, `~/Downloads`,
+    /// a temp dir. Host registration is refused in that state (#198),
+    /// because the path we would write as `command` is dead by the time the
+    /// host makes its first tool call. Drives a blocking banner in Settings
+    /// telling the user to move the app and relaunch.
+    ephemeral_install: bool,
 }
 
 const fn current_os() -> &'static str {
@@ -562,14 +901,42 @@ const fn current_os() -> &'static str {
 }
 
 #[tauri::command]
+// A Tauri command whose arguments are injected State handles + the window;
+// each is load-bearing (privileged-window check, expensive-probe cache, lock
+// and update state), so the count is inherent, not a design smell.
+#[allow(clippy::too_many_arguments)]
 async fn status(
+    window: tauri::WebviewWindow,
+    // `force: true` bypasses the expensive-probe cache. The frontend passes
+    // it for user-triggered refreshes only; the 2 s poll leaves it unset,
+    // which is what keeps an open Settings window off `pgrep`/`tasklist`
+    // more than four times a minute (#208).
+    force: Option<bool>,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
     http_err: tauri::State<'_, Arc<std::sync::Mutex<Option<String>>>>,
     pending_update: tauri::State<'_, Arc<PendingUpdate>>,
+    lock_err: tauri::State<'_, Arc<LockError>>,
+    expensive: tauri::State<'_, Arc<ExpensiveStatusCache>>,
 ) -> Result<StatusReport, String> {
+    // #195: this discloses the token path, the HTTP port and every registered
+    // SSH alias — reconnaissance for anything that got script into a dialog.
+    require_privileged_window(&window, "status")?;
     let bin = setup::app_binary_path();
-    let http_alive = probe_http_self(&cfg).await;
+    // #208: the HTTP round-trip and the `pgrep`/`tasklist` spawn are behind
+    // a 15 s TTL. The rest — config flags, skill stat, remotes, tunnels —
+    // is cheap enough to answer on every poll and is what the user actually
+    // watches change while they click around in Settings.
+    let cfg_for_probe = cfg.inner().clone();
+    let expensive = expensive
+        .sample(force.unwrap_or(false), || async move {
+            ExpensiveStatus {
+                probe: probe_http_self(&cfg_for_probe).await,
+                claude_desktop_running: setup::is_claude_desktop_running(),
+            }
+        })
+        .await;
+    let http_error = http_err.lock().ok().and_then(|s| s.clone());
     Ok(StatusReport {
         app_binary_path: bin.clone(),
         token_path: cfg.token_path.display().to_string(),
@@ -577,16 +944,116 @@ async fn status(
         claude_config_ok: setup::is_claude_config_current(&bin),
         claude_code_config_ok: setup::is_claude_code_config_current(&bin),
         skill_installed: skill::is_installed_locally(),
-        claude_desktop_running: setup::is_claude_desktop_running(),
+        claude_desktop_running: expensive.claude_desktop_running,
         remotes: setup::load_remotes(),
         tunnels: tm.snapshot().await,
         build_info: logging::BUILD_INFO,
         welcome_pending: is_first_run(&cfg),
-        http_error: http_err.lock().ok().and_then(|s| s.clone()),
-        http_alive,
+        http_alive: expensive.probe.is_alive(),
+        http_probe_reason: expensive.probe.as_str(),
+        http_hint_key: health_hint_key(
+            expensive.probe.as_str(),
+            http_error.is_some(),
+            current_os(),
+        ),
+        http_error,
+        lock_error: lock_err.0.lock().ok().and_then(|s| s.clone()),
         os: current_os(),
-        pending_update: pending_update.0.lock().ok().and_then(|s| s.clone()),
+        pending_update: current_pending_update(pending_update.inner()),
+        ephemeral_install: setup::is_ephemeral_install(),
     })
+}
+
+/// Read the pending-update slot, dropping it when the on-disk version has
+/// caught up (#197). Clears the slot rather than merely filtering the
+/// report, so the 6 h headless check treats the *next* genuinely new
+/// version as news again. No `update:available` emit needed: the Settings
+/// banner is driven by this very status poll, which runs every 2 s.
+fn current_pending_update(state: &PendingUpdate) -> Option<String> {
+    let mut slot = state.0.lock().ok()?;
+    if slot
+        .as_deref()
+        .is_some_and(|v| pending_update_is_stale(v, env!("CARGO_PKG_VERSION")))
+    {
+        logging::trace(&format!(
+            "update-check: clearing stale pending-update banner (pending {:?} <= on-disk {})",
+            slot.as_deref(),
+            env!("CARGO_PKG_VERSION")
+        ));
+        *slot = None;
+    }
+    slot.clone()
+}
+
+/// Why the HTTP self-probe said what it said.
+///
+/// #208: the probe used to return a bare `bool`, and Settings turned every
+/// `false` into one sentence — "something else is holding port 7777, check
+/// `lsof`". Four unrelated conditions collapse into that `false`, and only
+/// one of them is a port conflict. The deterministic case is Uninstall:
+/// `uninstall_all` deletes the token file, the next probe can't read it, and
+/// the user is told to hunt a squatter that does not exist while aiui's own
+/// server is still listening. The outcome travels to the frontend so the
+/// hint can name the actual failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// `/probe` answered with our marker — the server on the port is us.
+    Alive,
+    /// The token file is missing or unreadable, so the probe never ran.
+    /// Says nothing at all about the port.
+    TokenUnreadable,
+    /// Nobody answered within the 500 ms budget (or the connection failed).
+    Unreachable,
+    /// Something answered, but it isn't aiui — this *is* the squatter case.
+    WrongService,
+    /// `reqwest` refused to build a client. Local fault, not the port's.
+    ClientBuildFailed,
+}
+
+impl ProbeOutcome {
+    /// Stable, lower-snake wire name for `StatusReport.http_probe_reason`.
+    /// Consumed by `health_hint_key` and shown in no UI directly.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProbeOutcome::Alive => "alive",
+            ProbeOutcome::TokenUnreadable => "token_unreadable",
+            ProbeOutcome::Unreachable => "unreachable",
+            ProbeOutcome::WrongService => "wrong_service",
+            ProbeOutcome::ClientBuildFailed => "client_build_failed",
+        }
+    }
+
+    pub(crate) fn is_alive(self) -> bool {
+        matches!(self, ProbeOutcome::Alive)
+    }
+}
+
+/// Which i18n key the health banner's hint line should render (#208).
+///
+/// Pure so the mapping — the part that was wrong — is testable without a
+/// window, a port or a token file.
+///
+/// `bind_failed` is `http_error.is_some()`: the HTTP server recorded an
+/// actual bind/serve failure at startup. That, and a live non-aiui service
+/// on the port, are the only two states where "something else is holding
+/// the port" is a true statement; everything else gets a hint that matches
+/// what actually happened.
+pub(crate) fn health_hint_key(reason: &str, bind_failed: bool, os: &str) -> String {
+    let squatter = format!("settings.http_error.hint.{os}");
+    if bind_failed {
+        return squatter;
+    }
+    match reason {
+        "wrong_service" => squatter,
+        "token_unreadable" => "settings.http_error.hint.token".to_string(),
+        "unreachable" | "client_build_failed" => {
+            "settings.http_error.hint.unreachable".to_string()
+        }
+        // `alive` (banner not shown) and anything a future probe adds:
+        // the OS hint is the historical default, so an unmapped reason
+        // degrades to today's behaviour rather than to an empty line.
+        _ => squatter,
+    }
 }
 
 /// Authenticated HTTP self-probe to verify our own HTTP server is
@@ -595,14 +1062,15 @@ async fn status(
 /// LISTEN — the kernel answers SYN regardless of who's behind it. Issue
 /// #77 (revised in v0.4.10): we hit `/probe` with our bearer token and
 /// verify the response carries the aiui marker. Anything else (squatter
-/// without our token, non-aiui content, timeout) reads as "down".
+/// without our token, non-aiui content, timeout) reads as "down" — but
+/// since #208 it reads as a *specific* kind of down, see `ProbeOutcome`.
 ///
 /// 500 ms timeout to cover token-read + HTTP round-trip + JSON parse
 /// over loopback; this stays well under the Settings refresh interval.
-async fn probe_http_self(cfg: &config::AppConfig) -> bool {
+async fn probe_http_self(cfg: &config::AppConfig) -> ProbeOutcome {
     let token = match std::fs::read_to_string(&cfg.token_path) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::TokenUnreadable,
     };
     let url = format!("http://127.0.0.1:{}/probe", cfg.http_port);
     let client = match reqwest::Client::builder()
@@ -610,28 +1078,116 @@ async fn probe_http_self(cfg: &config::AppConfig) -> bool {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::ClientBuildFailed,
     };
     let resp = match client.get(&url).bearer_auth(&token).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return false,
+        // A 401/403/5xx means *something* is answering on the port and it
+        // isn't behaving like our server — that is the squatter shape. A
+        // transport error (refused, timed out) is nobody answering.
+        Ok(_) => return ProbeOutcome::WrongService,
+        Err(_) => return ProbeOutcome::Unreachable,
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return ProbeOutcome::WrongService,
     };
-    body.get("aiui")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    if body.get("aiui").and_then(|v| v.as_bool()).unwrap_or(false) {
+        ProbeOutcome::Alive
+    } else {
+        ProbeOutcome::WrongService
+    }
+}
+
+/// The half of `status` that costs real resources: the authenticated HTTP
+/// round-trip (token read + `reqwest` client + request) and the Claude
+/// Desktop liveness check, which spawns `pgrep` on macOS and `tasklist` on
+/// Windows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpensiveStatus {
+    pub(crate) probe: ProbeOutcome,
+    pub(crate) claude_desktop_running: bool,
+}
+
+/// TTL for [`ExpensiveStatusCache`]. Settings refreshes every 2 s while it is
+/// visible, which is the right cadence for config flags and tunnel state but
+/// absurd for a child-process spawn. 15 s keeps the window feeling live while
+/// capping the process spawns at four a minute.
+pub(crate) const EXPENSIVE_STATUS_TTL: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Memoises [`ExpensiveStatus`] for [`EXPENSIVE_STATUS_TTL`] (#208).
+///
+/// Not a general-purpose cache: it exists because the Settings poll is the
+/// only caller and it asks far more often than the answer changes.
+pub(crate) struct ExpensiveStatusCache {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, ExpensiveStatus)>>,
+}
+
+impl ExpensiveStatusCache {
+    pub(crate) fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fresh(&self) -> Option<ExpensiveStatus> {
+        let guard = self.slot.lock().ok()?;
+        let (at, value) = guard.as_ref()?;
+        (at.elapsed() < self.ttl).then_some(*value)
+    }
+
+    /// Returns the cached sample, or runs `compute` and caches its result.
+    ///
+    /// `force` bypasses the TTL. Settings passes it for refreshes the *user*
+    /// triggered — reopening the window, restarting Claude Desktop, adding a
+    /// remote — where a 15 s-stale answer would read as the button not having
+    /// worked. The 2 s poll never forces.
+    ///
+    /// The lock is never held across the `await` — it is a `std::sync::Mutex`
+    /// and the future has to stay `Send` for a Tauri command. Two concurrent
+    /// misses may therefore both compute; that costs one extra probe and is
+    /// cheaper than the async mutex it would take to prevent.
+    pub(crate) async fn sample<F, Fut>(&self, force: bool, compute: F) -> ExpensiveStatus
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ExpensiveStatus>,
+    {
+        if !force {
+            if let Some(hit) = self.fresh() {
+                return hit;
+            }
+        }
+        let value = compute().await;
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some((std::time::Instant::now(), value));
+        }
+        value
+    }
+}
+
+impl Default for ExpensiveStatusCache {
+    fn default() -> Self {
+        Self::new(EXPENSIVE_STATUS_TTL)
+    }
 }
 
 /// Marks the welcome banner as dismissed so it doesn't reappear on the
 /// next launch. Frontend calls this when the user clicks "Got it" on the
 /// first-run welcome section.
+///
+/// Returns the write error rather than swallowing it (#196): the flag is
+/// what `is_first_run` reads on every 2 s status tick, so a silent failure
+/// means the wizard reappears seconds later and nobody learns why.
 #[tauri::command]
-fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), String> {
-    mark_first_run_done(&cfg);
-    Ok(())
+fn dismiss_welcome(
+    window: tauri::WebviewWindow,
+    cfg: tauri::State<'_, Arc<config::AppConfig>>,
+) -> Result<(), String> {
+    require_privileged_window(&window, "dismiss_welcome")?;
+    mark_first_run_done(&cfg).map_err(|e| format!("could not persist first_run_done: {e}"))
 }
 
 /// Re-installs the local skill file. Bound to the "Skill reparieren" button
@@ -640,8 +1196,50 @@ fn dismiss_welcome(cfg: tauri::State<'_, Arc<config::AppConfig>>) -> Result<(), 
 /// case; this command is for the rare situation where the file got removed
 /// or corrupted between launches.
 #[tauri::command]
-fn repair_skill() -> Result<setup::StepResult, String> {
+fn repair_skill(window: tauri::WebviewWindow) -> Result<setup::StepResult, String> {
+    require_privileged_window(&window, "repair_skill")?;
     Ok(skill::install_locally())
+}
+
+/// Re-writes this binary's `aiui` entry into every MCP host installed here.
+/// Bound to the "Repair config" button in the Settings status row, which
+/// only appears when `claude_config_ok` reports false.
+///
+/// #198: the setup closure patches a host only when its `is_*_current`
+/// predicate says otherwise, so before this command there was no in-app way
+/// out of a stale entry the predicate had *already* accepted — the user saw
+/// a red dot and a button that only fixed the skill. Refuses while the app
+/// runs from an ephemeral location: registering a path that disappears is
+/// exactly the state the banner is asking the user to leave.
+#[tauri::command]
+fn repair_claude_config() -> Result<Vec<setup::StepResult>, String> {
+    let bin = setup::app_binary_path();
+    if setup::is_ephemeral_install() {
+        return Ok(vec![setup::StepResult {
+            ok: false,
+            message: "aiui runs from a temporary location — move aiui to Applications and relaunch."
+                .into(),
+            details: Some(bin),
+        }]);
+    }
+    let mut results = Vec::new();
+    if setup::is_claude_desktop_installed() {
+        results.push(setup::patch_claude_desktop_config(&bin));
+    }
+    if setup::is_claude_code_installed() {
+        results.push(setup::patch_claude_code_config(&bin));
+    }
+    if setup::is_codex_installed() {
+        results.push(setup::patch_codex_config(&bin));
+    }
+    if results.is_empty() {
+        results.push(setup::StepResult {
+            ok: true,
+            message: "No MCP host found on this machine — nothing to register.".into(),
+            details: None,
+        });
+    }
+    Ok(results)
 }
 
 /// Open a URL in the user's default browser. Tauri's WebView blocks
@@ -656,6 +1254,17 @@ fn repair_skill() -> Result<setup::StepResult, String> {
 /// metacharacters (`&`, `|`, `^`, …) inside the URL stay inert — closing
 /// the command-injection surface that the previous `cmd /C start "" …`
 /// path had on Windows (Codex review of PR #128).
+///
+/// #195 deliberately leaves this the **one** command a dialog window may
+/// still call. It is not an oversight: since #189 a `[text](https://…)` link
+/// in agent-supplied markdown is *meant* to route through here
+/// (`external-link.ts` swallows the click and invokes `open_url`, because
+/// `is_allowed_app_navigation` refuses to let the window navigate itself).
+/// Gating it on `is_privileged_window` would make every link in a `markdown`
+/// or `compare` field silently dead. What the dialog window gains is bounded
+/// to "open an http(s) URL in the user's browser" — no local state, no
+/// disclosure, nothing irreversible — and the scheme check below is the gate
+/// that matters here.
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     // Sanity-check: only allow http(s) so a compromised renderer can't
@@ -669,13 +1278,34 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Put `text` on the system clipboard from the Rust side (#208).
+///
+/// The welcome wizard's "copy demo prompt" button used `navigator.clipboard`,
+/// which needs a secure context and is not reliably available in WKWebView —
+/// and its failure path did nothing at all, leaving a first-run user clicking
+/// a button that never responds with no other route to the prompt. Rust-side
+/// clipboard access has no secure-context requirement.
+///
+/// No capability grant is added for this: the frontend calls *this* command,
+/// not the plugin's JS API, and app commands are not gated by capabilities.
+/// Granting `clipboard-manager:allow-write-text` would hand clipboard access
+/// to the dialog window too, which renders agent-supplied content.
+#[tauri::command]
+fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("clipboard write failed: {e}"))
+}
+
 /// Quit aiui after Uninstall has cleaned up configs/tokens/skill, killing
 /// every `aiui --mcp-stdio` child first so the auto-resurrect path in
 /// `mcp_attach` can't relaunch the GUI behind us. Without this, the user
 /// still couldn't drag aiui.app to the Trash because the process kept
 /// running. Issue #72.
 #[tauri::command]
-async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+async fn quit_app(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_privileged_window(&window, "quit_app")?;
     // Case (b): explicit uninstall. Latch the exit authority *first* so the
     // `ExitRequested` default-deny gate honours the `app.exit(0)` below instead
     // of vetoing it (Invariant I1).
@@ -707,8 +1337,12 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 /// The HTTP `/update` path latches the same authority directly in Rust.
 #[tauri::command]
 async fn authorize_exit_for_update(
+    window: tauri::WebviewWindow,
     exit_authority: tauri::State<'_, Arc<lifetime::ExitAuthority>>,
 ) -> Result<(), String> {
+    // #195: the latch is irreversible — once set, the very next window close
+    // terminates the host process. Settings-only.
+    require_privileged_window(&window, "authorize_exit_for_update")?;
     exit_authority.authorize();
     logging::trace("authorize_exit_for_update: exit authority latched for update-restart");
     Ok(())
@@ -731,7 +1365,8 @@ async fn authorize_exit_for_update(
 ///   We probe both; whichever exists wins. If neither does, surface a
 ///   clear error instead of silently no-oping.
 #[tauri::command]
-async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
+async fn restart_claude_desktop(window: tauri::WebviewWindow) -> Result<setup::StepResult, String> {
+    require_privileged_window(&window, "restart_claude_desktop")?;
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -887,10 +1522,14 @@ async fn restart_claude_desktop() -> Result<setup::StepResult, String> {
 
 #[tauri::command]
 async fn add_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    // #195: SSHes to a user-registered alias and writes persistent state on
+    // it. Settings-only, never from a window rendering agent content.
+    require_privileged_window(&window, "add_remote")?;
     // Validate at the API boundary: anything that doesn't pass
     // `is_valid_host_alias` is rejected here, before we spawn ssh or
     // touch persistent state. This is the primary defense against
@@ -1004,7 +1643,8 @@ async fn add_remote(
 }
 
 #[tauri::command]
-async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
+async fn reinstall_skill(window: tauri::WebviewWindow) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "reinstall_skill")?;
     let mut results = vec![skill::install_locally()];
     for host in setup::load_remotes() {
         results.push(skill::install_to_remote(&host));
@@ -1027,8 +1667,10 @@ async fn reinstall_skill() -> Result<Vec<setup::StepResult>, String> {
 /// path is to end and restart that Claude Code session.
 #[tauri::command]
 async fn resync_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
 ) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "resync_remote")?;
     let our_version = env!("CARGO_PKG_VERSION");
     // #184: use the uvx path discovered when this host was added. Passing
     // `None` here is what rewrote a pinned absolute path back down to the
@@ -1064,10 +1706,12 @@ async fn resync_remote(
 
 #[tauri::command]
 async fn remove_remote(
+    window: tauri::WebviewWindow,
     host_alias: String,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    require_privileged_window(&window, "remove_remote")?;
     // Stop the tunnel first so the forward port is freed before we touch
     // ssh config and remote token.
     tm.stop(&host_alias).await;
@@ -1097,27 +1741,133 @@ async fn remove_remote(
 
 /// Uninstall hint shown after the cleanup sweep — tells the user how to
 /// remove the app bundle itself, which aiui can't do for itself
-/// (a running process can't delete its own binary on either OS).
-fn uninstall_app_removal_hint() -> &'static str {
+/// (a running process can't delete its own binary on either OS), and that
+/// the `.bak.<ts>` copies aiui made of *their* config files are deliberately
+/// left in place (#196).
+fn uninstall_app_removal_hint() -> String {
     #[cfg(target_os = "macos")]
-    {
-        "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen."
-    }
+    let app = "Verschiebe /Applications/aiui.app in den Papierkorb, um auch die App zu entfernen.";
     #[cfg(target_os = "windows")]
-    {
-        "Deinstalliere aiui über \"Apps & Features\" in den Windows-Einstellungen, um auch die App zu entfernen."
-    }
+    let app = "Deinstalliere aiui über \"Apps & Features\" in den Windows-Einstellungen, um auch die App zu entfernen.";
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        "Entferne das aiui-Binary manuell, um auch die App zu entfernen."
+    let app = "Entferne das aiui-Binary manuell, um auch die App zu entfernen.";
+    format!(
+        "{app} Die Sicherungskopien `.bak.<ts>` neben deinen eigenen Config-Dateien \
+         (Claude-Desktop-Config, ~/.claude.json, ~/.codex/config.toml) bleiben absichtlich \
+         liegen — es sind Backups deiner Dateien, nicht aiui-State. Lösche sie selbst, \
+         wenn du sie nicht mehr brauchst."
+    )
+}
+
+/// The local state aiui owns inside its config dir, in removal order. The
+/// media cache lives outside it (under the Tauri app-cache dir) and is
+/// handled separately.
+const LOCAL_STATE_FILES: [&str; 6] = [
+    "token",
+    "first_run_done",
+    "remotes.json",
+    // #184: the uvx sidecar is local state too.
+    "remote-uvx.json",
+    "gui.lock",
+    "gui.sock",
+];
+
+/// `remove_file`, with "was not there anyway" counting as success — the
+/// point of the sweep is the end state, not who did the removing.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_dir_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove every file aiui wrote for itself and report, per path, whether it
+/// worked (#196).
+///
+/// The previous sweep deleted two of them behind `let _ =` and then claimed
+/// `ok: true` for the whole config dir. `remotes.json`, `gui.lock`,
+/// `gui.sock` and up to 1 GiB of cached review media survived an operation
+/// that reported them gone — and `save_remotes(&[])`, which was meant to
+/// clear the list, went through `atomic_write`'s `create_dir_all` and so
+/// *created* `remotes.json` on machines that never had one.
+fn sweep_local_state(
+    config_dir: &Path,
+    media_dir: Option<&Path>,
+) -> Vec<(PathBuf, std::io::Result<()>)> {
+    let mut out: Vec<(PathBuf, std::io::Result<()>)> = LOCAL_STATE_FILES
+        .iter()
+        .map(|name| {
+            let p = config_dir.join(name);
+            let r = remove_if_present(&p);
+            (p, r)
+        })
+        .collect();
+    if let Some(dir) = media_dir {
+        let r = remove_dir_if_present(dir);
+        out.push((dir.to_path_buf(), r));
+    }
+    out
+}
+
+/// Turn a sweep into the log line the user reads. `ok` is true only when
+/// every entry succeeded; anything that could not be removed is named in
+/// `details`, with its reason.
+fn sweep_step_result(
+    config_dir: &Path,
+    media_dir: Option<&Path>,
+    sweep: &[(PathBuf, std::io::Result<()>)],
+) -> setup::StepResult {
+    let failures: Vec<String> = sweep
+        .iter()
+        .filter_map(|(p, r)| r.as_ref().err().map(|e| format!("{}: {e}", p.display())))
+        .collect();
+    let removed_from = match media_dir {
+        Some(m) => format!("{} und {}", config_dir.display(), m.display()),
+        None => config_dir.display().to_string(),
+    };
+    let hint = uninstall_app_removal_hint();
+    if failures.is_empty() {
+        setup::StepResult {
+            ok: true,
+            message: format!("Lokale Dateien entfernt: {removed_from}"),
+            details: Some(hint),
+        }
+    } else {
+        setup::StepResult {
+            ok: false,
+            message: format!(
+                "Lokale Dateien nur teilweise entfernt: {removed_from} — \
+                 {} Eintrag/Einträge blieben liegen",
+                failures.len()
+            ),
+            details: Some(format!(
+                "Nicht entfernt:\n{}\n\n(gui.lock/gui.sock hält dieser Prozess noch offen — \
+                 sie verschwinden spätestens beim Beenden.)\n\n{hint}",
+                failures.join("\n")
+            )),
+        }
     }
 }
 
 #[tauri::command]
 async fn uninstall_all(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     cfg: tauri::State<'_, Arc<config::AppConfig>>,
     tm: tauri::State<'_, Arc<tunnel::TunnelManager>>,
 ) -> Result<Vec<setup::StepResult>, String> {
+    // #195: the largest blast radius in the app — stops every tunnel, deletes
+    // the token, the skill and every local *and remote* host config.
+    require_privileged_window(&window, "uninstall_all")?;
     tm.stop_all().await;
     let mut results = Vec::new();
     results.push(setup::remove_claude_desktop_config());
@@ -1136,20 +1886,25 @@ async fn uninstall_all(
         }
     }
     results.push(skill::remove_locally());
-    let _ = std::fs::remove_file(&cfg.token_path);
-    let _ = std::fs::remove_file(cfg.config_dir.join("first_run_done"));
-    let _ = setup::save_remotes(&[]);
-    // #184: the uvx sidecar is local state too — uninstall must not leave
-    // it behind.
-    let _ = std::fs::remove_file(cfg.config_dir.join("remote-uvx.json"));
-    results.push(setup::StepResult {
-        ok: true,
-        message: format!(
-            "Lokale Dateien entfernt: {}",
-            cfg.config_dir.display()
-        ),
-        details: Some(uninstall_app_removal_hint().into()),
-    });
+    // #196: sweep every file we own and report what actually happened. The
+    // media cache is the big one — `MEDIA_TOTAL_CAP` bounds it at 1 GiB of
+    // clips the user had aiui show them, and it lives outside the config
+    // dir, so the old message named neither the files nor the directory.
+    let media_dir = media::media_dir_path(&app).ok();
+    let sweep = sweep_local_state(&cfg.config_dir, media_dir.as_deref());
+    for (path, result) in &sweep {
+        if let Err(e) = result {
+            logging::trace(&format!(
+                "uninstall: could not remove {}: {e}",
+                path.display()
+            ));
+        }
+    }
+    results.push(sweep_step_result(
+        &cfg.config_dir,
+        media_dir.as_deref(),
+        &sweep,
+    ));
     Ok(results)
 }
 
@@ -1157,8 +1912,15 @@ fn is_first_run(cfg: &config::AppConfig) -> bool {
     !cfg.config_dir.join("first_run_done").exists()
 }
 
-fn mark_first_run_done(cfg: &config::AppConfig) {
-    let _ = std::fs::write(cfg.config_dir.join("first_run_done"), b"");
+/// Persist the "welcome dismissed" flag.
+///
+/// #196: this used to be `let _ = std::fs::write(…)`. A failed write left
+/// `is_first_run` reporting true, so the 2 s status tick brought the whole
+/// welcome wizard back about two seconds after the user dismissed it — on
+/// every launch, with the error visible nowhere. The caller now propagates
+/// it. Written through `atomic_write`, like the token in `config.rs`.
+fn mark_first_run_done(cfg: &config::AppConfig) -> std::io::Result<()> {
+    fsutil::atomic_write(&cfg.config_dir.join("first_run_done"), b"")
 }
 
 fn show_settings_window(app: &tauri::AppHandle) {
@@ -1172,6 +1934,10 @@ fn show_settings_window(app: &tauri::AppHandle) {
         let _ = win.show();
         let _ = win.set_focus();
         let _ = win.unminimize();
+        // #208: the component is still mounted from the last time the window
+        // was open, with its poll stopped. Tell it it's back on screen so it
+        // refreshes once immediately and resumes ticking.
+        let _ = app.emit(SETUP_VISIBILITY_EVENT, true);
         return;
     }
     if let Err(e) = build_setup_window(app) {
@@ -1398,6 +2164,12 @@ pub fn run_mcp_stdio_only() {
     // orphans exist; never touches live siblings.
     let _ = housekeeping::kill_orphaned_mcp_stdio_children();
 
+    // Baseline for the cross-platform half of the stale-binary self-check
+    // (#200). `disk_version_if_stale` above is macOS-only; the exe's mtime
+    // works everywhere and is what catches a Windows NSIS in-place update.
+    // Read once, here, before anything can have replaced the file.
+    let exe_mtime_at_start = housekeeping::current_exe_mtime();
+
     let cfg = Arc::new(config::AppConfig::load_or_init().expect("config init"));
     logging::trace(&format!(
         "mcp-stdio: entering run loop, token_path={}",
@@ -1412,18 +2184,27 @@ pub fn run_mcp_stdio_only() {
         // Periodic stale-binary self-check (v0.4.43, Codex review P1a):
         // every 30 s we re-run disk_version_if_stale. If the on-disk
         // bundle has been replaced (in-app update, manual DMG drop)
-        // since we started, we exit so Claude Desktop respawns us
-        // against the fresh binary. Without this, a child spawned
-        // before the update keeps running its old in-RAM code
-        // indefinitely — the exact failure mode that the 2026-05-23
+        // since we started, we exit so the host respawns us against the
+        // fresh binary. Without this, a child spawned before the update
+        // keeps running its old in-RAM code indefinitely — the exact
+        // failure mode that the 2026-05-23
         // 0.4.40-children-survive-update cascade was driven by.
-        tokio::spawn(async {
+        //
+        // #200: the version check is macOS-only (there is no Info.plist
+        // on Windows), so the tick also compares the exe's mtime against
+        // the baseline taken at start. That is the Windows arm of the
+        // same guarantee: after the GUI-side path sweep became
+        // orphan-gated it no longer force-refreshes a live child, so an
+        // NSIS in-place update has to be noticed here or not at all.
+        // Exiting ourselves is also the only shutdown Claude Code /
+        // Cowork / Codex answer with a respawn.
+        tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if let Some(disk_version) = housekeeping::disk_version_if_stale() {
                     eprintln!(
                         "[aiui] mcp-stdio: periodic self-check: in-memory v{} \
-                         != on-disk v{}; exiting so Claude Desktop respawns \
+                         != on-disk v{}; exiting so the host respawns \
                          the fresh build.",
                         env!("CARGO_PKG_VERSION"),
                         disk_version
@@ -1434,6 +2215,21 @@ pub fn run_mcp_stdio_only() {
                         disk_version,
                         env!("CARGO_PKG_VERSION")
                     ));
+                    std::process::exit(0);
+                }
+                if housekeeping::is_exe_mtime_stale(
+                    exe_mtime_at_start,
+                    housekeeping::current_exe_mtime(),
+                ) {
+                    eprintln!(
+                        "[aiui] mcp-stdio: periodic self-check: the executable \
+                         on disk was replaced since we started; exiting so the \
+                         host respawns the fresh build."
+                    );
+                    logging::trace(
+                        "mcp-stdio: periodic self-check fired — exe mtime \
+                         changed since start; exiting (clean)",
+                    );
                     std::process::exit(0);
                 }
             }
@@ -1461,10 +2257,24 @@ pub fn run() {
     // Drop is bound to process death via `mem::forget` further down —
     // we don't want it released while the GUI is still alive on a
     // panic-unwind path.
+    //
+    // #196: `try_acquire` fails for two unrelated reasons and only one of
+    // them is "a second GUI". Contention keeps today's silent exit(0).
+    // Anything else — a deny-share handle from an AV/backup agent, a
+    // network-redirected roaming `%APPDATA%`, a `gui.lock` that is a
+    // directory — is no evidence that another GUI exists, and exiting on it
+    // made aiui unstartable while `mcp_attach` respawned it every ~20 s for
+    // the whole session. So we keep running without the lock and say so in
+    // the UI. That trade is sound: the lock is a fast-path guard against the
+    // v0.4.43 two-GUIs-in-the-same-millisecond bind race, not the last line
+    // of defence — `tauri_plugin_single_instance` still covers the
+    // second-launch case, and an HTTP bind collision already degrades
+    // instead of exiting.
     let lock_path = cfg.config_dir.join("gui.lock");
+    let mut lock_error_message: Option<String> = None;
     let gui_lock = match housekeeping::ProcessLock::try_acquire(&lock_path) {
-        Ok(g) => g,
-        Err(e) => {
+        Ok(g) => Some(g),
+        Err(e) if housekeeping::is_lock_contention(&e) => {
             // Another aiui-GUI is alive and holds the lock. Exit
             // immediately, traced so the post-mortem in the trace log
             // explains the silent disappearance.
@@ -1477,11 +2287,40 @@ pub fn run() {
             // mounted the HTTP server, so there's nothing to sweep.
             std::process::exit(0);
         }
+        Err(e) => {
+            logging::trace(&format!(
+                "[aiui] gui-lock-error on {} (kind={:?}): {e} — not lock contention, \
+                 continuing without the lock",
+                lock_path.display(),
+                e.kind()
+            ));
+            lock_error_message = Some(format!(
+                "Konnte {} nicht sperren — aiui läuft ohne diese Absicherung weiter. {e}",
+                lock_path.display()
+            ));
+            None
+        }
     };
-    logging::trace(&format!(
-        "[aiui] gui-lock acquired: {}",
-        gui_lock.path().display()
-    ));
+    match &gui_lock {
+        Some(g) => logging::trace(&format!(
+            "[aiui] gui-lock acquired: {}",
+            g.path().display()
+        )),
+        None => logging::trace("[aiui] running without gui-lock (see gui-lock-error above)"),
+    }
+
+    // #196: `remotes.json` moved into the per-OS config dir. One-shot, here
+    // rather than inside `load_remotes` — that one runs on every status tick
+    // and in the tunnel loops. No-op on macOS/Linux, where both paths are
+    // the same file.
+    match setup::migrate_remotes_if_needed(&cfg.config_dir) {
+        Ok(true) => logging::trace(&format!(
+            "[aiui] migrated remotes.json into {}",
+            cfg.config_dir.display()
+        )),
+        Ok(false) => {}
+        Err(e) => logging::trace(&format!("[aiui] remotes.json migration failed: {e}")),
+    }
 
     // Pre-GUI sweep (v0.4.43, Codex review P2a): now that we hold the
     // exclusive GUI lock, kill any aiui-mcp-stdio children that started
@@ -1520,6 +2359,16 @@ pub fn run() {
     // later while the window kept *looking* alive.
     let http_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // #196: same idea for a non-contention `gui.lock` failure recorded
+    // above — we are running without the lock and the user should be told,
+    // rather than aiui vanishing with exit code 0.
+    let lock_error = Arc::new(LockError::default());
+    let lock_error_at_startup = lock_error_message.is_some();
+    if let Some(msg) = lock_error_message {
+        if let Ok(mut slot) = lock_error.0.lock() {
+            *slot = Some(msg);
+        }
+    }
 
     // Pending-update state (v0.4.44). Set by the silent updater path
     // in `updater.ts` whenever the periodic auto-check finds a newer
@@ -1574,21 +2423,64 @@ pub fn run() {
                 .level_for("aiui_lib", log::LevelFilter::Trace)
                 .max_file_size(5_000_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("aiui".into()),
-                    }),
-                ])
+                .targets({
+                    // #181: no stdout target in a release build. The GUI can
+                    // be started by `aiui --mcp-stdio`, whose stdout *is* the
+                    // host's JSON-RPC pipe; a single `[aiui] http listening
+                    // on …` line landing there is a protocol error the host
+                    // sees and our own logs do not. `spawn_detached` already
+                    // stops the handle from being inherited — this is the
+                    // second half of the same fix, so no future spawn site
+                    // can reopen it. The LogDir target and
+                    // `/tmp/aiui-trace.log` are unchanged; only running the
+                    // release binary from a terminal no longer streams logs
+                    // to the console.
+                    let mut targets = vec![tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::LogDir {
+                            file_name: Some("aiui".into()),
+                        },
+                    )];
+                    if cfg!(debug_assertions) {
+                        targets.push(tauri_plugin_log::Target::new(
+                            tauri_plugin_log::TargetKind::Stdout,
+                        ));
+                    }
+                    targets
+                })
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            // #197: on Windows the updater plugin ends its install path with
+            // `std::process::exit(0)` right after handing the NSIS installer
+            // to `ShellExecuteW` (tauri-plugin-updater 2.10.1,
+            // `#[cfg(windows)] fn install_inner`). That bypasses
+            // `RunEvent::ExitRequested`, so neither our exit gate nor
+            // `pre_exit_cleanup` runs: a Windows update leaks the instance's
+            // `ssh -NTR` child, and the relaunched instance finds the remote
+            // port already forwarded and pins itself to `ConnectedShared`.
+            //
+            // tauri-plugin-updater 2.10.1's `Builder` exposes no pre-exit hook
+            // to wire that sweep into (the `on_before_exit` API this once
+            // reached for does not exist on the pinned version), so the
+            // Windows-only leak is a known gap tracked as a follow-up. On
+            // macOS/Linux `downloadAndInstall()` returns normally and
+            // `updater.ts` latches the exit authority + relaunches via
+            // `authorize_exit_for_update` — after the install, because
+            // `ExitAuthority::authorize()` is irreversible and arming it in
+            // front of an install that can still fail would leave a live host
+            // with its exit gate permanently disarmed (Invariant I1).
+            tauri_plugin_updater::Builder::new().build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         // Backs the `notify` MCP tool (#17) — native OS notification shown
         // directly from Rust (http.rs `/notify`), no capability grant needed
         // since it's never invoked from the WebView side.
         .plugin(tauri_plugin_notification::init())
+        // Backs the `copy_to_clipboard` command (#208). Registered for its
+        // Rust API only — no capability is granted, so the WebView cannot
+        // reach the plugin's own commands.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(cfg.clone())
         .manage(dialog_state.clone())
         .manage(ui_acks.clone())
@@ -1596,12 +2488,20 @@ pub fn run() {
         .manage(exit_authority.clone())
         .manage(tunnel_mgr.clone())
         .manage(http_error.clone())
+        .manage(lock_error.clone())
         .manage(pending_update.clone())
+        // #208: memoises the two expensive halves of `status` (the
+        // authenticated HTTP self-probe and the `pgrep`/`tasklist` spawn)
+        // so an open Settings window polling every 2 s doesn't spawn a
+        // child process 30 times a minute.
+        .manage(Arc::new(ExpensiveStatusCache::default()))
         .invoke_handler(tauri::generate_handler![
             dialog_submit,
             dialog_cancel,
             write_dialog_targets,
             get_dialog_spec,
+            get_dialog_remaining,
+            resolve_dialog_targets,
             ui_pong,
             close_window,
             surface_for_dialog,
@@ -1614,11 +2514,13 @@ pub fn run() {
             resync_remote,
             reinstall_skill,
             repair_skill,
+            repair_claude_config,
             restart_claude_desktop,
             uninstall_all,
             quit_app,
             authorize_exit_for_update,
             dismiss_welcome,
+            copy_to_clipboard,
             open_url
         ])
         .setup(move |app| {
@@ -1641,20 +2543,48 @@ pub fn run() {
             // actually installed here (#168); no phantom config for a host the
             // user doesn't use. Idempotent, GUI mode only.
             let bin = setup::app_binary_path();
-            if setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
+
+            // #198: refuse to register a path that won't exist next launch.
+            // Gatekeeper App Translocation hands a DMG-launched or
+            // ~/Downloads-launched app a
+            // `/private/var/folders/…/AppTranslocation/<uuid>/d/…` path that
+            // is gone when it quits and carries a fresh UUID next time —
+            // writing it into three host configs means every tool call fails
+            // with "no such file", and all three files get rewritten (plus a
+            // fresh `.bak`) on every single launch because the random path
+            // never matches. Substituting the canonical /Applications path
+            // would only swap a broken path for one pointing at nothing;
+            // `ephemeral_install` in the status report raises a banner asking
+            // the user to move the app.
+            let ephemeral = setup::is_ephemeral_install();
+            if ephemeral {
+                logging::trace(&format!(
+                    "gui: refusing host registration — binary sits in an ephemeral location: {bin}"
+                ));
+            }
+
+            if !ephemeral && setup::is_claude_desktop_installed() && !setup::is_claude_config_current(&bin) {
                 trace_step("Claude Desktop config registration", setup::patch_claude_desktop_config(&bin));
             }
 
-            // Kill any `aiui --mcp-stdio` children left over from an older app
-            // version. Without this, a user who drops a new aiui.app over an
-            // old one would still have the old MCP-stdio children running
-            // under Claude Desktop — which may lack the auto-resurrect loop
-            // and won't reconnect to the new GUI. SIGTERMing them forces
-            // Claude Desktop to respawn against the freshly patched config.
+            // Reap `aiui --mcp-stdio` children left over from an older app
+            // version at a different path. Without this, a user who drops a
+            // new aiui.app beside an old one would still have the old
+            // MCP-stdio children running — which may lack the auto-resurrect
+            // loop and won't reconnect to the new GUI.
+            //
+            // #200: only *orphaned* children qualify. A path mismatch alone
+            // is not abandonment — the user moving aiui.app out of
+            // ~/Downloads, or running a dev build next to the release, gives
+            // every live child a "stale" path. Claude Desktop respawns one we
+            // kill; Claude Code, Cowork and Codex do not, so an ungated sweep
+            // handed those users `Server disconnected` on their next tool
+            // call. The in-place-update case lives child-side instead (the
+            // 30 s self-check in run_mcp_stdio_only).
             let killed = housekeeping::kill_stale_mcp_stdio_children(&bin);
             if killed > 0 {
                 logging::trace(&format!(
-                    "gui: sent SIGTERM to {killed} stale mcp-stdio child(ren); Claude Desktop will respawn them"
+                    "gui: terminated {killed} orphaned stale-path mcp-stdio child(ren)"
                 ));
             }
 
@@ -1663,7 +2593,7 @@ pub fn run() {
             // entries from ≤ v0.2.x installs to the native app binary, so
             // every session sees aiui without a uv/uvx dependency — but only
             // if Claude Code is set up here (#168).
-            if setup::is_claude_code_installed() {
+            if !ephemeral && setup::is_claude_code_installed() {
                 trace_step("Claude Code config registration", setup::patch_claude_code_config(&bin));
             }
 
@@ -1671,7 +2601,7 @@ pub fn run() {
             // up here (#168): aiui writes its own ~/.codex/config.toml entry
             // pointing at the same bundled --mcp-stdio server — no manual setup,
             // exactly like the Claude hosts.
-            if setup::is_codex_installed() {
+            if !ephemeral && setup::is_codex_installed() {
                 trace_step("Codex config registration", setup::patch_codex_config(&bin));
             }
 
@@ -1748,12 +2678,18 @@ pub fn run() {
             });
 
             // Startup orphan sweep: any `ssh -NTR <port>:localhost:<port>`
-            // process that's been re-parented to launchd (ppid=1) is a
-            // tunnel from a previously-crashed aiui that exited via
+            // process whose parent is gone is a tunnel from a
+            // previously-crashed or force-quit aiui that exited via
             // `app.exit()` / `process::exit()` and skipped Drop. Left
             // alive, it holds the remote-side port and forces the new
             // GUI into shared-forward mode forever — the v0.4.36 loop
             // root cause. Sweep before binding our own tunnels. v0.4.37.
+            //
+            // "Parent is gone" is `is_orphaned_child`, not `ppid == 1`
+            // (#200): the launchd-reparenting rule the sweep used to
+            // apply is macOS-only, so this was a permanent no-op on
+            // Windows and a force-quit `aiui.exe` wedged the remote's
+            // port across every restart.
             {
                 let port = cfg.http_port;
                 let killed = housekeeping::kill_aiui_ssh_ntr(port, true);
@@ -1917,6 +2853,25 @@ pub fn run() {
                             }
                             Ok(None) => {
                                 logging::trace("update-check: already on latest");
+                                // #197: "no update available" has to retract
+                                // the banner, not just be logged. A release
+                                // that is yanked — or a `latest.json` that
+                                // stops advertising this platform — used to
+                                // leave the slot set forever, so the user kept
+                                // a banner offering a version the updater
+                                // would no longer hand out, and every click
+                                // answered "you are on the current version".
+                                let had_pending = match pending_update_task.0.lock() {
+                                    Ok(mut slot) => slot.take().is_some(),
+                                    Err(_) => false,
+                                };
+                                if had_pending {
+                                    logging::trace(
+                                        "update-check: retracting stale pending-update banner",
+                                    );
+                                    let _ = app_handle_update
+                                        .emit("update:available", None::<String>);
+                                }
                             }
                             Err(e) => {
                                 logging::trace(&format!("update-check: check failed: {e}"));
@@ -1929,6 +2884,13 @@ pub fn run() {
                     tokio::time::sleep(CHECK_INTERVAL).await;
                 }
             });
+
+            if lock_error_at_startup {
+                // #196: same treatment as the degraded HTTP mode — a failure
+                // the user cannot otherwise see gets a window and a banner
+                // instead of a silent exit.
+                show_settings_window(&app_handle);
+            }
 
             if is_first_run(&cfg) {
                 // First-ever launch: surface the settings window so the user
@@ -2013,6 +2975,15 @@ pub fn run() {
                 // both proxies) is removed.
                 api.prevent_close();
                 let _ = window.hide();
+                // #208: because the window is hidden and never destroyed, the
+                // Svelte component stays mounted and its `onDestroy` never
+                // runs — that is how a 2 s status poll survived for the life
+                // of the process, spawning `pgrep`/`tasklist` ~43k times a
+                // day for a UI nobody was looking at. `visibilitychange`
+                // alone is not trustworthy here (a hidden WKWebView can keep
+                // reporting `visibilityState: "visible"`), so Rust tells the
+                // frontend plainly when the window went away.
+                let _ = app.emit(SETUP_VISIBILITY_EVENT, false);
                 #[cfg(target_os = "macos")]
                 {
                     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -2214,6 +3185,437 @@ mod navigation_tests {
     }
 }
 
+/// #195: the window permission model — which window may run which command,
+/// and which capability file covers which window.
+///
+/// These tests exist because nothing else reads `capabilities/`. The retired
+/// `"dialog"` label sat in `default.json` from PR #137 until #195 without
+/// anyone noticing, precisely because a capability that matches no window
+/// fails silently: the app commands kept working (Tauri does not ACL-check
+/// them), so the only symptom was a `plugin:` command being denied in a
+/// window nobody was testing plugin commands in.
+#[cfg(test)]
+mod window_permission_tests {
+    use super::*;
+
+    /// A label of the shape `build_dialog_window` actually produces — a v4
+    /// UUID, which is what every dialog window has been called since Step 4.
+    const SAMPLE_DIALOG_LABEL: &str = "9f1c2d34-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+    /// What a dialog window — aiui's untrusted-content surface — may be
+    /// granted. Listen/unlisten so Rust can push an event *into* it (the
+    /// `/health` `ui:ping` probe); nothing that lets it push one back out,
+    /// and nothing from the updater/process/dialog/notification plugins.
+    const DIALOG_ALLOWED_PERMISSIONS: &[&str] =
+        &["core:event:allow-listen", "core:event:allow-unlisten"];
+
+    /// Plugin permission prefixes that must never leave the setup window.
+    const SETUP_ONLY_PERMISSION_PREFIXES: &[&str] =
+        &["updater:", "process:", "dialog:", "notification:"];
+
+    /// Every `*.json` under `capabilities/`, parsed. Read from the directory
+    /// rather than a hard-coded list so a capability file added later is
+    /// covered by these assertions without anyone remembering to add it.
+    fn capabilities() -> Vec<(String, serde_json::Value)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("capabilities/ is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let src = std::fs::read_to_string(&path).expect("capability file is readable");
+            let value = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} is not valid JSON: {e}"));
+            out.push((name, value));
+        }
+        assert!(!out.is_empty(), "no capability files found in {dir:?}");
+        out
+    }
+
+    fn string_list(cap: &serde_json::Value, key: &str) -> Vec<String> {
+        cap.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stand-in for the `glob::Pattern` match Tauri applies to a capability's
+    /// window list (`tauri-2.10.3 src/ipc/authority.rs:457-461`). Only the two
+    /// shapes aiui uses need to be understood: a literal label, and the bare
+    /// `*` — which matches any label containing no `/`, and a UUID has none.
+    fn window_glob_matches(pattern: &str, label: &str) -> bool {
+        match pattern {
+            "*" => !label.contains('/'),
+            literal => literal == label,
+        }
+    }
+
+    fn covers(cap: &serde_json::Value, label: &str) -> bool {
+        let windows = string_list(cap, "windows");
+        let webviews = string_list(cap, "webviews");
+        windows
+            .iter()
+            .chain(webviews.iter())
+            .any(|p| window_glob_matches(p, label))
+    }
+
+    #[test]
+    fn capabilities_do_not_reference_retired_dialog_label() {
+        // The defect: PR #137 gave every dialog window its own UUID label,
+        // and `"dialog"` in `default.json` has matched nothing since. The
+        // file read as if dialog windows were permissioned; they were not.
+        for (name, cap) in capabilities() {
+            for key in ["windows", "webviews"] {
+                for entry in string_list(&cap, key) {
+                    assert_ne!(
+                        entry, "dialog",
+                        "{name}: `{key}` still names the retired \"dialog\" label; \
+                         a dialog window's label is its dialog id"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn privileged_plugin_permissions_are_setup_scoped() {
+        // The updater, the relaunch, the native dialog and notifications are
+        // Settings-side, all of them. Any capability that hands one of them
+        // out must reach the setup window and nothing else.
+        let mut seen = 0;
+        for (name, cap) in capabilities() {
+            let permissions = string_list(&cap, "permissions");
+            let privileged: Vec<&String> = permissions
+                .iter()
+                .filter(|p| {
+                    SETUP_ONLY_PERMISSION_PREFIXES
+                        .iter()
+                        .any(|prefix| p.starts_with(prefix))
+                })
+                .collect();
+            if privileged.is_empty() {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                string_list(&cap, "windows"),
+                vec![SETUP_WINDOW_LABEL.to_string()],
+                "{name} grants {privileged:?} — it must be scoped to the setup window alone"
+            );
+            assert!(
+                string_list(&cap, "webviews").is_empty(),
+                "{name} grants {privileged:?} and widens its scope via `webviews`"
+            );
+            assert!(
+                !covers(&cap, SAMPLE_DIALOG_LABEL),
+                "{name} grants {privileged:?} to a dialog window"
+            );
+        }
+        assert_eq!(
+            seen, 1,
+            "exactly one capability should carry the Settings-side plugin permissions"
+        );
+    }
+
+    #[test]
+    fn dialog_capability_matches_a_uuid_label() {
+        // The other half of the same defect: a dialog window must now be
+        // covered by *something*, and that something must be the minimum.
+        let matching: Vec<(String, serde_json::Value)> = capabilities()
+            .into_iter()
+            .filter(|(_, cap)| covers(cap, SAMPLE_DIALOG_LABEL))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one capability should cover a dialog window, got {:?}",
+            matching.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+        let (name, cap) = &matching[0];
+        for permission in string_list(cap, "permissions") {
+            assert!(
+                DIALOG_ALLOWED_PERMISSIONS.contains(&permission.as_str()),
+                "{name} grants {permission:?} to the untrusted-content window; \
+                 allowed: {DIALOG_ALLOWED_PERMISSIONS:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_capability_lets_a_dialog_window_emit_events() {
+        // `allow-emit` / `allow-emit-to` would let the untrusted window forge
+        // `update:available` (or any other app event) into Settings.
+        for (name, cap) in capabilities() {
+            if !covers(&cap, SAMPLE_DIALOG_LABEL) {
+                continue;
+            }
+            for permission in string_list(&cap, "permissions") {
+                assert!(
+                    !permission.starts_with("core:event:allow-emit"),
+                    "{name} grants {permission:?} to a dialog window"
+                );
+                assert_ne!(
+                    permission, "core:event:default",
+                    "{name}: `core:event:default` includes allow-emit — \
+                     list allow-listen/allow-unlisten explicitly"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_privileged_window_only_for_setup() {
+        assert!(is_privileged_window(SETUP_WINDOW_LABEL));
+        assert!(!is_privileged_window(SAMPLE_DIALOG_LABEL));
+        assert!(!is_privileged_window(""));
+        // The retired label is not a back door either: nothing builds a
+        // window called "dialog" any more, but if anything did, it would be
+        // a dialog window like all the others.
+        assert!(!is_privileged_window("dialog"));
+        // The two predicates must stay each other's complement.
+        for label in [SETUP_WINDOW_LABEL, SAMPLE_DIALOG_LABEL, "", "Setup"] {
+            assert_ne!(is_privileged_window(label), is_dialog_window_label(label));
+        }
+    }
+
+    #[test]
+    fn dialog_command_allowed_requires_matching_id() {
+        // The legitimate call: `DialogShell.svelte` passes
+        // `getCurrentWindow().label` as the id, so this is a no-op for it.
+        assert!(dialog_command_allowed(
+            SAMPLE_DIALOG_LABEL,
+            SAMPLE_DIALOG_LABEL
+        ));
+        // The cross-session read this closes: two dialogs open, one asks for
+        // the other's spec — which may be a `form` holding a secret.
+        assert!(!dialog_command_allowed(
+            SAMPLE_DIALOG_LABEL,
+            "00000000-0000-4000-8000-000000000000"
+        ));
+        // The setup window is not exempt — it never renders a dialog.
+        assert!(!dialog_command_allowed(
+            SETUP_WINDOW_LABEL,
+            SAMPLE_DIALOG_LABEL
+        ));
+        // Fail closed on the degenerate cases rather than matching "" == "".
+        assert!(!dialog_command_allowed(SAMPLE_DIALOG_LABEL, ""));
+        assert!(!dialog_command_allowed("", SAMPLE_DIALOG_LABEL));
+        assert!(!dialog_command_allowed("", ""));
+    }
+}
+
+/// #208 — the settings pane told four different failures the same story,
+/// and polled for them forever. These cover the Rust half: what the probe
+/// actually reports, which hint that maps to, and the TTL that keeps an
+/// open window off `pgrep`/`tasklist`.
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cfg_with(token_path: std::path::PathBuf, port: u16) -> config::AppConfig {
+        config::AppConfig {
+            token: "a".repeat(64),
+            config_dir: token_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default(),
+            token_path,
+            http_port: port,
+        }
+    }
+
+    /// A directory under the OS temp dir that nothing else is using, and a
+    /// path inside it that does not exist. No `tempfile` dependency in this
+    /// crate, so this is the shape the other tests use too.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aiui-208-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A port nobody is listening on: bind one, learn its number, drop it.
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        l.local_addr().expect("local addr").port()
+    }
+
+    #[tokio::test]
+    async fn probe_outcome_is_token_unreadable_when_token_file_missing() {
+        // The deterministic #208 scenario: `uninstall_all` removes the token
+        // file, and the very next poll's probe bails on the read. That is
+        // *not* evidence about the port, and it used to be reported as such.
+        let dir = scratch("no-token");
+        let cfg = cfg_with(dir.join("token"), free_port());
+        assert_eq!(
+            probe_http_self(&cfg).await,
+            ProbeOutcome::TokenUnreadable,
+            "a missing token says nothing about who owns the port"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn probe_outcome_is_unreachable_when_nothing_listens() {
+        let dir = scratch("nothing-listens");
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "a".repeat(64)).expect("write token");
+        let cfg = cfg_with(token_path, free_port());
+        let started = std::time::Instant::now();
+        assert_eq!(probe_http_self(&cfg).await, ProbeOutcome::Unreachable);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the probe must stay inside its own timeout budget"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_hint_key_only_claims_port_conflict_on_bind_failure() {
+        // The banner's hint claimed a port squatter unconditionally. It may
+        // only say that when the HTTP server actually failed to bind, or
+        // when something that isn't aiui answered on the port.
+        assert_eq!(
+            health_hint_key("unreachable", true, "macos"),
+            "settings.http_error.hint.macos"
+        );
+        assert_eq!(
+            health_hint_key("wrong_service", false, "macos"),
+            "settings.http_error.hint.macos"
+        );
+        assert_eq!(
+            health_hint_key("wrong_service", false, "windows"),
+            "settings.http_error.hint.windows"
+        );
+        for reason in ["token_unreadable", "unreachable", "client_build_failed"] {
+            assert_ne!(
+                health_hint_key(reason, false, "macos"),
+                "settings.http_error.hint.macos",
+                "{reason} is not evidence of a port conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn health_hint_key_names_the_missing_token() {
+        assert_eq!(
+            health_hint_key("token_unreadable", false, "macos"),
+            "settings.http_error.hint.token"
+        );
+        assert_eq!(
+            health_hint_key("unreachable", false, "linux"),
+            "settings.http_error.hint.unreachable"
+        );
+        assert_eq!(
+            health_hint_key("client_build_failed", false, "linux"),
+            "settings.http_error.hint.unreachable"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_reason_degrades_to_the_os_hint() {
+        // Whatever a future probe outcome is called, the banner must still
+        // render a sentence rather than an empty line.
+        assert_eq!(
+            health_hint_key("something_new", false, "other"),
+            "settings.http_error.hint.other"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reuses_cached_expensive_probes_within_ttl() {
+        // The poll ticks every 2 s; the probe and the `pgrep`/`tasklist`
+        // spawn behind it must not.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::new(std::time::Duration::from_secs(15));
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: true,
+                }
+            }
+        };
+        for _ in 0..8 {
+            assert!(cache.sample(false, compute).await.probe.is_alive());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "eight polls, one probe");
+    }
+
+    #[tokio::test]
+    async fn an_expired_ttl_takes_a_fresh_sample() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::new(std::time::Duration::from_millis(20));
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: false,
+                }
+            }
+        };
+        cache.sample(false, compute).await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        cache.sample(false, compute).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_user_triggered_refresh_bypasses_the_cache() {
+        // Clicking "Restart Claude Desktop" and then being told for another
+        // 15 s that it isn't running reads as the button not having worked.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache = ExpensiveStatusCache::default();
+        let compute = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ExpensiveStatus {
+                    probe: ProbeOutcome::Alive,
+                    claude_desktop_running: true,
+                }
+            }
+        };
+        cache.sample(false, compute).await;
+        cache.sample(true, compute).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn probe_reasons_are_distinct_wire_names() {
+        let all = [
+            ProbeOutcome::Alive,
+            ProbeOutcome::TokenUnreadable,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::WrongService,
+            ProbeOutcome::ClientBuildFailed,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|o| o.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len());
+        assert!(ProbeOutcome::Alive.is_alive());
+        assert_eq!(all.iter().filter(|o| o.is_alive()).count(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2243,6 +3645,38 @@ mod tests {
     fn none_action_commits() {
         // The built-in submit button (`action: null` in the result).
         assert!(action_commits_targets(&spec_with_documented_actions(), None));
+    }
+
+    #[test]
+    fn pending_update_is_stale_drops_equal_and_older() {
+        // #197: the banner must retract itself once the on-disk version has
+        // caught up — equal counts as caught up, because that is what the
+        // slot looks like immediately after a successful install.
+        assert!(pending_update_is_stale("0.10.1", "0.10.1"));
+        assert!(pending_update_is_stale("0.9.9", "0.10.1"));
+        // A genuinely newer release keeps its banner. `0.10.2` sorts *below*
+        // `0.9.9` lexically, which is the trap semver is here to avoid.
+        assert!(!pending_update_is_stale("0.10.2", "0.10.1"));
+        assert!(!pending_update_is_stale("0.10.2", "0.9.9"));
+    }
+
+    #[test]
+    fn pending_update_is_stale_keeps_banner_on_unparseable_input() {
+        // Neither input is ours to trust: `pending` is whatever `latest.json`
+        // advertised. Anything we cannot order must not panic, and must not
+        // clear a banner — taking the user's only install button away on a
+        // parse slip is the worse failure.
+        assert!(!pending_update_is_stale("", "0.10.1"));
+        assert!(!pending_update_is_stale("v0.10.2", "0.10.1"));
+        assert!(!pending_update_is_stale("2026-09-20", "0.10.1"));
+        assert!(!pending_update_is_stale("0.10.2", "not-a-version"));
+    }
+
+    #[test]
+    fn pending_update_is_stale_tolerates_surrounding_whitespace() {
+        // `set_pending_update` trims, but the headless loop and the updater
+        // feed are separate sources — don't let a stray newline pin a banner.
+        assert!(pending_update_is_stale(" 0.10.1\n", "0.10.1"));
     }
 
     #[test]
@@ -2313,5 +3747,278 @@ mod tests {
     fn collect_target_fields_empty_when_no_targets() {
         let spec = json!({"kind": "form", "fields": [{"kind": "text", "name": "x"}]});
         assert!(collect_target_fields(&spec).is_empty());
+    }
+
+    // ---------- #196: uninstall sweep + first_run_done ----------
+
+    use std::path::{Path, PathBuf};
+
+    /// Temp config dir in the house style (`temp_dir()` + a pid-suffixed
+    /// name), cleaned up by the test that made it.
+    fn sweep_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("aiui-test-sweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A config dir carrying every file aiui writes for itself.
+    fn seed_local_state(config_dir: &Path) {
+        for name in LOCAL_STATE_FILES {
+            std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn sweep_local_state_removes_every_known_file() {
+        // The old sweep deleted `token` and `first_run_done` and reported
+        // the whole config dir as cleaned. `remotes.json`, `gui.lock`,
+        // `gui.sock` and up to 1 GiB of cached media stayed behind.
+        let base = sweep_test_dir("removes");
+        let config_dir = base.join("config");
+        let media_dir = base.join("cache/media");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&media_dir).unwrap();
+        seed_local_state(&config_dir);
+        std::fs::write(media_dir.join("clip.mp4"), b"video").unwrap();
+
+        let sweep = sweep_local_state(&config_dir, Some(&media_dir));
+        for (path, result) in &sweep {
+            assert!(result.is_ok(), "{} should be removable", path.display());
+            assert!(!path.exists(), "{} should be gone", path.display());
+        }
+        for name in LOCAL_STATE_FILES {
+            assert!(
+                sweep
+                    .iter()
+                    .any(|(p, _)| p.file_name() == Some(std::ffi::OsStr::new(name))),
+                "{name} must be part of the sweep"
+            );
+        }
+        assert!(
+            sweep.iter().any(|(p, _)| p.as_path() == media_dir.as_path()),
+            "media cache is swept too"
+        );
+
+        let step = sweep_step_result(&config_dir, Some(&media_dir), &sweep);
+        assert!(step.ok);
+        assert!(step.message.contains(&config_dir.display().to_string()));
+        assert!(
+            step.message.contains(&media_dir.display().to_string()),
+            "the message must name the media dir, which is outside the config dir"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sweep_local_state_treats_absent_files_as_success() {
+        // Uninstalling twice, or before a file was ever written, is not a
+        // failure — the sweep is about the end state.
+        let config_dir = sweep_test_dir("absent");
+        let sweep = sweep_local_state(&config_dir, None);
+        assert!(sweep.iter().all(|(_, r)| r.is_ok()));
+        assert!(sweep_step_result(&config_dir, None, &sweep).ok);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn sweep_local_state_reports_failure_instead_of_claiming_success() {
+        // A non-empty directory where a file belongs cannot be removed with
+        // `remove_file`. The whole point of #196 is that this surfaces
+        // instead of rendering as a green "Lokale Dateien entfernt".
+        let config_dir = sweep_test_dir("failure");
+        let stuck = config_dir.join("remotes.json");
+        std::fs::create_dir_all(stuck.join("not-a-file")).unwrap();
+
+        let sweep = sweep_local_state(&config_dir, None);
+        let entry = sweep
+            .iter()
+            .find(|(p, _)| p.as_path() == stuck.as_path())
+            .expect("the stuck path is part of the sweep");
+        assert!(entry.1.is_err(), "a directory here must not report success");
+
+        let step = sweep_step_result(&config_dir, None, &sweep);
+        assert!(!step.ok, "one failure makes the whole step a failure");
+        let details = step.details.expect("failures are always explained");
+        assert!(
+            details.contains(&stuck.display().to_string()),
+            "details must name what was left behind: {details}"
+        );
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn uninstall_never_recreates_remotes_json() {
+        // Regression guard against `save_remotes(&[])`: it went through
+        // `atomic_write`'s `create_dir_all` and so *created* the file — and
+        // on Windows the stray directory holding it — during an uninstall
+        // that claimed to have removed it.
+        let config_dir = sweep_test_dir("no-recreate");
+        seed_local_state(&config_dir);
+        let remotes = setup::remotes_path_in(&config_dir);
+
+        let sweep = sweep_local_state(&config_dir, None);
+        assert!(sweep.iter().all(|(_, r)| r.is_ok()));
+        assert!(!remotes.exists(), "remotes.json must be gone, not rewritten");
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    fn test_config(config_dir: &Path) -> config::AppConfig {
+        config::AppConfig {
+            token: "0".repeat(64),
+            config_dir: config_dir.to_path_buf(),
+            token_path: config_dir.join("token"),
+            http_port: 7777,
+        }
+    }
+
+    #[test]
+    fn mark_first_run_done_propagates_write_error() {
+        // Happy path: the flag lands and `is_first_run` flips.
+        let dir = sweep_test_dir("first-run-ok");
+        let cfg = test_config(&dir);
+        assert!(is_first_run(&cfg));
+        mark_first_run_done(&cfg).expect("writing the flag must succeed");
+        assert!(!is_first_run(&cfg));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Failure path: a directory in the flag's place. The write used to
+        // be `let _ =`, so the frontend hid the banner, the next 2 s tick
+        // reported `welcome_pending: true`, and the wizard came back.
+        let dir = sweep_test_dir("first-run-err");
+        let cfg = test_config(&dir);
+        std::fs::create_dir_all(dir.join("first_run_done").join("blocker")).unwrap();
+        let err = mark_first_run_done(&cfg).expect_err("a directory must fail the write");
+        // What `dismiss_welcome` hands the frontend: a non-empty reason,
+        // where it previously returned `Ok(())` regardless.
+        let surfaced = format!("could not persist first_run_done: {err}");
+        assert!(surfaced.len() > "could not persist first_run_done: ".len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn target_names(spec: &serde_json::Value) -> Vec<String> {
+        collect_target_fields(spec)
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn collect_target_fields_walks_flat_fields() {
+        // The whole write-target contract of `write_dialog_targets`: what
+        // this returns is exactly what lands on disk. Everything it misses
+        // is a file the user expected and never got, on a dialog that
+        // reported success (#211).
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "plain"},
+                {"kind": "secret", "name": "pat",
+                 "target": {"mode": "create", "path": "~/.github_tokens/x"}}
+            ]
+        });
+        assert_eq!(target_names(&spec), vec!["pat".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_walks_tab_fields() {
+        // A tabbed form has no flat `fields` at all. A refactor that stops
+        // descending into `tabs[]` writes nothing for the whole dialog.
+        let spec = json!({
+            "kind": "form",
+            "tabs": [
+                {"label": "Creds", "fields": [
+                    {"kind": "secret", "name": "pat",
+                     "target": {"mode": "create", "path": "/tmp/pat"}}
+                ]},
+                {"label": "Notes", "fields": [
+                    {"kind": "text", "name": "note"},
+                    {"kind": "text", "name": "env",
+                     "target": {"mode": "append", "path": "/tmp/env"}}
+                ]}
+            ]
+        });
+        assert_eq!(target_names(&spec), vec!["pat".to_string(), "env".to_string()]);
+    }
+
+    #[test]
+    fn collect_target_fields_skips_null_and_absent_targets() {
+        // `"target": null` is a deliberate opt-out, not a target. Relaxing
+        // the `!t.is_null()` test to a plain `.is_some()` would feed `null`
+        // into `serde_json::from_value::<filewrite::Target>` and turn every
+        // such field into a "bad target spec" outcome.
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "no_key"},
+                {"kind": "text", "name": "nulled", "target": serde_json::Value::Null}
+            ],
+            "tabs": [
+                {"label": "T", "fields": [
+                    {"kind": "text", "name": "nulled_in_tab", "target": serde_json::Value::Null}
+                ]}
+            ]
+        });
+        assert!(collect_target_fields(&spec).is_empty());
+    }
+
+    #[test]
+    fn collect_target_fields_keeps_duplicate_names() {
+        // Both are returned; the caller's `HashMap` then keeps the last
+        // outcome per name. That last-write-wins is a deliberate, visible
+        // choice here rather than something this function quietly decides.
+        let spec = json!({
+            "kind": "form",
+            "fields": [
+                {"kind": "text", "name": "dup", "target": {"mode": "create", "path": "/tmp/a"}}
+            ],
+            "tabs": [
+                {"label": "T", "fields": [
+                    {"kind": "text", "name": "dup", "target": {"mode": "create", "path": "/tmp/b"}}
+                ]}
+            ]
+        });
+        let fields = collect_target_fields(&spec);
+        assert_eq!(fields.len(), 2, "both survive collection: {fields:?}");
+        assert_eq!(target_names(&spec), vec!["dup".to_string(), "dup".to_string()]);
+        assert_eq!(fields[0]["target"]["path"], json!("/tmp/a"));
+        assert_eq!(fields[1]["target"]["path"], json!("/tmp/b"));
+    }
+
+    #[test]
+    fn is_dialog_window_label_rejects_setup_label() {
+        // Every dialog-window teardown path (Dock demote, teardown stamp,
+        // close handling) hangs off this one predicate: a window label IS a
+        // dialog id, except for the single setup window.
+        assert!(!is_dialog_window_label(SETUP_WINDOW_LABEL));
+        assert!(is_dialog_window_label("d-4f3a91"));
+        assert!(is_dialog_window_label("setup-2"), "prefix is not enough");
+        assert!(is_dialog_window_label(""));
+    }
+
+    #[test]
+    fn current_os_names_this_platform() {
+        // Reported to the agent in `/status` and used by the bridge to
+        // decide platform-specific hints, so "other" would be a silent
+        // downgrade on a platform we actually ship.
+        #[cfg(target_os = "macos")]
+        assert_eq!(current_os(), "macos");
+        #[cfg(target_os = "windows")]
+        assert_eq!(current_os(), "windows");
+        #[cfg(target_os = "linux")]
+        assert_eq!(current_os(), "linux");
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        assert_eq!(current_os(), "other");
+    }
+
+    #[test]
+    fn uninstall_hint_names_this_platforms_removal_path() {
+        let hint = uninstall_app_removal_hint();
+        assert!(!hint.is_empty());
+        #[cfg(target_os = "macos")]
+        assert!(hint.contains("/Applications/aiui.app"), "{hint}");
+        #[cfg(target_os = "windows")]
+        assert!(hint.contains("Apps & Features"), "{hint}");
     }
 }

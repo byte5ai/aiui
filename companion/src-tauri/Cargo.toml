@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.10.1"
+version = "0.11.0"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""
@@ -38,6 +38,12 @@ tauri-plugin-process = "2"
 # dialog response. On macOS this drives UNUserNotificationCenter (one-time
 # permission prompt on first send, same as any other native app).
 tauri-plugin-notification = "2"
+# Backs the `copy_to_clipboard` command (#208). The welcome wizard's "copy
+# demo prompt" button used `navigator.clipboard`, which needs a secure
+# context WKWebView does not always grant; the Rust API has no such
+# requirement. Used from Rust only — no capability is granted, so the
+# WebView cannot reach the plugin's own commands.
+tauri-plugin-clipboard-manager = "2"
 serde_json = "1.0"
 # Format-preserving TOML editing for `~/.codex/config.toml` (#168) — Codex
 # reads TOML, and the file is the user's own, so we must keep their comments
@@ -48,7 +54,10 @@ log = "0.4"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+# `set-header` (#194): the `/media/blob` capability URLs are served with
+# `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`,
+# so a cached file can never act inside the API's own loopback origin.
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 rand = "0.8"
@@ -56,6 +65,12 @@ hex = "0.4"
 futures = "0.3"
 regex = "1"
 chrono = "0.4"
+# #197: ordering the pending-update banner's version against our own
+# `CARGO_PKG_VERSION`, so a banner for an already-installed (or yanked)
+# release clears itself. Hand-rolled string comparison gets `0.10.2` vs
+# `0.9.9` backwards. Already in the lockfile via Tauri, so promoting it to a
+# direct dependency adds no new supply-chain surface.
+semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Direct dep so we can set SO_REUSEADDR/SO_REUSEPORT before bind. Without
 # those flags, macOS keeps the socket in TIME_WAIT for 30–60s after every

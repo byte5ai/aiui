@@ -7,8 +7,11 @@ bridge, SSH-tunneled remotes through this Python one. Drift between
 them produces silent "works in one setup, broken in the other"
 bugs.
 """
+
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -34,6 +37,45 @@ def test_looks_like_local_path_classifies_correctly() -> None:
     assert not _looks_like_local_path("./relative.png")
     assert not _looks_like_local_path("relative.png")
     assert not _looks_like_local_path("")
+
+
+# The Windows shapes the Rust classifier accepts under `cfg!(windows)` —
+# kept entry-for-entry in step with `looks_like_local_path_classifies_correctly`
+# in `companion/src-tauri/src/imageresolve.rs` (#201).
+_WINDOWS_PATHS = [
+    r"C:\Users\me\x.png",
+    "D:/renders/x.png",
+    r"\\?\C:\Users\me\x.png",
+    r"\\srv\share\x.png",
+]
+
+
+def test_looks_like_local_path_accepts_windows_paths_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiui_mcp import server
+
+    monkeypatch.setattr(server, "_IS_WINDOWS", True)
+    for p in _WINDOWS_PATHS:
+        assert server._looks_like_local_path(p), p
+    # Platform-independent shapes keep classifying the same way.
+    assert server._looks_like_local_path(r"~\Pictures\x.png")
+    assert server._looks_like_local_path("/Users/me/x.png")
+    assert not server._looks_like_local_path("relative.png")
+    assert not server._looks_like_local_path("https://a.test/x.png")
+
+
+def test_looks_like_local_path_rejects_windows_paths_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiui_mcp import server
+
+    monkeypatch.setattr(server, "_IS_WINDOWS", False)
+    for p in _WINDOWS_PATHS:
+        # `C:\x.png` is not a path on Linux — accepting it would push
+        # garbage into the file reader instead of leaving the value alone.
+        assert not server._looks_like_local_path(p), p
+    assert server._looks_like_local_path("/Users/me/x.png")
 
 
 def test_read_path_as_data_url_uses_extension_mime(tmp_path: Path) -> None:
@@ -89,9 +131,7 @@ def test_resolve_local_paths_inlines_real_file_and_skips_others(tmp_path: Path) 
 
     # Local path was rewritten in both places.
     assert spec["fields"][0]["src"].startswith("data:image/png;base64,")
-    assert spec["fields"][3]["items"][0]["thumbnail"].startswith(
-        "data:image/png;base64,"
-    )
+    assert spec["fields"][3]["items"][0]["thumbnail"].startswith("data:image/png;base64,")
     # HTTPS URL is left alone — that's the server-side resolver's job.
     assert spec["fields"][1]["src"] == "https://leave.me/alone.png"
     # Pre-existing data: URL is untouched.
@@ -103,6 +143,33 @@ def test_resolve_local_paths_fails_soft_on_missing_file() -> None:
     spec = {"src": original}
     _resolve_local_paths(spec)  # should not raise
     assert spec["src"] == original
+
+
+def test_resolve_local_paths_fails_soft_on_tilde_user_path() -> None:
+    """`~user/…` and `~\\…` make `Path.expanduser()` raise RuntimeError on a
+    POSIX host — not OSError. Unmapped it escaped the resolver's handler and
+    failed the whole `ask`/`form`/… tool call (#201). The contract is
+    fail-soft: keep the original value, raise nothing.
+    """
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "image", "src": "~nosuchuser42/x.png"},
+            {"kind": "image", "src": "~\\Pictures\\x.png"},
+        ],
+    }
+    _resolve_local_paths(spec)  # must not raise
+    assert spec["fields"][0]["src"] == "~nosuchuser42/x.png"
+    assert spec["fields"][1]["src"] == "~\\Pictures\\x.png"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX `~user` expansion — Windows `expanduser` does not raise for an unknown user",
+)
+def test_read_path_as_data_url_maps_unexpandable_tilde_to_value_error() -> None:
+    with pytest.raises(ValueError, match="cannot expand"):
+        _read_path_as_data_url("~nosuchuser42/x.png")
 
 
 def test_resolve_local_paths_ignores_non_src_keys() -> None:
@@ -281,10 +348,79 @@ def test_collect_and_replace_local_audio_mirrors_rust() -> None:
     mapping = {"/Users/me/sample.mp3": "http://127.0.0.1:7777/media/blob/x.mp3"}
     _replace_srcs(spec, mapping)
     assert spec["fields"][0]["src"] == "http://127.0.0.1:7777/media/blob/x.mp3"
-    assert (
-        spec["fields"][3]["items"][0]["thumbnail"]
-        == "http://127.0.0.1:7777/media/blob/x.mp3"
-    )
+    assert spec["fields"][3]["items"][0]["thumbnail"] == "http://127.0.0.1:7777/media/blob/x.mp3"
     # Untouched: https audio and the image.
     assert spec["fields"][1]["src"] == "https://x.test/two.mp3"
     assert spec["fields"][2]["src"] == "/Users/me/pic.png"
+
+
+class _RefusingClient:
+    """Stand-in for `httpx.AsyncClient` that fails the test if anything is
+    POSTed. The point of the size pre-check (#194) is that an oversize clip
+    never reaches the wire — and never reaches RAM either.
+    """
+
+    async def post(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("no /media POST may be attempted for an oversize clip")
+
+
+def _sparse_file(path: Path, size: int) -> None:
+    """A file that *reports* `size` without occupying it — reading it would
+    cost half a gigabyte, which is exactly what must not happen."""
+    with path.open("wb") as f:
+        f.truncate(size)
+
+
+def test_upload_local_videos_skips_oversize_file(tmp_path: Path) -> None:
+    from aiui_mcp.server import _MEDIA_FILE_CAP, _upload_local_videos
+
+    clip = tmp_path / "screen-recording.mp4"
+    _sparse_file(clip, _MEDIA_FILE_CAP + 1)
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": str(clip)}]}
+
+    warnings = asyncio.run(_upload_local_videos(spec, _RefusingClient()))
+
+    # The path is left exactly as the agent wrote it — the render goes ahead,
+    # only without this clip.
+    assert spec["items"][0]["src"] == str(clip)
+    assert len(warnings) == 1
+    assert "too large" in warnings[0]
+    assert str(clip) in warnings[0]
+
+
+def test_upload_local_audios_skips_oversize_file(tmp_path: Path) -> None:
+    from aiui_mcp.server import _MEDIA_FILE_CAP, _upload_local_audios
+
+    memo = tmp_path / "voice-memo.mp3"
+    _sparse_file(memo, _MEDIA_FILE_CAP + 1)
+    spec = {"kind": "form", "fields": [{"kind": "audio", "src": str(memo)}]}
+
+    warnings = asyncio.run(_upload_local_audios(spec, _RefusingClient()))
+
+    assert spec["fields"][0]["src"] == str(memo)
+    assert len(warnings) == 1
+    assert "too large" in warnings[0]
+
+
+def test_upload_local_videos_reports_a_missing_clip(tmp_path: Path) -> None:
+    # A missing path is the same class of non-fatal failure: the render
+    # proceeds, and the agent is told rather than left to wonder why the user
+    # saw a broken player (#194).
+    from aiui_mcp.server import _upload_local_videos
+
+    missing = tmp_path / "gone.mp4"
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": str(missing)}]}
+    warnings = asyncio.run(_upload_local_videos(spec, _RefusingClient()))
+    assert len(warnings) == 1
+    assert "not a file" in warnings[0]
+    assert spec["items"][0]["src"] == str(missing)
+
+
+def test_a_clean_render_produces_no_warnings(tmp_path: Path) -> None:
+    # The warning list must stay empty when nothing failed — `_post_render`
+    # only adds `media_warnings` to the result when there is something to
+    # say, and an always-present empty list trains agents to skip the key.
+    from aiui_mcp.server import _upload_local_videos
+
+    spec = {"kind": "gallery", "items": [{"value": "a", "src": "https://x.test/clip.mp4"}]}
+    assert asyncio.run(_upload_local_videos(spec, _RefusingClient())) == []

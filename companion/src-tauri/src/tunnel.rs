@@ -369,6 +369,42 @@ fn probe_response_is_self(body: &str) -> bool {
         && matches!(body_sha, Some(s) if s == our_sha)
 }
 
+/// The full argv of the reverse-tunnel spawn, **including `"ssh"` at index
+/// 0** — `housekeeping::is_aiui_ssh_ntr_for_port` matches on `args[0]`, so
+/// the program name is part of the shape it recognises.
+///
+/// Built once here and shared by the spawner (`run_tunnel`, which skips the
+/// argv[0] when handing the rest to `Command::new("ssh")`) and the orphan
+/// reaper's matcher tests. Before this existed, `housekeeping`'s tests
+/// asserted against a hand-copied duplicate of these flags: adding or
+/// reordering one `-o` here left the test green while the matcher stopped
+/// recognising aiui's own reparented tunnels, so `ssh -NTR` orphans kept
+/// piling up on the remote and squatting :7777 (#211).
+pub(crate) fn ssh_ntr_args(host: &str, port: u16) -> Vec<String> {
+    [
+        "ssh",
+        "-N",
+        "-T",
+        "-R",
+        &format!("{port}:localhost:{port}"),
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "--",
+        host,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 async fn run_tunnel(
     host: String,
     port: u16,
@@ -384,26 +420,12 @@ async fn run_tunnel(
         ));
         *status.lock().await = TunnelStatus::Connecting;
 
+        let argv = ssh_ntr_args(&host, port);
         let mut child = match no_window_tokio(
             Command::new("ssh")
-                .args([
-                    "-N",
-                    "-T",
-                    "-R",
-                    &format!("{port}:localhost:{port}"),
-                    "-o",
-                    "ServerAliveInterval=30",
-                    "-o",
-                    "ServerAliveCountMax=3",
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "--",
-                    &host,
-                ])
+                // `argv[0]` is the program itself, which `Command::new`
+                // already supplies.
+                .args(argv.iter().skip(1))
                 .stdout(std::process::Stdio::null())
                 // #187: captured, not discarded. ssh explains its failures
                 // here; without it every one surfaced as "ssh exit code 255".
@@ -647,6 +669,13 @@ mod probe_cmd_tests {
         );
     }
 
+    // #210: the three tests below run the probe through the *local* shell.
+    // The script itself only ever executes on the remote, which is a POSIX
+    // host by construction (it is reached over ssh), and a Windows runner
+    // guarantees neither `sh` nor `curl` nor tilde-expansion against a
+    // drive-lettered `HOME`. Gating them keeps the Windows leg honest — the
+    // two string-shape tests above still assert the shipped command there.
+    #[cfg(unix)]
     #[test]
     fn the_command_is_valid_shell() {
         // Syntax-check with a real shell rather than by eye.
@@ -663,6 +692,7 @@ mod probe_cmd_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_token_exits_with_our_marker() {
         // Run the real command with HOME pointed at an empty dir: no token
@@ -680,6 +710,7 @@ mod probe_cmd_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_empty_token_file_also_exits_with_the_marker() {
         let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));
@@ -869,5 +900,39 @@ mod tests {
     fn probe_invalid_json_returns_false() {
         assert!(!probe_response_is_self("not json"));
         assert!(!probe_response_is_self(""));
+    }
+
+    /// `remotes.json` is deserialised as a bare `Vec<String>` with no
+    /// validation (`setup::load_remotes`), and startup hands every entry
+    /// straight to `ensure`. The guard at the top of `ensure` is the only
+    /// check on that path — `add_remote`'s boundary validation is not on it.
+    /// Nothing asserted that `ensure` consults the validator at all, so the
+    /// guard could be reordered below `entries.insert` or dropped as
+    /// "already validated upstream" with every test still green (#211).
+    ///
+    /// Hermetic: a rejected alias returns *before* the insert, so no task is
+    /// spawned and no `ssh` ever runs — an empty snapshot is the proof.
+    #[tokio::test]
+    async fn ensure_rejects_option_like_alias() {
+        let mgr = TunnelManager::new(7777);
+        for alias in ["-oProxyCommand=touch /tmp/pwned", "user@-evil", "a b"] {
+            // The control: these are rejected because the validator rejects
+            // them, not because `ensure` refuses everything.
+            assert!(
+                !crate::setup::is_valid_host_alias(alias),
+                "{alias:?} must be invalid for this test to mean anything"
+            );
+            mgr.ensure(alias.to_string()).await;
+        }
+        let snap = mgr.snapshot().await;
+        assert!(
+            snap.is_empty(),
+            "no tunnel task may exist for an alias the validator rejects: {snap:?}"
+        );
+        // …and the same manager does accept a normal alias, so the emptiness
+        // above is the guard's doing and not a dead `ensure`. (Asserted on
+        // the validator rather than by calling `ensure`, which would spawn a
+        // real `ssh` process from a unit test.)
+        assert!(crate::setup::is_valid_host_alias("macmini"));
     }
 }

@@ -86,22 +86,35 @@ jobs:
     name: Build signed Windows installer + attach to release
     runs-on: windows-latest
     steps:
+      # #192: every `uses:` below is pinned to a full commit SHA. This job
+      # holds the minisign updater private key, and aiui installs its own
+      # updates — a step resolved from a mutable ref would turn an upstream
+      # retag into a signed installer every Windows client accepts.
+      # `scripts/check-workflow-pins.sh` fails CI if a pin floats again.
       - name: Checkout the tagged commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The compiler is recorded in `rust-toolchain.toml`, not resolved from
+      # the moving `stable` branch at dispatch time.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-11
         with:
+          toolchain: "1.98.1"
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Assert the pinned Rust toolchain
+        shell: bash
+        working-directory: companion/src-tauri
+        run: bash ../../scripts/assert-rust-toolchain.sh
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
           key: x86_64-pc-windows-msvc-release
@@ -114,8 +127,16 @@ jobs:
         working-directory: companion
         run: npm run build
 
-      - name: Install Tauri CLI
-        run: npm install --global @tauri-apps/cli@^2
+      # #192: no global `@tauri-apps/cli@^2` install any more. That resolved
+      # a bundler at release time, discarded it, and recorded nothing — so
+      # the `.exe` a user runs and the `.sig` the updater verifies came from
+      # a version nobody could name afterwards, while `npm ci` two steps up
+      # had already installed the 2.10.1 the lockfile pins. `npx` below picks
+      # that one up, which is what the macOS job has always done.
+      - name: Assert the locked Tauri CLI
+        shell: bash
+        working-directory: companion
+        run: bash ../scripts/assert-tauri-cli.sh
 
       # Use the production tauri.conf.json — `createUpdaterArtifacts:
       # true` is correct here, the secrets are present, the produced
@@ -125,7 +146,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Locate produced bundle files
         id: bundle

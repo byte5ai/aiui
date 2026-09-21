@@ -1,8 +1,16 @@
-// Per-window lifecycle wiring shared by both entry points (setup + dialog).
+// Per-window lifecycle wiring for the **setup window only** (#195).
 //
-// Centralised here because the cooldown is per-window (each Tauri window
-// is its own JS VM, with its own `lastUpdateCheck` state) and we want
-// every window to participate in the same trigger set without copy-paste:
+// The dialog window used to install this too. It no longer does: it renders
+// agent-authored content, so `capabilities/dialog.json` grants it neither
+// `updater:*` (for `check()`) nor the event permission this listener needs,
+// and the headless 6 h updater task in `run()` (lib.rs) already detects new
+// releases independently of any window. Calling it from there produced two
+// unhandled promise rejections per render — `plugin:event|listen` and
+// `plugin:updater|check`, both "not allowed by ACL" — for a trigger set that
+// was redundant. Keep this import out of `dialog.ts`.
+//
+// The cooldown is per-window (each Tauri window is its own JS VM, with its
+// own `lastUpdateCheck` state), and the triggers are:
 //
 //   • on first mount (initial check at GUI start),
 //   • on `update:check` event from Rust (fired after each successful render —
@@ -37,6 +45,8 @@ function maybeCheckForUpdates(reason: string) {
  * Install update-check triggers for the current window. Returns a
  * teardown function that unbinds the listeners — entry points pass it
  * back through Svelte's `onMount` cleanup.
+ *
+ * `setup.ts` is the only caller, and must stay the only one (#195).
  */
 export function installUpdateChecks(): () => void {
   const onFocus = () => maybeCheckForUpdates("window-focus");

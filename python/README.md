@@ -24,14 +24,44 @@ See the main repo for the full install flow and companion download:
 
 ## Tools
 
-- `aiui.confirm` — hard yes/no with optional destructive styling
-- `aiui.ask` — single- or multi-choice with per-option descriptions
-- `aiui.form` — composite window with typed fields and action buttons
-- `aiui.aiui_health` — reachability check
+- `confirm` — hard yes/no with optional destructive styling
+- `ask` — single- or multi-choice with per-option descriptions
+- `form` — composite window with typed fields and action buttons
+- `gallery` — image/video grid the user picks from
+- `compare` — side-by-side diff of two texts or images
+- `upload` — native file picker on the user's machine; the chosen file
+  lands on the agent host
+- `notify` — fire-and-forget OS notification, no dialog, no reply
+- `aiui_health` — reachability check
+- `version` — companion version, build info, binary path, updater endpoint
+- `update` — silent update check + install on the user's machine
+
+## Environment variables
+
+None of these need setting — the defaults are what aiui registers for you.
+A bad value is **warned about and ignored**, never fatal: a typo in one of
+these must not turn into "the aiui MCP server failed to start".
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AIUI_ENDPOINT` | `http://127.0.0.1:7777` | Companion base URL — the local end of the SSH reverse-tunnel. |
+| `AIUI_TOKEN_PATH` | `~/.config/aiui/token` (`%APPDATA%\aiui\token` on Windows) | Pairing token file, written by the companion and copied to each registered remote. |
+| `AIUI_TIMEOUT_S` | `120` | Seconds for a held request (`/notify`, `/update`). |
+| `AIUI_HEALTH_TIMEOUT_S` | `3` | Seconds for `aiui_health` and `/version` — deliberately short; it is the diagnostic. |
+| `AIUI_COLDSTART_WAIT_S` | `30` | Seconds to poll `/ping` before the first call, so a companion that is still starting gets time to serve. |
+| `AIUI_UPLOAD_TIMEOUT_S` | `900` | Seconds for the held `POST /upload` — generous, because the user browses a file picker inside it. |
+| `AIUI_LOG_LEVEL` | `INFO` | Any standard `logging` level name. |
+| `AIUI_LIVE` | unset | Test-only: set to `1` to run the integration tests against a real companion. |
 
 ## Prompts
 
 - `/aiui:teach` — briefs the agent on aiui (full widget catalog, design rules, anti-patterns)
+- `/aiui:update` — agent calls the `update` tool and reports the outcome
+- `/aiui:version` — reports the installed aiui version in one line
+- `/aiui:health` — one-line health check of the companion
+- `/aiui:test-dialog` — pops a demo dialog to verify the wiring end to end
+- `/aiui:remotes` — lists the registered aiui remotes in chat
+- `/aiui:upload` — hands a file from the user's machine to the agent session
 
 ## License
 

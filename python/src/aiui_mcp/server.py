@@ -1,4 +1,4 @@
-"""aiui MCP server — renders native macOS dialogs via the aiui companion.
+"""aiui MCP server — renders native desktop dialogs via the aiui companion.
 
 Topology:
 
@@ -8,12 +8,13 @@ Topology:
                                      http://127.0.0.1:7777
                                                │  (local, or via SSH reverse-tunnel)
                                                ▼
-                                       Mac: aiui.app (Tauri companion)
+                                 companion host: aiui (Tauri companion)
 
 The aiui token is read from `~/.config/aiui/token` — installed once when
-the companion runs on the Mac, and scp'd automatically to each remote host
-registered in the companion's settings window.
+the companion runs on the user's own machine, and scp'd automatically to
+each remote host registered in the companion's settings window.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -46,13 +47,75 @@ def _version() -> str:
 VERSION = _version()
 BUILD_INFO = f"aiui-mcp v{VERSION}"
 
+
+# Warnings raised while parsing env knobs *before* `basicConfig` has run —
+# drained through `log` the moment it exists, just below `basicConfig`.
+_ENV_WARNINGS: list[str] = []
+
+
+def _env_warn(message: str) -> None:
+    """Queue or emit a bad-env-value warning depending on whether logging is
+    configured yet. `AIUI_LOG_LEVEL` is parsed before `basicConfig`, so that
+    one warning has nowhere to go until afterwards."""
+    if "log" in globals():
+        log.warning("%s", message)
+    else:
+        _ENV_WARNINGS.append(message)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float knob from the environment, never letting a typo in one
+    stop the server from starting (#203).
+
+    These parses run at import time, before FastMCP registers a single tool,
+    so an unguarded `float("120s")` turns `AIUI_TIMEOUT_S=120s` into "the aiui
+    MCP server failed to start", with the cause buried in a log the user may
+    not know how to open — and these are exactly the knobs someone reaches
+    for while debugging a flaky tunnel. A bad value falls back to the default
+    and is *warned about*: silently ignoring it would leave the user believing
+    a knob took effect that never did.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _env_warn(f"{name}={raw!r} is not a number — ignoring it, using {default}")
+        return default
+
+
+# Spelled out rather than via `logging.getLevelNamesMapping()`, which only
+# exists from 3.11 — this package supports 3.10.
+_LOG_LEVELS = frozenset(
+    {"CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET"}
+)
+
+
+def _env_log_level(default: str = "INFO") -> str:
+    """Same contract as `_env_float`, for `AIUI_LOG_LEVEL`. `basicConfig`
+    raises `ValueError: Unknown level: 'TRACE'` for anything that is not a
+    known level name, which would kill the process just as dead."""
+    raw = os.environ.get("AIUI_LOG_LEVEL")
+    if raw is None:
+        return default
+    level = raw.strip().upper()
+    if level in _LOG_LEVELS:
+        return level
+    _env_warn(f"AIUI_LOG_LEVEL={raw!r} is not a known log level — using {default}")
+    return default
+
+
 logging.basicConfig(
-    level=os.environ.get("AIUI_LOG_LEVEL", "INFO").upper(),
+    level=_env_log_level(),
     format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stderr,
 )
 log = logging.getLogger("aiui")
+for _queued in _ENV_WARNINGS:
+    log.warning("%s", _queued)
+_ENV_WARNINGS.clear()
 log.info("---- %s started pid=%d ----", BUILD_INFO, os.getpid())
 
 
@@ -82,8 +145,8 @@ def _default_token_path() -> str:
 
 TOKEN_PATH = Path(os.environ.get("AIUI_TOKEN_PATH", _default_token_path())).expanduser()
 ENDPOINT = os.environ.get("AIUI_ENDPOINT", "http://127.0.0.1:7777")
-TIMEOUT_S = float(os.environ.get("AIUI_TIMEOUT_S", "120"))
-HEALTH_TIMEOUT_S = float(os.environ.get("AIUI_HEALTH_TIMEOUT_S", "3"))
+TIMEOUT_S = _env_float("AIUI_TIMEOUT_S", 120.0)
+HEALTH_TIMEOUT_S = _env_float("AIUI_HEALTH_TIMEOUT_S", 3.0)
 
 # Cooperative version floor (Step 2). The wire contract between this bridge and
 # the Mac companion is versioned independently of either side's release version.
@@ -100,23 +163,53 @@ _wire_checked = False
 # companion answers or this budget elapses — so a freshly-launched Claude
 # Desktop / just-up SSH tunnel gets time to start serving instead of failing
 # the first call. Replaces the brittle single 3 s /health preflight.
-COLDSTART_WAIT_S = float(os.environ.get("AIUI_COLDSTART_WAIT_S", "30"))
+COLDSTART_WAIT_S = _env_float("AIUI_COLDSTART_WAIT_S", 30.0)
 
 # Per-GET timeout for the async-render poll. Must exceed the companion's
 # ~25 s server-side poll window so the server always answers `{pending:true}`
 # before we time out, letting us re-poll cleanly.
 ASYNC_POLL_TIMEOUT_S = 40.0
 
+# Poll-retry budget for the async render (#202). The whole point of the async
+# design is that a dropped connection cannot cost the user's think-time: the
+# dialog stays on the Mac's screen for the full server-side TTL, so a transport
+# error on one poll is a blip, not an answer. Aborting on the first one
+# abandoned an answered window and made the agent's natural retry open a
+# *second* dialog for the same question. Five consecutive failures a second
+# apart tolerate roughly three minutes of outage once the 40 s per-GET timeout
+# is counted in — an SSH reverse-tunnel re-establish or a WebView restart during
+# an in-app update fits comfortably. The counter resets on every successful
+# poll, so a flaky link never accumulates its way to a false give-up. Only
+# transport errors are retried: a 404 means the slot is genuinely gone.
+ASYNC_POLL_MAX_CONSECUTIVE_FAILURES = 5
+ASYNC_POLL_RETRY_BACKOFF_S = 1.0
+
+# Floor between two poll iterations. A real companion holds each GET for its
+# ~25 s poll window so the loop cannot spin today, but a companion that answers
+# `{pending: true}` immediately would turn this into a CPU spin plus a flood of
+# progress notifications.
+ASYNC_POLL_MIN_INTERVAL_S = 0.2
+
+# Fallback when a 202 body carries no `ttl_secs` — mirrors the companion's
+# `DIALOG_TTL` (2 h). The advertised TTL is the wall-clock ceiling on retrying:
+# past it the id is gone on the companion side.
+DEFAULT_POLL_TTL_S = 7200.0
+
+# Budget for the best-effort `DELETE /render/{id}` that retracts a dialog whose
+# caller was cancelled (#193). Short: cleanup must never outlive the thing it
+# cleans up.
+CANCEL_RENDER_TIMEOUT_S = 2.0
+
 # Timeout for the `upload` tool's held `POST /upload` (#146). The picker + byte
 # transfer runs on one request and the user may browse their filesystem before
 # choosing, so this is deliberately generous — far beyond any realistic
 # file-picker think-time. A periodic progress notification keeps the MCP client
 # reassured while the call is held.
-UPLOAD_TIMEOUT_S = float(os.environ.get("AIUI_UPLOAD_TIMEOUT_S", "900"))
+UPLOAD_TIMEOUT_S = _env_float("AIUI_UPLOAD_TIMEOUT_S", 900.0)
 UPLOAD_FILE_CAP = 512 * 1024 * 1024  # mirrors the companion's cap
 
 _INSTRUCTIONS = """\
-aiui is connected — you can render native dialogs on the user's Mac \
+aiui is connected — you can render native dialogs on the user's machine \
 instead of asking via chat. Default behaviour for this session:
 
 - Yes/no question (esp. before delete / drop / force-push / deploy) → \
@@ -124,7 +217,7 @@ instead of asking via chat. Default behaviour for this session:
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
   table-row triage, image confirm/grid → call `form`.
-- User wants to hand you a file from their Mac (`/aiui:upload`, \
+- User wants to hand you a file from their machine (`/aiui:upload`, \
   "take this file", "upload …") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
 - Async-completion signal the user doesn't need to answer (tests green, \
@@ -147,7 +240,7 @@ def _token() -> str:
     if not TOKEN_PATH.exists():
         raise RuntimeError(
             f"aiui token not found at {TOKEN_PATH}. "
-            "Install the aiui companion on your Mac and register this remote from its "
+            "Install the aiui companion on your own machine and register this remote from its "
             "settings window (adds the token automatically). "
             "Download: https://github.com/byte5ai/aiui/releases/latest"
         )
@@ -158,7 +251,7 @@ def _token() -> str:
     if len(tok) != 64 or any(c not in "0123456789abcdefABCDEF" for c in tok):
         raise RuntimeError(
             f"aiui token at {TOKEN_PATH} is malformed ({len(tok)} chars, expected 64 hex). "
-            "Re-register this remote from the companion's settings window on your Mac "
+            "Re-register this remote from the companion's settings window on your machine "
             "to write a fresh token."
         )
     return tok
@@ -178,6 +271,22 @@ def _explain_exc(e: BaseException) -> str:
     return msg if msg else type(e).__name__
 
 
+def _health_body(r: Any) -> dict[str, Any] | None:
+    """Parse a ``/health`` response body, on any status code.
+
+    ``None`` when the body is not a JSON object — which is itself diagnostic:
+    something that isn't the companion is answering on this port. Callers must
+    read the body even on a non-2xx, because since #179 it carries the
+    ``reason``/``hint`` that explain the status instead of the caller having to
+    guess from the number.
+    """
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 — any parse failure means "no usable body"
+        return None
+    return body if isinstance(body, dict) else None
+
+
 async def _preflight() -> None:
     """Quick sanity check before every render call: the service on :7777 must
     accept our bearer token. Guards against stale local aiui instances that
@@ -192,7 +301,8 @@ async def _preflight() -> None:
         except httpx.ConnectError as e:
             raise RuntimeError(
                 f"aiui companion not reachable at {ENDPOINT}. "
-                f"Is Claude Desktop running on your Mac? For remote projects, the "
+                f"Is Claude Desktop running on the machine with the aiui companion? "
+                f"For remote projects, the "
                 f"SSH reverse-tunnel must also be active (companion handles it "
                 f"automatically if this host is registered in its settings). "
                 f"Underlying error: {e}"
@@ -212,9 +322,9 @@ async def _preflight() -> None:
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} accepted the connection but sent no "
                 f"response (ReadError). On a remote this means the SSH reverse-tunnel "
-                f"is up but the Mac-side aiui isn't serving — Claude Desktop may be "
+                f"is up but the companion-side aiui isn't serving — Claude Desktop may be "
                 f"closed, or a stale tunnel is squatting :7777. Open Claude Desktop on "
-                f"the Mac; if it persists, re-register this remote in aiui.app settings. "
+                f"the companion host; if it persists, re-register this remote in aiui.app settings. "
                 f"({_explain_exc(e)})"
             ) from e
         except httpx.RemoteProtocolError as e:
@@ -229,9 +339,9 @@ async def _preflight() -> None:
             # at least sees *something* concrete.
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} reset the connection. "
-                f"The Mac-side mcp-stdio normally auto-resurrects aiui.app on "
+                f"The companion-side mcp-stdio normally auto-resurrects aiui.app on "
                 f"the next call — if this persists, a stale process may hold "
-                f"the port. Verify that Claude Desktop is open on the Mac and, "
+                f"the port. Verify that Claude Desktop is open on the companion host and, "
                 f"on remotes, re-register the host in aiui.app settings to "
                 f"re-sync the token. "
                 f"({_explain_exc(e)})"
@@ -242,7 +352,7 @@ async def _preflight() -> None:
             # exception with an empty message.
             raise RuntimeError(
                 f"aiui companion request to {ENDPOINT} failed: {_explain_exc(e)}. "
-                f"Verify Claude Desktop is open on the Mac; auto-resurrect "
+                f"Verify Claude Desktop is open on the companion host; auto-resurrect "
                 f"normally restores the GUI on the next call. If repeated, "
                 f"check the SSH reverse-tunnel and re-register this remote "
                 f"in aiui.app settings to re-sync the token."
@@ -255,9 +365,35 @@ async def _preflight() -> None:
                 f"token. Run `pkill -f '^aiui$'` on this host, then re-register it "
                 f"from the companion's settings window to re-sync the token."
             )
+        body = _health_body(r)
+
         if r.status_code != 200:
+            # Only a genuinely unserviceable companion reaches here: since
+            # #179 the companion answers 503 for `webview_unresponsive` alone.
+            # Relay its `hint` verbatim — the old `r.text[:200]` handed the
+            # user a status code and half a JSON blob.
+            hint = (body.get("hint") or body.get("reason")) if body else None
             raise RuntimeError(
-                f"aiui companion /health returned {r.status_code}: {r.text[:200]}"
+                f"aiui companion at {ENDPOINT} is not serving "
+                f"(HTTP {r.status_code}): {hint or r.text[:200]}"
+            )
+
+        if body is None:
+            raise RuntimeError(
+                f"aiui companion /health returned a 200 with an unparseable body: "
+                f"{r.text[:200]}. Another process may be holding {ENDPOINT}."
+            )
+
+        # Degraded-but-serving (`dialog_registry_full`, `too_many_children`)
+        # comes back as 200 + `ready: false`. It must NOT block this session:
+        # /render sweeps expired dialogs and evicts the oldest on its own, so
+        # one session's backlog used to take rendering down for every other
+        # session sharing the companion (#179).
+        if body.get("ready") is False:
+            log.warning(
+                "aiui companion degraded but serving (reason=%s): %s",
+                body.get("reason") or "unknown",
+                body.get("hint") or "",
             )
 
         # Cooperative version floor (Step 2): once per process, confirm the
@@ -271,7 +407,7 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
     Raises a structured ``RuntimeError`` (surfaced to the agent as a tool error)
     on a hard wire-version mismatch, telling the user to restart this Claude
     Code session so it respawns ``aiui-mcp`` at a matching version — the
-    cooperative replacement for the Mac externally killing this bridge.
+    cooperative replacement for the companion externally killing this bridge.
 
     Tolerant by design: a companion too old to report ``wire_version`` (field
     absent → treated as v1), or any transient error reading ``/version``, does
@@ -298,7 +434,7 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
         # (e.g. after the user restarts the companion) re-checks cleanly.
         raise RuntimeError(
             f"incompatible aiui versions — this bridge (aiui-mcp {VERSION}) speaks wire "
-            f"v{EXPECTED_WIRE_VERSION}, but the companion on your Mac speaks wire "
+            f"v{EXPECTED_WIRE_VERSION}, but the companion on your machine speaks wire "
             f"v{remote_wire}. Restart this Claude Code session so it respawns aiui-mcp at "
             f"a matching version (or update the side that is behind)."
         )
@@ -307,6 +443,10 @@ async def _check_wire_compat(client: httpx.AsyncClient) -> None:
 
 _SRC_KEYS = {"src", "thumbnail"}
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB — mirrors the Rust resolver
+# Largest single clip the companion's `/media` cache accepts (#194). Mirrors
+# `media::MEDIA_FILE_CAP` in the Rust half; checked here *before* the read so
+# an oversize file is skipped rather than pulled into RAM first.
+_MEDIA_FILE_CAP = 512 * 1024 * 1024
 _LOCAL_PATH_MIME_OVERRIDES = {
     # mimetypes.guess_type returns None for SVG without a hint on some
     # Pythons, and `image/svg` (without `+xml`) on others. Lock it down
@@ -327,27 +467,59 @@ _LOCAL_PATH_MIME_OVERRIDES = {
 }
 
 
+# Module-level rather than computed per call so a test can monkeypatch it
+# and exercise the Windows branch on a POSIX runner — the same reason the
+# Rust mirror takes the platform as a parameter (#201).
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _is_windows_abs_path(s: str) -> bool:
+    """`C:\\foo`, `D:/bar`, long-path `\\\\?\\C:\\…`, UNC `\\\\server\\share\\…`.
+
+    Mirrors the `cfg!(windows)` branch of `imageresolve::looks_like_local_path`.
+    """
+    if s.startswith("\\\\"):
+        return True
+    return len(s) >= 3 and s[0].isascii() and s[0].isalpha() and s[1] == ":" and s[2] in "\\/"
+
+
 def _looks_like_local_path(s: str) -> bool:
     """Mirror of `imageresolve::looks_like_local_path` in the Rust bridge.
 
-    Accepts absolute paths and `~/`-rooted paths. Rejects `data:` URLs,
+    Accepts absolute paths and `~`-rooted paths, plus — on a Windows host
+    only — drive-letter, long-path and UNC paths. Rejects `data:` URLs,
     `http(s)://` URLs, relative paths (no stable cwd contract on MCP
     bridges), and anything else.
+
+    The Windows shapes are gated on the host platform on purpose: `C:\\x.png`
+    is not a path on Linux, and accepting it there would push garbage into
+    `_read_path_as_data_url` instead of leaving the value alone.
     """
     if not s:
         return False
     if s.startswith(("data:", "http://", "https://")):
         return False
-    return s.startswith("/") or s.startswith("~")
+    if s.startswith("/") or s.startswith("~"):
+        return True
+    return _IS_WINDOWS and _is_windows_abs_path(s)
 
 
 def _read_path_as_data_url(raw: str) -> str:
     """Read a local file and return it as `data:<mime>;base64,…`.
 
     Raises ValueError on anything that should make the resolver leave
-    the original `src` value alone (missing file, oversize, not a file).
+    the original `src` value alone (missing file, oversize, not a file,
+    an unexpandable `~`).
     """
-    path = Path(raw).expanduser()
+    try:
+        path = Path(raw).expanduser()
+    except RuntimeError as e:
+        # `expanduser()` raises RuntimeError — not OSError — when it cannot
+        # determine a home directory, which is what `~someuser/x.png` and
+        # `~\Pictures\x.png` do on POSIX. Left unmapped it escaped
+        # `_resolve_local_paths`'s handler and failed the whole tool call,
+        # breaking this module's fail-soft contract (#201).
+        raise ValueError(f"cannot expand {raw}: {e}") from e
     if not path.is_file():
         raise ValueError(f"not a file: {path}")
     size = path.stat().st_size
@@ -367,7 +539,7 @@ def _read_path_as_data_url(raw: str) -> str:
 def _resolve_local_paths(node: Any) -> None:
     """Walk a render spec in place, replacing absolute / `~/` paths in
     `src` / `thumbnail` properties with `data:` URLs. The bridge-side
-    counterpart to the Mac's HTTPS resolver — runs wherever this MCP
+    counterpart to the companion's HTTPS resolver — runs wherever this MCP
     server runs (local or remote), which is by definition the host
     that holds the agent's files.
 
@@ -429,27 +601,60 @@ def _replace_srcs(node: Any, mapping: dict[str, str]) -> None:
             _replace_srcs(item, mapping)
 
 
-async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+async def _read_media_file(p: str) -> bytes:
+    """Read a local media file for the `/media` push, size-checked first (#194).
+
+    Two things the old inline `read_bytes()` got wrong. It learned the size
+    only *after* materialising the file, so a 3–4 GB screen recording — an
+    ordinary thing to hand a `gallery` — was pulled into RAM before anything
+    compared it to the companion's 512 MB ceiling; the `MemoryError` that can
+    follow is not an `OSError`, so it escaped the best-effort handler and
+    killed the whole tool call instead of skipping one clip. And it was
+    blocking I/O inside an `async def`, stalling the event loop — and with it
+    the progress heartbeat — for the whole read.
+
+    Raises `ValueError` for a file that is missing, not a file, or over the
+    cap; `OSError` for a read that fails. Same shape as
+    `_read_path_as_data_url`.
+    """
+    path = Path(p).expanduser()
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
+    size = path.stat().st_size
+    if size > _MEDIA_FILE_CAP:
+        raise ValueError(f"too large: {size} bytes (max {_MEDIA_FILE_CAP})")
+    return await asyncio.to_thread(path.read_bytes)
+
+
+async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) -> list[str]:
     """Push local video files to the companion's `/media` cache and rewrite
     their `src`/`thumbnail` to the returned loopback playback URL.
 
     Videos are too big to inline as `data:` (the 10 MB cap + base64 bloat),
-    and a remote agent's file isn't readable from the Mac — so the bridge
+    and a remote agent's file isn't readable from the companion host — so the bridge
     streams the bytes over the same :7777 channel the render uses (loopback
     locally, reverse tunnel remotely). Best-effort: a read error, a 413, or
     an old companion without `/media` (404) leaves the path untouched, and
     `_resolve_local_paths` then does whatever it can with it.
+
+    Returns one human-readable warning per clip that did not make it (#194).
+    The render still happens — only the silence was wrong: the user saw a
+    broken player while the agent believed the clip was on screen.
     """
     paths: list[str] = []
     _collect_local_videos(spec, paths)
+    warnings: list[str] = []
     if not paths:
-        return
+        return warnings
     mapping: dict[str, str] = {}
     for p in paths:
         try:
-            data = Path(p).expanduser().read_bytes()
-        except OSError as e:
+            data = await _read_media_file(p)
+        except (OSError, ValueError, MemoryError, RuntimeError) as e:
+            # RuntimeError: `expanduser()` on an unexpandable `~user` /
+            # `~\…` path — fail soft here too (#201).
             log.warning("video skipped (read failed) %s: %s", p, e)
+            warnings.append(f"video not shown — {p}: {e}")
             continue
         ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp4"
         try:
@@ -466,10 +671,12 @@ async def _upload_local_videos(spec: dict[str, Any], client: httpx.AsyncClient) 
             url = r.json().get("url")
         except (httpx.HTTPError, ValueError) as e:
             log.warning("video upload failed %s: %s", p, e)
+            warnings.append(f"video not shown — {p}: {e}")
             continue
         if url:
             mapping[p] = url
     _replace_srcs(spec, mapping)
+    return warnings
 
 
 _AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac")
@@ -501,28 +708,35 @@ def _collect_local_audios(node: Any, out: list[str]) -> None:
             _collect_local_audios(item, out)
 
 
-async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) -> None:
+async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) -> list[str]:
     """Push local audio files to the companion's `/media` cache and rewrite
     their `src`/`thumbnail` to the returned loopback playback URL (#25).
 
     Same reasoning as `_upload_local_videos`: local files are too big (or
     simply unnecessary) to inline as `data:` given the 10 MB cap + base64
-    bloat, and a remote agent's file isn't readable from the Mac — so the
+    bloat, and a remote agent's file isn't readable from the companion host — so the
     bridge streams the bytes over the same :7777 channel the render uses.
     Best-effort: a read error, a 413, or an old companion without `/media`
     (404) leaves the path untouched, and `_resolve_local_paths` then does
     whatever it can with it.
+
+    Returns one warning per clip that did not make it (#194), same contract
+    as the video half.
     """
     paths: list[str] = []
     _collect_local_audios(spec, paths)
+    warnings: list[str] = []
     if not paths:
-        return
+        return warnings
     mapping: dict[str, str] = {}
     for p in paths:
         try:
-            data = Path(p).expanduser().read_bytes()
-        except OSError as e:
+            data = await _read_media_file(p)
+        except (OSError, ValueError, MemoryError, RuntimeError) as e:
+            # RuntimeError: `expanduser()` on an unexpandable `~user` /
+            # `~\…` path — fail soft here too (#201).
             log.warning("audio skipped (read failed) %s: %s", p, e)
+            warnings.append(f"audio not played — {p}: {e}")
             continue
         ext = p.lower().split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[-1] or "mp3"
         try:
@@ -539,10 +753,12 @@ async def _upload_local_audios(spec: dict[str, Any], client: httpx.AsyncClient) 
             url = r.json().get("url")
         except (httpx.HTTPError, ValueError) as e:
             log.warning("audio upload failed %s: %s", p, e)
+            warnings.append(f"audio not played — {p}: {e}")
             continue
         if url:
             mapping[p] = url
     _replace_srcs(spec, mapping)
+    return warnings
 
 
 def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -553,7 +769,19 @@ def _collect_target_fields(spec: dict[str, Any]) -> list[dict[str, Any]]:
     def scan(fields: Any) -> None:
         if isinstance(fields, list):
             for f in fields:
-                if isinstance(f, dict) and f.get("target") is not None and isinstance(f.get("name"), str):
+                # #199: `isinstance(..., dict)`, not `is not None` — a
+                # `"target": "~/x"` string used to be collected here and then
+                # `.get()`-ed in `_write_local_target`, killing the tool call
+                # with `AttributeError` *after* the user had typed a secret.
+                # A current companion rejects that shape at validate_spec; a
+                # non-dict target that still reaches us is simply not a
+                # target (a `secret` carrying one is still stripped by
+                # `_collect_secret_fields`).
+                if (
+                    isinstance(f, dict)
+                    and isinstance(f.get("target"), dict)
+                    and isinstance(f.get("name"), str)
+                ):
                     out.append(f)
 
     scan(spec.get("fields"))
@@ -589,17 +817,87 @@ def _collect_secret_fields(spec: dict[str, Any]) -> list[str]:
     return out
 
 
-def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
+def _target_path_error(raw_path: str) -> str | None:
+    """Why a `target.path` is unusable, or None. Mirror of the Rust
+    `filewrite::target_path_error` — same rule, same wording, because #199 was
+    exactly the two bridges quietly accepting different paths.
+
+    A relative path has no stable cwd to resolve against (the bridge's is the
+    agent's, the Finder-launched companion's is typically `/`) and `~user/`
+    only ever worked on this side, so both are rejected rather than written
+    somewhere the user never approved. Same rule `_upload_expand_dir`
+    enforces for `upload`'s `target_dir`.
+    """
+    if (
+        not raw_path
+        or len(raw_path) > 4096
+        or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw_path)
+    ):
+        return "invalid target path"
+    # `startswith("/")` in addition to `is_absolute()` so a POSIX-style path
+    # is accepted identically on a Windows bridge host, matching the Rust
+    # side's `has_root()`.
+    if raw_path.startswith("~/") or raw_path.startswith("/") or Path(raw_path).is_absolute():
+        return None
+    return f"target path must be an absolute or ~/-rooted path, got '{raw_path}'"
+
+
+def _resolve_target_path(path: Path) -> Path:
+    """Resolve the destination a write really lands on (#199). Mirror of the
+    Rust `filewrite::resolve_target`.
+
+    `Path.resolve(strict=True)` on the whole path is wrong here: for `create`
+    the file does not exist yet. So canonicalise the *parent* and re-join the
+    name, then follow the final component while it is an existing symlink —
+    otherwise `substitute` reads through the link but `os.replace`s a fresh
+    regular file over the link itself, leaving the real config untouched and
+    the secret in what used to be the link.
+    """
+    cur = path
+    for _ in range(32):  # bounded, so a symlink cycle can't spin here
+        try:
+            base = cur.parent.resolve(strict=True) / cur.name
+        except OSError:
+            base = cur  # parent doesn't exist yet — nothing to resolve
+        if not base.is_symlink():
+            return base
+        try:
+            dest = Path(os.readlink(base))
+        except OSError:
+            return base
+        cur = dest if dest.is_absolute() else base.parent / dest
+    return cur
+
+
+def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
     host (the bridge runs where the agent runs, so the file is always local).
     `create` (atomic tmp+rename, refuses clobber without overwrite) or
     `substitute` (replace a placeholder occurring exactly once). Never logs the
-    value. Returns `{written, target, bytes, error?}`.
+    value. Returns `{written, target, bytes, mode?, error?}`.
+
+    #199: nothing here may escape as an exception. Every failure happens
+    *after* the user has typed a value they cannot retype (a credential), so
+    a traceback loses the secret and tells the agent nothing. Structured
+    outcome or nothing.
     """
+    if not isinstance(target, dict):
+        # The Python equivalent of Rust's `WriteOutcome::invalid` — no
+        # destination to even name.
+        return {
+            "written": False,
+            "target": "",
+            "bytes": 0,
+            "error": "target must be an object with mode/path",
+        }
     raw_path = str(target.get("path", ""))
-    if not raw_path or any(ord(c) < 0x20 or ord(c) == 0x7f for c in raw_path):
-        return {"written": False, "target": raw_path, "bytes": 0, "error": "invalid target path"}
-    path = Path(raw_path).expanduser()
+    why = _target_path_error(raw_path)
+    if why:
+        return {"written": False, "target": raw_path, "bytes": 0, "error": why}
+    try:
+        path = _resolve_target_path(Path(raw_path).expanduser())
+    except Exception:  # noqa: BLE001  # pragma: no cover - expanduser on an exotic home
+        path = Path(raw_path)
     display = str(path)
     # Issue #177: an empty credential is never a legitimate write, and
     # truncating the user's file is not a dialog's job. Refusing here, before
@@ -608,20 +906,43 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     # erase the sentinel, making a retry impossible). Mirrors the identical
     # guard in Rust `filewrite::write_local`.
     if value == "":
-        return {"written": False, "target": display, "bytes": 0,
-                "error": "refusing to write an empty value"}
+        return {
+            "written": False,
+            "target": display,
+            "bytes": 0,
+            "error": "refusing to write an empty value",
+        }
     mode = target.get("mode")
     perm_s = target.get("perm")
     try:
-        perm = int(str(perm_s), 8) if perm_s else 0o600
+        perm: int | None = int(str(perm_s), 8) if perm_s else None
     except ValueError:
-        perm = 0o600
+        perm = None
+    if perm is None:
+        # #199: one default per mode, matching Rust. `create` stays tight by
+        # default — a fresh credential file must never inherit the umask.
+        # `substitute` is editing a file the user already owns, and silently
+        # re-chmod'ing a 0644 compose file to 0600 stopped the container that
+        # read it; it keeps the destination's mode instead.
+        if mode == "substitute":
+            try:
+                perm = path.stat().st_mode & 0o7777
+            except OSError:
+                perm = 0o600  # unreadable → the read below fails anyway
+        else:
+            perm = 0o600
+    # Mirrors Rust's `#[cfg(unix)]` guard: off POSIX there are no mode bits
+    # (and `os.fchmod` does not exist — an unguarded call made *every* target
+    # write on a Windows bridge host die with AttributeError).
+    can_chmod = hasattr(os, "fchmod")
+    mode_out: dict[str, Any] = {"mode": f"{perm:04o}"} if can_chmod else {}
 
     def atomic_write(p: Path, data: bytes) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".aiui-write-", dir=str(p.parent))
         try:
-            os.fchmod(fd, perm)
+            if can_chmod:
+                os.fchmod(fd, perm)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, p)
@@ -635,28 +956,61 @@ def _write_local_target(value: str, target: dict[str, Any]) -> dict[str, Any]:
     try:
         if mode == "create":
             if path.exists() and not target.get("overwrite"):
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "file exists and overwrite is false (mode: create)"}
-            atomic_write(path, value.encode())
-            return {"written": True, "target": display, "bytes": len(value.encode())}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "file exists and overwrite is false (mode: create)",
+                }
+            data = value.encode("utf-8")
+            atomic_write(path, data)
+            return {"written": True, "target": display, "bytes": len(data), **mode_out}
         if mode == "substitute":
             placeholder = target.get("placeholder")
             if not placeholder:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": "substitute mode requires 'placeholder'"}
-            existing = path.read_text()
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": "substitute mode requires 'placeholder'",
+                }
+            # #199: explicit UTF-8 on BOTH sides. The read used to take the
+            # process locale while the write-back was always UTF-8, so on a
+            # latin-1 host every non-ASCII byte in the user's file was
+            # silently re-encoded by a one-line substitution. A non-UTF-8
+            # target now fails structurally (UnicodeDecodeError is caught
+            # below), exactly as the Rust `read_to_string` already did —
+            # `errors="replace"` would trade a loud failure for silent
+            # corruption, which is the bug, not the fix.
+            existing = path.read_text(encoding="utf-8")
             count = existing.count(placeholder)
             if count != 1:
-                return {"written": False, "target": display, "bytes": 0,
-                        "error": (f"placeholder '{placeholder}' not found in target file"
-                                  if count == 0
-                                  else f"placeholder '{placeholder}' found {count}× (must be exactly 1)")}
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": (
+                        f"placeholder '{placeholder}' not found in target file"
+                        if count == 0
+                        else f"placeholder '{placeholder}' found {count}× (must be exactly 1)"
+                    ),
+                }
             updated = existing.replace(placeholder, value, 1)
-            atomic_write(path, updated.encode())
-            return {"written": True, "target": display, "bytes": len(updated.encode())}
+            data = updated.encode("utf-8")
+            atomic_write(path, data)
+            return {"written": True, "target": display, "bytes": len(data), **mode_out}
         return {"written": False, "target": display, "bytes": 0, "error": f"unknown mode '{mode}'"}
-    except OSError as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers UnicodeDecodeError (a non-UTF-8 target), which is
+        # NOT an OSError and used to escape as a raw traceback.
         return {"written": False, "target": display, "bytes": 0, "error": str(e)}
+    except Exception as e:  # noqa: BLE001  # pragma: no cover - backstop, see the docstring
+        return {
+            "written": False,
+            "target": display,
+            "bytes": 0,
+            "error": f"target write failed: {e.__class__.__name__}: {e}",
+        }
 
 
 def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
@@ -690,6 +1044,35 @@ def _action_commits_targets(spec: dict[str, Any], action: Any) -> bool:
     return entry.get("skip_validation") is not True
 
 
+def _annotate_target_paths(spec: dict[str, Any]) -> None:
+    """Stamp every `target`-carrying field with `target.resolved_path` — the
+    absolute destination THIS host will write — so the dialog's approval line
+    names the file rather than the raw spec string (#199). The companion
+    renders the spec but the write happens here, so this is the only place
+    that can resolve it truthfully. Mutates `spec` in place; always
+    overwrites, so an agent-supplied value can't misstate the destination.
+    """
+
+    def scan(fields: Any) -> None:
+        if not isinstance(fields, list):
+            return
+        for f in fields:
+            if not isinstance(f, dict) or not isinstance(f.get("target"), dict):
+                continue
+            raw = f["target"].get("path")
+            if not isinstance(raw, str) or _target_path_error(raw):
+                continue
+            try:
+                f["target"]["resolved_path"] = str(_resolve_target_path(Path(raw).expanduser()))
+            except Exception:  # noqa: BLE001  # pragma: no cover - display only, never fatal
+                pass
+
+    scan(spec.get("fields"))
+    for tab in spec.get("tabs") or []:
+        if isinstance(tab, dict):
+            scan(tab.get("fields"))
+
+
 def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
     """After a render returns, perform the local file writes for `target`
     fields on THIS host and fold the outcomes back into the result, stripping
@@ -718,16 +1101,35 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
         v = values.get(name)
         if not commits:
             label = action if action is not None else "(submit)"
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0,
-                       "error": f"action '{label}' does not commit target writes"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": f"action '{label}' does not commit target writes",
+            }
         elif name not in values or v is None:
             # "Absent from the payload" is not "submitted blank": never
             # launder a missing key into an empty write.
-            outcome = {"written": False, "target": str(field["target"].get("path", "")),
-                       "bytes": 0, "error": "no value submitted for this field"}
+            outcome = {
+                "written": False,
+                "target": str(field["target"].get("path", "")),
+                "bytes": 0,
+                "error": "no value submitted for this field",
+            }
         else:
-            outcome = _write_local_target(str(v), field["target"])
+            try:
+                outcome = _write_local_target(str(v), field["target"])
+            except Exception as e:  # noqa: BLE001  # pragma: no cover - belt and braces
+                # #199: one bad field used to abort the loop mid-way, so the
+                # writes that had already landed were never reported and the
+                # tool call died with a traceback. Every field gets an
+                # outcome; nothing propagates out of the submit path.
+                outcome = {
+                    "written": False,
+                    "target": str(field["target"].get("path", "")),
+                    "bytes": 0,
+                    "error": f"target write failed: {e.__class__.__name__}: {e}",
+                }
         if field.get("kind") == "secret":
             values[name] = outcome  # write-only: raw value never returned
         else:
@@ -767,9 +1169,21 @@ def _upload_expand_dir(raw: str) -> Path | None:
     relative path — there is no stable cwd contract to resolve it against, so
     it's treated as a caller error (the cwd default is applied by the caller
     only when `target_dir` is absent). Mirrors `expand_dir` in the Rust bridge.
+
+    #194: only `~` and `~/…` are expandable, byte-for-byte the Rust rule. Any
+    other leading `~` — `~nosuchuser/x` — used to reach `expanduser()`, which
+    raises `RuntimeError: Could not determine home directory` for an unknown
+    user. That escaped the `upload` tool entirely and broke its contract that
+    every failure comes back as `{status: "error", error}`. It is now just
+    another unexpandable path, and the caller says so in words.
     """
+    if raw == "~" or raw.startswith("~/"):
+        try:
+            return Path(raw).expanduser()
+        except (RuntimeError, OSError):
+            return None
     if raw.startswith("~"):
-        return Path(raw).expanduser()
+        return None
     p = Path(raw)
     return p if p.is_absolute() else None
 
@@ -793,15 +1207,52 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
             try:
                 os.link(tmp, dest)
             except FileExistsError:
-                return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
+                return {
+                    "status": "error",
+                    "error": f"target already exists, not overwriting: {dest}",
+                }
+            except OSError as e:
+                # #194: exFAT/FAT32 and many SMB mounts have no hard links, so
+                # an upload to a USB stick or a share failed *after* the bytes
+                # had crossed the tunnel, with an OS message that named no
+                # cause the user could act on. Fall back to creating the
+                # destination with O_EXCL: no-clobber survives (that is the
+                # promise), atomicity does not (which nothing promises).
+                log.info("hard link unsupported for %s (%s) — writing directly", dest, e)
+                _upload_write_exclusive(dest, data)
         finally:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+    except FileExistsError:
+        return {"status": "error", "error": f"target already exists, not overwriting: {dest}"}
     except OSError as e:
         return {"status": "error", "error": f"writing {dest}: {e}"}
     return {"status": "ok", "path": str(dest), "filename": filename, "bytes": len(data)}
+
+
+def _upload_write_exclusive(dest: Path, data: bytes) -> None:
+    """Create `dest` with `O_EXCL` and write `data` into it (#194).
+
+    The never-clobber half of `_upload_write` for filesystems without hard
+    links. Raises `FileExistsError` when the destination is taken — the same
+    signal `os.link` gives — and cleans up a partially written file it created
+    itself, so a retry doesn't trip over our own debris. Mirrors
+    `fsutil::write_new_unlinked` in the Rust bridge.
+    """
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
 
 
 async def _upload_heartbeat(ctx: Context) -> None:
@@ -845,10 +1296,35 @@ async def _wait_for_aiui() -> None:
             await asyncio.sleep(0.5)
 
 
+async def _cancel_render(render_id: str) -> None:
+    """Best-effort `DELETE /render/{id}` (#193) — tell the companion to retract a
+    dialog this bridge no longer has a caller for, so it doesn't sit on the
+    user's machine waiting for an agent that is gone.
+
+    Builds its own client on purpose: the `async with httpx.AsyncClient(...)` in
+    `_post_render` may already be unwinding when this runs. Every failure is
+    swallowed, and a `404`/`405` simply means an older companion without the
+    route — nothing to do, never an error.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=CANCEL_RENDER_TIMEOUT_S) as client:
+            r = await client.delete(
+                f"{ENDPOINT}/render/{render_id}",
+                headers={"Authorization": f"Bearer {_token()}"},
+            )
+            if r.status_code in (404, 405):
+                log.debug("cancel render %s: companion has no DELETE route", render_id)
+            else:
+                log.info("cancelled render %s (http %s)", render_id, r.status_code)
+    except Exception as e:  # noqa: BLE001
+        log.debug("cancel render %s failed: %s", render_id, _explain_exc(e))
+
+
 async def _poll_render(
     client: httpx.AsyncClient,
     render_id: str,
     ctx: Context | None,
+    ttl_secs: float = DEFAULT_POLL_TTL_S,
 ) -> dict[str, Any]:
     """Poll `GET /render/{id}` until the terminal result (Step 3 async render).
 
@@ -858,38 +1334,92 @@ async def _poll_render(
     which is what immunises the remote path against the multi-minute-ReadError
     class. Emits an MCP progress notification each pending iteration so the
     client (Claude Code) knows the tool is alive, not hung.
+
+    On cancellation (#193) the dialog is retracted before the exception
+    propagates. The MCP SDK already cancels this task on a `CancelledNotification`,
+    so the task died today but the window on the user's machine did not.
+
+    #202: a transport error on one poll is retried against the SAME id rather
+    than ending the call. The dialog is already on the user's screen and stays
+    there for `ttl_secs`; aborting here abandons it and makes the agent's retry
+    open a second window for the same question. Never re-POST `/render` — the
+    id from the 202 is the whole point. Bounded by
+    `ASYNC_POLL_MAX_CONSECUTIVE_FAILURES` and by the advertised TTL.
     """
     poll_url = f"{ENDPOINT}/render/{render_id}"
     iteration = 0
-    while True:
-        pr = await client.get(
-            poll_url,
-            headers={"Authorization": f"Bearer {_token()}"},
-            timeout=ASYNC_POLL_TIMEOUT_S,
-        )
-        if pr.status_code == 404:
-            raise RuntimeError(
-                f"aiui lost track of render {render_id} (expired or never "
-                f"registered). Restart the dialog."
+    consecutive_failures = 0
+    deadline = time.monotonic() + ttl_secs
+    try:
+        while True:
+            try:
+                pr = await client.get(
+                    poll_url,
+                    headers={"Authorization": f"Bearer {_token()}"},
+                    timeout=ASYNC_POLL_TIMEOUT_S,
+                )
+            except httpx.HTTPError as e:
+                consecutive_failures += 1
+                if (
+                    consecutive_failures >= ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
+                    or time.monotonic() >= deadline
+                ):
+                    # `_explain_exc` guarantees a non-empty message: httpx leaves
+                    # `str(e)` empty for RemoteProtocolError / ReadError, which is
+                    # exactly the class that shows up on a dropped tunnel.
+                    raise RuntimeError(
+                        f"aiui lost contact with the companion while waiting for "
+                        f"render {render_id}: {_explain_exc(e)} "
+                        f"({consecutive_failures} consecutive poll failures). "
+                        f"The dialog may still be open on the user's machine — check it "
+                        f"before re-asking."
+                    ) from e
+                log.warning(
+                    "poll %s failed (%s), retry %d/%d",
+                    render_id,
+                    _explain_exc(e),
+                    consecutive_failures,
+                    ASYNC_POLL_MAX_CONSECUTIVE_FAILURES,
+                )
+                await asyncio.sleep(ASYNC_POLL_RETRY_BACKOFF_S)
+                continue
+            consecutive_failures = 0
+            if pr.status_code == 404:
+                raise RuntimeError(
+                    f"aiui lost track of render {render_id} (expired or never "
+                    f"registered). Restart the dialog."
+                )
+            pr.raise_for_status()
+            pv = pr.json()
+            if pv.get("pending") is True:
+                iteration += 1
+                if ctx is not None:
+                    # Best-effort: a missing progressToken or any reporting
+                    # hiccup must never break the render.
+                    try:
+                        await ctx.report_progress(progress=float(iteration), total=None)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("progress report skipped: %s", _explain_exc(e))
+                await asyncio.sleep(ASYNC_POLL_MIN_INTERVAL_S)
+                continue
+            return pv
+    except asyncio.CancelledError:
+        # `shield` is load-bearing: a bare `await` inside an `except
+        # CancelledError` block is re-cancelled immediately on most loop states
+        # and the DELETE never goes out. `BaseException`, not `Exception`,
+        # because the shield itself re-raises `CancelledError`.
+        try:
+            await asyncio.shield(
+                asyncio.wait_for(_cancel_render(render_id), CANCEL_RENDER_TIMEOUT_S)
             )
-        pr.raise_for_status()
-        pv = pr.json()
-        if pv.get("pending") is True:
-            iteration += 1
-            if ctx is not None:
-                # Best-effort: a missing progressToken or any reporting hiccup
-                # must never break the render.
-                try:
-                    await ctx.report_progress(progress=float(iteration), total=None)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("progress report skipped: %s", _explain_exc(e))
-            continue
-        return pv
+        except BaseException as e:  # noqa: BLE001
+            log.debug("render cancel cleanup: %s", _explain_exc(e))
+        raise
 
 
 def _session_origin() -> str:
     """This bridge's host, auto-attached to every render as `session_origin`
-    (Step 4, I8). The Mac can't tell remotes apart at the shared `:7777`, so
+    (Step 4, I8). The companion can't tell remotes apart at the shared `:7777`, so
     the origin must come from the caller side — the user always sees which host
     a dialog came from even when the agent passes no `session` label."""
     try:
@@ -911,11 +1441,11 @@ async def _post_render(
         # Video first: push local video files to the Mac's /media cache and
         # swap their `src` for the returned playback URL — BEFORE the image
         # inliner runs, so it never tries to base64 a huge clip.
-        await _upload_local_videos(spec, client)
+        media_warnings = await _upload_local_videos(spec, client)
         # Audio (#25): same reasoning — local audio for the form `audio`
         # field is routed through the /media cache instead of the 10 MB
         # `data:` inliner, uniformly regardless of clip size.
-        await _upload_local_audios(spec, client)
+        media_warnings += await _upload_local_audios(spec, client)
         # Resolve any absolute / `~/`-rooted file paths *before* shipping
         # the spec down the HTTP wire. This bridge runs on the same host
         # as the agent — local for Mac use, remote for SSH-tunneled
@@ -923,20 +1453,38 @@ async def _post_render(
         # agent's filesystem actually exists. The Mac-side server resolver
         # only handles HTTPS.
         _resolve_local_paths(spec)
+        # #199: the write for a `target` field happens on THIS host after
+        # submit, so only this side knows where it lands. Resolve it into the
+        # spec before the companion renders the approval line.
+        _annotate_target_paths(spec)
         # Async render (Step 3): opt in via the header. A current companion
         # registers the dialog and answers immediately with `{id, ttl_secs}`
         # (202); we then poll for the result. An older companion ignores the
         # header and answers synchronously (200 with the terminal shape) — we
         # detect that and use it directly (backward-compatible).
-        r = await client.post(
-            f"{ENDPOINT}/render",
-            headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
-            json={
-                "spec": spec,
-                "session": session,
-                "session_origin": _session_origin(),
-            },
-        )
+        try:
+            r = await client.post(
+                f"{ENDPOINT}/render",
+                headers={"Authorization": f"Bearer {_token()}", "x-aiui-async": "1"},
+                json={
+                    "spec": spec,
+                    "session": session,
+                    "session_origin": _session_origin(),
+                },
+            )
+        except httpx.HTTPError as e:
+            # #202: a blip during registration used to let a raw httpx
+            # exception escape `_post_render` entirely — not routed through
+            # `_explain_exc`, so a RemoteProtocolError (empty `str(e)`)
+            # surfaced as the `error: ""` class of bug. Retrying the POST is
+            # NOT the fix: it would open a second dialog window for the same
+            # question. Fail with an explained error and let the agent decide.
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} failed to register the dialog: "
+                f"{_explain_exc(e)}. No dialog was opened. On a remote this is "
+                f"usually the SSH reverse-tunnel dropping — check aiui "
+                f"Settings → Connections on the user's machine, then retry."
+            ) from e
         # #186/#182: a 422 from the companion carries `{error, detail, hint}`
         # — the whole point of the structured rejection. `raise_for_status`
         # discards the body, so a bridge-served agent used to get a bare
@@ -945,7 +1493,7 @@ async def _post_render(
         if r.status_code == 422:
             try:
                 body = r.json()
-            except Exception:
+            except Exception:  # noqa: BLE001 — a non-JSON 422 body is still a 422
                 body = {}
             detail = body.get("detail") or "the companion rejected the dialog spec"
             hint = body.get("hint")
@@ -953,13 +1501,62 @@ async def _post_render(
                 f"aiui rejected the dialog spec (invalid_spec): {detail}"
                 + (f" — {hint}" if hint else "")
             )
-        r.raise_for_status()
+        # #178: a spec past the companion's size ceiling — practically always
+        # inlined images. Same `{error, detail, hint}` shape as the 422; the
+        # hint is the whole point ("pass an http(s):// src instead"), so a bare
+        # `HTTPStatusError: 413` would strip the only actionable part. Checked
+        # before the generic `>= 400` arm below so it keeps its tailored hint.
+        if r.status_code == 413:
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            detail = body.get("detail") or "the dialog spec is too large"
+            hint = body.get("hint")
+            raise RuntimeError(
+                f"aiui rejected the dialog spec (spec_too_large): {detail}"
+                + (f" — {hint}" if hint else "")
+            )
+        # #202: the remaining non-2xx statuses were left to `raise_for_status`,
+        # which hands the agent a bare `HTTPStatusError` naming a URL and a
+        # status code. Translate them into the same actionable style
+        # `_preflight` uses, so a remote session gets the guidance a
+        # Mac-local Rust-bridge session already gets.
+        if r.status_code == 401:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} rejected our token (401) while "
+                f"opening the dialog. The token was rotated mid-session, or "
+                f"another aiui process is listening on this port. Re-register "
+                f"this host from the companion's settings window on the user's machine."
+            )
+        if r.status_code >= 500:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} failed to open the dialog "
+                f"(HTTP {r.status_code}): {r.text[:200]}. This is a companion-side "
+                f"fault — retry once; if it persists, restart the aiui companion on the user's machine."
+            )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} refused the render "
+                f"(HTTP {r.status_code}): {r.text[:200]}"
+            )
         first = r.json()
         if r.status_code == 202:
             render_id = first.get("id")
-            if not render_id:
-                raise RuntimeError("async /render: 202 response missing `id`")
-            data = await _poll_render(client, render_id, ctx)
+            if not isinstance(render_id, str) or not render_id:
+                raise RuntimeError(
+                    "aiui accepted the dialog (202) but its response carries no "
+                    "`id`, so there is nothing to poll. The dialog may be open on "
+                    "the user's machine with no one listening — check it, and report this as "
+                    "a companion bug."
+                )
+            ttl = first.get("ttl_secs")
+            ttl_secs = (
+                float(ttl)
+                if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl > 0
+                else DEFAULT_POLL_TTL_S
+            )
+            data = await _poll_render(client, render_id, ctx, ttl_secs)
         else:
             data = first  # synchronous companion — terminal result already
     # Issue #135: this bridge runs ON the agent's host, so `target` fields are
@@ -967,17 +1564,50 @@ async def _post_render(
     # channel, never via the agent). Secret values are written and stripped
     # before the result is handed to the agent.
     _apply_target_writes(spec, data)
+    # #194: a clip that never reached the media cache used to produce a
+    # broken player for the user and no signal at all for the agent. The key
+    # only appears when something actually failed — an always-present empty
+    # list trains agents to skip it.
+    if media_warnings:
+        data["media_warnings"] = media_warnings
     dt = (datetime.now(timezone.utc) - t0).total_seconds()
     log.info(
         "render ← kind=%s cancelled=%s took=%.2fs",
-        spec.get("kind"), data.get("cancelled"), dt,
+        spec.get("kind"),
+        data.get("cancelled"),
+        dt,
     )
     return data
 
 
-def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
+def _cancel_defaults(kind: str | None) -> dict[str, Any]:
+    """The falsy keys a cancelled dialog still returns, per tool (#202).
+
+    `_format_result` used to answer a bare `{"cancelled": True}`, contradicting
+    every tool's own docstring — `confirm` promises `{cancelled, confirmed}`,
+    `ask` promises `{cancelled, answers}`, `form` promises `{cancelled, values}`
+    — and contradicting the Rust bridge, whose `format_confirm_result` always
+    emits both keys. An agent following the documented shape and reading
+    `result["confirmed"]` therefore worked on a local session and raised a
+    `KeyError` only on a remote: a bridge-dependent bug invisible in local
+    testing. `compare` is deliberately absent: `docs/skill.md` documents
+    `selected` as *absent* on cancel, and inventing a falsy value there would
+    read as a real selection.
+    """
+    if kind == "confirm":
+        return {"confirmed": False}
+    if kind == "ask":
+        return {"answers": []}
+    if kind == "form":
+        return {"values": {}}
+    if kind == "gallery":
+        return {"decisions": {}}
+    return {}
+
+
+def _format_result(payload: dict[str, Any], kind: str | None = None) -> dict[str, Any]:
     if payload.get("cancelled"):
-        out: dict[str, Any] = {"cancelled": True}
+        out: dict[str, Any] = {"cancelled": True, **_cancel_defaults(kind)}
         # #180: forward WHY. The companion sets `host_exiting`,
         # `ttl_expired`, `evicted` and `channel_dropped`, but the bridge
         # flattened them all into a bare
@@ -987,8 +1617,22 @@ def _format_result(payload: dict[str, Any]) -> dict[str, Any]:
         reason = payload.get("reason")
         if isinstance(reason, str) and reason:
             out["reason"] = reason
+        _carry_media_warnings(payload, out)
         return out
-    return {"cancelled": False, **payload.get("result", {})}
+    out = {"cancelled": False, **payload.get("result", {})}
+    _carry_media_warnings(payload, out)
+    return out
+
+
+def _carry_media_warnings(payload: dict[str, Any], out: dict[str, Any]) -> None:
+    """Forward `media_warnings` from the render payload onto the tool result
+    (#194). Mirrors `carry_media_warnings` in the Rust bridge — and applies to
+    the cancelled branch too: a user who cancels *because* the clip was a
+    broken player is exactly the case the agent needs the warning for.
+    """
+    warnings = payload.get("media_warnings")
+    if warnings:
+        out["media_warnings"] = warnings
 
 
 @mcp.tool()
@@ -997,7 +1641,7 @@ async def ask(
     options: list[dict[str, Any]],
     header: str | None = None,
     multi_select: bool = False,
-    allow_other: bool = True,
+    allow_other: bool = False,
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -1029,7 +1673,11 @@ async def ask(
             "thumbnail"?: str}`.
         header: Short chip above the question (≤ 14 chars).
         multi_select: Allow selecting multiple options.
-        allow_other: Offer a free-text fallback.
+        allow_other: Offer a free-text fallback. Off by default — opt in when
+            an answer you did not list is genuinely useful, because the reply
+            then comes back in `other` instead of `answers`.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "ask",
@@ -1039,7 +1687,7 @@ async def ask(
         "multiSelect": multi_select,
         "allowOther": allow_other,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1104,7 +1752,7 @@ async def form(
     - color:       {kind, name, label, default?}  — hex "#RRGGBB"
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
     - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
-    - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the Mac), or a `data:` URL. Use for visual confirmation of agent-generated previews.
+    - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the companion host), or a `data:` URL. Use for visual confirmation of agent-generated previews.
     - annotated_image: {kind, name, src, label?, alt?, mode?, max_height?, required?, default?}  — let the user MARK a spot on an image (logo placement, crop hint, bug location). `src` follows the same rules as `image`. `mode` ∈ {"point" (click one marker, default), "region" (drag a rectangle), "both" (user flips a Point/Region tool)}. `default` may seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized units. Result under `name`: {point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null} — all coordinates normalized 0..1; multiply by `natural` for pixels.
     - audio:       {kind, src, label?}  — read-only native `<audio controls>` player. Use for "listen to this TTS sample / voice memo / generated sound clip before deciding". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner.
     - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders to SVG and DOMPurify-sanitises before display.
@@ -1151,6 +1799,8 @@ async def form(
             Rarely needed — prefer `size`.
         height: Explicit starting height in logical px (overrides `size`).
             Rarely needed — prefer `size`.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "form",
@@ -1166,7 +1816,7 @@ async def form(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1207,11 +1857,16 @@ async def confirm(
         message: One-sentence explanation of what happens on confirm.
         header: Chip above the title.
         destructive: Red confirm button.
-        confirm_label: Defaults to "Ja".
-        cancel_label: Defaults to "Nein".
+        confirm_label: Defaults to the companion's localized affirmative
+            label — resolved from the user's locale, so do not name it in
+            chat unless you set it yourself.
+        cancel_label: Defaults to the companion's localized negative label,
+            same rule.
         image: `{"src": str, "alt"?: str, "max_height"?: int}`. Shown above
             the title for visual confirmation. `src` follows the standard
             aiui resolution rules.
+        session: Short human label for this session, shown in the window
+            chrome so parallel dialogs stay distinguishable.
     """
     spec = {
         "kind": "confirm",
@@ -1223,7 +1878,7 @@ async def confirm(
         "cancelLabel": cancel_label,
         "image": image,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1302,7 +1957,7 @@ async def gallery(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1311,16 +1966,16 @@ async def upload(
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Pull a file FROM the user's Mac INTO this agent session.
+    """Pull a file FROM the user's machine INTO this agent session.
 
-    Calling this opens a native file picker on the user's Mac; the file they
+    Calling this opens a native file picker on the user's machine; the file they
     choose is streamed back over aiui's channel and written to `target_dir` on
     YOUR host (the machine you run on — the remote for an SSH session). This is
     the counterpart to the user having to `scp` a file over: reach for it
     whenever the user says "take this file", "upload …", "here's the
     file/screenshot/PDF", or triggers `/aiui:upload`.
 
-    WHEN TO USE: the user wants to give you a local Mac file. Do NOT ask them
+    WHEN TO USE: the user wants to give you a file from their own machine. Do NOT ask them
     which file — they pick it in the native dialog. Do NOT ask where to put it;
     infer `target_dir` from the conversation (usually your cwd or the active
     project dir) and pass it.
@@ -1337,19 +1992,25 @@ async def upload(
       `target_dir` or move the old file first.
     - Blocks until the user picks a file or dismisses the picker. Progress
       notifications fire every ~10 s meanwhile — a slow response just means the
-      user is choosing a file, not that aiui is broken.
+      user is choosing a file, not that aiui is broken. The picker may take a
+      moment to come forward.
+    - Only one picker at a time: a concurrent `upload` errors with "another
+      upload is already waiting" — let that one finish, then retry. An
+      unanswered picker times out with an error rather than hanging forever.
 
     Returns `{status: "ok", path, filename, bytes}` on success, or
     `{status: "error", error}` on any failure (user cancelled, file unreadable,
-    file too large — 512 MB cap, target directory missing/not writable). Report
-    briefly; on `ok`, mention the path the file landed at.
+    file too large — 512 MB cap, target directory missing/not writable, another
+    upload in flight, picker never answered). Report briefly; on `ok`, mention
+    the path the file landed at.
 
     Args:
         target_dir: Absolute or `~/`-rooted directory on your host where the
             picked file is written as `<target_dir>/<filename>`. Defaults to
             your process's cwd.
-        session: Short human label for this session, shown in aiui's window
-            chrome so parallel dialogs stay distinguishable.
+        session: Short human label for this session, shown in the file
+            picker's title bar so the user can tell which agent asked for a
+            file.
     """
     # Resolve the destination up front so a bad target_dir fails before the
     # picker even opens (nothing worse than picking a file only to be rejected).
@@ -1361,7 +2022,15 @@ async def upload(
                 "error": f"target_dir must be an absolute or ~/-rooted path, got '{target_dir}'",
             }
     else:
-        dest_dir = Path.cwd()
+        # #194: `Path.cwd()` raises when the process's working directory has
+        # been removed — an exception escaping `upload` breaks its contract
+        # that every failure comes back as `{status: "error", error}`. The
+        # Rust bridge already answered "no target_dir given and cwd
+        # unavailable"; say the same thing here.
+        try:
+            dest_dir = Path.cwd()
+        except (OSError, RuntimeError) as e:
+            return {"status": "error", "error": f"no target_dir given and cwd unavailable: {e}"}
     if not dest_dir.is_dir():
         return {"status": "error", "error": f"target directory does not exist: {dest_dir}"}
 
@@ -1374,6 +2043,10 @@ async def upload(
             r = await client.post(
                 f"{ENDPOINT}/upload",
                 headers={"Authorization": f"Bearer {_token()}"},
+                # #194: the optional body titles the picker, so a user facing
+                # several agents can tell which one is asking. Additive — an
+                # older companion has no body extractor and ignores it.
+                json={"session": session},
             )
     except httpx.HTTPError as e:
         return {"status": "error", "error": f"POST /upload failed: {_explain_exc(e)}"}
@@ -1383,6 +2056,26 @@ async def upload(
 
     if r.status_code == 204:
         return {"status": "error", "error": "upload cancelled — no file was selected"}
+    if r.status_code == 409:
+        # #194: the companion serialises the native picker — two stacked
+        # system panels are indistinguishable to the user.
+        return {
+            "status": "error",
+            "error": (
+                "another upload is already waiting for the user — one file picker at a "
+                "time. Wait for that one to be answered, then retry."
+            ),
+        }
+    if r.status_code == 504:
+        # #194: the companion's own 600 s bound fires before this bridge's
+        # 900 s, so its diagnosis wins the race over a generic timeout.
+        return {
+            "status": "error",
+            "error": (
+                "the file picker was never answered — it timed out on the user's "
+                "machine. Ask the user whether the picker appeared, then retry."
+            ),
+        }
     if r.status_code == 413:
         return {"status": "error", "error": f"selected file too large: {r.text[:200]}"}
     if r.status_code != 200:
@@ -1475,7 +2168,7 @@ async def compare(
         "width": width,
         "height": height,
     }
-    return _format_result(await _post_render(spec, ctx, session))
+    return _format_result(await _post_render(spec, ctx, session), spec["kind"])
 
 
 @mcp.tool()
@@ -1485,7 +2178,7 @@ async def notify(
     subtitle: str | None = None,
     sound: str | None = None,
 ) -> dict[str, Any]:
-    """Fire a native macOS notification and return immediately — use this
+    """Fire a native OS notification and return immediately — use this
     for an async-completion signal to a user who isn't watching this
     session ("tests green", "deploy finished", "merge conflicts, need
     you"). Unlike `confirm`/`ask`/`form`/`gallery`, this tool does NOT wait
@@ -1502,9 +2195,9 @@ async def notify(
     input) — `notify` has no way to carry a reply back. Use `confirm`,
     `ask`, or `form` instead.
 
-    Runs against the *user's Mac*, regardless of whether this MCP is local
-    or reached via an SSH reverse-tunnel — same as `update`/`version`,
-    the notification always renders on the Mac side.
+    Runs against the *user's own machine*, regardless of whether this MCP is
+    local or reached via an SSH reverse-tunnel — same as `update`/`version`,
+    the notification always renders on the companion side.
 
     Returns `{ok: bool, error?: str}`. `ok: False` most commonly means the
     user hasn't granted aiui notification permission on macOS yet (the OS
@@ -1519,6 +2212,11 @@ async def notify(
         sound: Optional OS notification sound name (e.g. "default").
             Omit for silent.
     """
+    # Cold-start gate, same as the render path (#203). `notify` is by
+    # definition called when a long task finishes — the moment the tunnel is
+    # most likely to have just been re-established — so failing instantly
+    # against a companion that is still starting is exactly the wrong trade.
+    await _wait_for_aiui()
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
             r = await client.post(
@@ -1552,7 +2250,7 @@ def teach_prompt() -> str:
     the agent reaches for the right dialog without further prompting."""
     try:
         return (resources.files("aiui_mcp") / "skill.md").read_text()
-    except Exception:
+    except Exception:  # noqa: BLE001 — a missing/unreadable doc must degrade to the link
         return (
             "aiui skill doc not bundled with this install. "
             "See https://github.com/byte5ai/aiui/blob/main/docs/skill.md"
@@ -1572,6 +2270,11 @@ Check whether an aiui update is available and install it if so. Call the \
   will hit the new version.
 - If `updated: false` and `note: "already on latest"`, report "aiui is \
   on the latest version ({current})".
+- If `updated: false` and `note` mentions a dialog in flight, report that \
+  aiui {available} is ready but was not installed because a dialog is \
+  still open on the user's machine — installing would close it and \
+  discard what they typed. Ask them to finish it, then run /aiui:update \
+  again. Do not retry on your own.
 - If `error` is set, report the error verbatim.
 
 Keep the reply to one short sentence unless the user asked for detail.
@@ -1590,10 +2293,10 @@ def update() -> str:
     """Instructs the agent to call `update` and report the outcome.
 
     Wired up so Claude Code exposes `/aiui:update` as a slash-command that
-    triggers a silent update check + install on the user's Mac. Works both
+    triggers a silent update check + install on the user's machine. Works both
     locally (MCP talks to aiui on localhost) and remotely (MCP calls reach
-    aiui through the SSH reverse-tunnel — the update runs on the user's Mac,
-    not on the remote host)."""
+    aiui through the SSH reverse-tunnel — the update runs on the user's
+    machine, not on the remote host)."""
     return _UPDATE_PROMPT
 
 
@@ -1608,9 +2311,13 @@ _HEALTH_PROMPT = """\
 Run the `aiui_health` tool and report the result in one short sentence:
 
 - If `ready: true`, say "aiui ready (v{version})".
-- If `ready: false`, point at the most likely cause based on the response \
-  body (WebView frozen, dialog backlog, too many children) and suggest the \
-  one-step fix ("open Settings, click Check for updates" or "restart aiui").
+- If `ready: false`, read `reason` and `hint` from the response body and \
+  relay the `hint` — it already names the cause and the one-step fix, with \
+  the live numbers filled in. Don't guess a cause the body doesn't state. \
+  Only if `hint` is absent, fall back to "restart aiui".
+- `ready: false` with `reason: "dialog_registry_full"` or \
+  `"too_many_children"` is degraded, not down: say so, because dialogs \
+  still render.
 
 Don't dump the raw JSON unless the user asked for it.
 """
@@ -1633,8 +2340,9 @@ _REMOTES_PROMPT = """\
 Show the user a quick rundown of their registered aiui remotes — same set \
 the Settings window's "Eingerichtete Remote-Hosts" section shows, but in \
 chat. Call `aiui_health` first to confirm aiui is up; if it isn't, just \
-tell the user that and stop. Otherwise read \
-`~/.config/aiui/remotes.json` (JSON array of host strings) and present \
+tell the user that and stop. Otherwise read `remotes.json` from aiui's \
+config directory — `~/.config/aiui/` on Unix, \
+`%APPDATA%\\aiui\\` on Windows (JSON array of host strings) — and present \
 the entries in a compact list. If the file is missing or empty, say "no \
 remotes registered yet — open Settings to add one".
 """
@@ -1662,14 +2370,14 @@ def remotes_prompt() -> str:
 
 
 _UPLOAD_PROMPT = """\
-Call the `upload` tool to let me hand you a file from my Mac. \
+Call the `upload` tool to let me hand you a file from my machine. \
 Use my current working directory as the target unless I say otherwise.
 """
 
 
 @mcp.prompt(name="upload")
 def upload_prompt() -> str:
-    """Hand a file from the Mac to the agent session — opens a native file
+    """Hand a file from your machine to the agent session — opens a native file
     picker and writes the chosen file to the agent host. Surfaces as
     `/aiui:upload` in Claude Code."""
     return _UPLOAD_PROMPT
@@ -1682,17 +2390,47 @@ async def aiui_health() -> dict[str, Any]:
     Use this first if dialogs hang or fail — it distinguishes a cold companion
     (user needs to launch Claude Desktop, or the SSH tunnel is down) from a
     rogue local process holding the port with the wrong token.
+
+    The companion's body is returned on *any* status: a 503 carries the
+    ``reason``, ``hint``, ``pending``, ``oldest_age_secs`` and
+    ``lifecycle_phase`` that are the whole point of the composite response, and
+    `raise_for_status()` used to throw exactly that diagnosis away (#179).
+    ``ok`` reports whether the companion answered 200, so a degraded-but-serving
+    companion comes back as ``ok: true`` with ``ready: false``.
     """
+    # Deliberately NOT gated by `_wait_for_aiui` (#203). Every other tool
+    # waits out a cold start; this one is the diagnostic and must answer fast
+    # — spending COLDSTART_WAIT_S before reporting "unreachable" would make
+    # the tool people run *because* things hang hang too. Do not "fix" this.
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
             r = await client.get(
                 f"{ENDPOINT}/health",
                 headers={"Authorization": f"Bearer {_token()}"},
             )
-            r.raise_for_status()
-            data = r.json()
-            return {"ok": True, **data, "endpoint": ENDPOINT, "server": BUILD_INFO}
-    except Exception as e:
+            data = _health_body(r)
+            if data is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"/health answered HTTP {r.status_code} with a non-JSON body: "
+                        f"{r.text[:200]}"
+                    ),
+                    "endpoint": ENDPOINT,
+                    "server": BUILD_INFO,
+                }
+            out: dict[str, Any] = {
+                "ok": r.status_code == 200,
+                **data,
+                "endpoint": ENDPOINT,
+                "server": BUILD_INFO,
+            }
+            if r.status_code != 200:
+                # Keep the status legible now that it is no longer the whole
+                # answer — a 401 body is just `{"error": "unauthorized"}`.
+                out["http_status"] = r.status_code
+            return out
+    except Exception as e:  # noqa: BLE001
         log.warning("health check failed: %s", e)
         return {
             "ok": False,
@@ -1710,8 +2448,9 @@ async def version_tool() -> dict[str, Any]:
     """Report aiui companion version, build info, binary path, and updater endpoint.
 
     Cheap; does not hit the network. Works against both a local companion
-    (on-Mac) and a remote one reached via SSH tunnel.
+    (same host) and a remote one reached via SSH tunnel.
     """
+    await _wait_for_aiui()  # cold-start gate, as on every other tool (#203)
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
             r = await client.get(
@@ -1733,17 +2472,24 @@ async def version_tool() -> dict[str, Any]:
 
 @mcp.tool(name="update")
 async def update_tool() -> dict[str, Any]:
-    """Check for an aiui update on the user's Mac and install it silently.
+    """Check for an aiui update on the user's machine and install it silently.
 
-    Responds BEFORE the companion schedules its relaunch, so the caller
-    receives `{updated, current, available, note}`. Next agent call hits
-    the new version.
+    Responds BEFORE the companion goes away, so the caller receives
+    `{updated, current, available, note}`. Next agent call hits the new
+    version. Two outcomes are not installs and need no retry logic:
+    `updated: false` with `note: "already on latest"`, and `updated: false`
+    with `note: "dialog in flight — update deferred"` — the companion
+    refuses to restart out from under a dialog the user is filling in, so
+    ask them to finish it and call again.
 
-    Runs the updater against the *user's Mac*, regardless of whether the
+    Runs the updater against the *user's own machine*, regardless of whether the
     MCP is local or reached via an SSH reverse-tunnel — because the
-    /update HTTP endpoint lives on the aiui.app companion, not on this
-    process.
+    /update HTTP endpoint lives on the aiui companion, not on this process.
     """
+    # Cold-start gate (#203): `update` is the tool a user reaches for right
+    # after restarting things, i.e. against a companion that is still coming
+    # up.
+    await _wait_for_aiui()
     # Use the long render timeout because download + install of the updater
     # bundle can take several seconds on a slow network.
     try:

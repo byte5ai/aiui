@@ -1,0 +1,57 @@
+name: Dependency refresh (unlocked)
+
+# #210: CI runs the Python bridge against `python/uv.lock`, which is exactly
+# what makes it reproducible — and exactly what hides an upstream `mcp` 1.x
+# minor that breaks us. End users do not resolve from our lock: `uvx
+# aiui-mcp` on a remote host resolves `mcp>=1.26.0,<2` fresh at spawn time,
+# so a breaking release reaches them before it reaches any PR.
+#
+# This job is the other half of that trade. Once a week it throws the
+# resolution away, takes the newest versions the ranges allow, and runs the
+# suite. A failure here means "the next `uvx` on a remote will break", days
+# before a release would have found out — and it fails a scheduled run,
+# never someone's PR.
+
+on:
+  schedule:
+    # Mondays, 04:17 UTC — off the hour, so it is not queued behind the
+    # crowd of cron jobs that fire at :00.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unlocked:
+    name: aiui-mcp against the newest resolvable deps
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        with:
+          # Exact, not `latest`: this job holds UV_PUBLISH_TOKEN, so the uv
+          # binary is part of the trusted set (matches ci.yml / release, #192).
+          version: "0.12.17"
+
+      - name: Re-resolve every dependency to its newest allowed version
+        working-directory: python
+        run: uv lock --upgrade
+
+      # Printed before the tests so the run's log says WHICH upgrade broke
+      # things even when the next step fails.
+      - name: Show what moved since the committed lock
+        working-directory: python
+        run: git --no-pager diff -- uv.lock
+
+      - name: Run unit tests
+        working-directory: python
+        run: uv run --extra dev pytest tests/ -v
+
+      - name: Build wheel + sdist
+        working-directory: python
+        run: uv build
