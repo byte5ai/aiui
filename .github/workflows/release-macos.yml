@@ -83,7 +83,7 @@ jobs:
       # its own updates — so a step resolved from a mutable ref turns one
       # upstream retag into signed, notarized code on every user's machine.
       # `scripts/check-workflow-pins.sh` fails CI if a pin floats again.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Four manifests must agree on the version BEFORE we spend build
       # minutes: Cargo.toml (build), tauri.conf.json (Info.plist),
