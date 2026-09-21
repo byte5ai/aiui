@@ -98,7 +98,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # when our process dies, so we never leak stale lock files. v0.4.43,
 # after Codex review (PR #131 follow-up) flagged the probe/remove/bind
 # race in lifetime::gui_serve.
-fs4 = { version = "0.12", features = ["sync"] }
+fs4 = { version = "1.1", features = ["sync"] }
 
 # Unix-only: `O_NOFOLLOW` when opening the trace log, so a symlink planted
 # at the log path fails the open instead of being appended through (#185).
