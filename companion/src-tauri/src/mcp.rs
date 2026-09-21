@@ -220,7 +220,7 @@ the Settings window's \"Eingerichtete Remote-Hosts\" section, but in chat. \
 Hit the companion's GET /health endpoint via `aiui_health` first to make \
 sure aiui is up; if it isn't, just tell the user that and stop. Otherwise \
 read the user's `remotes.json` from aiui's config directory — \
-`~/.config/aiui/` on macOS and Linux, `%APPDATA%\\aiui\\` on Windows (one \
+`~/.config/aiui/` on Unix, `%APPDATA%\\aiui\\` on Windows (one \
 host per line / JSON list) — and present them in a compact table with \
 hostname only. If the file \
 is missing or empty, say \"no remotes registered yet — open Settings to \
@@ -2264,6 +2264,13 @@ mod tests {
         let (two, two_aborted) = parked_entry(Some("render-2"));
         in_flight.insert("1".into(), one);
         in_flight.insert("2".into(), two);
+        // Let both parked tasks be polled to their `DropFlag` guard before the
+        // cancel aborts task 1 — a freshly `tokio::spawn`ed task has not run
+        // yet on the current-thread test runtime, so aborting it now would
+        // drop a future that never armed the flag.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
 
         let render_id = handle_cancelled(&mut in_flight, &json!({"requestId": 1}));
 
@@ -2306,6 +2313,13 @@ mod tests {
         let in_flight: InFlightMap = Arc::new(Mutex::new(HashMap::new()));
         let (entry, aborted) = parked_entry(None);
         in_flight.lock().unwrap().insert("1".into(), entry);
+        // Let the parked task be polled to its `DropFlag` guard before EOF
+        // aborts it — a freshly `tokio::spawn`ed task has not run yet on the
+        // current-thread test runtime, so aborting it now would drop a future
+        // that never armed the flag.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
 
         // An input that is already at EOF: the parent closed the pipe.
         let (client, server) = tokio::io::duplex(64);
