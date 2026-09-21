@@ -50,7 +50,9 @@ def test_create_writes_and_refuses_clobber(tmp_path: Path) -> None:
     out = _write_local_target("s3cr3t", target)
     assert out["written"], out
     assert path.read_text() == "s3cr3t"
-    assert (path.stat().st_mode & 0o777) == 0o600
+    # Unix file mode only — Windows has no 0600 and the bridge skips chmod there.
+    if os.name != "nt":
+        assert (path.stat().st_mode & 0o777) == 0o600
     # Refuse clobber without overwrite.
     out2 = _write_local_target("other", target)
     assert not out2["written"] and out2.get("error")

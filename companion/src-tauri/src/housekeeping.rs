@@ -1308,32 +1308,6 @@ mod tests {
         assert!(!is_exe_mtime_stale(None, None));
     }
 
-    fn ssh_ntr_args(host: &str, port: u16) -> Vec<String> {
-        // Mirrors the spawn in tunnel.rs:run_tunnel exactly.
-        [
-            "ssh",
-            "-N",
-            "-T",
-            "-R",
-            &format!("{port}:localhost:{port}"),
-            "-o",
-            "ServerAliveInterval=30",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "--",
-            host,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
     /// `ssh_ntr_args` here is the **production builder** from `tunnel.rs`
     /// (imported at the top of this module), not a copy. A hand-copied
     /// duplicate used to live in this file, which made this test inert: an

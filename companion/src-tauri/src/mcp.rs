@@ -2337,6 +2337,7 @@ mod tests {
             &test_cfg(),
             &reqwest::Client::new(),
             &tx,
+            &new_render_sink(),
         )
         .await
         .expect("ping must be answered, not rejected");

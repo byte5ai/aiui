@@ -3270,8 +3270,8 @@ mod window_permission_tests {
             for key in ["windows", "webviews"] {
                 for entry in string_list(&cap, key) {
                     assert_ne!(
-                        entry, DIALOG_WINDOW_LABEL,
-                        "{name}: `{key}` still names the retired label {DIALOG_WINDOW_LABEL:?}; \
+                        entry, "dialog",
+                        "{name}: `{key}` still names the retired \"dialog\" label; \
                          a dialog window's label is its dialog id"
                     );
                 }
@@ -3373,7 +3373,7 @@ mod window_permission_tests {
         // The retired label is not a back door either: nothing builds a
         // window called "dialog" any more, but if anything did, it would be
         // a dialog window like all the others.
-        assert!(!is_privileged_window(DIALOG_WINDOW_LABEL));
+        assert!(!is_privileged_window("dialog"));
         // The two predicates must stay each other's complement.
         for label in [SETUP_WINDOW_LABEL, SAMPLE_DIALOG_LABEL, "", "Setup"] {
             assert_ne!(is_privileged_window(label), is_dialog_window_label(label));
