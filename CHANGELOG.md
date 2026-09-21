@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-21
+
 ### Added
 
 - **A system notification when an update is found.** The settings banner
