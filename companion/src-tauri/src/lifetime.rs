@@ -179,6 +179,10 @@ pub fn accept_backoff(consecutive_failures: u32) -> Duration {
 /// syscall and a spurious non-blocking wakeup are genuinely transient, and
 /// making them wait would add latency to the very attach the user is
 /// waiting on. Everything else — descriptor exhaustion above all — backs off.
+// Only the Unix-domain-socket accept loop (`#[cfg(unix)]`) calls this; on
+// Windows it is exercised by unit tests alone, which the release clippy build
+// does not compile — so it reads as dead there.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn accept_error_is_transient(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
