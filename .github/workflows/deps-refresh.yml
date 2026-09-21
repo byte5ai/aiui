@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           # Exact, not `latest`: this job holds UV_PUBLISH_TOKEN, so the uv
           # binary is part of the trusted set (matches ci.yml / release, #192).
