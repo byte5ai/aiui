@@ -182,10 +182,44 @@ fn resolve_target(path: &Path) -> PathBuf {
     cur
 }
 
-/// The destination string a `target.path` resolves to on THIS host — what the
-/// approval line should show, and what the outcome later reports (#199).
-pub fn resolve_display(raw_path: &str) -> String {
-    resolve_target(&expand_tilde(raw_path)).display().to_string()
+/// `create`'s destination: the parent canonicalised, the final component
+/// taken as given — never followed (review C-04). #199 needed link-following
+/// for `substitute` (read-modify-write of the real file); extending it to
+/// `create` turned a planted symlink at the destination into a write-through
+/// onto whatever it points at — a shell rc, an ssh config — with an
+/// approval line naming only the link.
+fn resolve_parent_only(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(c) => c.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Where a write in `mode` lands for `path` (already tilde-expanded).
+fn resolve_for_mode(path: &Path, mode: &WriteMode) -> PathBuf {
+    match mode {
+        WriteMode::Create => resolve_parent_only(path),
+        WriteMode::Substitute => resolve_target(path),
+    }
+}
+
+/// The destination string a `target` resolves to on THIS host — what the
+/// approval line shows and what the outcome later reports (#199, C-03): the
+/// same resolution the writer uses, so the approved path IS the written one.
+/// `mode` is the raw spec string; anything but `substitute` is treated as
+/// `create` (validation rejects other values before a window exists).
+pub fn resolve_display(raw_path: &str, mode: &str) -> String {
+    let mode = if mode == "substitute" {
+        WriteMode::Substitute
+    } else {
+        WriteMode::Create
+    };
+    resolve_for_mode(&expand_tilde(raw_path), &mode)
+        .display()
+        .to_string()
 }
 
 /// The destination's current mode bits, or `None` where they don't exist
@@ -269,8 +303,9 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
         return WriteOutcome::fail(target.path.clone(), why);
     }
     // Resolve before anything else, so the read, the rename and the reported
-    // destination all name the same real file even when `path` is a symlink.
-    let path = resolve_target(&expand_tilde(&target.path));
+    // destination all name the same real file even when `path` is a symlink
+    // (substitute) — or, for create, the link itself, which is refused below.
+    let path = resolve_for_mode(&expand_tilde(&target.path), &target.mode);
     let display = path.display().to_string();
     // An empty credential is never a legitimate write, and truncating the
     // user's file is not a dialog's job (issue #177). Refusing here, before
@@ -297,6 +332,18 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
         });
     match target.mode {
         WriteMode::Create => {
+            // C-04: never write THROUGH a symlink in create mode.
+            let is_link = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link {
+                return WriteOutcome::fail(
+                    display,
+                    "the destination is a symlink — create mode does not write through links \
+                     (use substitute to edit the file it points at)"
+                        .into(),
+                );
+            }
             if path.exists() && !target.overwrite {
                 return WriteOutcome::fail(
                     display,
@@ -340,6 +387,40 @@ pub fn write_local(value: &str, target: &Target) -> WriteOutcome {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn create_refuses_to_write_through_a_symlink() {
+        // C-04: with overwrite:true, a planted link at the destination used to
+        // redirect the approved write onto the file it points at.
+        let dir = std::env::temp_dir().join(format!("aiui-fw-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let link = dir.join("dest");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let t = Target {
+            mode: WriteMode::Create,
+            path: link.display().to_string(),
+            perm: None,
+            overwrite: true,
+            placeholder: None,
+        };
+        let out = write_local("ghp_secret", &t);
+        assert!(!out.written);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        // The approval line names the link, which is what create would touch.
+        assert_eq!(
+            resolve_display(&link.display().to_string(), "create"),
+            dir.canonicalize().unwrap().join("dest").display().to_string()
+        );
+        // substitute still edits the real file, and says so.
+        assert_eq!(
+            resolve_display(&link.display().to_string(), "substitute"),
+            victim.canonicalize().unwrap().display().to_string()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Readable predicate over [`target_path_error`] for the path tests.
     fn is_sane_target_path(p: &str) -> bool {
         target_path_error(p).is_none()
@@ -355,7 +436,7 @@ mod tests {
     #[test]
     fn sane_target_path_basic() {
         assert!(is_sane_target_path("~/.config/aiui/token"));
-        assert!(is_sane_target_path("/Users/me/.github_tokens/byte5ai"));
+        assert!(is_sane_target_path("/Users/me/.config/demo/token"));
         assert!(!is_sane_target_path(""));
         assert!(!is_sane_target_path("a\nb"));
         assert!(!is_sane_target_path("a\0b"));

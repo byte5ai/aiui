@@ -22,19 +22,31 @@ aiui/
 │   └── skill.md              Agent-facing widget catalog (shipped into
 │                             ~/.claude/skills/aiui/)
 ├── scripts/
-│   ├── check-release-ordering.sh   Guards the order of the release steps
-│   ├── check-skill-drift.sh        Keeps both skill.md copies in sync
-│   ├── check-updater-feed.sh       Validates a release's latest.json
-│   ├── diagnose-session-startup.sh Session-startup troubleshooting dump
-│   ├── test-check-updater-feed.sh  Fixtures for the feed guard
-│   └── release.sh            Stub that refuses to run — releases are CI-only
+│   ├── assert-rust-toolchain.sh        rustc matches rust-toolchain.toml
+│   ├── assert-tauri-cli.sh             the bundler is the one package-lock.json locks
+│   ├── check-doc-claims.sh             no surface promises an install without a click
+│   ├── check-i18n-parity.sh            en/de catalogs agree, no hardcoded German
+│   ├── check-leaks.sh                  no private infrastructure in this public repo
+│   ├── check-release-ordering.sh       guards the order of the release steps
+│   ├── check-release-preconditions.sh  manifests + CHANGELOG agree before a release
+│   ├── check-skill-drift.sh            keeps both skill.md copies in sync
+│   ├── check-svelte-warnings.sh        svelte-check warning ratchet
+│   ├── check-tauri-versions.sh         @tauri-apps npm packages match their crates' minor
+│   ├── check-updater-feed.sh           validates a release's latest.json
+│   ├── check-workflow-pins.sh          every `uses:` pinned by SHA
+│   ├── diagnose-session-startup.sh     session-startup troubleshooting dump
+│   ├── test-check-*.sh                 self-tests for the guards above
+│   └── release.sh                      stub that refuses to run — releases are CI-only
+├── script/setup              one-command dev setup (deps + git hooks)
+├── .hooks/pre-push           blocks direct pushes to main
 ├── assets/                   Brand assets (icon, logo, dmg background)
 └── CHANGELOG.md
 ```
 
 ## Building locally
 
-Prerequisites: Rust (stable), Node.js ≥ 20, [uv](https://docs.astral.sh/uv/),
+Prerequisites: Rust (the version pinned in `rust-toolchain.toml`; rustup
+picks it up automatically), Node.js ≥ 20, [uv](https://docs.astral.sh/uv/),
 plus Xcode command-line tools on macOS.
 
 ```sh
@@ -64,22 +76,25 @@ For the Python side:
 cd python
 uv run --locked --extra dev pytest tests/ -v   # the suite CI runs
 uv run --locked --extra dev ruff check .       # lint (ruff format --check too)
-uv build --locked                              # dist/aiui_mcp-*.whl + .tar.gz
+uv lock --check && uv build                    # dist/aiui_mcp-*.whl + .tar.gz
 ```
 
 ### `python/uv.lock` is tracked
 
 Like `Cargo.lock` and `companion/package-lock.json`, the Python lock is
-committed and CI resolves nothing on its own: every step runs `--locked`, and
-so does the release. **Whenever you change a dependency in
+committed and CI resolves nothing on its own: every resolving step runs
+`--locked` (the release's pytest too), and the wheel build verifies the lock
+with `uv lock --check` first — `uv build` itself takes no `--locked`. Cargo
+runs `--locked` everywhere as well. **Whenever you change a dependency in
 `python/pyproject.toml`, run `uv lock` and commit the result in the same
 change** — otherwise CI fails with "the lockfile is not up-to-date".
 
 The lock governs what *we* test; it is not what users get. `pyproject.toml`'s
 ranges stay the published contract, so `uvx aiui-mcp` on a remote host still
-resolves `mcp>=1.26.0,<2` fresh. `deps-refresh.yml` runs weekly against that
+resolves its `mcp` range fresh. `deps-refresh.yml` (dispatched by hand —
+no scheduled workflows in this repo) runs the suite against that
 freshly-resolved set, which is how an upstream break surfaces here instead of
-on someone's remote.
+on someone's remote. Dispatch it before a release.
 
 ## Releasing
 
@@ -117,10 +132,11 @@ red test never reaches the signing keychain.
 
 ### macOS — `release-macos.yml`
 
-Builds on a `macos-14` runner, Developer-ID-signs + notarizes via the App
-Store Connect API key, produces the DMG + signed updater bundle +
-`latest.json`, cuts the GitHub release **as a draft**, publishes
-`aiui-mcp` to PyPI, and dispatches the Windows workflow.
+Builds on a `macos-14` runner, refuses a commit whose `ci.yml` run on
+`main` is not green, Developer-ID-signs + notarizes via the App Store
+Connect API key, produces the DMG + signed updater bundle + `latest.json`,
+publishes `aiui-mcp` to PyPI, then tags and cuts the GitHub release **as a
+draft**, and dispatches the Windows workflow.
 
 ```sh
 gh workflow run release-macos.yml -f version=X.Y.Z --repo byte5ai/aiui
@@ -130,14 +146,23 @@ gh workflow run release-macos.yml -f version=X.Y.Z \
   -f prerelease=true -f publish-pypi=false --repo byte5ai/aiui
 ```
 
-PyPI runs last, after the GitHub release succeeded, because PyPI versions
-are permanent. The tag and release steps are idempotent, so a run that
-failed at PyPI can be re-dispatched with the same version to recover — and
-since #209 that re-run also **re-uploads** what it just built
-(`gh release upload --clobber`), instead of building it and throwing it
-away. Its `latest.json` is merged into the published feed rather than
+PyPI runs **before** the tag and the release (#191): the companion pins
+`aiui-mcp==<version>` on every remote, so an app without its bridge on PyPI
+would cut every remote off. The tag and release steps are idempotent, and
+a run that failed after pushing the tag can be re-dispatched with the same
+version **from the same commit** to recover: the preconditions accept an
+existing tag only when it points at the dispatched commit (F-04). That
+re-run **re-uploads** what it just built (`gh release upload --clobber`),
+and its `latest.json` is merged into the published feed rather than
 replacing it, so re-dispatching macOS after the Windows run does not drop
 the `windows-x86_64` entry.
+
+A validate-first pre-release (`prerelease=true publish-pypi=false`) is
+stamped NOT PROMOTABLE in its notes. Promote a pre-release **only** with
+`gh workflow run release-promote.yml -f tag=vX.Y.Z --repo byte5ai/aiui`,
+which refuses until `aiui-mcp` for that version is on PyPI and the feed
+carries both platforms. `release-windows.yml` likewise refuses to publish a
+full release whose bridge is missing from PyPI.
 
 **The release stays a draft until the Windows run completes.** A draft is
 not served by `releases/latest/download/latest.json`, which is what every
@@ -229,8 +254,10 @@ For bug reports, please include:
 The constraints that shape decisions in this project:
 
 - **User installs nothing per project.** aiui registers itself as a
-  global MCP server in Claude Code (`~/.claude.json`) on first launch;
-  the PyPI package is pulled on demand via `uvx`.
+  global MCP server on first launch — the native app binary locally
+  (`aiui --mcp-stdio` in Claude Desktop, Claude Code and Codex), and the
+  pinned PyPI package `aiui-mcp==<version>` via `uvx` on registered
+  remote hosts.
 - **Agents can't make slop.** Rules live both in tool docstrings (always
   visible) and the full skill (auto-installed). Widgets constrain rather
   than expand freedom where that improves outcomes.

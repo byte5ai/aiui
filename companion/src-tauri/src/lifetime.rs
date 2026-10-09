@@ -75,6 +75,13 @@ pub fn wirt_gone(cd_is_wirt: bool, cd_running: bool) -> bool {
     cd_is_wirt && !cd_running
 }
 
+/// Is Claude Desktop this host's Wirt? Only if it is installed AND this
+/// process has seen it running at least once (review B2-09) — not merely
+/// installed. Pure, so the rule is pinned by a test.
+pub fn cd_is_wirt(installed: bool, seen_running: bool) -> bool {
+    installed && seen_running
+}
+
 /// May an update be installed right now?
 ///
 /// Installing means `downloadAndInstall` + relaunch, which tears down every
@@ -226,6 +233,41 @@ pub fn terminal_exit(
     port: u16,
     scope: crate::housekeeping::SweepScope,
 ) -> ! {
+    drain_and_sweep(app, reason, port, scope);
+    std::process::exit(code)
+}
+
+/// Set by the first [`drain_and_sweep`]; every later call is a no-op. An
+/// honoured update-restart drains in the `ExitRequested` gate and then lets
+/// Tauri run its exit sequence, whose `RunEvent::Exit` arm calls this again.
+static DRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Steps 1–4 of [`terminal_exit`] without the final `process::exit`: drain
+/// the dialog registry, flush, sweep the tunnels (scoped), record `HostExit`
+/// and dump the ring. Idempotent.
+///
+/// Split out for the paths that must NOT end in `std::process::exit`:
+///
+/// - **Update restart (#180 regression, review B2-01).** Tauri restarts in
+///   two steps: `request_restart()` fires `ExitRequested { code:
+///   Some(RESTART_EXIT_CODE) }`, and the relaunch itself happens later, in
+///   the `RunEvent::Exit` arm of Tauri's own loop. Calling `terminal_exit`
+///   from the honoured gate exited before that arm ran, so *Install* quit
+///   aiui and nothing came back. See [`exit_mode_for`].
+/// - **macOS `terminate:`** (⌘Q, app-menu or Dock Quit; review B2-03). AppKit
+///   delivers `RunEvent::Exit` without any `ExitRequested`, so the gate never
+///   sees it. The `Exit` arm cannot veto, but it can still answer every
+///   pending dialog with `host_exiting` (I7) and sweep the tunnels instead of
+///   leaving `ssh -NTR` children holding the remotes' :7777.
+pub fn drain_and_sweep(
+    app: &AppHandle,
+    reason: &'static str,
+    port: u16,
+    scope: crate::housekeeping::SweepScope,
+) {
+    if DRAINED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Exiting);
 
     if let Some(state) = app.try_state::<Arc<crate::dialog::DialogState>>() {
@@ -249,15 +291,37 @@ pub fn terminal_exit(
     for line in crate::lifecycle_log::recent() {
         trace(&format!("lifecycle-dump {line}"));
     }
-    std::process::exit(code)
+}
+
+/// How an honoured `ExitRequested` ends the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitMode {
+    /// Drain, sweep and `std::process::exit` — [`terminal_exit`].
+    Terminate,
+    /// Drain and sweep, then return so Tauri finishes its exit sequence: its
+    /// `RunEvent::Exit` arm performs the relaunch an update asked for.
+    LetTauriRestart,
+}
+
+/// Pure decision for the honoured branch of the `ExitRequested` gate. A
+/// restart (`app.restart()`, `request_restart()`, the process plugin's
+/// `relaunch()`) carries `tauri::RESTART_EXIT_CODE`; `std::process::exit`
+/// there would kill the relaunch Tauri performs afterwards (review B2-01).
+pub fn exit_mode_for(code: Option<i32>) -> ExitMode {
+    if code == Some(tauri::RESTART_EXIT_CODE) {
+        ExitMode::LetTauriRestart
+    } else {
+        ExitMode::Terminate
+    }
 }
 
 /// Explicit exit authority for the two non-Wirt-death cases (uninstall, update
 /// restart). A plain latch: set once by `quit_app` / the updater right before
 /// they ask Tauri to terminate, read by the `ExitRequested` default-deny gate
 /// so those — and only those — Tauri-initiated exits are honoured. Everything
-/// else Tauri tries (last-window-close, ⌘Q, OS quit-all) is vetoed while Claude
-/// Desktop is alive.
+/// else that reaches the gate (last-window-close, a programmatic exit) is
+/// vetoed while Claude Desktop is alive. macOS `terminate:` (⌘Q, Dock Quit)
+/// never reaches it; see `drain_and_sweep`.
 pub struct ExitAuthority {
     authorized: std::sync::atomic::AtomicBool,
 }
@@ -652,8 +716,17 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
     let wake_w = wake.clone();
     // #180: decided once, at startup. If Claude Desktop is not installed it
     // is not our Wirt, and its absence must never be read as "the Wirt left".
-    let cd_is_wirt = crate::setup::is_claude_desktop_installed();
+    let cd_installed = crate::setup::is_claude_desktop_installed();
+    // Seed the "seen running" latch at startup (B2-09).
+    let _ = crate::setup::is_claude_desktop_running();
     tokio::spawn(async move {
+        // Review B2-12: while the ONLY thing holding the host is an open
+        // dialog, the watcher re-arms every grace period. Recording each
+        // round (4 ring entries + 2 trace lines) replaced the whole 256-entry
+        // lifecycle ring in ~5 min — exactly the forensics that explain how
+        // the host got there. Quiet re-arms log nothing until the outcome
+        // or its reason changes.
+        let mut quiet_rearm = false;
         loop {
             wake_w.notified().await;
             // Edge: the last MCP-stdio child just disconnected. The counter is
@@ -677,39 +750,52 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
             // with no further edge ever firing, stranding the host alive after
             // its Wirt is gone (a Step-2 regression). The cost is a single 5 s
             // timer + one `pgrep` per disconnect edge — no continuous poll.
-            trace(&format!(
-                "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
-            ));
-            crate::lifecycle_log::transition(crate::lifecycle_log::Phase::GracePending);
-            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceArmed {
-                secs: SHUTDOWN_GRACE_SECS,
-            });
+            if !quiet_rearm {
+                trace(&format!(
+                    "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
+                ));
+                crate::lifecycle_log::transition(crate::lifecycle_log::Phase::GracePending);
+                crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceArmed {
+                    secs: SHUTDOWN_GRACE_SECS,
+                });
+            }
             tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
             let child_returned = conns_w.load(Ordering::SeqCst) > 0;
             let cd_running = crate::setup::is_claude_desktop_running();
-            // #180: "Claude Desktop is not my Wirt" means stay, not exit.
+            // #180: "Claude Desktop is not my Wirt" means stay, not exit —
+            // and an installed CD this process never saw running is not it
+            // (B2-09).
+            let cd_is_wirt = cd_is_wirt(cd_installed, crate::setup::claude_desktop_seen_running());
             let gone = wirt_gone(cd_is_wirt, cd_running);
             let pending = app
                 .try_state::<Arc<crate::dialog::DialogState>>()
                 .map(|s| s.pending_count())
                 .unwrap_or(0);
             let outcome = grace_outcome(child_returned, gone, pending);
-            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
-                outcome: match outcome {
-                    GraceOutcome::Stay => "stay",
-                    GraceOutcome::Exit => "exit",
-                },
-                claude_desktop_running: cd_running,
-                child_returned,
-            });
+            let held_by_dialog_only =
+                outcome == GraceOutcome::Stay && gone && !child_returned && pending > 0;
+            let quiet = quiet_rearm && held_by_dialog_only;
+            if !quiet {
+                crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
+                    outcome: match outcome {
+                        GraceOutcome::Stay => "stay",
+                        GraceOutcome::Exit => "exit",
+                    },
+                    claude_desktop_running: cd_running,
+                    child_returned,
+                });
+            }
+            quiet_rearm = held_by_dialog_only;
             match outcome {
                 GraceOutcome::Stay => {
-                    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
-                    trace(&format!(
-                        "lifetime: staying after grace (cd_is_wirt={cd_is_wirt}, \
-                         claude_desktop_running={cd_running}, child_returned={child_returned}, \
-                         pending_dialogs={pending})"
-                    ));
+                    if !quiet {
+                        crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
+                        trace(&format!(
+                            "lifetime: staying after grace (cd_is_wirt={cd_is_wirt}, \
+                             claude_desktop_running={cd_running}, child_returned={child_returned}, \
+                             pending_dialogs={pending})"
+                        ));
+                    }
                     // #180: if the ONLY thing holding us is an open dialog,
                     // decide again when it is gone. Otherwise the host could
                     // outlive its Wirt indefinitely, waiting for a child edge
@@ -979,9 +1065,9 @@ async fn rotate_pipe_with_retry(pipe_name: &str) -> std::io::Result<NamedPipeSer
 fn spawn_gui_detached() {
     #[cfg(target_os = "macos")]
     {
-        let _ = crate::proc_ext::spawn_detached(
+        reap_in_background(crate::proc_ext::spawn_detached(
             std::process::Command::new("open").args(["-g", "-a", "aiui", "--args", "--auto"]),
-        );
+        ));
     }
     #[cfg(target_os = "windows")]
     {
@@ -1001,10 +1087,25 @@ fn spawn_gui_detached() {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = crate::proc_ext::spawn_detached(
+            reap_in_background(crate::proc_ext::spawn_detached(
                 std::process::Command::new(exe).arg("--auto"),
-            );
+            ));
         }
+    }
+}
+
+/// Wait for a spawned child on a detached thread (review B2-10). `std` does
+/// not reap a dropped `Child`, and tokio reaps only its own children, so every
+/// resurrect spawn used to leave a zombie in the long-lived `--mcp-stdio`
+/// process — about 25 an hour per session while the GUI cannot start, enough
+/// over days to exhaust the per-user process limit. (On Windows there are no
+/// zombies, so the Windows branch keeps dropping the handle.)
+#[cfg(unix)]
+fn reap_in_background(spawned: std::io::Result<std::process::Child>) {
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
@@ -1077,6 +1178,31 @@ mod tests {
         // must read as "not my Wirt", never as "my Wirt died".
         assert!(!wirt_gone(false, false));
         assert!(!wirt_gone(false, true));
+    }
+
+    #[test]
+    fn a_claude_desktop_never_seen_running_is_not_the_wirt() {
+        // B2-09: installed-but-closed made the host exit (and drop every
+        // tunnel) when the last local Claude Code session closed.
+        assert!(!cd_is_wirt(true, false));
+        assert!(!wirt_gone(cd_is_wirt(true, false), false), "never there, cannot leave");
+        assert!(cd_is_wirt(true, true));
+        assert!(wirt_gone(cd_is_wirt(true, true), false), "seen, now gone → follow it out");
+        assert!(!cd_is_wirt(false, true));
+    }
+
+    #[test]
+    fn an_update_restart_lets_tauri_relaunch() {
+        // B2-01: the honoured gate used to `process::exit` on a restart code,
+        // so Tauri's `RunEvent::Exit` arm — where the relaunch happens — never
+        // ran and *Install* quit aiui for good.
+        assert_eq!(
+            exit_mode_for(Some(tauri::RESTART_EXIT_CODE)),
+            ExitMode::LetTauriRestart
+        );
+        assert_eq!(exit_mode_for(Some(0)), ExitMode::Terminate);
+        assert_eq!(exit_mode_for(Some(1)), ExitMode::Terminate);
+        assert_eq!(exit_mode_for(None), ExitMode::Terminate);
     }
 
     #[test]

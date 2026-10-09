@@ -40,40 +40,98 @@ export const MERMAID_INIT_CONFIG = {
   // links are not rendered as links, no `<foreignObject>` escape hatches.
   securityLevel: "strict" as const,
   htmlLabels: false,
+  // Without this, a source Mermaid cannot parse or draw leaves its scratch
+  // element — the diagram so far, its `<style>` and any `classDef`-styled
+  // node — in `document.body` for good: `render()` throws before its own
+  // cleanup runs. MermaidView shows the error itself, so Mermaid's
+  // "syntax error" bomb graphic was never wanted anyway.
+  suppressErrorRendering: true,
 };
 
 /**
- * Sanitise a rendered Mermaid SVG before it reaches the DOM.
+ * Sanitise a rendered Mermaid SVG and return it as a standalone XML document.
  *
- * Deliberately unchanged by #189: the sanitiser was never the thing that
- * needed loosening. `<style>` is forbidden alongside `<script>` because
- * Mermaid's `classDef` directive turns caller-supplied text into emitted
- * CSS, and attacker-controlled CSS in a dialog window is UI redressing —
- * these windows are where the user clicks Confirm on destructive actions.
+ * The output is never inserted into the dialog's DOM. It is only ever shown
+ * through {@link mermaidImageSrc}, i.e. as an `<img>`, and that is the
+ * actual security boundary here:
  *
- * #212 measured where that CSS actually lands, and the `<style>` element is
- * not the whole answer: Mermaid emits a `classDef`'s declarations as an
- * inline `style` attribute on the styled node, verbatim and with
- * `!important` appended to every one of them. DOMPurify's svg profile allows
- * `style`, and DOMPurify does not parse the CSS inside it — so a source line
- * like
+ * #212 measured that Mermaid's `classDef` turns caller-supplied text into
+ * emitted CSS, verbatim and with `!important` appended, both in the theme
+ * `<style>` block and as an inline `style` attribute on the styled node. A
+ * source line like
  *
  *   classDef x position:fixed,top:0,width:100vw,height:100vh,z-index:99999,opacity:0.02
  *
  * reached the DOM intact as a near-invisible overlay covering the whole
- * dialog, including the Confirm button. Hence `style` is forbidden as an
- * attribute too, not only as an element. The cost is nil: the theme's own
- * styling travels in the `<style>` block this sanitiser already drops, so
- * nothing we ship was getting its look from an inline `style` either.
+ * dialog, including the Confirm button. The 0.11.0 fix forbade both the
+ * `<style>` element and the `style` attribute. That closed the overlay, but
+ * the theme's own fills, strokes and label colours travel in exactly that
+ * stylesheet, so every node rendered as a black box with black text on it
+ * (review finding D-04): legible markup, nothing a user could read.
  *
- * Both halves are exercised against the real renderer in
- * `mermaid-config.test.ts` — a Mermaid bump that moves caller-supplied CSS
- * to some third channel is meant to turn that red.
+ * An SVG shown as an image is a separate document. Its stylesheet can only
+ * style that document, never the dialog around it; its scripts never run;
+ * its links are inert; it cannot load anything external. So the theme
+ * `<style>` and inline styles can stay. `classDef` colours work again, and a
+ * hostile `classDef` can at most repaint the diagram it came with.
+ *
+ * DOMPurify still runs, as defence in depth and to keep the markup small:
+ * `<script>`, event handlers and `<foreignObject>` (which `htmlLabels: false`
+ * should keep from ever being emitted) are dropped.
+ *
+ * Returns `""` when nothing renderable survives.
  */
 export function sanitizeMermaidSvg(raw: string): string {
-  return DOMPurify.sanitize(raw, {
+  const body = DOMPurify.sanitize(raw, {
     USE_PROFILES: { svg: true, svgFilters: true },
-    FORBID_TAGS: ["script", "style", "foreignObject"],
-    FORBID_ATTR: ["style", "onclick", "onload", "onerror", "onmouseover"],
-  });
+    FORBID_TAGS: ["script", "foreignObject"],
+    FORBID_ATTR: ["onclick", "onload", "onerror", "onmouseover", "onfocus", "onbegin", "onend"],
+    RETURN_DOM: true,
+  }) as HTMLElement;
+  const svg = body.querySelector("svg");
+  if (!svg) return "";
+  fixIntrinsicSize(svg);
+  // XMLSerializer, not `outerHTML`: an `<img>` parses the payload as XML, and
+  // the HTML serialiser writes things like `&nbsp;` that XML rejects, which
+  // would turn the whole diagram into a broken-image icon.
+  return new XMLSerializer().serializeToString(svg);
+}
+
+/**
+ * Mermaid sizes its root `<svg>` for inline use: `width="100%"`, a
+ * `max-width` in the style attribute, and no `height`. An image needs an
+ * intrinsic size instead, or the browser falls back to 300x150 and
+ * letterboxes the diagram. Take it from the `viewBox`.
+ */
+function fixIntrinsicSize(svg: Element): void {
+  const vb = (svg.getAttribute("viewBox") ?? "").trim().split(/[\s,]+/).map(Number);
+  if (vb.length !== 4 || !vb.every(Number.isFinite)) return;
+  const [, , w, h] = vb;
+  if (w <= 0 || h <= 0) return;
+  svg.setAttribute("width", String(Math.ceil(w)));
+  svg.setAttribute("height", String(Math.ceil(h)));
+}
+
+/** UTF-8 safe base64. `btoa` alone throws on anything outside Latin-1, and
+ *  diagram labels are agent-supplied text in any script. */
+function base64Utf8(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/**
+ * The only way a Mermaid diagram reaches the dialog: as the `src` of an
+ * `<img>`. See {@link sanitizeMermaidSvg} for why that, and not the
+ * sanitiser, is what keeps diagram CSS out of the dialog.
+ *
+ * Returns `""` when there is nothing to show.
+ */
+export function mermaidImageSrc(raw: string): string {
+  const xml = sanitizeMermaidSvg(raw);
+  return xml ? `data:image/svg+xml;base64,${base64Utf8(xml)}` : "";
 }

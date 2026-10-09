@@ -1,5 +1,6 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
+  import { maxHeightStyle } from "../style-values";
 
   type ConfirmImage = {
     src: string; // data: URL, http(s) URL, or absolute / `~/` local path — bridge resolves before the spec hits the WebView
@@ -31,7 +32,8 @@
   <div class="window-scroll">
     {#if spec.header}<span class="chip">{spec.header}</span>{/if}
     {#if spec.image}
-      <figure class="confirm-image" style={spec.image.max_height ? `max-height: ${spec.image.max_height}px` : ""}>
+      <!-- D-01: `max_height` reaches `style` only as a bounded number. -->
+      <figure class="confirm-image" style={maxHeightStyle(spec.image.max_height)}>
         <img src={spec.image.src} alt={spec.image.alt ?? spec.title} />
       </figure>
     {/if}

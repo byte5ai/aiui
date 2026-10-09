@@ -1,6 +1,6 @@
 [package]
 name = "aiui"
-version = "0.11.0"
+version = "0.12.0"
 description = "aiui companion — renders dialogs for remote Claude Code sessions"
 authors = ["byte5"]
 license = ""
@@ -44,7 +44,10 @@ tauri-plugin-notification = "2"
 # requirement. Used from Rust only — no capability is granted, so the
 # WebView cannot reach the plugin's own commands.
 tauri-plugin-clipboard-manager = "2"
-serde_json = "1.0"
+# `preserve_order` (review B1-11): aiui rewrites the user's own Claude
+# configs. Without it `Map` is a BTreeMap, so every patch alphabetised the
+# whole file at every depth. Insertion order keeps the user's layout.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 # Format-preserving TOML editing for `~/.codex/config.toml` (#168) — Codex
 # reads TOML, and the file is the user's own, so we must keep their comments
 # and other MCP servers intact. serde_json handles the two Claude JSON configs.
@@ -62,6 +65,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 rand = "0.8"
 hex = "0.4"
+# HMAC-SHA256 for the `/probe?nonce=` challenge (review B1-01): the tunnel
+# manager proves the listener on a remote's :7777 is an aiui holding our token
+# WITHOUT sending the token to it. Already in the lockfile via Tauri.
+sha2 = "0.10"
 futures = "0.3"
 regex = "1"
 chrono = "0.4"
@@ -113,4 +120,6 @@ libc = "0.2"
 # listener and answer the bridges in our place (#185).
 [target.'cfg(windows)'.dependencies]
 # 0.59, not 0.52: SO_EXCLUSIVEADDRUSE is only defined from 0.59 on.
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+# Win32_Foundation + Win32_System_Console: clearing handle inheritance on the
+# --mcp-stdio path (review B2-06).
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_Console"] }

@@ -14,6 +14,20 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+const XLINK_NS = "http://www.w3.org/1999/xlink";
+
+/**
+ * The link target of an `<a>` or `<area>`, in every form the sanitiser lets
+ * through: the HTML `href`, or an SVG `<a>`'s `href` / `xlink:href`.
+ */
+function linkTarget(anchor: Element): string | null {
+  return (
+    anchor.getAttribute("href") ??
+    anchor.getAttributeNS(XLINK_NS, "href") ??
+    anchor.getAttribute("xlink:href")
+  );
+}
+
 /**
  * Delegated click handler for a container of rendered markdown.
  *
@@ -21,20 +35,28 @@ import { invoke } from "@tauri-apps/api/core";
  * anchors have no Svelte lifecycle to hook. Walks up to the nearest `<a>`,
  * so a click on a `<strong>` inside a link still counts.
  *
+ * Review finding D-07: three link shapes used to slip past this and
+ * navigate the window. An `<area>` of an image map is not an `<a>`; an SVG
+ * `<a xlink:href>` is one, but has no plain `href`, and the handler returned
+ * before `preventDefault()`. Both are covered now, and the click is swallowed
+ * as soon as any link element is found — whether or not it has a target we
+ * would open.
+ *
  * `open_url` already refuses anything that is not http(s) and dispatches via
  * the `open` crate without a shell, so no new command and no new capability
  * entry is needed.
  */
 export function handleContentClick(event: MouseEvent): void {
   const target = event.target as Element | null;
-  const anchor = target?.closest?.("a");
+  const anchor = target?.closest?.("a, area");
   if (!anchor) return;
-  const href = anchor.getAttribute("href");
-  if (!href) return;
 
-  // Always swallow the click: even a href we will not open must not be
+  // Always swallow the click: even a link we will not open must not be
   // allowed to navigate the dialog away.
   event.preventDefault();
+
+  const href = linkTarget(anchor);
+  if (!href) return;
 
   if (!/^https?:\/\//i.test(href)) {
     // Relative links, `javascript:`, `file:` … nothing to open, and

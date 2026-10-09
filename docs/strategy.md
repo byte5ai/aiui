@@ -89,7 +89,7 @@ Eine Absage, die wir zurückgenommen haben, wird hier verbucht statt aus der Tab
 
 | Idee | Ursprüngliche Absage | Warum revidiert |
 |---|---|---|
-| `pick_path` (NSOpenPanel) | Macht aiui zur Datei-Transfer-Schicht (Pfad → Remote-Agent → Inhalt). Bricht Architektur-Prinzip 3. Use-Case-Dichte für die Remote-Topologie zu dünn. | Ausgeliefert als `upload` (#146, v0.9.0) — in einer Form, die das Bedenken auflöst: nicht ein Pfad wandert (den der Agent dann frei nachlesen könnte), sondern die Bytes der *einen* Datei, die der User im nativen Picker auswählt. Genau ein Transfer pro Nutzer-Aktion, kein Browsing-Zugriff. Die Use-Case-Dichte war entgegen der Annahme da („nimm diese Datei“ ist der häufigste `scp`-Ersatz). Prinzip 3 ist entsprechend geschärft: verboten bleibt Sync ohne Nutzer-Akt, nicht der einzelne, vom User ausgelöste Transfer. |
+| `pick_path` (NSOpenPanel) | Macht aiui zur Datei-Transfer-Schicht (Pfad → Remote-Agent → Inhalt). Bricht Architektur-Prinzip 3. Use-Case-Dichte für die Remote-Topologie zu dünn. | Ausgeliefert als `upload` (#146) — in einer Form, die das Bedenken auflöst: nicht ein Pfad wandert (den der Agent dann frei nachlesen könnte), sondern die Bytes der *einen* Datei, die der User im nativen Picker auswählt. Genau ein Transfer pro Nutzer-Aktion, kein Browsing-Zugriff. Die Use-Case-Dichte war entgegen der Annahme da („nimm diese Datei“ ist der häufigste `scp`-Ersatz). Prinzip 3 ist entsprechend geschärft: verboten bleibt Sync ohne Nutzer-Akt, nicht der einzelne, vom User ausgelöste Transfer. |
 
 ## Prozess-Konsequenzen
 

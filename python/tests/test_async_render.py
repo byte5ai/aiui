@@ -120,7 +120,7 @@ def test_poll_render_retries_transport_error_then_succeeds(
     result is still there on the second GET.
     """
     _setup_token(monkeypatch, tmp_path)
-    monkeypatch.setattr(server, "ASYNC_POLL_RETRY_BACKOFF_S", 0.0)
+    _fake_clock(monkeypatch)
     calls = {"n": 0}
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
@@ -140,30 +140,226 @@ def test_poll_render_retries_transport_error_then_succeeds(
     assert calls["n"] == 2  # one failed GET, one retry
 
 
-def test_poll_render_gives_up_after_the_retry_budget(
+class _FakeClock:
+    """Drives `_poll_render` on fake time (E-01): `_now` reads it, `_sleep`
+    advances it. A GET can advance it too, to model a request that hangs
+    until its timeout."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.t += delay
+        await asyncio.sleep(0)
+
+
+def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    clock = _FakeClock()
+    # `raising=False`: the names are the seam this fix introduced, so the test
+    # still reaches its assertion (and fails there) against the old loop.
+    monkeypatch.setattr(server, "_now", clock.now, raising=False)
+    monkeypatch.setattr(server, "_sleep", clock.sleep, raising=False)
+    return clock
+
+
+def _run_poll(ttl_secs: float = server.DEFAULT_POLL_TTL_S, render_id: str = "x") -> Any:
+    async def run() -> dict[str, Any]:
+        async with httpx.AsyncClient() as client:
+            # A hard real-time cap: the pre-fix loop must fail, never hang.
+            return await asyncio.wait_for(
+                _poll_render(client, render_id, None, ttl_secs), timeout=10
+            )
+
+    return asyncio.run(run())
+
+
+def test_poll_render_survives_a_refused_port_for_most_of_the_budget(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
+    """E-01: a refused connection fails in milliseconds — the SSH reverse-tunnel
+    restarting looks exactly like this. A count budget gave up after ~4 s; the
+    wall-clock budget must carry the dialog through ~3 minutes of it."""
     _setup_token(monkeypatch, tmp_path)
-    monkeypatch.setattr(server, "ASYNC_POLL_RETRY_BACKOFF_S", 0.0)
+    clock = _fake_clock(monkeypatch)
+    start = clock.t
     calls = {"n": 0}
 
     async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
         calls["n"] += 1
+        if clock.t - start < 170:
+            raise httpx.ConnectError("[Errno 111] Connection refused")
+        return _FakeResp({"id": "x", "cancelled": False, "result": {"confirmed": True}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    data = _run_poll()
+    assert data["result"]["confirmed"] is True
+    assert clock.t - start >= 170, "the outage really lasted ~170 s of poll time"
+
+
+def test_poll_render_backoff_is_capped_exponential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """1, 2, 4, 8, 8, … s between retries — the contract both bridges share."""
+    _setup_token(monkeypatch, tmp_path)
+    clock = _fake_clock(monkeypatch)
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    with pytest.raises(RuntimeError):
+        _run_poll()
+    assert clock.sleeps[:6] == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+    assert max(clock.sleeps) == server.ASYNC_POLL_MAX_BACKOFF_S
+
+
+def test_poll_render_gives_up_once_the_outage_budget_is_spent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The retry is bounded by wall-clock time, not by a count — and not
+    before the budget either."""
+    _setup_token(monkeypatch, tmp_path)
+    clock = _fake_clock(monkeypatch)
+    start = clock.t
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
         raise httpx.ReadError("tunnel down")
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
 
-    async def run() -> dict[str, Any]:
-        async with httpx.AsyncClient() as client:
-            return await _poll_render(client, "x", None)
-
-    # #202: give-up is now bounded by consecutive transport failures and the
-    # error is wrapped in an actionable RuntimeError (not the bare ReadError),
-    # so the agent is told the dialog may still be open on the Mac.
     with pytest.raises(RuntimeError) as exc_info:
-        asyncio.run(run())
-    assert "consecutive poll failures" in str(exc_info.value)
-    assert calls["n"] == server.ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
+        _run_poll(render_id="r-42")
+    msg = str(exc_info.value)
+    # #202: wrapped in an actionable RuntimeError (not the bare ReadError),
+    # naming the render and telling the agent the dialog may still be open.
+    assert "consecutive poll failures" in msg
+    assert "r-42" in msg
+    assert "may still be open" in msg
+    elapsed = clock.t - start
+    assert server.POLL_OUTAGE_BUDGET_S <= elapsed <= server.POLL_OUTAGE_BUDGET_S + 1e-6
+
+
+def test_poll_render_outage_budget_restarts_after_a_good_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Two separate 150 s outages with one good poll between them are two
+    blips, not one 300 s outage."""
+    _setup_token(monkeypatch, tmp_path)
+    clock = _fake_clock(monkeypatch)
+    start = clock.t
+    seen_pending = {"done": False}
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        t = clock.t - start
+        if t < 150:
+            raise httpx.ConnectError("refused")
+        if not seen_pending["done"]:
+            seen_pending["done"] = True
+            return _FakeResp({"pending": True})
+        if t < 310:
+            raise httpx.ConnectError("refused")
+        return _FakeResp({"id": "x", "cancelled": False, "result": {"confirmed": True}})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    assert _run_poll()["result"]["confirmed"] is True
+
+
+def test_poll_render_404_after_an_outage_names_the_reaper(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """After an outage, a 404 almost always means the companion closed the
+    dialog because nobody polled it — "expired or never registered" sent the
+    agent looking for the wrong cause."""
+    _setup_token(monkeypatch, tmp_path)
+    _fake_clock(monkeypatch)
+    calls = {"n": 0}
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise httpx.ConnectError("refused")
+        return _FakeResp({"error": "unknown_render_id"}, status=404)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_poll()
+    msg = str(exc_info.value)
+    assert "lost track" in msg
+    assert "nobody polled it for too long" in msg
+
+
+def test_poll_render_ends_as_ttl_expired_even_while_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """E-05: the TTL used to be checked only after a failed poll, so a
+    companion answering `{pending: true}` forever held the call open forever.
+    Past TTL + grace the bridge retracts the dialog and returns the documented
+    `ttl_expired` cancel."""
+    _setup_token(monkeypatch, tmp_path)
+    clock = _fake_clock(monkeypatch)
+    deleted: list[str] = []
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        clock.t += 25  # the companion holds each GET for its poll window
+        return _FakeResp({"pending": True})
+
+    async def fake_delete(self: Any, url: str, **kwargs: Any) -> Any:
+        deleted.append(url)
+        return _FakeResp({}, status=204)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx.AsyncClient, "delete", fake_delete)
+
+    data = _run_poll(ttl_secs=300.0)
+    assert data["cancelled"] is True
+    assert data["reason"] == "ttl_expired"
+    assert server._format_result(data, "form") == {
+        "cancelled": True,
+        "values": {},
+        "reason": "ttl_expired",
+    }
+    assert deleted == [f"{server.ENDPOINT}/render/x"], "the stale window is retracted"
+    assert "x" not in server._LIVE_RENDERS
+
+
+def _http_resp(status: int, content: bytes) -> httpx.Response:
+    return httpx.Response(
+        status, content=content, request=httpx.Request("GET", "http://127.0.0.1:7777/render/x")
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "content", "needle"),
+    [
+        (401, b'{"error":"unauthorized"}', "Re-register this host"),
+        (500, b"boom", "HTTP 500"),
+        (200, b"<html>not json</html>", "unreadable answer"),
+        (200, b"[1, 2]", "non-object answer"),
+    ],
+)
+def test_poll_render_turns_bad_answers_into_named_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, status: int, content: bytes, needle: str
+) -> None:
+    """E-03: a 401/5xx or a non-JSON / non-object body on the poll used to
+    escape as a raw HTTPStatusError / JSONDecodeError / AttributeError — no
+    render id, no re-register guidance, no word that the dialog is still open."""
+    _setup_token(monkeypatch, tmp_path)
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        return _http_resp(status, content)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_poll(render_id="r-7")
+    msg = str(exc_info.value)
+    assert needle in msg
+    assert "r-7" in msg
 
 
 def test_poll_render_does_not_retry_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:

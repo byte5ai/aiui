@@ -1,22 +1,30 @@
 # Issue #212. Before this file, nothing in the repo looked at a dependency
-# after it was pinned: no `schedule:` trigger anywhere in `.github/`, no audit
-# step, so the advisory count against the lockfile could only grow between
-# releases and the only way anyone found out was running `npm audit` by hand.
+# after it was pinned, so the advisory count against the lockfile could only
+# grow between releases.
 #
 # CI's `npm audit --audit-level=high` is the gate that stops a new high
 # advisory landing; this is the other half — the thing that produces the
 # update PR that clears one. It also keeps #192's SHA-pinned actions from
 # rotting: a pinned SHA is only safe as long as something bumps it.
 #
-# Weekly, on Monday, so the four ecosystems arrive together rather than
-# trickling in; `open-pull-requests-limit` is kept low deliberately, because a
-# queue nobody reads is the same as no queue.
+# F-10 (2026-10 review): the first configuration jammed itself. Majors that
+# cannot land without code changes (mcp 2, mermaid 12, TypeScript 7, fs4 1)
+# sat red in the queue, the `pip` ecosystem edited pyproject.toml without
+# touching uv.lock (red by construction under `--locked`), and a JS-only
+# Tauri minor broke the Windows bundle's crate/JS version check. With
+# `open-pull-requests-limit` reached, nothing new — including an advisory
+# fix — could open. Hence:
+#   - majors that need a port are ignored here and done as deliberate work;
+#   - `build-chain` only groups minor/patch bumps;
+#   - Python uses the `uv` ecosystem, which updates uv.lock;
+#   - `@tauri-apps/*` JS minors are held: they must move together with the
+#     `tauri*` crates (the Tauri CLI refuses mismatched minors), which is a
+#     deliberate paired bump, not a bot PR.
 version: 2
 updates:
   # Tauri companion frontend. `appdmg` lives here as an optionalDependency and
   # is exempt from the CI audit gate (see ci.yml for why) — dependabot still
-  # reports on it, which is the right asymmetry: exempt from blocking, not
-  # exempt from being looked at.
+  # reports on it: exempt from blocking, not exempt from being looked at.
   - package-ecosystem: npm
     directory: /companion
     schedule:
@@ -25,7 +33,8 @@ updates:
     open-pull-requests-limit: 5
     groups:
       # `vite`, `svelte` and their plugins move together; one PR per bump of
-      # a shared build chain is noise, not signal.
+      # a shared build chain is noise, not signal. Minor/patch only: a major
+      # in the group (TypeScript 7 in #275) blocked all its siblings.
       build-chain:
         patterns:
           - "vite"
@@ -35,6 +44,20 @@ updates:
           - "typescript"
           - "vitest"
           - "jsdom"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Mermaid 12 pulls chevrotain → lodash-es with two high advisories
+      # (fails our own audit gate) and is a renderer change to verify by hand.
+      - dependency-name: "mermaid"
+        update-types: ["version-update:semver-major"]
+      # svelte-check's peer range does not admit TypeScript 7 yet.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # Must match the `tauri*` crates' minor; bumped as a pair by hand.
+      - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: chore
 
@@ -45,17 +68,32 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # fs4 1.x is an API break (`fs_std` / `try_lock_exclusive` changed).
+      - dependency-name: "fs4"
+        update-types: ["version-update:semver-major"]
+      # The `tauri*` crates move with `@tauri-apps/*` (see above).
+      - dependency-name: "tauri"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "tauri-build"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: chore
 
-  # The Python MCP bridge. `pip` is dependabot's name for the ecosystem; it
-  # reads `pyproject.toml` here, uv's lockfile is not a dependabot format.
-  - package-ecosystem: pip
+  # The Python MCP bridge. The `uv` ecosystem updates `uv.lock` together with
+  # `pyproject.toml`, so its PRs pass the `--locked` CI legs; the old `pip`
+  # entry edited pyproject.toml alone and every PR it opened was red.
+  - package-ecosystem: uv
     directory: /python
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # mcp 2.x renamed `mcp.server.fastmcp`; the bridge does not import
+      # under it. A port, not a bump — the `<2` cap is deliberate.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: chore
 

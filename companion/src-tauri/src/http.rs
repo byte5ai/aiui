@@ -46,6 +46,17 @@ const REASON_TOO_MANY_CHILDREN: &str = "too_many_children";
 /// unchanged, so the wire contract stays v1.
 const ASYNC_RENDER_HEADER: &str = "x-aiui-async";
 
+/// Async mode is chosen by the header's VALUE, not its presence: a signed
+/// request binds the value (absent and empty both sign as ""), so presence
+/// alone would let an empty header flip the mode without breaking the MAC
+/// (Codex review). Both bridges send "1".
+fn wants_async_render(headers: &HeaderMap) -> bool {
+    headers
+        .get(ASYNC_RENDER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 /// How long a single `GET /render/{id}` long-poll parks before returning
 /// `{pending:true}` so the caller can re-poll (and emit a progress
 /// notification). Short enough to stay well under any client read timeout, so
@@ -62,10 +73,20 @@ const ASYNC_POLL_WINDOW: Duration = Duration::from_secs(25);
 const SLOT_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// How long a slot may go unpolled before its caller counts as gone (#193).
-/// Both bridges re-poll every ≤40 s, so ~3 missed windows is unambiguous. On
-/// expiry the reaper cancels the dialog, which tears the window down — the fix
-/// for "the agent was killed and the dialog sat on the desktop for two hours".
-const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(90);
+/// On expiry the reaper cancels the dialog with `reason: "abandoned"`, which
+/// tears the window down — the fix for "the agent was killed and the dialog
+/// sat on the desktop for two hours".
+///
+/// It must outlast the longest outage a bridge is entitled to ride out
+/// (review A-01/E-01). The 90 s this used to be sat inside the bridges' own
+/// retry budget, so a Wi-Fi or VPN change during a long form destroyed the
+/// window — and the typed input — while the bridge was still waiting for the
+/// tunnel to come back. Both bridges now give up after
+/// `POLL_OUTAGE_BUDGET` (180 s) of wall-clock outage; add one in-flight GET
+/// (40 s) and one backoff (8 s) and the worst case is 228 s. Pinned by
+/// `the_reaper_outlasts_the_bridge_outage_budget` here and by the Python
+/// bridge's contract test, which parses this line.
+pub(crate) const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(300);
 
 /// Upper bound on buffered async-render slots. Past this the reaper evicts the
 /// oldest by `created_at` (cancelling their dialogs), so a pathological caller
@@ -355,6 +376,16 @@ pub async fn serve(
         .layer(sandboxed)
     };
 
+    // Review A-04: axum runs every extractor before the handler, so a
+    // handler-level `auth_ok` came AFTER the body was buffered — up to
+    // 64 MiB on /render and 512 MiB on /media for a caller without the
+    // token (any local account, or any user on a shared remote host via the
+    // tunnel). This layer answers 401 after the headers alone.
+    let token_gate = axum::middleware::from_fn_with_state(
+        std::sync::Arc::<str>::from(state.cfg.token.as_str()),
+        require_token,
+    );
+
     let router = Router::new()
         .route("/health", get(health))
         // #178: without this layer axum's 2 MiB default applied, so a routine
@@ -364,14 +395,19 @@ pub async fn serve(
         // guard so the 413 the agent sees is ours, structured and actionable.
         .route(
             "/render",
-            post(render).layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP)),
+            post(render)
+                .layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP))
+                .layer(token_gate.clone()),
         )
         // GET polls an async render; DELETE retracts it (#193) — the route a
         // bridge needs to close the dialog when its caller is cancelled.
         .route("/render/:id", get(render_poll).delete(render_cancel))
-        .route("/notify", post(notify))
+        .route("/notify", post(notify).layer(token_gate.clone()))
         .route("/version", get(version))
-        .route("/update", post(update))
+        .route("/update", post(update).layer(token_gate.clone()))
+        // B2-04: a second, user-started aiui asks the running one to show
+        // Settings before it exits on the GUI lock.
+        .route("/show-settings", post(show_settings).layer(token_gate.clone()))
         .route("/ping", get(ping))
         .route("/probe", get(probe))
         // Bridge pushes media bytes here; capped well above the per-file
@@ -380,14 +416,18 @@ pub async fn serve(
         .route(
             "/media",
             post(media_upload)
-                .layer(DefaultBodyLimit::max(crate::media::MEDIA_FILE_CAP as usize)),
+                // Strictly above the handler's own `MEDIA_FILE_CAP` guard, so
+                // an oversize push gets OUR structured 413 (A-04: with equal
+                // limits that branch could never fire).
+                .layer(DefaultBodyLimit::max(MEDIA_BODY_LIMIT))
+                .layer(token_gate.clone()),
         )
         // Inbound file transfer (#146): the bridge asks the Mac to open a
         // native file picker; on selection the picked file's bytes stream
         // back over the same :7777 channel (the reverse direction of
         // `POST /media`). This is the "get a Mac file into the agent
         // session" path.
-        .route("/upload", post(upload_pick))
+        .route("/upload", post(upload_pick).layer(token_gate.clone()))
         // Capability-URL playback: unauthenticated (filename is a UUID),
         // range-capable for video seeking via tower-http's ServeDir.
         //
@@ -398,7 +438,13 @@ pub async fn serve(
         // served out of the media cache can act inside the API's own
         // `127.0.0.1:<port>` origin.
         .nest_service("/media/blob", blob_service)
-        .with_state(state);
+        .with_state(state.clone())
+        // Outermost: turns a valid signed request into the bearer form every
+        // handler checks, before any route layer runs (see `signed_auth`).
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::<str>::from(state.cfg.token.as_str()),
+            signed_auth,
+        ));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = bind_with_reuse(addr)?;
@@ -484,6 +530,248 @@ async fn ping() -> &'static str {
     "pong"
 }
 
+/// Header carrying the locality proof (`config::AppConfig::local_proof_path`)
+/// that only a bridge on this machine can present (review C-01).
+pub(crate) const LOCAL_PROOF_HEADER: &str = "x-aiui-local-proof";
+
+/// `session_origin` given to a render that neither proved locality nor named
+/// its host. Shown on the approval line ("on unverified host").
+const UNVERIFIED_ORIGIN: &str = "unverified host";
+
+/// Refuse a target-bearing render that neither proved locality nor named its
+/// host (Codex review of C-01): nobody would write its `target` fields, and a
+/// `secret` would come back to the agent in plaintext.
+fn must_refuse_unproven(proven_local: bool, origin: Option<&str>, has_targets: bool) -> bool {
+    !proven_local && origin.unwrap_or("").is_empty() && has_targets
+}
+
+fn local_proof_ok(headers: &HeaderMap, cfg: &AppConfig) -> bool {
+    let Some(want) = cfg.read_local_proof() else {
+        return false;
+    };
+    headers
+        .get(LOCAL_PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|got| constant_time_eq(got.trim().as_bytes(), want.as_bytes()))
+        .unwrap_or(false)
+}
+
+async fn show_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    trace("show-settings: requested by a second launch");
+    crate::show_settings_from_second_launch(&state.app);
+    StatusCode::NO_CONTENT
+}
+
+/// Review B1-01, Codex follow-up: the remote Python bridge never sends the
+/// token itself. Its `/probe?nonce=` challenge proves the listener first, but
+/// cannot pin the TCP connection the next request travels on: if the
+/// listener closes it and a squatter grabs the port in between, a bearer
+/// token went to the squatter. So the bridge SIGNS each request instead:
+///
+///   Authorization: AIUI-HMAC ts=<unix>,nonce=<hex>,pid=<n>,bd=<sha256 hex>,mac=<hex>
+///   mac = HMAC-SHA256(token,
+///         "aiui-req-v2|METHOD|path?query|ts|nonce|pid|bd|<x-aiui-async value>")
+///
+/// What a captured header can still do, and why that is nothing:
+/// - another method, path or body, or the sync/async mode → the MAC breaks
+///   (`bd` is the body's SHA-256, checked once the body is read);
+/// - a replay → each nonce is accepted once, inside ±[`SIGNED_REQUEST_WINDOW`];
+/// - a replay after a companion restart (the nonce cache is per process) →
+///   `pid` is the companion process the bridge's challenge just proved, and a
+///   restarted companion is a different pid.
+///
+/// The MAC over the CLAIMED digest is checked from the headers alone, so a
+/// caller without the token is refused before any body byte is read (A-04);
+/// only an authenticated request has its body buffered and compared. The
+/// header is then rewritten to the bearer form the handlers check, so no
+/// handler changes. `Bearer` stays accepted — the local Rust bridge and older
+/// bridges use it.
+async fn signed_auth(
+    State(token): State<std::sync::Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let params = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("AIUI-HMAC "))
+        .map(str::to_owned);
+    let Some(params) = params else {
+        return next.run(req).await;
+    };
+    let unauthorized = |why: &str| {
+        trace(&format!("signed request refused: {why}"));
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response()
+    };
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "/".into());
+    let async_hdr = req
+        .headers()
+        .get("x-aiui-async")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let claimed = match verify_signed_request(
+        &token,
+        req.method().as_str(),
+        &path_query,
+        &async_hdr,
+        &params,
+        now,
+        std::process::id(),
+        seen_nonces(),
+    ) {
+        Ok(digest) => digest,
+        Err(why) => return unauthorized(why),
+    };
+    // Authenticated: now the body may be read, and must be the one signed.
+    let (mut parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MEDIA_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": "body_too_large"})),
+            )
+                .into_response()
+        }
+    };
+    if !constant_time_eq(sha256_hex(&bytes).as_bytes(), claimed.as_bytes()) {
+        return unauthorized("body does not match the signed digest");
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
+        parts.headers.insert(axum::http::header::AUTHORIZATION, v);
+    }
+    next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+/// How far a signed request's timestamp may be from this machine's clock.
+/// Generous on purpose: a remote dev host's clock is not ours to fix, and the
+/// nonce cache — not the window — is what stops a replay.
+const SIGNED_REQUEST_WINDOW: u64 = 300;
+
+/// Nonces seen inside the window (nonce → its ts). Pruned on insert.
+/// `OnceLock`, not `LazyLock`: the MSRV is 1.77.
+fn seen_nonces() -> &'static Mutex<std::collections::HashMap<String, u64>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The signed-request MAC (see [`signed_auth`]), hex. The Python bridge
+/// computes the same with `hmac.new`; both sides pin one test vector.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signed_request_mac(
+    token: &str,
+    method: &str,
+    path_query: &str,
+    ts: u64,
+    nonce: &str,
+    pid: u32,
+    body_digest: &str,
+    async_hdr: &str,
+) -> String {
+    let msg = format!(
+        "aiui-req-v2|{method}|{path_query}|{ts}|{nonce}|{pid}|{body_digest}|{async_hdr}"
+    );
+    hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
+}
+
+/// Verify a signed header from the headers alone; on success return the
+/// body digest it claims (the caller compares it with the real body).
+#[allow(clippy::too_many_arguments)]
+fn verify_signed_request(
+    token: &str,
+    method: &str,
+    path_query: &str,
+    async_hdr: &str,
+    params: &str,
+    now: u64,
+    our_pid: u32,
+    seen: &Mutex<std::collections::HashMap<String, u64>>,
+) -> Result<String, &'static str> {
+    if token.is_empty() {
+        return Err("no token configured");
+    }
+    let (mut ts, mut nonce, mut pid, mut bd, mut mac) = (None, None, None, None, None);
+    for part in params.split(',') {
+        match part.trim().split_once('=') {
+            Some(("ts", v)) => ts = v.parse::<u64>().ok(),
+            Some(("nonce", v)) => nonce = Some(v),
+            Some(("pid", v)) => pid = v.parse::<u32>().ok(),
+            Some(("bd", v)) => bd = Some(v),
+            Some(("mac", v)) => mac = Some(v),
+            _ => return Err("malformed signature header"),
+        }
+    }
+    let (Some(ts), Some(nonce), Some(pid), Some(bd), Some(mac)) = (ts, nonce, pid, bd, mac) else {
+        return Err("incomplete signature header");
+    };
+    if !is_probe_nonce(nonce) {
+        return Err("bad nonce");
+    }
+    if bd.len() != 64 || !bd.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("bad body digest");
+    }
+    if pid != our_pid {
+        return Err("signed for another companion process");
+    }
+    if now.abs_diff(ts) > SIGNED_REQUEST_WINDOW {
+        return Err("timestamp outside the window");
+    }
+    let want = signed_request_mac(token, method, path_query, ts, nonce, pid, bd, async_hdr);
+    if !constant_time_eq(mac.as_bytes(), want.as_bytes()) {
+        return Err("bad signature");
+    }
+    let mut seen = seen.lock().unwrap();
+    seen.retain(|_, t| now.abs_diff(*t) <= 2 * SIGNED_REQUEST_WINDOW);
+    if seen.insert(nonce.to_string(), ts).is_some() {
+        return Err("replayed nonce");
+    }
+    Ok(bd.to_ascii_lowercase())
+}
+
+/// Route layer for every body-consuming endpoint: 401 before any body byte
+/// is read (review A-04). The handlers keep their own `auth_ok` as well.
+async fn require_token(
+    State(token): State<std::sync::Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !auth_ok(req.headers(), &token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// `/media`'s transport limit: one MiB above `MEDIA_FILE_CAP`.
+const MEDIA_BODY_LIMIT: usize = crate::media::MEDIA_FILE_CAP as usize + 1024 * 1024;
+
 /// Authenticated probe used by the tunnel-manager's shared-forward
 /// detection. Unlike /ping, this requires the bearer token, so it
 /// distinguishes "another aiui with our token is forwarding the port"
@@ -495,10 +783,46 @@ async fn ping() -> &'static str {
 /// that produced the 2026-05-04 connection-reset incident — two
 /// companions, both with the user's token, indistinguishable from
 /// `aiui: true` alone).
+///
+/// Review B1-01: a caller that wants to know whether the listener holds the
+/// token must not have to SEND the token to find out. The remote end of a
+/// reverse tunnel is a first-come loopback port on a possibly shared host; a
+/// co-tenant squatting it used to receive `Authorization: Bearer <token>` on
+/// every probe cycle. With `?nonce=<hex>` the probe needs no credentials and
+/// answers with `mac = HMAC-SHA256(token, "aiui-probe-v1|nonce|pid|build_sha")`
+/// ([`probe_mac`]); the caller, who knows the token, verifies it locally. A
+/// squatter can neither answer the challenge nor learn anything from it.
+/// Without a nonce the endpoint keeps its old, authenticated contract.
+#[derive(Deserialize)]
+struct ProbeQuery {
+    nonce: Option<String>,
+}
+
 async fn probe(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<ProbeQuery>,
 ) -> impl IntoResponse {
+    let pid = std::process::id();
+    let build_sha = env!("AIUI_GIT_SHA");
+    if let Some(nonce) = q.nonce.as_deref() {
+        if !is_probe_nonce(nonce) || state.cfg.token.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "bad_nonce"})),
+            )
+                .into_response();
+        }
+        return Json(serde_json::json!({
+            "aiui": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "wire_version": WIRE_VERSION,
+            "pid": pid,
+            "build_sha": build_sha,
+            "mac": probe_mac(&state.cfg.token, nonce, pid, build_sha),
+        }))
+        .into_response();
+    }
     if !auth_ok(&headers, &state.cfg.token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -510,10 +834,48 @@ async fn probe(
         "aiui": true,
         "version": env!("CARGO_PKG_VERSION"),
         "wire_version": WIRE_VERSION,
-        "pid": std::process::id(),
-        "build_sha": env!("AIUI_GIT_SHA"),
+        "pid": pid,
+        "build_sha": build_sha,
     }))
     .into_response()
+}
+
+/// A challenge nonce: 32–128 lowercase hex characters. Bounded so the MAC
+/// input stays small, hex so it is safe to splice into a remote shell URL.
+pub(crate) fn is_probe_nonce(nonce: &str) -> bool {
+    (32..=128).contains(&nonce.len())
+        && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `HMAC-SHA256(token, "aiui-probe-v1|<nonce>|<pid>|<build_sha>")`, hex. Binds
+/// the answer to the challenge and to the identity fields the tunnel manager
+/// compares, so neither can be replayed or swapped. The Python bridge
+/// computes the same value with `hmac.new(token, msg, sha256)`.
+pub(crate) fn probe_mac(token: &str, nonce: &str, pid: u32, build_sha: &str) -> String {
+    let msg = format!("aiui-probe-v1|{nonce}|{pid}|{build_sha}");
+    hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
+}
+
+/// RFC 2104 HMAC over SHA-256, written out rather than pulling in a crate:
+/// `sha2` is already in the tree via Tauri.
+pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha256::new().chain_update(ipad).chain_update(msg).finalize();
+    let outer = Sha256::new().chain_update(opad).chain_update(inner).finalize();
+    hex::encode(outer)
 }
 
 /// A redacted, loggable description of a render spec.
@@ -574,7 +936,7 @@ fn spec_summary(spec: &serde_json::Value) -> String {
 /// the work independent of *where* the first difference is. Lengths are
 /// compared first and deliberately: a length mismatch is not secret, and
 /// leaking it is unavoidable in any fixed-work comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -775,9 +1137,16 @@ async fn upload_pick(
 
     // #194: promote out of Accessory mode (macOS) so the panel is reachable,
     // and serialise — a second concurrent picker is a stack of identical
-    // system panels the user cannot tell apart. Dropping the guard demotes
-    // again on every path below, including the timeout and the 413.
-    let Some(_picker) = crate::surface_for_native_picker(&state.app) else {
+    // system panels the user cannot tell apart.
+    //
+    // Review A-06: the guard lives in the picker's CALLBACK, not on this
+    // handler's stack. The handler returns on timeout (504) or is dropped
+    // when the bridge cancels, while the native panel stays on screen; a
+    // stack-held guard released the slot then, so the agent's retry stacked a
+    // second panel over the first, and the app was demoted behind the
+    // frontmost one. Now the slot is held — and the app kept Regular — until
+    // the panel actually closes.
+    let Some(picker) = crate::surface_for_native_picker(&state.app) else {
         trace("upload_pick: rejected — a picker is already open");
         return (
             StatusCode::CONFLICT,
@@ -805,6 +1174,7 @@ async fn upload_pick(
     }
     builder.pick_file(move |picked| {
         let _ = tx.send(picked);
+        drop(picker);
     });
 
     let picked = match tokio::time::timeout(UPLOAD_PICK_TIMEOUT, rx).await {
@@ -1029,12 +1399,16 @@ fn health_hint(reason: &str, pending: usize, attached: usize) -> String {
 /// alternative of grabbing the first entry of `app.webview_windows()` is a
 /// `HashMap` iteration-order pick and would make the probe flap between
 /// windows; `DialogState::newest_id()` is deterministic.
+/// How old a dialog must be before `/health` pings its window: long enough
+/// for the page to load and register its `ui:ping` listener (A-08).
+const UI_PING_MOUNT_GRACE: Duration = Duration::from_secs(3);
+
 async fn probe_webview(state: &AppState) -> WebviewHealth {
     // Probe a dialog window's webview specifically — the setup window is
     // user-driven and irrelevant for render-pipeline health.
     let Some(label) = state
         .dialog
-        .newest_id()
+        .newest_settled_id(UI_PING_MOUNT_GRACE, std::time::Instant::now())
         .filter(|l| crate::is_dialog_window_label(l.as_str()))
     else {
         return WebviewHealth::no_dialog_window();
@@ -1117,7 +1491,33 @@ async fn update(
         ));
     }
 
-    let updater = match state.app.updater() {
+    // Codex review of B2-13: the Windows install exits the process from
+    // inside `install()`. Latching the exit authority and draining BEFORE
+    // calling it left both armed when the install then failed (writing the
+    // installer, launching it) and aiui kept running. The plugin's
+    // `on_before_exit` hook runs only after the installer is prepared, right
+    // before `process::exit` — so the latch, drain and sweep go there. It
+    // replaces the plugin's default hook, so `cleanup_before_exit` is called
+    // explicitly. macOS/Linux never run the hook.
+    let hook_app = state.app.clone();
+    let hook_port = state.cfg.http_port;
+    let updater = match state
+        .app
+        .updater_builder()
+        .on_before_exit(move || {
+            if let Some(auth) = hook_app.try_state::<Arc<crate::lifetime::ExitAuthority>>() {
+                auth.authorize();
+            }
+            crate::lifetime::drain_and_sweep(
+                &hook_app,
+                "update-install",
+                hook_port,
+                crate::housekeeping::SweepScope::All,
+            );
+            hook_app.cleanup_before_exit();
+        })
+        .build()
+    {
         Ok(u) => u,
         Err(e) => {
             trace(&format!("update: updater unavailable: {e}"));
@@ -1182,29 +1582,60 @@ async fn update(
 
     // #197: on Windows the updater plugin hands the NSIS installer to
     // `ShellExecuteW` and then calls `std::process::exit(0)` — the process
-    // dies *inside* `download_and_install`, so nothing after it ever runs.
-    // Building the response afterwards meant the `{updated, current,
-    // available}` JSON was never flushed and `aiui-mcp`'s `update_tool`
-    // raised a transport error instead of reporting the version delta —
-    // `/aiui:update` was structurally broken there. So on Windows: answer
-    // first, install after the same 500 ms settle delay the macOS restart
-    // path uses. Exit-time cleanup (latching `ExitAuthority`, sweeping the
-    // ssh-NTR children) is covered by the updater plugin's `on_before_exit`
-    // hook in `lib.rs`, which the plugin invokes only on that branch.
+    // dies *inside* the install, so nothing after it ever runs and the
+    // response has to be written first.
+    //
+    // Review B2-13: it used to be written before the DOWNLOAD, too, so a
+    // download, signature or disk failure still reached the agent as
+    // `updated: true, "installer launched"`. And the plugin's exit skips our
+    // own exit path: no ExitAuthority latch, no `host_exiting` for a dialog
+    // that registered meanwhile, no tunnel sweep. Now: download and verify
+    // first (`download()` checks the minisign signature), re-check the I5
+    // gate (a dialog may have opened during the download — D-08's Windows
+    // half), answer, and only then latch, drain, sweep and install.
     //
     // `cfg!` rather than `#[cfg]` on purpose: both arms then type-check on
     // every target, so the Windows path is compiled — and reviewed — by the
     // macOS CI leg too.
     if cfg!(windows) {
+        let bytes = match update.download(|_, _| {}, || {}).await {
+            Ok(b) => b,
+            Err(e) => {
+                trace(&format!("update: download failed: {e}"));
+                return Ok(Json(UpdateResponse {
+                    updated: false,
+                    current,
+                    available: Some(to_version),
+                    error: Some(format!("download failed: {e}")),
+                    note: None,
+                }));
+            }
+        };
+        let pending_dialogs = state.dialog.stats().orphan_count;
+        if !crate::lifetime::update_install_is_safe(pending_dialogs) {
+            trace(&format!(
+                "update: a dialog opened during the download — deferring install of {to_version}"
+            ));
+            return Ok(Json(UpdateResponse {
+                updated: false,
+                current,
+                available: Some(to_version),
+                error: None,
+                note: Some("dialog in flight — update deferred".into()),
+            }));
+        }
         let version_for_task = to_version.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             trace(&format!(
                 "update: launching installer for {version_for_task} (response already flushed)"
             ));
-            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-                // Only reachable if the download or the signature check
-                // fails — a successful Windows install never returns.
+            // The latch, drain and sweep run in the `on_before_exit` hook
+            // above, only once the installer is ready to launch.
+            let res = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+            if let Ok(Err(e)) = res {
+                // Only reachable if preparing or launching the installer
+                // fails — nothing was latched or drained, aiui keeps serving.
                 trace(&format!("update: install failed: {e}"));
             }
         });
@@ -1214,7 +1645,10 @@ async fn update(
             current,
             available: Some(to_version),
             error: None,
-            note: Some("installer launched — aiui restarts into the new version".into()),
+            note: Some(
+                "downloaded and verified — installer launching; aiui restarts into the new version"
+                    .into(),
+            ),
         }));
     }
 
@@ -1298,6 +1732,12 @@ const RENDER_BODY_HARD_CAP: usize = 64 * 1024 * 1024;
 /// instead of axum's opaque "Failed to buffer the request body". (#178)
 const RENDER_SPEC_SOFT_CAP: usize = 48 * 1024 * 1024;
 
+// The soft cap must sit strictly below the route layer's hard cap: if they
+// were equal (as /media's used to be) axum would reject first and the
+// structured `spec_too_large` body would be dead code. A compile-time check —
+// as a runtime test it was a constant assertion clippy rejects.
+const _: () = assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
+
 /// `true` when a `/render` body is past the soft cap and must be refused by
 /// the handler. Split out so the ceiling is unit-testable without a router.
 fn render_body_too_large(body_len: usize) -> bool {
@@ -1341,6 +1781,83 @@ fn entry_value(v: &serde_json::Value) -> Option<&str> {
         .or_else(|| v.get("value").and_then(|x| x.as_str()))
 }
 
+/// The platform-neutral half of the target-path rule, for a bridge-served
+/// dialog (review C-11): absolute in POSIX or Windows syntax, or `~/`/`~\`
+/// rooted. The bridge, which knows its own OS, applies the exact rule.
+fn bridge_target_path_error(p: &str) -> Option<String> {
+    if p.is_empty() || p.len() > 4096 || !p.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return Some("invalid target path".into());
+    }
+    let b = p.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    if p.starts_with('/') || p.starts_with("\\\\") || p.starts_with("~/") || p.starts_with("~\\") || drive {
+        return None;
+    }
+    Some(format!("target path must be an absolute or ~/-rooted path, got '{p}'"))
+}
+
+/// Review A-02: every entry of a keyed collection must carry a non-empty
+/// STRING `value` (a bare non-empty string counts where the widget accepts
+/// one, `allow_bare`). `entry_value` simply skipped anything else, so a list
+/// of `{label}` items or numeric row values sailed past the duplicate check
+/// and crashed the keyed `{#each}` at mount — a blank, always-on-top window,
+/// for what the tool description itself calls the most common stumble.
+fn require_entry_values(
+    what: &str,
+    entries: &[serde_json::Value],
+    allow_bare: bool,
+) -> Result<(), (String, String)> {
+    for (i, e) in entries.iter().enumerate() {
+        let ok = match e.as_str() {
+            Some(s) => allow_bare && !s.is_empty(),
+            None => e
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+        };
+        if !ok {
+            return Err((
+                format!("{what} #{i} has no non-empty string 'value'"),
+                format!(
+                    "Each {what} needs a unique, non-empty string 'value' — it keys the \
+                     rendered list and the returned result. A missing or numeric value \
+                     is not accepted."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A required collection key of a form field (review A-03): the renderer
+/// dereferences it unconditionally, so a missing or misspelt key threw at
+/// init and blanked the window.
+fn require_array<'a>(
+    f: &'a serde_json::Value,
+    name: &str,
+    fk: &str,
+    key: &str,
+    shape: &str,
+) -> Result<&'a Vec<serde_json::Value>, (String, String)> {
+    f.get(key).and_then(|v| v.as_array()).ok_or_else(|| {
+        (
+            format!("{fk} field '{name}' is missing the '{key}' array"),
+            format!("A `{fk}` field needs {key}: {shape}."),
+        )
+    })
+}
+
+/// Every node of a `tree` forest, recursively.
+fn tree_nodes(items: &[serde_json::Value], out: &mut Vec<serde_json::Value>) {
+    for it in items {
+        out.push(it.clone());
+        if let Some(children) = it.get("children").and_then(|c| c.as_array()) {
+            tree_nodes(children, out);
+        }
+    }
+}
+
 /// Flatten a `tree` field's forest into every `value` it contains.
 ///
 /// One flat pass covers both failure modes: repeated *siblings* crash
@@ -1380,7 +1897,8 @@ fn annotate_target_paths(spec: &mut serde_json::Value) {
             let Some(raw) = t.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
                 continue;
             };
-            let resolved = crate::filewrite::resolve_display(&raw);
+            let mode = t.get("mode").and_then(|v| v.as_str()).unwrap_or("create").to_owned();
+            let resolved = crate::filewrite::resolve_display(&raw, &mode);
             t.insert("resolved_path".into(), serde_json::Value::String(resolved));
         }
     }
@@ -1400,7 +1918,15 @@ fn annotate_target_paths(spec: &mut serde_json::Value) {
 /// only rejects what the frontend genuinely cannot render (bad
 /// top-level kind, unknown field kind), never well-formed-but-unusual
 /// specs.
+#[cfg(test)]
 fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
+    validate_spec_for(spec, false)
+}
+
+/// `bridge_served`: the dialog's `target` writes happen on the bridge's host,
+/// whose OS may differ from this one — so the OS-specific absoluteness test
+/// is the bridge's to make, and only a platform-neutral one runs here (C-11).
+fn validate_spec_for(spec: &serde_json::Value, bridge_served: bool) -> Result<(), (String, String)> {
     let kind = spec.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if !matches!(kind, "ask" | "form" | "confirm" | "gallery" | "compare") {
         return Err((
@@ -1487,6 +2013,26 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 )?;
             }
         }
+        // A-02 / D-05: per-item decision buttons are keyed `(a.value)` too,
+        // and were never looked at — a missing or repeated value blanked the
+        // window just like an item's.
+        match spec.get("actions") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(actions)) => {
+                require_entry_values("gallery action", actions, false)?;
+                reject_duplicate_keys(
+                    "gallery action",
+                    "value",
+                    actions.iter().filter_map(entry_value),
+                )?;
+            }
+            Some(_) => {
+                return Err((
+                    "gallery 'actions' is not an array".into(),
+                    "actions: [{value, label}, …] — or omit it for Approve / Revise / Skip.".into(),
+                ));
+            }
+        }
         return Ok(());
     }
     // #178: an `ask` with no options opens a window carrying the question and
@@ -1511,16 +2057,17 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
             }
             Some(arr) => {
                 for (i, opt) in arr.iter().enumerate() {
-                    let labelled = ["label", "value"].into_iter().any(|k| {
-                        opt.get(k)
-                            .and_then(|v| v.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                    });
+                    // A-03: the button renders `label` only, so a value-only
+                    // option was a blank button the user picked blind.
+                    let labelled = opt
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
                     if !labelled {
                         return Err((
-                            format!("ask option #{i} has neither a non-empty 'label' nor 'value'"),
-                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A bare 'description' renders as a blank button."
+                            format!("ask option #{i} has no non-empty 'label'"),
+                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A value-only or description-only option renders as a blank button."
                                 .into(),
                         ));
                     }
@@ -1530,15 +2077,62 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
         return Ok(());
     }
     let mut fields: Vec<&serde_json::Value> = Vec::new();
-    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
-        for t in tabs {
-            if let Some(fs) = t.get("fields").and_then(|v| v.as_array()) {
-                fields.extend(fs.iter());
-            }
+    let tabs = spec
+        .get("tabs")
+        .and_then(|v| v.as_array())
+        .filter(|t| !t.is_empty());
+    let flat = spec
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .filter(|f| !f.is_empty());
+    // A-03: with `tabs` the form renders ONLY the tabs, so flat `fields`
+    // next to them were validated and then silently dropped — the agent got
+    // an answer without them and no error.
+    if tabs.is_some() && flat.is_some() {
+        return Err((
+            "form spec has both 'tabs' and 'fields'".into(),
+            "Use `fields` for a single page OR `tabs` (each with its own `fields`), not both — with tabs, top-level fields are not shown."
+                .into(),
+        ));
+    }
+    if let Some(tabs) = tabs {
+        for (i, t) in tabs.iter().enumerate() {
+            // A-03: a tab without `fields` made the renderer's `flatMap`
+            // yield `undefined` and blanked the window.
+            let Some(fs) = t.get("fields").and_then(|v| v.as_array()) else {
+                return Err((
+                    format!("form tab #{i} has no 'fields' array"),
+                    "Each tab is {label, fields: […]}.".into(),
+                ));
+            };
+            fields.extend(fs.iter());
         }
     }
-    if let Some(fs) = spec.get("fields").and_then(|v| v.as_array()) {
+    if let Some(fs) = flat {
         fields.extend(fs.iter());
+    }
+    // Codex review of C-02: form actions are matched by `value` — the
+    // writers take the first match, the frontend the one pressed. A missing,
+    // non-string or repeated value let the two disagree about whether an
+    // action commits `target` writes.
+    if kind == "form" {
+        match spec.get("actions") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(actions)) => {
+                require_entry_values("form action", actions, false)?;
+                reject_duplicate_keys(
+                    "form action",
+                    "value",
+                    actions.iter().filter_map(entry_value),
+                )?;
+            }
+            Some(_) => {
+                return Err((
+                    "form 'actions' is not an array".into(),
+                    "actions: [{label, value, primary?, success?, destructive?, skip_validation?, writes_targets?}, …] — or omit it for Cancel + Submit.".into(),
+                ));
+            }
+        }
     }
     // #178: `fields` and `tabs` are both optional, so `form(title="x")` used
     // to open a window with nothing but Submit/Cancel — the agent then got
@@ -1593,42 +2187,33 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
         let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
         match fk {
             "list" => {
-                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("list field '{name}' item"),
-                        "value",
-                        items.iter().filter_map(entry_value),
-                    )?;
-                }
+                let items = require_array(f, name, fk, "items", "[{label, value}, …] (or bare strings)")?;
+                let what = format!("list field '{name}' item");
+                require_entry_values(&what, items, true)?;
+                reject_duplicate_keys(&what, "value", items.iter().filter_map(entry_value))?;
             }
             "table" => {
-                if let Some(rows) = f.get("rows").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("table field '{name}' row"),
-                        "value",
-                        rows.iter().filter_map(entry_value),
-                    )?;
-                }
+                require_array(f, name, fk, "columns", "[{key, label}, …]")?;
+                let rows = require_array(f, name, fk, "rows", "[{value, values: {…}}, …]")?;
+                let what = format!("table field '{name}' row");
+                require_entry_values(&what, rows, false)?;
+                reject_duplicate_keys(&what, "value", rows.iter().filter_map(entry_value))?;
             }
             "image_grid" => {
-                if let Some(images) = f.get("images").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("image_grid field '{name}' image"),
-                        "value",
-                        images.iter().filter_map(entry_value),
-                    )?;
-                }
+                let images = require_array(f, name, fk, "images", "[{value, src, label?}, …]")?;
+                let what = format!("image_grid field '{name}' image");
+                require_entry_values(&what, images, false)?;
+                reject_duplicate_keys(&what, "value", images.iter().filter_map(entry_value))?;
             }
             "tree" => {
-                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
-                    let mut values = Vec::new();
-                    collect_tree_values(items, &mut values);
-                    reject_duplicate_keys(
-                        &format!("tree field '{name}' node"),
-                        "value",
-                        values.into_iter(),
-                    )?;
-                }
+                let items = require_array(f, name, fk, "items", "[{label, value, children?}, …]")?;
+                let mut nodes = Vec::new();
+                tree_nodes(items, &mut nodes);
+                let what = format!("tree field '{name}' node");
+                require_entry_values(&what, &nodes, false)?;
+                let mut values = Vec::new();
+                collect_tree_values(items, &mut values);
+                reject_duplicate_keys(&what, "value", values.into_iter())?;
             }
             _ => {}
         }
@@ -1669,8 +2254,31 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                     hint,
                 ));
             };
-            if let Some(why) = crate::filewrite::target_path_error(path) {
+            let path_err = if bridge_served {
+                bridge_target_path_error(path)
+            } else {
+                crate::filewrite::target_path_error(path)
+            };
+            if let Some(why) = path_err {
                 return Err((format!("form field '{name}': {why}"), hint));
+            }
+            // C-05: the optional keys are typed too. `"overwrite": "false"`
+            // (a string) used to fail the local writer's deserialisation only
+            // after the user had typed the secret — and the Python bridge
+            // read it as truthy and clobbered the file.
+            let typed = [
+                ("perm", obj.get("perm").map(|v| v.is_null() || v.is_string())),
+                ("overwrite", obj.get("overwrite").map(|v| v.is_null() || v.is_boolean())),
+                ("placeholder", obj.get("placeholder").map(|v| v.is_null() || v.is_string())),
+            ];
+            for (key, ok) in typed {
+                if ok == Some(false) {
+                    let want = if key == "overwrite" { "a boolean" } else { "a string" };
+                    return Err((
+                        format!("form field '{name}' has target.{key} that is not {want}"),
+                        hint,
+                    ));
+                }
             }
         }
     }
@@ -1707,12 +2315,49 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
 /// `invalid_spec` — still made the user's machine `GET` every URL in it,
 /// turning `/render` into a network probe that leaves nothing on screen.
 /// Validating first means a probe costs the prober a real dialog (#201).
+#[cfg(test)]
 async fn validate_then_resolve(
     spec: &mut serde_json::Value,
+    bridge_served: bool,
 ) -> Result<(), (String, String)> {
-    validate_spec(spec)?;
-    crate::imageresolve::resolve_image_srcs(spec).await;
-    Ok(())
+    validate_then_resolve_within(spec, bridge_served, usize::MAX)
+        .await
+        .map_err(|r| match r {
+            RenderReject::Invalid(d, h) | RenderReject::TooLarge(d, h) => (d, h),
+        })
+}
+
+/// Why a spec was refused before any window opened.
+enum RenderReject {
+    /// 422 `invalid_spec`.
+    Invalid(String, String),
+    /// 413 `spec_too_large` — here: the images it inlines (A-07).
+    TooLarge(String, String),
+}
+
+/// [`validate_then_resolve`] with the inline budget the render handler
+/// derives from the body it already has (review A-07).
+async fn validate_then_resolve_within(
+    spec: &mut serde_json::Value,
+    bridge_served: bool,
+    inline_budget: usize,
+) -> Result<(), RenderReject> {
+    validate_spec_for(spec, bridge_served).map_err(|(d, h)| RenderReject::Invalid(d, h))?;
+    crate::imageresolve::resolve_image_srcs_within(spec, inline_budget)
+        .await
+        .map_err(|inlined| {
+            RenderReject::TooLarge(
+                format!(
+                    "the images this spec links would inline to more than {} bytes \
+                     ({inlined} fetched before stopping; max {RENDER_SPEC_SOFT_CAP} per dialog)",
+                    inline_budget
+                ),
+                "Too much image data for one dialog: fewer or smaller images per call, \
+                 or split the review across several dialogs. An http(s) URL is inlined \
+                 too — it counts against the same ceiling."
+                    .into(),
+            )
+        })
 }
 
 /// RAII cleanup for a registered render — closes the cancellation-safety hole
@@ -1891,13 +2536,22 @@ fn slots_over_cap(
     if slots.len() <= cap {
         return Vec::new();
     }
-    let mut by_age: Vec<(&String, Instant)> =
-        slots.iter().map(|(id, s)| (id, s.created_at)).collect();
-    by_age.sort_by_key(|(_, t)| *t);
-    by_age
+    // Review A-05: only FINISHED slots are evictable — delivered ones first,
+    // then finished-but-uncollected, oldest first within each. A live dialog
+    // (`!done`) is never evicted: `DIALOG_HARD_CAP` already bounds those, and
+    // evicting by age alone destroyed a half-filled form while keeping 64
+    // answers nobody needed any more.
+    let mut finished: Vec<(&String, bool, Instant)> = slots
+        .iter()
+        .filter(|(_, s)| s.done.load(std::sync::atomic::Ordering::SeqCst) || s.result.is_some())
+        .map(|(id, s)| (id, s.delivered_at.is_none(), s.created_at))
+        .collect();
+    // `false` (delivered) sorts before `true` (uncollected).
+    finished.sort_by_key(|(_, uncollected, t)| (*uncollected, *t));
+    finished
         .into_iter()
         .take(slots.len() - cap)
-        .map(|(id, _)| id.clone())
+        .map(|(id, _, _)| id.clone())
         .collect()
 }
 
@@ -1925,7 +2579,12 @@ fn sweep_async_slots(state: &AppState) {
                 SlotVerdict::Abandon => abandoned.push(id.clone()),
             }
         }
-        for id in dropped.iter().chain(abandoned.iter()) {
+        // An abandoned slot is NOT removed: cancelling resolves the dialog,
+        // the resolver writes `{cancelled, reason: "abandoned"}` back into the
+        // slot, and a bridge that does come back (an outage longer than its
+        // budget) reads that instead of a 404 — the reason used to be set and
+        // then never reachable. The finished slot ages out like any other.
+        for id in dropped.iter() {
             slots.remove(id);
         }
         evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
@@ -1937,13 +2596,15 @@ fn sweep_async_slots(state: &AppState) {
         trace(&format!(
             "sweep_async_slots: caller stopped polling id={id} — cancelling the dialog"
         ));
-        state.dialog.cancel(&id);
+        // Not the user's "no": a distinct reason for the trace and for any
+        // caller that comes back after all.
+        state.dialog.cancel_with_reason(&id, Some("abandoned"));
     }
     for id in evicted {
         trace(&format!(
-            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting oldest id={id}"
+            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting finished id={id}"
         ));
-        state.dialog.cancel(&id);
+        state.dialog.cancel_with_reason(&id, Some("evicted"));
     }
 }
 
@@ -2106,7 +2767,7 @@ async fn render(
                     body.len(),
                     RENDER_SPEC_SOFT_CAP
                 ),
-                "hint": "Inlined images dominate the spec — shrink the image, send fewer at once, or pass an http(s):// src instead of a local path.",
+                "hint": "Inlined images dominate the spec — shrink the images or send fewer per dialog. An http(s):// src is inlined by aiui too and counts against the same ceiling.",
             })),
         )
             .into_response();
@@ -2120,13 +2781,63 @@ async fn render(
     };
     trace(&format!("render: auth ok, {}", spec_summary(&req.spec)));
 
+    // Review C-01: who performs a `target` write is decided by PROOF, not by
+    // an absent field. A render without a valid locality proof and without a
+    // declared origin is bridge-served: nothing is written on this machine,
+    // and the approval line says the write happens elsewhere.
+    let proven_local = local_proof_ok(&headers, &state.cfg);
+    if !proven_local && req.session_origin.as_deref().unwrap_or("").is_empty() {
+        // Codex review: a render with neither a locality proof nor an origin
+        // is an older native bridge mid-upgrade, a native bridge whose proof
+        // file could not be created, or a remote pretending to be local.
+        // None of them writes `target` fields — and the frontend strips a
+        // secret only for writes it performs itself — so a `secret` typed
+        // there would travel back to the agent in plaintext. Refuse
+        // target-bearing specs outright instead of rendering them.
+        if must_refuse_unproven(
+            proven_local,
+            req.session_origin.as_deref(),
+            !crate::collect_target_fields(&req.spec).is_empty(),
+        ) {
+            trace("render: rejected — target fields without a locality proof or origin");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "locality_unproven",
+                    "detail": "this dialog writes files (`target` fields), but the request \
+                               neither proved it comes from this machine nor named its host",
+                    "hint": "Restart the aiui MCP server so it matches the running aiui \
+                             version (a server started before an update cannot prove \
+                             locality), and check that aiui's config directory is writable.",
+                })),
+            )
+                .into_response();
+        }
+        req.session_origin = Some(UNVERIFIED_ORIGIN.to_string());
+    }
+    let bridge_served = !req.session_origin.as_deref().unwrap_or("").is_empty();
+
     // Spec validation (v0.4.46, Bug B+): reject anything the frontend
     // can't render *before* creating a window, and tell the agent
     // exactly what to fix. Without this, a bad `kind` opened a window
     // showing the "unknown_kind" placeholder — a confusing surface the
     // user had to dismiss. Now the agent gets `invalid_spec` + detail
     // and can correct the call; nothing is shown to the user.
-    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec).await {
+    let inline_budget = RENDER_SPEC_SOFT_CAP.saturating_sub(body.len());
+    let checked = validate_then_resolve_within(&mut req.spec, bridge_served, inline_budget).await;
+    if let Err(RenderReject::TooLarge(detail, hint)) = &checked {
+        trace(&format!("render: rejected — spec_too_large after inlining: {detail}"));
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "spec_too_large",
+                "detail": detail,
+                "hint": hint,
+            })),
+        )
+            .into_response();
+    }
+    if let Err(RenderReject::Invalid(detail, hint)) = checked {
         trace(&format!("render: rejected — invalid_spec: {detail}"));
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2259,7 +2970,7 @@ async fn render(
     // caller polls `GET /render/{id}`. This removes the multi-minute open HTTP
     // connection that a tunnel/GUI blip turns into a remote ReadError —
     // resolution now lives in a task, not on the wire.
-    if headers.contains_key(ASYNC_RENDER_HEADER) {
+    if wants_async_render(&headers) {
         // The detached task owns resolution + window teardown from here; the
         // slot below is what keeps the dialog tied to its caller (#193) — the
         // background reaper cancels it if nobody polls any more.
@@ -2416,6 +3127,136 @@ mod validate_tests {
     use super::{validate_spec, validate_then_resolve};
     use serde_json::json;
 
+    // ---------- review A-02 / A-03 / C-05 / C-11 ----------
+
+    #[test]
+    fn rejects_list_items_without_value() {
+        // A-02: `{label}`-only items crashed the keyed {#each} at mount.
+        let spec = json!({"kind":"form","fields":[{"kind":"list","name":"rank","sortable":true,
+            "items":[{"label":"A"},{"label":"B"}]}]});
+        let (detail, _) = validate_spec(&spec).unwrap_err();
+        assert!(detail.contains("rank") && detail.contains("value"), "{detail}");
+        // Bare strings stay allowed for list (the widget uses them as both).
+        let bare = json!({"kind":"form","fields":[{"kind":"list","name":"l","items":["a","b"]}]});
+        assert!(validate_spec(&bare).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_string_values() {
+        // A-02: numeric values slipped past the duplicate check entirely.
+        let spec = json!({"kind":"form","fields":[{"kind":"table","name":"t",
+            "columns":[{"key":"n","label":"N"}],
+            "rows":[{"value":1,"values":{}},{"value":1,"values":{}}]}]});
+        assert!(validate_spec(&spec).is_err());
+        let grid = json!({"kind":"form","fields":[{"kind":"image_grid","name":"g",
+            "images":[{"value":"","src":"data:image/png;base64,AA"}]}]});
+        assert!(validate_spec(&grid).is_err(), "empty string value");
+        let tree = json!({"kind":"form","fields":[{"kind":"tree","name":"t","items":[
+            {"label":"root","value":"r","children":[{"label":"leaf"}]}]}]});
+        let (detail, _) = validate_spec(&tree).unwrap_err();
+        assert!(detail.contains("tree"), "a nested node without value: {detail}");
+    }
+
+    #[test]
+    fn rejects_gallery_actions_without_or_with_duplicate_value() {
+        // A-02 / D-05: gallery `actions` were never validated.
+        let base = || json!({"kind":"gallery","items":[{"value":"a","src":"data:image/png;base64,AA"}]});
+        let mut missing = base();
+        missing["actions"] = json!([{"label":"Keep"},{"label":"Redo"}]);
+        assert!(validate_spec(&missing).is_err());
+        let mut dup = base();
+        dup["actions"] = json!([{"label":"Keep","value":"k"},{"label":"Also","value":"k"}]);
+        assert!(validate_spec(&dup).is_err());
+        let mut ok = base();
+        ok["actions"] = json!([{"label":"Keep","value":"keep"},{"label":"Redo","value":"redo"}]);
+        assert!(validate_spec(&ok).is_ok());
+        let mut not_array = base();
+        not_array["actions"] = json!("keep");
+        assert!(validate_spec(&not_array).is_err());
+        assert!(validate_spec(&base()).is_ok(), "omitted actions use the defaults");
+    }
+
+    #[test]
+    fn rejects_missing_required_collections() {
+        // A-03: the renderer dereferences these unconditionally.
+        for (kind, extra) in [
+            ("list", json!({})),
+            ("tree", json!({})),
+            ("image_grid", json!({})),
+            ("table", json!({"columns":[{"key":"a","label":"A"}],"data":[]})),
+            ("table", json!({"rows":[]})),
+        ] {
+            let mut f = json!({"kind": kind, "name": "x"});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            let spec = json!({"kind":"form","fields":[f]});
+            assert!(validate_spec(&spec).is_err(), "{kind} {extra}");
+        }
+    }
+
+    #[test]
+    fn rejects_tabs_next_to_fields_and_tabs_without_fields() {
+        // A-03: with tabs, flat fields were validated and then never shown.
+        let both = json!({"kind":"form",
+            "fields":[{"kind":"text","name":"why"}],
+            "tabs":[{"label":"Adv","fields":[{"kind":"checkbox","name":"force"}]}]});
+        assert!(validate_spec(&both).is_err());
+        let fieldless = json!({"kind":"form","tabs":[
+            {"label":"A","fields":[{"kind":"text","name":"a"}]},{"label":"B"}]});
+        assert!(validate_spec(&fieldless).is_err());
+    }
+
+    #[test]
+    fn rejects_form_actions_without_or_with_duplicate_values() {
+        let base = || json!({"kind":"form","fields":[{"kind":"text","name":"a"}]});
+        let mut dup = base();
+        dup["actions"] = json!([{"label":"Go","value":"go"},{"label":"Also","value":"go","skip_validation":true}]);
+        assert!(validate_spec(&dup).is_err());
+        let mut missing = base();
+        missing["actions"] = json!([{"label":"Go"}]);
+        assert!(validate_spec(&missing).is_err());
+        let mut ok = base();
+        ok["actions"] = json!([{"label":"Cancel","value":"__cancel__","skip_validation":true},{"label":"Send","value":"__submit__","primary":true}]);
+        assert!(validate_spec(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_value_only_ask_options() {
+        // A-03: the button renders the label only — a value-only option was a
+        // blank button.
+        let spec = json!({"kind":"ask","question":"Strategy?","options":[
+            {"value":"blue-green","description":"…"},{"value":"rolling","description":"…"}]});
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_mistyped_target_keys() {
+        // C-05: these failed only after submit (Rust) or clobbered (Python).
+        for (key, bad) in [("overwrite", json!("false")), ("perm", json!(600)), ("placeholder", json!(1))] {
+            let mut target = json!({"mode":"create","path":"~/x"});
+            target[key] = bad.clone();
+            let spec = json!({"kind":"form","fields":[{"kind":"password","name":"p","target":target}]});
+            let (detail, _) = validate_spec(&spec).unwrap_err();
+            assert!(detail.contains(key), "{key}={bad}: {detail}");
+        }
+        let good = json!({"kind":"form","fields":[{"kind":"password","name":"p",
+            "target":{"mode":"create","path":"~/x","overwrite":true,"perm":"600"}}]});
+        assert!(validate_spec(&good).is_ok());
+    }
+
+    #[test]
+    fn a_bridge_served_target_path_is_judged_platform_neutrally() {
+        // C-11: a Windows bridge behind a macOS companion sends a drive path.
+        let spec = |p: &str| json!({"kind":"form","fields":[{"kind":"password","name":"p",
+            "target":{"mode":"create","path":p}}]});
+        assert!(super::validate_spec_for(&spec("C:\\Users\\me\\x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("/home/me/x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("~\\x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("relative/x"), true).is_err());
+        assert!(super::validate_spec_for(&spec("~other/x"), true).is_err());
+    }
+
     #[tokio::test]
     async fn invalid_spec_is_rejected_before_any_fetch() {
         // #201: `resolve_image_srcs` used to run first, so a spec that was
@@ -2427,7 +3268,7 @@ mod validate_tests {
             "kind": "not-a-real-kind",
             "image": {"src": "http://93.184.216.34/probe.png"}
         });
-        let (detail, _hint) = validate_then_resolve(&mut spec).await.unwrap_err();
+        let (detail, _hint) = validate_then_resolve(&mut spec, false).await.unwrap_err();
         assert!(detail.contains("top-level 'kind'"), "got: {detail}");
         assert_eq!(
             crate::imageresolve::fetch_attempts(),
@@ -2492,7 +3333,7 @@ mod validate_tests {
         // for first) used to reach the Python bridge's post-submit write and
         // die there on `.get()` — after the user had typed a credential.
         let spec = json!({"kind":"form","fields":[
-            {"kind":"secret","name":"pat","target":"~/.github_tokens/byte5ai"}
+            {"kind":"secret","name":"pat","target":"~/.config/demo/token"}
         ]});
         let (detail, hint) = validate_spec(&spec).unwrap_err();
         assert!(detail.contains("pat"), "names the offending field: {detail}");
@@ -2523,7 +3364,7 @@ mod validate_tests {
         // A well-formed target still validates, in a tab too.
         let good = json!({"kind":"form","fields":[
             {"kind":"secret","name":"pat",
-             "target":{"mode":"create","path":"~/.github_tokens/byte5ai","perm":"0600"}},
+             "target":{"mode":"create","path":"~/.config/demo/token","perm":"0600"}},
             {"kind":"text","name":"note",
              "target":{"mode":"substitute","path":"/etc/app.yml","placeholder":"__X__"}}
         ]});
@@ -2920,18 +3761,11 @@ mod validate_tests {
 
 #[cfg(test)]
 mod render_body_cap_tests {
-    use super::{render_body_too_large, RENDER_BODY_HARD_CAP, RENDER_SPEC_SOFT_CAP};
+    use super::{render_body_too_large, RENDER_SPEC_SOFT_CAP};
 
     // #178: axum's 2 MiB default killed a routine 2 MB screenshot before the
     // handler ever ran — a sixth of the 10 MB per-image cap the docs promise,
     // with an opaque 413 and nothing in the trace log.
-
-    #[test]
-    fn soft_cap_is_strictly_below_the_hard_cap() {
-        // If they were equal (as on /media) axum would reject first and the
-        // structured `spec_too_large` body would be dead code.
-        assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
-    }
 
     #[test]
     fn accepts_a_spec_above_the_old_axum_default() {
@@ -3256,13 +4090,34 @@ mod async_render_tests {
     }
 
     #[test]
-    fn slot_cap_evicts_oldest() {
+    fn slot_cap_never_evicts_a_live_dialog() {
+        // A-05: one live form opened first, then a burst of answered
+        // confirms. Eviction by age alone took the live form.
+        let base = Instant::now();
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        slots.insert("live".into(), slot(base, false));
+        for i in 0..ASYNC_SLOT_CAP + 1 {
+            let mut s = slot(base + Duration::from_secs(1 + i as u64), true);
+            if i % 2 == 0 {
+                s.delivered_at = Some(base + Duration::from_secs(2 + i as u64));
+            }
+            slots.insert(format!("d{i}"), s);
+        }
+        let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        assert_eq!(evicted.len(), 2);
+        assert!(!evicted.contains(&"live".to_string()), "{evicted:?}");
+        // Delivered slots go before uncollected ones, oldest first.
+        assert_eq!(evicted, vec!["d0".to_string(), "d2".to_string()]);
+    }
+
+    #[test]
+    fn slot_cap_evicts_oldest_finished() {
         let base = Instant::now();
         let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
         for i in 0..ASYNC_SLOT_CAP + 2 {
             slots.insert(
                 format!("d{i}"),
-                slot(base + Duration::from_secs(i as u64), false),
+                slot(base + Duration::from_secs(i as u64), true),
             );
         }
         let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
@@ -3421,6 +4276,161 @@ mod auth_tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer ".parse().unwrap());
         assert!(!auth_ok(&h, ""));
+    }
+
+    #[test]
+    fn an_unproven_render_with_targets_is_refused() {
+        assert!(must_refuse_unproven(false, None, true));
+        assert!(must_refuse_unproven(false, Some(""), true));
+        assert!(!must_refuse_unproven(false, None, false), "no targets: render as unverified");
+        assert!(!must_refuse_unproven(true, None, true), "proven local writes itself");
+        assert!(!must_refuse_unproven(false, Some("devbox"), true), "a bridge writes on its host");
+    }
+
+    #[tokio::test]
+    async fn the_token_gate_answers_before_the_body_is_read() {
+        // A-04: the handler's `body: String` extractor buffered the whole
+        // body before its own auth check. Behind the gate, a tokenless
+        // request never reaches the handler (or its extractor) at all.
+        use tower::ServiceExt;
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = reached.clone();
+        let app = Router::new().route(
+            "/x",
+            post(move |_body: String| {
+                r2.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { "ok" }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::<str>::from("tok"),
+                require_token,
+            )),
+        );
+        let req = |auth: Option<&str>| {
+            let mut b = axum::http::Request::builder().method("POST").uri("/x");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(axum::body::Body::from(vec![0u8; 1024])).unwrap()
+        };
+        let res = app.clone().oneshot(req(None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = app.clone().oneshot(req(Some("Bearer wrong"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst), "handler ran without a token");
+        let res = app.oneshot(req(Some("Bearer tok"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[allow(clippy::too_many_arguments)]
+    fn hdr(token: &str, method: &str, pq: &str, ts: u64, n: &str, pid: u32, bd: &str, asy: &str) -> String {
+        let mac = signed_request_mac(token, method, pq, ts, n, pid, bd, asy);
+        format!("ts={ts},nonce={n},pid={pid},bd={bd},mac={mac}")
+    }
+
+    #[test]
+    fn an_empty_async_header_does_not_select_async_mode() {
+        let mut h = HeaderMap::new();
+        assert!(!wants_async_render(&h));
+        h.insert("x-aiui-async", axum::http::HeaderValue::from_static(""));
+        assert!(!wants_async_render(&h), "same signature as absent, so same mode");
+        h.insert("x-aiui-async", axum::http::HeaderValue::from_static("1"));
+        assert!(wants_async_render(&h));
+    }
+
+    #[test]
+    fn a_signed_request_is_accepted_once_and_only_as_signed() {
+        let n = "ab".repeat(16);
+        let h = hdr("tok", "GET", "/render/x", 1_000, &n, 42, EMPTY_SHA, "");
+        let verify = |method: &str, pq: &str, asy: &str, h: &str, now: u64, pid: u32, seen: &Mutex<_>| {
+            verify_signed_request("tok", method, pq, asy, h, now, pid, seen)
+        };
+        let seen = Mutex::new(std::collections::HashMap::new());
+        assert_eq!(verify("GET", "/render/x", "", &h, 1_010, 42, &seen).as_deref(), Ok(EMPTY_SHA));
+        assert!(verify("GET", "/render/x", "", &h, 1_011, 42, &seen).is_err(), "replay");
+        let fresh = || Mutex::new(std::collections::HashMap::new());
+        assert!(verify("POST", "/render/x", "", &h, 1_010, 42, &fresh()).is_err(), "method");
+        assert!(verify("GET", "/update", "", &h, 1_010, 42, &fresh()).is_err(), "path");
+        assert!(verify("GET", "/render/x", "1", &h, 1_010, 42, &fresh()).is_err(), "async mode");
+        assert!(verify("GET", "/render/x", "", &h, 1_010, 43, &fresh()).is_err(), "restarted companion");
+        assert!(verify("GET", "/render/x", "", &h, 1_000 + 301, 42, &fresh()).is_err(), "stale");
+        assert!(verify("GET", "/render/x", "", "ts=1000", 1_000, 42, &fresh()).is_err(), "malformed");
+        assert!(
+            verify_signed_request("other", "GET", "/render/x", "", &h, 1_010, 42, &fresh()).is_err(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn the_signed_request_mac_formula_is_pinned() {
+        // The Python bridge pins the same vector (test_listener_verification.py).
+        assert_eq!(
+            signed_request_mac(&"k".repeat(64), "POST", "/render", 1_700_000_000, &"ab".repeat(16), 4242, EMPTY_SHA, "1"),
+            "69e9c08260c11b26fc5f217fb7bbe0699291522a1c69f53da4095b99b04fea21"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signed_layer_checks_the_body_and_hands_handlers_the_bearer_form() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/x",
+                post(|h: HeaderMap, body: String| async move {
+                    if auth_ok(&h, "tok") && body == "signed" { StatusCode::OK } else { StatusCode::UNAUTHORIZED }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(std::sync::Arc::<str>::from("tok"), signed_auth));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let pid = std::process::id();
+        let req = |n: &str, body: &'static str| {
+            let h = hdr("tok", "POST", "/x?a=1", now, n, pid, &sha256_hex(b"signed"), "");
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/x?a=1")
+                .header("authorization", format!("AIUI-HMAC {h}"))
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let n1 = format!("{:032x}", now as u128 * 7919 + 1);
+        assert_eq!(app.clone().oneshot(req(&n1, "signed")).await.unwrap().status(), StatusCode::OK);
+        // Same signature shape, substituted body: refused.
+        let n2 = format!("{:032x}", now as u128 * 7919 + 2);
+        assert_eq!(
+            app.oneshot(req(&n2, "phishing form")).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        // RFC 4231 test case 2 — the probe MAC is only as good as this.
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than the block size is hashed first.
+        assert_eq!(
+            hmac_sha256_hex(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn probe_nonce_shape_is_bounded_hex() {
+        assert!(is_probe_nonce(&"a1".repeat(16)));
+        assert!(is_probe_nonce(&"0".repeat(128)));
+        assert!(!is_probe_nonce(&"0".repeat(31)), "too short");
+        assert!(!is_probe_nonce(&"0".repeat(129)), "too long");
+        assert!(!is_probe_nonce(&format!("{}G", "0".repeat(40))), "not hex");
+        assert!(!is_probe_nonce(&"A".repeat(40)), "uppercase is not ours");
+        assert!(!is_probe_nonce(&format!("{}';rm", "0".repeat(40))), "shell metachar");
     }
 
     #[test]

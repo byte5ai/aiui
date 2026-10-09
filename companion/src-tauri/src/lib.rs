@@ -81,16 +81,31 @@ fn pending_update_notification(version: &str) -> (String, String) {
 ///
 /// Pure, so the matrix is unit-testable without a window.
 pub(crate) fn is_allowed_app_navigation(url: &tauri::Url) -> bool {
+    is_allowed_app_navigation_in(url, cfg!(debug_assertions))
+}
+
+/// Review D-07: `localhost` used to be allowed on ANY port and path in
+/// release builds too, so a Mermaid `click … href "http://localhost:5173/"`
+/// or an SVG link navigated a dialog — with the user's typed input — to a
+/// local dev server. Only a debug build, and only the `devUrl` port, may.
+fn is_allowed_app_navigation_in(url: &tauri::Url, dev: bool) -> bool {
     match url.scheme() {
         // macOS / Linux production.
         "tauri" => true,
         // Windows production (`useHttpsScheme` unset → http) and the dev server.
-        "http" => matches!(url.host_str(), Some("tauri.localhost") | Some("localhost")),
+        "http" => match url.host_str() {
+            Some("tauri.localhost") => true,
+            Some("localhost") => dev && url.port() == Some(DEV_SERVER_PORT),
+            _ => false,
+        },
         // Windows production with `useHttpsScheme: true`.
         "https" => url.host_str() == Some("tauri.localhost"),
         _ => false,
     }
 }
+
+/// `build.devUrl`'s port in `tauri.conf.json`.
+const DEV_SERVER_PORT: u16 = 5173;
 
 /// Timestamp of the most recent dialog-window teardown (X-close, submit/cancel
 /// close, or programmatic destroy). The macOS `RunEvent::Reopen` handler reads
@@ -108,8 +123,8 @@ fn mark_dialog_teardown() {
 }
 
 /// Only the macOS `RunEvent::Reopen` handler reads this — every other
-/// platform either has no equivalent event (Windows surfaces a second
-/// instance via tauri-plugin-single-instance instead) or treats reopen
+/// platform either has no equivalent event (a second launch elsewhere asks
+/// the running instance via `POST /show-settings`, B2-04) or treats reopen
 /// without the dialog-teardown discrimination. Keeping the function
 /// `cfg`-gated avoids a `dead_code` warning under
 /// `clippy --target x86_64-pc-windows-msvc -- -D warnings`. The
@@ -143,10 +158,32 @@ fn dialog_cancel(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
+    reason: Option<String>,
 ) -> Result<(), String> {
     require_own_dialog(&window, &id, "dialog_cancel")?;
-    state.cancel(&id);
+    state.cancel_with_reason(&id, frontend_cancel_reason(reason.as_deref()));
     Ok(())
+}
+
+/// Does this dialog's `target` write happen on THIS machine? Only for a
+/// render that proved locality — `/render` gives every other one a
+/// `session_origin` (review C-01).
+fn writes_on_this_host(req: &dialog::DialogRequest) -> bool {
+    req.session_origin.as_deref().unwrap_or("").is_empty()
+}
+
+/// The reasons a dialog window may attach to its own cancel (review D-02).
+/// A reason-less cancel means "the user declined" to the agent
+/// (`docs/skill.md`), so the window's TTL countdown firing must say
+/// `ttl_expired` — it used to arrive reason-less, and a timed-out destructive
+/// `confirm` read as an explicit "no, do not re-ask". Anything else a window
+/// sends is dropped rather than forwarded: the window renders agent content,
+/// and must not be able to dress a user's refusal up as something else.
+fn frontend_cancel_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("ttl_expired") => Some("ttl_expired"),
+        _ => None,
+    }
 }
 
 /// Issue #135: write the values of `target`-carrying form fields to **local**
@@ -175,6 +212,15 @@ fn write_dialog_targets(
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
+    // Review C-01: only a render that PROVED it came from the local bridge
+    // (`x-aiui-local-proof`) may write on this machine. `/render` stamps every
+    // other one with a `session_origin`, so the frontend never asks — and if
+    // it does anyway, the stored request decides, not the window.
+    if !writes_on_this_host(&req) {
+        return Err(
+            "target writes for a bridge-served dialog happen on the bridge's host".to_string(),
+        );
+    }
 
     let commits = action_commits_targets(&req.spec, action.as_deref());
 
@@ -274,7 +320,7 @@ fn action_commits_targets(spec: &serde_json::Value, action: Option<&str>) -> boo
 
 /// Collect every form field that carries a non-null `target`, walking both the
 /// flat `fields` array and any `tabs[].fields`.
-fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut consider = |fields: &serde_json::Value| {
         if let Some(arr) = fields.as_array() {
@@ -322,9 +368,12 @@ fn get_dialog_spec(
 /// deadline derived once at mount drifts in both directions (#207).
 #[tauri::command]
 fn get_dialog_remaining(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<Option<u64>, String> {
+    // D-10: a window may only ask about its own dialog (#195).
+    require_own_dialog(&window, &id, "get_dialog_remaining")?;
     Ok(state.remaining_secs(&id))
 }
 
@@ -337,9 +386,13 @@ fn get_dialog_remaining(
 /// (#207).
 #[tauri::command]
 fn resolve_dialog_targets(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<std::collections::HashMap<String, String>, String> {
+    // D-10: another session's dialog would disclose its target field names
+    // and absolute paths.
+    require_own_dialog(&window, &id, "resolve_dialog_targets")?;
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
@@ -349,18 +402,19 @@ fn resolve_dialog_targets(
             Some(n) => n.to_string(),
             None => continue,
         };
-        let path = match field
-            .get("target")
-            .and_then(|t| t.get("path"))
-            .and_then(|v| v.as_str())
-        {
+        let target = field.get("target");
+        let path = match target.and_then(|t| t.get("path")).and_then(|v| v.as_str()) {
             Some(p) => p,
             None => continue,
         };
-        out.insert(
-            name,
-            filewrite::expand_tilde(path).to_string_lossy().into_owned(),
-        );
+        let mode = target
+            .and_then(|t| t.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("create");
+        // C-03: the approval line shows the destination the writer will use
+        // — symlinks resolved for substitute, the link itself for create —
+        // not a tilde expansion that could name a different file.
+        out.insert(name, filewrite::resolve_display(path, mode));
     }
     Ok(out)
 }
@@ -644,8 +698,8 @@ pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle, id: &str) {
 /// user would otherwise notice a leftover empty frame.
 ///
 /// Currently wired only to macOS `RunEvent::Reopen`; other platforms have no
-/// trigger yet (Windows surfaces the existing window via the single-instance
-/// plugin), so allow it to be unused there instead of `#[cfg]`-gating the
+/// trigger yet (elsewhere a second launch asks the running instance via
+/// `POST /show-settings`, B2-04), so allow it to be unused there instead of `#[cfg]`-gating the
 /// whole fn — keeps it ready for a future Windows hook without tripping CI's
 /// `-D warnings` dead-code check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -829,6 +883,15 @@ struct StatusReport {
     /// this binary. Separate from `claude_config_ok` because Claude Desktop
     /// and Claude Code read different config files.
     claude_code_config_ok: bool,
+    /// Review B1-14: the header's "is aiui wired in?" signal. True iff at
+    /// least one MCP host is installed and every installed host's config is
+    /// current. `claude_config_ok` alone (Claude Desktop only) kept the
+    /// header red — "will be set automatically on next launch", which never
+    /// happens — for every Claude-Code-only Mac and most Windows boxes.
+    hosts_config_ok: bool,
+    /// Whether Claude Desktop is installed — the welcome checklist shows its
+    /// row only then.
+    claude_desktop_installed: bool,
     /// True iff `~/.claude/skills/aiui/SKILL.md` exists and is non-empty.
     /// Drives the skill-status row in Settings — replaces the old
     /// "Skill installieren" button which suggested optionality.
@@ -943,6 +1006,11 @@ async fn status(
         http_port: cfg.http_port,
         claude_config_ok: setup::is_claude_config_current(&bin),
         claude_code_config_ok: setup::is_claude_code_config_current(&bin),
+        hosts_config_ok: hosts_config_ok(
+            setup::is_claude_desktop_installed().then(|| setup::is_claude_config_current(&bin)),
+            setup::is_claude_code_installed().then(|| setup::is_claude_code_config_current(&bin)),
+        ),
+        claude_desktop_installed: setup::is_claude_desktop_installed(),
         skill_installed: skill::is_installed_locally(),
         claude_desktop_running: expensive.claude_desktop_running,
         remotes: setup::load_remotes(),
@@ -1212,7 +1280,9 @@ fn repair_skill(window: tauri::WebviewWindow) -> Result<setup::StepResult, Strin
 /// runs from an ephemeral location: registering a path that disappears is
 /// exactly the state the banner is asking the user to leave.
 #[tauri::command]
-fn repair_claude_config() -> Result<Vec<setup::StepResult>, String> {
+fn repair_claude_config(window: tauri::WebviewWindow) -> Result<Vec<setup::StepResult>, String> {
+    // D-10 / B1-09: rewrites the user's MCP host configs — Settings only.
+    require_privileged_window(&window, "repair_claude_config")?;
     let bin = setup::app_binary_path();
     if setup::is_ephemeral_install() {
         return Ok(vec![setup::StepResult {
@@ -1291,7 +1361,14 @@ fn open_url(url: String) -> Result<(), String> {
 /// Granting `clipboard-manager:allow-write-text` would hand clipboard access
 /// to the dialog window too, which renders agent-supplied content.
 #[tauri::command]
-fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
+fn copy_to_clipboard(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    text: String,
+) -> Result<(), String> {
+    // D-10: a dialog window renders agent content; it must not be able to
+    // swap what the user is about to paste into a terminal.
+    require_privileged_window(&window, "copy_to_clipboard")?;
     use tauri_plugin_clipboard_manager::ClipboardExt;
     app.clipboard()
         .write_text(text)
@@ -1325,6 +1402,12 @@ async fn quit_app(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result
         .map(|c| c.http_port)
         .unwrap_or(7777);
     housekeeping::pre_exit_cleanup(port, "quit_app/uninstall");
+    // B2-14: the files this process held go only now, as it exits.
+    if let Some(cfg) = app.try_state::<Arc<config::AppConfig>>() {
+        for name in PROCESS_HELD_FILES {
+            let _ = remove_if_present(&cfg.config_dir.join(name));
+        }
+    }
     app.exit(0);
     Ok(())
 }
@@ -1627,7 +1710,11 @@ async fn add_remote(
     let mut list = setup::load_remotes();
     if !list.contains(&host_alias) {
         list.push(host_alias.clone());
-        let _ = setup::save_remotes(&list);
+        // B1-12: a failed write used to be swallowed — all steps green, the
+        // tunnel started, and the host gone from the list after a restart.
+        if let Err(e) = setup::save_remotes(&list) {
+            results.push(remotes_save_failed(&host_alias, &e));
+        }
     }
     // #184: remember the absolute uvx path the probe just found. Without
     // this it was discovered, pinned once, and then thrown away — so the
@@ -1732,11 +1819,32 @@ async fn remove_remote(
         .into_iter()
         .filter(|h| h != &host_alias)
         .collect();
-    let _ = setup::save_remotes(&list);
+    // B1-12: if the alias cannot be dropped, the next launch rebuilds a
+    // tunnel to a host whose token was just deleted — say so.
+    if let Err(e) = setup::save_remotes(&list) {
+        results.push(remotes_save_failed(&host_alias, &e));
+    }
     // #184: forget the host's uvx path too, so a later re-add starts from a
     // fresh probe rather than a stale path to a uvx that may have moved.
     let _ = setup::save_remote_uvx(&host_alias, None);
     Ok(results)
+}
+
+/// Header status (B1-14): `Some(ok)` per installed host, `None` when the
+/// host is not installed. Green only when something is installed and every
+/// installed host is current.
+fn hosts_config_ok(desktop: Option<bool>, code: Option<bool>) -> bool {
+    let installed: Vec<bool> = [desktop, code].into_iter().flatten().collect();
+    !installed.is_empty() && installed.iter().all(|ok| *ok)
+}
+
+/// The step that reports a failed `remotes.json` write (review B1-12).
+fn remotes_save_failed(host_alias: &str, e: &std::io::Error) -> setup::StepResult {
+    setup::StepResult {
+        ok: false,
+        message: format!("Could not update the list of remote hosts for {host_alias}"),
+        details: Some(format!("remotes.json: {e}")),
+    }
 }
 
 /// Uninstall hint shown after the cleanup sweep — tells the user how to
@@ -1762,15 +1870,23 @@ fn uninstall_app_removal_hint() -> String {
 /// The local state aiui owns inside its config dir, in removal order. The
 /// media cache lives outside it (under the Tauri app-cache dir) and is
 /// handled separately.
-const LOCAL_STATE_FILES: [&str; 6] = [
+const LOCAL_STATE_FILES: [&str; 5] = [
     "token",
+    // Review C-01: the locality proof the local bridge presents.
+    "local-proof",
     "first_run_done",
     "remotes.json",
     // #184: the uvx sidecar is local state too.
     "remote-uvx.json",
-    "gui.lock",
-    "gui.sock",
 ];
+
+/// Files the RUNNING GUI holds: its process lock and its lifetime socket.
+/// Review B2-14: unlinking them during the uninstall sweep succeeds on Unix
+/// while this process still holds them (locks and sockets are per inode),
+/// so a reattaching MCP child could start a SECOND GUI that took a fresh
+/// lock — two GUIs, one of them without the HTTP port. They are removed in
+/// `quit_app`, right before the uninstalling process exits.
+const PROCESS_HELD_FILES: [&str; 2] = ["gui.lock", "gui.sock"];
 
 /// `remove_file`, with "was not there anyway" counting as success — the
 /// point of the sweep is the end state, not who did the removing.
@@ -1850,8 +1966,7 @@ fn sweep_step_result(
                 failures.len()
             ),
             details: Some(format!(
-                "Nicht entfernt:\n{}\n\n(gui.lock/gui.sock hält dieser Prozess noch offen — \
-                 sie verschwinden spätestens beim Beenden.)\n\n{hint}",
+                "Nicht entfernt:\n{}\n\n{hint}",
                 failures.join("\n")
             )),
         }
@@ -2115,6 +2230,40 @@ fn no_visible_windows(app: &tauri::AppHandle) -> bool {
         .all(|w| !w.is_visible().unwrap_or(false))
 }
 
+/// `POST /show-settings` to the running instance (review B2-04). Plain
+/// HTTP/1.1 over a short-timeout TCP socket — this runs before any runtime
+/// exists, and pulling one up to send a single request is not worth it.
+fn request_show_settings(port: u16, token: &str) -> Result<u16, String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+        .map_err(|e| format!("connect: {e}"))?;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    sock.write_all(show_settings_request(token).as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut head = [0u8; 64];
+    let n = sock.read(&mut head).map_err(|e| format!("read: {e}"))?;
+    let line = String::from_utf8_lossy(&head[..n]);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| format!("unexpected response: {line:?}"))
+}
+
+fn show_settings_request(token: &str) -> String {
+    format!(
+        "POST /show-settings HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// Surface Settings on behalf of a second launch (B2-04). Runs the same path
+/// as the single-instance callback and the macOS `Reopen`.
+pub(crate) fn show_settings_from_second_launch(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_settings_window(&handle));
+}
+
 fn is_auto_launch() -> bool {
     std::env::args().any(|a| a == "--auto")
 }
@@ -2124,6 +2273,13 @@ fn is_auto_launch() -> bool {
 /// attaches to the GUI process via the lifetime socket so the GUI knows we're
 /// alive (and can self-terminate when we die).
 pub fn run_mcp_stdio_only() {
+    // Review B2-06 (#181, Windows): our stdin/stdout are the host's pipe ends,
+    // created inheritable so the host could hand them to us. Rust's `std`
+    // spawns with `bInheritHandles = TRUE`, so the GUI we resurrect inherited
+    // duplicates of them even with its own std handles set to NUL — and the
+    // host never saw EOF after this process exited, hanging its transport
+    // until the GUI quit. Clear inheritance before anything is spawned.
+    proc_ext::clear_std_handle_inheritance();
     // Stale-binary self-check (runs before any state is touched). On
     // macOS, an in-place `.app` replacement (in-app updater, manual DMG
     // drop) leaves any already-running mcp-stdio child holding the
@@ -2267,8 +2423,8 @@ pub fn run() {
     // the whole session. So we keep running without the lock and say so in
     // the UI. That trade is sound: the lock is a fast-path guard against the
     // v0.4.43 two-GUIs-in-the-same-millisecond bind race, not the last line
-    // of defence — `tauri_plugin_single_instance` still covers the
-    // second-launch case, and an HTTP bind collision already degrades
+    // of defence — a second user launch still surfaces Settings through
+    // `POST /show-settings` below (B2-04), and an HTTP bind collision degrades
     // instead of exiting.
     let lock_path = cfg.config_dir.join("gui.lock");
     let mut lock_error_message: Option<String> = None;
@@ -2283,6 +2439,19 @@ pub fn run() {
                  exiting without binding socket/http",
                 lock_path.display()
             ));
+            // Review B2-04: a USER launch (Start menu, double-click) must
+            // still surface Settings. `tauri_plugin_single_instance` would
+            // forward the launch, but it runs inside `Builder::build`, which
+            // this process never reaches — on Windows/Linux, with no tray and
+            // no Dock `Reopen`, a headless aiui had no way back to Settings.
+            // Ask the running instance over its own API instead. An
+            // auto-launch (`--auto`, an MCP child's resurrect) stays silent.
+            if !is_auto_launch() {
+                let asked = request_show_settings(cfg.http_port, &cfg.token);
+                logging::trace(&format!(
+                    "[aiui] gui-lock-busy: asked the running instance to show Settings: {asked:?}"
+                ));
+            }
             // No pre_exit_cleanup here: we never opened tunnels nor
             // mounted the HTTP server, so there's nothing to sweep.
             std::process::exit(0);
@@ -2351,7 +2520,7 @@ pub fn run() {
     // default-deny gate so those, and only those, Tauri-initiated terminations
     // are honoured while Claude Desktop is alive.
     let exit_authority = Arc::new(lifetime::ExitAuthority::new());
-    let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
+    let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port, &cfg.token);
     // Shared cell that records a fatal HTTP-server bind/serve failure (e.g.
     // port 7777 held by another process). Read by the `status` command and
     // surfaced as a banner in the Settings UI — without it, a stale
@@ -2459,10 +2628,14 @@ pub fn run() {
             // `ssh -NTR` child, and the relaunched instance finds the remote
             // port already forwarded and pins itself to `ConnectedShared`.
             //
-            // tauri-plugin-updater 2.10.1's `Builder` exposes no pre-exit hook
-            // to wire that sweep into (the `on_before_exit` API this once
-            // reached for does not exist on the pinned version), so the
-            // Windows-only leak is a known gap tracked as a follow-up. On
+            // The plugin-level `Builder` has no pre-exit hook (the
+            // `on_before_exit` hook exists only on `UpdaterBuilder`). The
+            // agent-driven `/update` path therefore downloads first and then
+            // latches, drains and sweeps itself before `install()` (review
+            // B2-13, http.rs `update`). The Settings *Install* button on
+            // Windows still goes through the plugin's JS `downloadAndInstall`
+            // and skips that cleanup — a known gap; the next start's orphan
+            // sweep reclaims the tunnel. On
             // macOS/Linux `downloadAndInstall()` returns normally and
             // `updater.ts` latches the exit authority + relaunches via
             // `authorize_exit_for_update` — after the install, because
@@ -2998,8 +3171,10 @@ pub fn run() {
         .expect("error building tauri application")
         .run(|app, event| {
             // ExitRequested gate — single exit authority (Invariant I1). Tauri
-            // fires ExitRequested on ⌘Q, on ⌘W / close of the last visible
-            // window, on OS shutdown, and on `.restart()`. The
+            // fires ExitRequested on ⌘W / close of the last visible window,
+            // on `app.exit()` and on `.restart()`. NOT on macOS ⌘Q / Dock
+            // Quit: AppKit `terminate:` goes straight to `RunEvent::Exit`
+            // (handled below — cleanup, no veto). The
             // last-window-close case is the dangerous one: as soon as the
             // agent's dialog window closes after a submit, Tauri wants to
             // terminate the process — but the host is meant to live headless
@@ -3020,8 +3195,8 @@ pub fn run() {
                 // exits are: (b) uninstall / (c) update-restart — both latch
                 // `ExitAuthority` before asking Tauri to terminate — or (a) the
                 // Wirt (Claude Desktop) is already gone. Every other
-                // Tauri-initiated exit (last-window-close, ⌘Q, OS quit-all) is
-                // vetoed. This is what stops the headless host dying ~18 ms
+                // Tauri-initiated exit (last-window-close, programmatic exit)
+                // is vetoed. This is what stops the headless host dying ~18 ms
                 // after a dialog submit (v0.4.42) and on overnight churn
                 // (v0.4.45): the child count and window visibility no longer
                 // enter the decision at all.
@@ -3034,8 +3209,25 @@ pub fn run() {
                 // Codex-only user it is permanently absent, which turned this
                 // default-DENY gate into default-ALLOW — the host quit as soon
                 // as a dialog submit closed its only window.
-                let cd_is_wirt = setup::is_claude_desktop_installed();
-                let cd_running = setup::is_claude_desktop_running();
+                //
+                // The probe spawns `pgrep`/`tasklist` and this runs on the
+                // main thread, so it is taken only when the answer can matter:
+                // an explicit latch is honoured and a `code: None` exit is
+                // vetoed whatever it says (review B2-11 — every last-window
+                // close used to pay for a subprocess it then ignored).
+                let needs_probe = !explicit && code.is_some();
+                let (cd_is_wirt, cd_running) = if needs_probe {
+                    let running = setup::is_claude_desktop_running();
+                    (
+                        lifetime::cd_is_wirt(
+                            setup::is_claude_desktop_installed(),
+                            setup::claude_desktop_seen_running(),
+                        ),
+                        running,
+                    )
+                } else {
+                    (false, false)
+                };
                 let gone = lifetime::wirt_gone(cd_is_wirt, cd_running);
                 // `code: None` is Tauri's user-interaction exit — including
                 // the last window being destroyed, which happens after every
@@ -3062,20 +3254,56 @@ pub fn run() {
                     "exit-claude-desktop-gone"
                 };
                 logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
-                // Drains pending dialogs, flushes, sweeps, dumps the ring and
-                // exits. Does not return.
-                lifetime::terminal_exit(app, reason, 0, port, housekeeping::SweepScope::All);
+                match lifetime::exit_mode_for(*code) {
+                    // An update restart: drain and sweep, then RETURN so Tauri
+                    // finishes its exit sequence — the relaunch happens in its
+                    // `RunEvent::Exit` handling, which `process::exit` here
+                    // would pre-empt (review B2-01).
+                    lifetime::ExitMode::LetTauriRestart => {
+                        lifetime::drain_and_sweep(
+                            app,
+                            reason,
+                            port,
+                            housekeeping::SweepScope::All,
+                        );
+                        return;
+                    }
+                    // Drains pending dialogs, flushes, sweeps, dumps the ring
+                    // and exits. Does not return.
+                    lifetime::ExitMode::Terminate => lifetime::terminal_exit(
+                        app,
+                        reason,
+                        0,
+                        port,
+                        housekeeping::SweepScope::All,
+                    ),
+                }
+            }
+
+            // macOS ⌘Q / app-menu Quit / Dock Quit send AppKit `terminate:`,
+            // which tao turns into `RunEvent::Exit` WITHOUT an `ExitRequested`
+            // first — the gate above never sees it and cannot veto it (review
+            // B2-03). What can still happen is the cleanup: answer every
+            // pending dialog with `host_exiting` (I7) and sweep the `ssh -NTR`
+            // children, which `kill_on_drop` does not reach on this path.
+            // Idempotent, so the restart path above draining first is fine.
+            if let tauri::RunEvent::Exit = &event {
+                let port = app
+                    .try_state::<Arc<config::AppConfig>>()
+                    .map(|cfg| cfg.http_port)
+                    .unwrap_or(7777);
+                lifetime::drain_and_sweep(app, "app-terminate", port, housekeeping::SweepScope::All);
             }
 
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.
             // → Settings-Fenster nach vorn holen. `RunEvent::Reopen` is
             // a Mac-only variant, so this whole branch is gated.
             //
-            // Windows has no analogous "reopen" semantics — clicking the
-            // installed `.exe` while it's already running is handled by
-            // tauri-plugin-single-instance, which surfaces the existing
-            // window through its own callback (wired up at plugin init,
-            // not here).
+            // Windows has no analogous "reopen" semantics. Clicking the
+            // installed `.exe` while it already runs starts a second process
+            // that exits on `gui.lock` before the single-instance plugin
+            // runs, so it asks the running instance via `POST /show-settings`
+            // instead (B2-04).
             #[cfg(target_os = "macos")]
             {
                 if let tauri::RunEvent::Reopen { .. } = event {
@@ -3101,6 +3329,101 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod hosts_config_ok_tests {
+    #[test]
+    fn a_claude_code_only_machine_can_be_green() {
+        // B1-14: the header read Claude Desktop's config only.
+        assert!(super::hosts_config_ok(None, Some(true)));
+        assert!(!super::hosts_config_ok(None, Some(false)));
+        assert!(!super::hosts_config_ok(Some(false), Some(true)), "every installed host");
+        assert!(super::hosts_config_ok(Some(true), None));
+        assert!(!super::hosts_config_ok(None, None), "nothing installed is not 'connected'");
+    }
+}
+
+#[cfg(test)]
+mod show_settings_request_tests {
+    #[test]
+    fn the_second_launch_request_is_well_formed_http() {
+        let req = super::show_settings_request("abc");
+        assert!(req.starts_with("POST /show-settings HTTP/1.1\r\n"));
+        assert!(req.contains("\r\nAuthorization: Bearer abc\r\n"));
+        assert!(req.contains("\r\nContent-Length: 0\r\n"));
+        assert!(req.ends_with("\r\n\r\n"), "headers end with an empty line");
+    }
+}
+
+#[cfg(test)]
+mod command_gate_wiring_tests {
+    /// Commands any window — a dialog window included — may call. Every
+    /// other registered command must call a #195 gate. Default-deny: a new
+    /// command that forgets its gate fails here instead of shipping open,
+    /// which is how four commands from one merge did (review D-10). The
+    /// #195 tests checked the predicates, never the wiring.
+    const ANY_WINDOW: [&str; 4] = [
+        "ui_pong",                   // acks a health ping, carries no data
+        "close_window",              // closes the CALLING window only
+        "is_update_safe_to_install", // a boolean
+        "open_url",                  // validates the scheme itself; opens externally
+    ];
+
+    #[test]
+    fn every_registered_command_is_gated_or_explicitly_open() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").expect("handler list");
+        let list = &src[start + "generate_handler![".len()..];
+        let list = &list[..list.find("])").expect("end of handler list")];
+        let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        assert!(names.len() > 10, "parsed the handler list: {names:?}");
+        for name in names {
+            if ANY_WINDOW.contains(&name) {
+                continue;
+            }
+            let decl = [format!("\nfn {name}("), format!("\nasync fn {name}(")]
+                .into_iter()
+                .find_map(|d| src.find(&d))
+                .unwrap_or_else(|| panic!("no fn {name} in lib.rs"));
+            let body = &src[decl..];
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("require_privileged_window(") || body.contains("require_own_dialog("),
+                "command `{name}` calls no window gate — add one, or list it in ANY_WINDOW with a reason"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dialog_cancel_reason_tests {
+    use super::{frontend_cancel_reason, writes_on_this_host};
+
+    #[test]
+    fn only_a_proven_local_render_writes_on_this_host() {
+        // C-01: `/render` stamps every render without a locality proof with a
+        // `session_origin`; the write command must refuse those.
+        let req = |origin: Option<&str>| crate::dialog::DialogRequest {
+            id: "d".into(),
+            spec: serde_json::json!({}),
+            ttl_secs: 60,
+            remaining_secs: 60,
+            session: None,
+            session_origin: origin.map(String::from),
+        };
+        assert!(writes_on_this_host(&req(None)));
+        assert!(!writes_on_this_host(&req(Some("unverified host"))));
+        assert!(!writes_on_this_host(&req(Some("devbox"))));
+    }
+
+    #[test]
+    fn only_the_ttl_reason_passes_from_a_window() {
+        assert_eq!(frontend_cancel_reason(Some("ttl_expired")), Some("ttl_expired"));
+        assert_eq!(frontend_cancel_reason(None), None, "Escape / Cancel stays a user no");
+        assert_eq!(frontend_cancel_reason(Some("host_exiting")), None);
+        assert_eq!(frontend_cancel_reason(Some("anything")), None);
+    }
 }
 
 #[cfg(test)]
@@ -3159,9 +3482,19 @@ mod navigation_tests {
             "Windows with useHttpsScheme"
         );
         assert!(
-            is_allowed_app_navigation(&url("http://localhost:5173/dialog.html")),
+            is_allowed_app_navigation_in(&url("http://localhost:5173/dialog.html"), true),
             "npm run tauri:dev, per tauri.conf.json build.devUrl"
         );
+    }
+
+    #[test]
+    fn a_release_build_never_navigates_to_localhost() {
+        // D-07: any localhost port and path was a valid destination in
+        // release builds — a local dev server or admin UI included.
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:5173/"), false));
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:3000/admin"), false));
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:3000/admin"), true), "dev: only the devUrl port");
+        assert!(is_allowed_app_navigation_in(&url("http://tauri.localhost/dialog.html"), false));
     }
 
     #[test]
@@ -3631,7 +3964,7 @@ mod tests {
                 "kind": "secret",
                 "name": "pat",
                 "label": "GitHub PAT",
-                "target": {"mode": "create", "path": "~/.github_tokens/x", "overwrite": true}
+                "target": {"mode": "create", "path": "~/.config/demo/x", "overwrite": true}
             }],
             "actions": [
                 {"label": "Cancel", "value": "cancel", "skip_validation": true},
@@ -3767,6 +4100,19 @@ mod tests {
     fn seed_local_state(config_dir: &Path) {
         for name in LOCAL_STATE_FILES {
             std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn the_uninstall_sweep_leaves_the_running_guis_lock_and_socket() {
+        // B2-14: removing them while held let a second GUI take a fresh lock.
+        let config_dir = sweep_test_dir("held");
+        for name in PROCESS_HELD_FILES {
+            std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+        let _ = sweep_local_state(&config_dir, None);
+        for name in PROCESS_HELD_FILES {
+            assert!(config_dir.join(name).exists(), "{name} must survive the live sweep");
         }
     }
 
@@ -3915,7 +4261,7 @@ mod tests {
             "fields": [
                 {"kind": "text", "name": "plain"},
                 {"kind": "secret", "name": "pat",
-                 "target": {"mode": "create", "path": "~/.github_tokens/x"}}
+                 "target": {"mode": "create", "path": "~/.config/demo/x"}}
             ]
         });
         assert_eq!(target_names(&spec), vec!["pat".to_string()]);

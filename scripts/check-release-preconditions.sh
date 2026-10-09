@@ -49,6 +49,16 @@
 #       "fix" that by setting `fetch-depth: 0`; that pulls the full
 #       history onto a macOS runner for one ref lookup.
 #
+#       RECOVERY RE-RUN: when `RELEASE_SHA` is set (release-macos.yml sets
+#       it to `$GITHUB_SHA`), an existing remote tag is accepted iff it
+#       points at exactly that commit. A run that pushed the tag and then
+#       failed (an asset upload, a transient API error) must be able to
+#       re-dispatch the same version from the same commit — the artifacts
+#       died with the runner, and `aiui-mcp <version>` may already be
+#       permanently on PyPI, so neither "bump the version" nor "delete the
+#       tag and re-tag whatever main is now" is a safe way out. A tag that
+#       points anywhere else is still refused.
+#
 # Run locally:  scripts/check-release-preconditions.sh
 #               scripts/check-release-preconditions.sh 0.11.0
 # CI:           .github/workflows/ci.yml -> job `release-preconditions`
@@ -126,9 +136,26 @@ git ls-remote --exit-code --tags origin "refs/tags/v${WANT}" >/dev/null 2>&1
 probe=$?
 set -e
 case "$probe" in
-  0) fail "tag v${WANT} already exists on origin — bump the version or delete the tag first" ;;
-  2) : ;; # --exit-code: the remote answered, no such tag
+  0) : ;;
+  2)
+    echo "release-preconditions: OK — ${#paths[@]} manifests agree on ${WANT}, CHANGELOG.md has its section, v${WANT} is not on origin."
+    exit 0
+    ;;
   *) fail "could not ask origin whether refs/tags/v${WANT} exists (git exited ${probe}) — refusing to guess" ;;
 esac
 
-echo "release-preconditions: OK — ${#paths[@]} manifests agree on ${WANT}, CHANGELOG.md has its section, v${WANT} is not on origin."
+# The tag exists. Only a recovery re-run of the SAME commit may proceed.
+[ -n "${RELEASE_SHA:-}" ] \
+  || fail "tag v${WANT} already exists on origin — bump the version or delete the tag first"
+
+# `^{}` is the peeled commit of an annotated tag; a lightweight tag has only
+# the plain line. Prefer the peeled one when both are listed.
+listing="$(git ls-remote --tags origin "refs/tags/v${WANT}" "refs/tags/v${WANT}^{}")" \
+  || fail "could not read refs/tags/v${WANT} from origin — refusing to guess"
+tag_commit="$(printf '%s\n' "$listing" | awk '$2 ~ /\^\{\}$/ {print $1}' | head -1)"
+[ -n "$tag_commit" ] || tag_commit="$(printf '%s\n' "$listing" | awk 'NR==1 {print $1}')"
+
+[ "$tag_commit" = "$RELEASE_SHA" ] \
+  || fail "tag v${WANT} already exists on origin at ${tag_commit}, not at the dispatched commit ${RELEASE_SHA} — a recovery re-run must come from the tagged commit; otherwise bump the version"
+
+echo "release-preconditions: OK — ${#paths[@]} manifests agree on ${WANT}, CHANGELOG.md has its section, v${WANT} on origin points at this commit (recovery re-run)."

@@ -4,6 +4,134 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-09
+
+Fixes from the 2026-10 review of the 0.11.0 audit closure: 24 of the 37
+audit issues closed for 0.11.0 were only partly fixed, and the fix series
+introduced regressions of its own.
+
+### Fixed
+
+- **Installing an update relaunches aiui again.** Since 0.11.0 the honoured
+  exit called `process::exit` before Tauri's relaunch ran, so *Install* (and
+  `/aiui:update` on macOS) quit aiui for good and dropped every tunnel.
+- **Mermaid diagrams are readable again.** 0.11.0's sanitiser stripped the
+  theme stylesheet, so every node rendered as a black box with black text.
+  Diagrams now render as an image: the theme stays, and diagram CSS and
+  links cannot reach the dialog.
+- **The macOS Claude Desktop probe works.** macOS `pgrep` is BSD; `-af`
+  printed PIDs only, so Claude Desktop always read as stopped. An
+  installed-but-closed Claude Desktop also no longer counts as the host that
+  left, which made aiui exit — dropping every tunnel — when the last local
+  Claude Code session closed.
+- **A network blip no longer destroys a half-filled dialog.** Both bridges
+  ride out up to 180 s of outage on a wall-clock budget (refused connections
+  used to give up after ~4 s), and the companion keeps an unpolled dialog
+  for 300 s instead of 90 s. A dialog the companion does close tells a
+  returning bridge `reason: "abandoned"`.
+- **A dialog that times out no longer reads as the user's "no".** The
+  window's own TTL countdown now cancels with `reason: "ttl_expired"`, and
+  re-checks the backend first, so a wall-clock jump after sleep no longer
+  fires it early. Every dialog tool's description now lists the cancel
+  reasons and says only a reason-less cancel is a user decision (#273).
+- **Specs that used to open a blank window are refused with `invalid_spec`**
+  instead: collection entries without a non-empty string `value`, gallery
+  `actions` with a missing or repeated value, missing `items`/`rows`/
+  `columns`/`images`, `tabs` next to top-level `fields`, a tab without
+  `fields`, and `ask` options without a `label`. The frontend no longer
+  blanks on such data either.
+- Form values: `datetime` carries the user's UTC offset (a `Z`/offset
+  default used to be shifted silently); an empty `number` is always `null`;
+  a `select` default that is not an option falls back to the first option;
+  `default_selected` keeps only offered values; a `slider` without bounds
+  runs 0–100 instead of being unsubmittable; `annotated_image` is usable
+  from the keyboard; Compare cards no longer swallow Enter on their links.
+- Both bridges return the documented empty keys (`answers`, `values`,
+  `decisions`) on a cancel.
+- The Windows `/aiui:update` downloads and verifies before it answers
+  (`updated: true` was reported for downloads that then failed), re-checks
+  for an open dialog, and drains dialogs and sweeps tunnels before the
+  installer takes over. The Settings install path re-checks for an open
+  dialog after the download, too.
+- A second launch while aiui runs headless (Windows/Linux) now brings up
+  Settings instead of silently exiting. macOS ⌘Q / Dock Quit answer open
+  dialogs with `host_exiting` and sweep the tunnels.
+- Remote hosts: `~/.claude.json` keeps its 0600 mode and symlinks; a
+  malformed remote config is reported as such ("left untouched"); every
+  setup-side ssh call has a hard timeout (a wedged host hung Uninstall
+  forever); an authentication failure pauses the tunnel instead of two
+  failed logins every 30 s.
+- Local host configs: patches keep the file's key order and leave valid
+  JSON of the wrong shape untouched; a Claude Desktop entry without
+  `--mcp-stdio` is detected and repaired; Codex configs with inline tables
+  keep their other MCP servers; the legacy ssh-config cleanup no longer
+  removes the user's own `ServerAliveInterval 300`; user-made `*.bak.*` files
+  are never pruned; the Settings header reflects every installed MCP host.
+- Windows: the auto-started GUI no longer inherits the host's pipe handles
+  (#181), and the remote-uvx sidecar lives in `%APPDATA%\aiui` like the
+  rest of aiui's state.
+- Smaller fixes: one file picker at a time even after a timeout; `/health`
+  pings the right dialog window and not one still loading; the Rust
+  bridge's `aiui_health` answers fast and in the Python bridge's shape;
+  inlined http(s) images share the 48 MB spec budget; uploads land 0600;
+  resurrect spawns are reaped; a recycled pid is never signalled.
+
+### Security
+
+- **The auth token no longer travels to a remote's port.** `/probe?nonce=`
+  answers an HMAC challenge, so the tunnel probe never sends the token, and
+  the Python bridge challenges the listener before every request and then
+  *signs* the request (`AIUI-HMAC`: method, path, body digest, sync/async
+  mode, timestamp, nonce and the proven companion process bound; each
+  signature accepted once) instead of sending the token. A co-tenant
+  squatting the remote port used to collect the token on every probe and
+  every bridge call. The local bridge keeps the bearer form.
+- **A remote can no longer have a `target` written on your machine** by
+  omitting `session_origin`: the local bridge proves locality with a
+  secret that never leaves the machine.
+- **Agent-supplied CSS can no longer hide the file-write approval line**:
+  markdown strips `<style>`/`style=`, and every spec value that reaches a
+  style is coerced to a bounded number. Markdown also strips media and
+  image-map elements.
+- `create`-mode target writes refuse a symlinked destination instead of
+  writing through it, and the approval line shows the path the writer will
+  really use. Target keys are type-checked before the window opens.
+- Dialog windows cannot navigate to `localhost` in release builds;
+  `media-src` no longer admits arbitrary loopback ports; every registered
+  command must call a window gate (a wiring test enforces it); the bearer
+  token is checked before a request body is read; image fetches ignore
+  environment proxies; new files are created owner-only.
+- Release pipeline: no third-party build code runs with signing material
+  in reach; releases require a green CI run on the commit; the Windows
+  release refuses a tag that is not on `main`; a full release refuses to go
+  live without its `aiui-mcp` on PyPI, and `release-promote.yml` is the
+  only promote path; the updater-feed guard checks the signing key ID and
+  the download host.
+
+### Changed
+
+- CI: npm audit gate green again (`source-map-js`), `Cargo.lock` records
+  every crate and all cargo calls run `--locked`, dependabot no longer
+  jams itself (uv ecosystem, majors ignored, minor/patch build-chain group),
+  no scheduled workflows, new light guards (`check-doc-claims.sh`,
+  `check-leaks.sh`), `ubuntu-24.04` pinned. The release's recovery re-run
+  works again from the tagged commit.
+- `aiui-mcp` requires `mcp>=1.27` (the first SDK that cancels handlers when
+  the host closes the transport).
+- Docs: SECURITY.md lists SSH to registered hosts as outbound traffic and
+  scopes code signing to macOS; CONTRIBUTING describes the actual release
+  and lock behaviour; skill catalogs are platform-neutral again.
+
+### Corrections to the 0.11.0 notes
+
+- "Windows CI runs the Rust test suite" was reverted before release: the
+  Windows leg compiles the tests (`--no-run`) because the test binary still
+  crashes at load on the runner (#141). The macOS leg executes them.
+- "Tests, the wheel build and the release all run `--locked`": `uv build`
+  takes no `--locked` (the wheel build verifies the lock with
+  `uv lock --check`), and the release's pytest was unlocked until this
+  release; Cargo was not locked anywhere until this release.
+
 ## [0.11.0] — 2026-09-21
 
 ### Added
@@ -2348,7 +2476,7 @@ identified the gaps. Five interlocking fixes:
   `kill_remote_mcp_stdio` sequence that runs in the background at
   every aiui-app startup — but on demand, with the StepResult log
   inline. Lets the user retry a sync that failed silently in the
-  background (e.g. the 2026-05-04 `dev@devhost: sweep failed` case)
+  background (e.g. the 2026-05-04 `dev@<remote>: sweep failed` case)
   without having to close + reopen aiui-app. Sweep failures appear
   in the activity log immediately.
 

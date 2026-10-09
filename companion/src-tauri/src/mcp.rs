@@ -468,7 +468,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "confirm",
-            "description": "Before writing any yes/no question into chat, call this tool instead. Pass `destructive: true` (red button) for delete / drop / force-push / rollback / prod-deploy — never trust loose prior approval for irreversible steps; re-confirm in a dialog. For visual sign-off (\"is this image OK?\", \"keep this generated diagram?\") pass `image: {src, alt?, max_height?}` — `src` accepts data: URLs, http(s) URLs, or absolute / `~/`-rooted local paths (resolved on YOUR host). Returns {cancelled, confirmed}. For 3+ options, use `ask`. For pure information the user only reads, render in chat. **This tool blocks until the user clicks a button. Response can take minutes — do not assume aiui is broken on slow response, the user is just thinking. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Show a native yes/no dialog on the user's machine and return the decision.\nUse it instead of a yes/no question in chat, especially before an\nirreversible step (delete / drop / force-push / rollback / prod deploy);\npass `destructive=True` there for a red confirm button.\n\nWHEN TO USE: irreversible or high-stakes step where \"just proceed\" is\nunsafe. For pure information, respond in chat. For 3+ options, use `ask`.\nFor visual sign-off (\"is this generated image OK?\"), pass `image`.\n\n`image` follows the same `src` rules as elsewhere (data: URL, http(s) URL,\nor absolute / `~/` local path on YOUR host).\n\nReturns `{cancelled, confirmed}`. `cancelled=False, confirmed=False` means\nthe explicit No button. On cancel `confirmed` is false; a cancel without a\n`reason` means the user pressed Escape or closed the window. When the\ndialog ended without the user answering, `reason` is set (`ttl_expired`,\n`evicted`, `channel_dropped`, `host_exiting`, `abandoned`) — only a\nreason-less cancel is a user decision. `media_warnings`, present only when\nsomething failed, lists local video/audio that could not be shown.\n\n**This tool blocks until the user clicks a button. Response can take minutes — do not assume aiui is broken on slow response, the user is just thinking. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -495,7 +495,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "ask",
-            "description": "Before listing options in chat and waiting for the user to type back which one (deploy strategy, migration path, file to act on …), call this tool instead. Per-option `description` carries the trade-off; `multi_select` and `allow_other` cover the rest. For visual choice (\"which of these images?\") pass `thumbnail: <src>` per option — same resolution rules as anywhere else in aiui (data:, http(s)://, or absolute local path). Returns {cancelled, answers, other?}. For yes/no, use `confirm`. For ≥ 2 related inputs, use `form`. **This tool blocks until the user picks an option or cancels. Response can take minutes — do not assume aiui is broken on slow response. Progress notifications fire every ~10 s while waiting.**",
+            "description": "Show a native choice dialog on the user's machine and return the pick.\nUse it instead of listing options in chat and waiting for a typed reply\n(deploy strategy, migration path, file to act on …). Per-option\n`description` carries the trade-off; `multi_select` and `allow_other`\ncover the rest.\n\nWHEN TO USE: 2–6 mutually-exclusive options where per-option context helps.\nFor yes/no, use `confirm`. For mixed inputs, use `form`.\n\nFor a visual choice (\"which of these images?\") add `thumbnail` per\noption — same `src` rules as everywhere else (data: URL, http(s) URL, or\nabsolute / `~/` local path on YOUR host); aiui resolves paths and URLs to\ndata: URLs before render.\n\nReturns `{cancelled, answers, other?}`. `answers` is a list of values.\nOn cancel `answers` is empty and, when the dialog ended without the user\nanswering, `reason` is set (`ttl_expired`, `evicted`, `channel_dropped`,\n`host_exiting`, `abandoned`) — only a reason-less cancel is a user\ndecision. `media_warnings`, present only when something failed, lists\nlocal video/audio that could not be shown.\n\n**This tool blocks until the user picks an option or cancels. Response can take minutes — do not assume aiui is broken on slow response. Progress notifications fire every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -523,7 +523,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "form",
-            "description": "Whenever the user needs to provide ≥ 2 related inputs, or any single input that doesn't belong in chat (secret, date/datetime/range, bounded number, sortable ranking, multi-select, color pick, table-row triage with column context, image confirm/grid, audio playback), call this tool instead of typing the questions one by one. Fields: text, password, secret, number, select, checkbox, slider, date, datetime, date_range, color, static_text, markdown, image, annotated_image, audio, mermaid, wireframe, image_grid, list, table, tree. **Audio field (#25):** `{\"kind\":\"audio\",\"src\":\"...\",\"label\":\"...\"}` — read-only native `<audio controls>` player, for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/`-rooted local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner, so large clips work too. **File-write / secret capture (#135):** any input field may carry an optional `target` to write the entered value to a file ON THE HOST THE AGENT RUNS ON when the user submits (the affirmative button IS the per-write approval; the user sees the path first): `{\"kind\":\"secret\",\"name\":\"pat\",\"label\":\"GitHub PAT\",\"target\":{\"mode\":\"create\",\"path\":\"~/.github_tokens/byte5ai\",\"perm\":\"0600\",\"overwrite\":true}}`. `mode`: `create` (write raw value; needs `overwrite:true` to clobber) or `substitute` (replace a `placeholder` that occurs exactly once in an existing file — for YAML/TOML/INI/etc; choose a DISTINCTIVE sentinel that can't collide with real file content, e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word — if it occurs 0 or >1 times the write is refused with an error, never misapplied to the wrong spot). A `secret`-kind field is **write-only**: its value is NEVER returned to you (result carries only `{written, target, bytes}`); use it precisely so a credential the user types never enters this conversation. A `secret` therefore REQUIRES a `target` — without one the render is rejected with `invalid_spec` rather than handing you the plaintext; if you want the value back, that field is a `password`, not a `secret`. Non-secret fields with a `target` are written AND returned. **Only an affirmative action commits the write:** the submit button or a plain named action. An action carrying `skip_validation:true` (your Cancel / Save-draft escape hatch) writes nothing and returns `{written:false, error}` per field — set `writes_targets:true` on it if it really must write. A blank field also writes nothing (`refusing to write an empty value`), in both modes, so a skipped optional field never truncates the user's file and `substitute` never erases its own sentinel. The destination is always the agent's own host: the aiui module already running there (the native app locally, the bridge on a remote SSH session) performs the write as a LOCAL file operation, so `create` and `substitute` both work identically local and remote — and you cannot target a foreign host. Errors come back as `{written:false, error}`. Group long forms with `tabs: [{label, fields: [...]}]` (one submit, all tabs validated). Footer actions are top-level on the form (`actions: [...]`), NOT inside a tab — they always render at the window's bottom. Action variants: primary (blue), success (green), destructive (red). Returns {cancelled, action?, values}. For yes/no, use `confirm`. For one-of-N pick, use `ask`. Sortable list field shape (most common stumble — always include `value` per item): {\"kind\":\"list\",\"name\":\"rank\",\"label\":\"Sortieren\",\"sortable\":true,\"items\":[{\"label\":\"A\",\"value\":\"a\"},{\"label\":\"B\",\"value\":\"b\"}]}. Image fields (`image`, `image_grid`, list-item `thumbnail`): `src` accepts (1) an absolute or `~/`-rooted local path — aiui's bridge on YOUR host reads it and inlines as `data:`; (2) an `http(s)://` URL — the companion fetches and inlines; (3) a `data:` URL — pass through. Pick the path form when the file is on disk on your host. Relative paths and cross-host paths don't resolve. Never base64-roundtrip through a shell pipeline — build the `data:` URL in your runtime. To have the user MARK a spot on an image (logo placement, crop hint, bug location) use `annotated_image`: `{\"kind\":\"annotated_image\",\"name\":\"spot\",\"src\":\"~/shot.png\",\"mode\":\"point\"}` — `mode` is `point` (click one marker, default), `region` (drag a rectangle), or `both` (user flips a Point/Region tool). `src` follows the same resolution rules as `image`. Returns normalized 0..1 coords under the field name: `{\"point\":{\"x\",\"y\"}|null,\"region\":{\"x\",\"y\",\"w\",\"h\"}|null,\"natural\":{\"width\",\"height\"}|null}` — multiply by `natural` for pixels. For schematic visualisations (flowcharts, sequence/state diagrams, gantt, mind-maps) use the `mermaid` field instead of ASCII art: `{\"kind\":\"mermaid\",\"source\":\"graph TD; A --> B; B --> C\"}`. For UI-layout mockups (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) use the `wireframe` field — declarative panel grid, NOT ASCII boxes-and-pipes: `{\"kind\":\"wireframe\",\"columns\":3,\"panels\":[{\"title\":\"STATUS\",\"content\":\"Tiefe: 18 m\nKurs: 270°\",\"col_span\":1},{\"title\":\"EMPFANG\",\"content\":\"14:32 [STARK]…\",\"col_span\":2}]}`. Each panel has optional `title` (uppercase header), `content` (multi-line monospace text, escape `\n`), `col_span`/`row_span` (default 1), and `tone` (\"default\"/\"muted\"/\"highlight\"). See the aiui skill for the full field catalog. **This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
+            "description": "Show a native form on the user's machine and return the entered values.\nUse it when the user needs to provide ≥ 2 related inputs, or any single\ninput that doesn't belong in chat (secret, date/datetime/range, bounded\nnumber, sortable ranking, multi-select, color pick, table-row triage with\ncolumn context, image confirm/grid), instead of asking one by one in chat.\n\nWHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.\nFor yes/no, use `confirm`. For a single choice, use `ask`.\n\nACTION BUTTONS: `[{label, value, primary?, success?, destructive?,\nskip_validation?, writes_targets?}]` — at most one of primary (blue) /\nsuccess (green) / destructive (red). `skip_validation` bypasses required-\nfield checks and does not commit `target` writes unless `writes_targets: true`.\n\nFIELD KINDS:\n- text:        {kind, name, label, placeholder?, default?, multiline?, required?}\n- password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.\n- secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you. Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.\n- FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{\"mode\": \"create\"|\"substitute\", \"path\": \"~/.config/demo/token\", \"perm\"?: \"0600\", \"overwrite\"?: bool, \"placeholder\"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value) and a `target` is REQUIRED: a target-less `secret` is rejected with `invalid_spec` instead of returning the plaintext — use `password` if you want the value back. A non-secret field with `target` is written AND returned. Only an affirmative action commits the write: the submit button or a plain named action — an action carrying `skip_validation:true` (Cancel / Save draft) writes nothing and returns `{written:false, error}` per field, unless you set `writes_targets:true` on it. A blank field writes nothing either (`refusing to write an empty value`), in both modes. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.\n- number:      {kind, name, label, default?, min?, max?, step?, required?}  — an empty field returns null\n- select:      {kind, name, label, options: [{label, value}], default?, required?}  — no `default`, or one that is not among the options, → the first option\n- checkbox:    {kind, name, label, default?}\n- slider:      {kind, name, label, min?, max?, step?, default?}  — min/max default to 0–100\n- date:        {kind, name, label, default?, required?}  — ISO YYYY-MM-DD\n- datetime:    {kind, name, label, default?, required?}  — default ISO YYYY-MM-DDTHH:MM (one with `Z`/an offset is shown in the user's local time); the result carries the user's UTC offset, e.g. 2026-06-01T09:30+02:00\n- date_range:  {kind, name, label, default?: {from, to}, required?}  — result {from, to}\n- color:       {kind, name, label, default?}  — hex \"#RRGGBB\"\n- static_text: {kind, text, tone?: \"info\"|\"warn\"|\"muted\"}  — display only\n- markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool. `<style>`, `style=`, `<audio>`/`<video>`/`<source>`/`<track>` and `<map>`/`<area>` are stripped — use the `audio` field for playback.\n- image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the companion host), or a `data:` URL. Use for visual confirmation of agent-generated previews.\n- annotated_image: {kind, name, src, label?, alt?, mode?, max_height?, required?, default?}  — let the user MARK a spot on an image (logo placement, crop hint, bug location). `src` follows the same rules as `image`. `mode` ∈ {\"point\" (click one marker, default), \"region\" (drag a rectangle), \"both\" (user flips a Point/Region tool)}. `default` may seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized units. Result under `name`: {point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null} — all coordinates normalized 0..1; multiply by `natural` for pixels.\n- audio:       {kind, src, label?}  — read-only native `<audio controls>` player. Use for \"listen to this TTS sample / voice memo / generated sound clip before deciding\". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner.\n- mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders it as an image, so links inside the diagram are inert (`click … href` does nothing).\n- wireframe:   {kind, panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}  — read-only UI-layout mockup. Real CSS-Grid panels with optional header (`title`) and multi-line monospace body (`content`, escape `\\n`). `tone` ∈ {\"default\",\"muted\",\"highlight\"}. Use this for *UI-layouts* (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) instead of ASCII boxes-and-pipes — `mermaid` is for *diagrams* (graphs, sequence/state, gantt). Wireframe complements it for the layout class.\n- image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}\n  Result: {selected: [values]}\n- list:        {kind, name, label?, items: [{label, value, description?, thumbnail?}],\n                selectable?, multi_select?, sortable?, default_selected?: [values]}\n  Result: {selected: [values], order: [values]} — `selected` is [] unless `selectable`. Every item needs a non-empty string `value`. Thumbnails optional per item.\n- table:       {kind, name, label?, columns: [{key, label, align?}], rows: [{value, values}],\n                multi_select?, sortable_by_column?, default_selected?, required?}\n  Result: {selected: [values], order: [values], sort: {column, dir}}\n- tree:        {kind, name, label?, items: [{label, value, description?, children?: [...]}],\n                multi_select?, default_selected?: [values], default_expanded?: [values]}\n  Result: {selected: [values]}\n`default_selected` keeps only values the widget offers, and at most one on a single-select widget.\n\nTABS (optional grouping for long forms):\nPass `tabs=[{\"label\": ..., \"fields\": [...]}, ...]` instead of `fields` —\n`tabs` with a non-empty top-level `fields`, or a tab without a `fields`\narray, is rejected with `invalid_spec`. One submit covers all tabs;\nvalidation jumps to the first invalid tab. An action that writes files\nfirst switches to any tab the user has not viewed that holds a `target`\nfield; the next press submits. Tabs structure presentation only — they\nare not a wizard, no per-tab confirmation.\n\nReturns `{cancelled, action?, values: {name: value, ...}}`.\nOn cancel `values` is empty and, when the dialog ended without the user\nanswering, `reason` is set (`ttl_expired`, `evicted`, `channel_dropped`,\n`host_exiting`, `abandoned`) — only a reason-less cancel is a user\ndecision. `media_warnings`, present only when something failed, lists\nlocal video/audio that could not be shown.\n\n**This tool blocks until the user submits or cancels. Response can take minutes (longer for complex forms) — do not assume aiui is broken on slow response, the user is filling the form. The companion sends MCP progress notifications every ~10 s while waiting.**",
             "inputSchema": {
                 "type": "object",
                 "required": ["title"],
@@ -556,7 +556,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "gallery",
-            "description": "Batch visual review: show several images and/or videos at once and collect a per-item decision (+ optional comment) in ONE window, instead of calling `confirm` once per asset. Use this for \"review these N generated images\", \"triage this batch of screenshots\", \"approve/revise/skip each of these renders\". Each item needs a stable `value` (the key you get decisions back under) and a `src` (data: URL, http(s):// URL, or absolute / `~/`-rooted local path on YOUR host — same resolution rules as the form `image` field; videos are detected by data:video/ MIME or .mp4/.mov/.m4v/.webm extension and rendered with native controls). Per-item buttons come from `actions` (default Approve / Revise / Skip); set `comment: true` to show a free-text field per item. Returns {cancelled, decisions: {\"<item value>\": {decision, comment?}}} — only items the user touched appear. For a single image sign-off use `confirm` with `image`; for one-of-N choice use `ask` with thumbnails. **Blocks until the user submits or cancels. Response can take minutes — progress notifications fire every ~10 s.**",
+            "description": "Batch visual review: show several images and/or videos at once and\ncollect a per-item decision (+ optional comment) in ONE window, instead\nof calling `confirm` once per asset.\n\nWHEN TO USE: \"review these N generated images\", \"triage this batch of\nscreenshots\", \"approve/revise/skip each of these renders\". For a single\nimage sign-off use `confirm` with `image`; for a one-of-N choice use\n`ask` with thumbnails.\n\nEach item needs a stable `value` (the key you get the decision back\nunder) and usually a `src`. `src` follows the standard aiui resolution\nrules (data: URL, http(s) URL, or absolute / `~/` local path on YOUR\nhost). Videos are detected by `data:video/` MIME or a\n.mp4/.mov/.m4v/.webm extension and render with native controls.\n\nPer-item buttons come from `actions` (default Approve / Revise / Skip).\nSet `comment=True` for a free-text field per item.\n\nReturns `{cancelled, decisions}` where `decisions` maps each touched\nitem's `value` to `{decision, comment?}`. Items the user didn't touch\nare omitted. On cancel `decisions` is empty and, when the dialog ended\nwithout the user answering, `reason` is set (`ttl_expired`, `evicted`,\n`channel_dropped`, `host_exiting`, `abandoned`) — only a reason-less\ncancel is a user decision. `media_warnings`, present only when something\nfailed, lists local video/audio that could not be shown.",
             "inputSchema": {
                 "type": "object",
                 "required": ["items"],
@@ -619,7 +619,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "compare",
-            "description": "Side-by-side A/B (or A/B/C) compare: render 2+ variants as full-content panes next to each other and let the user click ONE to pick. Use this instead of `ask`+thumbnail (which only shows a small icon per option, not the full content) or `gallery` (per-item batch review — approve/revise/skip each, not a single pick). Fits \"which draft is better\", \"which image edit\", \"before vs. after\", \"which of these three headlines\". Each variant needs a stable `value` (the key returned as `selected`) and at least one of `content` (markdown text — drafts, diffs, code) or `src` (image/video, same resolution rules as elsewhere: data: URL, http(s):// URL, or absolute / `~/`-rooted local path on YOUR host; videos render with native controls). A variant may carry both — e.g. an image plus a caption. Set `sync_scroll: true` when comparing long text so scrolling one pane scrolls all of them together. If `max_height` is set on any variant, it caps every pane's height (equal-height panes read as \"side by side\"; independent per-pane heights don't). Returns {cancelled, selected} — `selected` is the `value` of the picked variant (only set when the user actually submits; Cancel/Escape leaves it absent). For a plain yes/no use `confirm`; for choosing among many small thumbnails use `ask`+thumbnail or `image_grid`; for per-item batch verdicts use `gallery`. **Blocks until the user picks and submits or cancels. Response can take minutes — progress notifications fire every ~10 s.**",
+            "description": "Side-by-side A/B (or A/B/C) compare: render 2+ variants as full-content\npanes next to each other and let the user click ONE to pick.\n\nWHEN TO USE: \"which draft is better\", \"which image edit\", \"before vs.\nafter\", \"which of these three headlines\". Use this instead of `ask` with\n`thumbnail` (which only shows a small icon per option, not the full\ncontent) or `gallery` (per-item batch review — approve/revise/skip each,\nnot a single pick).\n\nEach variant needs a stable `value` (the key returned as `selected`) and\nat least one of `content` (markdown text — drafts, diffs, code) or `src`\n(image/video, standard aiui resolution rules: data: URL, http(s) URL, or\nabsolute / `~/` local path on YOUR host; videos render with native\ncontrols). A variant may carry both — e.g. an image plus a caption.\n\nReturns `{cancelled, selected}` — `selected` is the `value` of the picked\nvariant (only set when the user actually submits; absent on a cancel).\nWhen the dialog ended without the user answering, a cancel also carries\n`reason` (`ttl_expired`, `evicted`, `channel_dropped`, `host_exiting`,\n`abandoned`) — only a reason-less cancel is a user decision.\n`media_warnings`, present only when something failed, lists local\nvideo/audio that could not be shown.",
             "inputSchema": {
                 "type": "object",
                 "required": ["variants"],
@@ -658,7 +658,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "notify",
-            "description": "Fire a native OS notification and return immediately — use this for an async-completion signal to a user who isn't watching this session (\"tests green\", \"deploy finished\", \"merge conflicts, need you\"). Unlike confirm/ask/form/gallery, this tool does NOT wait for the user: it hands the notification to the OS and returns {ok: true} right away, with no dialog, no window, no response to parse. Use it instead of a chat message when the point is exactly that the user doesn't have to be looking at this session to notice. For anything that needs an answer (yes/no, a choice, input), use confirm/ask/form — notify has no way to carry a reply back. `title` is required and short (≤ ~40 chars, notification banners truncate); `body` carries the detail. `subtitle` is optional extra context (folded into the body on platforms without a distinct subtitle slot). `sound` is an optional OS sound name (e.g. \"default\"); omit for a silent notification.",
+            "description": "Fire a native OS notification and return immediately — use this\nfor an async-completion signal to a user who isn't watching this\nsession (\"tests green\", \"deploy finished\", \"merge conflicts, need\nyou\"). Unlike `confirm`/`ask`/`form`/`gallery`, this tool does NOT wait\nfor the user: it hands the notification to the OS and returns\n`{ok: True}` right away, with no dialog, no window, no response to\nparse.\n\nWHEN TO USE: the point is exactly that the user doesn't have to be\nlooking at this session to notice — a long-running task just finished,\nsomething needs their attention whenever they get to it. Use it\ninstead of a chat message for that case.\n\nWHEN NOT TO USE: anything that needs an answer (yes/no, a choice,\ninput) — `notify` has no way to carry a reply back. Use `confirm`,\n`ask`, or `form` instead.\n\nRuns against the *user's own machine*, regardless of whether this MCP is\nlocal or reached via an SSH reverse-tunnel — same as `update`/`version`,\nthe notification always renders on the companion side.\n\nReturns `{ok: bool, error?: str}`. `ok: False` means the OS refused the\nnotification — most commonly a missing notification permission\n(some systems prompt for it once, on the first `notify` call). Not a bug to\nretry around. `ok: True` means the OS accepted it, not that the user saw\nit: Do Not Disturb / Focus, or aiui's notifications being switched off in\nthe system settings (on any OS, Windows included), can hide it silently.",
             "inputSchema": {
                 "type": "object",
                 "required": ["title", "body"],
@@ -672,12 +672,12 @@ fn tools_list() -> Value {
         },
         {
             "name": "aiui_health",
-            "description": "Reachability check against the local aiui companion. Returns version + ready flag if the companion is running and responding.",
+            "description": "Reachability + token check against the aiui companion.\n\nUse this first if dialogs hang or fail — it distinguishes a companion that\nis not running or unreachable (e.g. the SSH tunnel is down) from a rogue\nlocal process holding the port with the wrong token. Answers fast; does\nnot wait out a cold start.\n\nThe companion's body is returned on *any* HTTP status: a 503 carries\n``reason``, ``hint``, ``pending``, ``oldest_age_secs`` and\n``lifecycle_phase``. ``ok`` is true only for HTTP 200, so a\ndegraded-but-serving companion comes back as ``ok: true`` with\n``ready: false``.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "version",
-            "description": "Report aiui companion version, build info, binary path, and the updater endpoint. Cheap; does not hit the network.",
+            "description": "Report aiui companion version, build info, binary path, and updater endpoint.\n\nNot free: it asks the companion over HTTP (through the SSH tunnel on a\nremote host) and, like the dialog tools, first waits up to 30 s for a\ncompanion that is still starting. Call it once, not in a loop.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -858,7 +858,11 @@ async fn tools_call(
     // Wait for it to become reachable instead of returning a connection-
     // refused error the moment we get one — that masks the auto-resurrect
     // path's startup window cleanly.
-    if !wait_for_aiui(http, cfg).await {
+    //
+    // NOT for `aiui_health` (review A-09, matching the Python bridge, #203):
+    // it is the diagnostic people run BECAUSE things hang, so it must answer
+    // fast — not after a 30 s cold-start wait.
+    if name != "aiui_health" && !wait_for_aiui(http, cfg).await {
         if let Some(h) = &progress_handle {
             h.abort();
         }
@@ -903,7 +907,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_ask_result,
         ),
 
         "form" => dispatch_render(
@@ -928,7 +932,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_form_result,
         ),
 
         "gallery" => dispatch_render(
@@ -954,7 +958,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_gallery_result,
         ),
 
         "upload" => Ok(do_upload(&args, cfg, http).await),
@@ -981,7 +985,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_compare_result,
         ),
 
         "notify" => post_json(
@@ -995,9 +999,9 @@ async fn tools_call(
 
         // Health is the one endpoint whose non-2xx body must survive: a 503
         // carries the `reason`/`hint` the agent is supposed to relay (#179).
-        "aiui_health" => get_json_allow_status(http, cfg, "/health")
-            .await
-            .map(value_to_tool_text),
+        "aiui_health" => Ok(value_to_tool_text(
+            health_result(get_json_with_status(http, cfg, "/health").await, &base_url(cfg)),
+        )),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
         "update" => post_empty(http, cfg, "/update")
             .await
@@ -1058,14 +1062,9 @@ async fn upload_media(
     path: &str,
     ext: &str,
 ) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(h) => h.join(rest),
-            None => std::path::PathBuf::from(path),
-        }
-    } else {
-        std::path::PathBuf::from(path)
-    };
+    // C-10: the same expansion the collector used, `~\` included on Windows.
+    let expanded = crate::imageresolve::expand_tilde(path)
+        .ok_or_else(|| format!("cannot expand {path} (a ~user path, or no home directory)"))?;
     // Stat first, read second (#194). `tokio::fs::read` on a 3–4 GB screen
     // recording — an entirely ordinary thing to put in a `gallery` item —
     // materialised the whole file in a `Vec<u8>` before anything checked it
@@ -1316,57 +1315,111 @@ enum RenderError {
     Transport(String),
 }
 
-/// Number of *consecutive* failed polls tolerated before `render_dialog`
-/// gives up on an in-flight dialog (#202). Five, one second apart, covers
-/// roughly three minutes of outage once the 40 s per-GET timeout is counted
-/// in — comfortably more than an SSH reverse-tunnel re-establish or a WebView
-/// restart during an in-app update. The counter resets on every successful
-/// poll, so a flaky link never accumulates its way to a false give-up.
-const POLL_MAX_CONSECUTIVE_FAILURES: u32 = 5;
+/// How long one outage may last before `render_dialog` gives up on an
+/// in-flight dialog — WALL-CLOCK time since the first failure of the current
+/// streak (review A-01/E-01).
+///
+/// #202 counted failures instead: five, a second apart. That only meant
+/// "about three minutes" when every failure was a 40 s timeout. A refused
+/// connection while the tunnel restarts fails in milliseconds, so the bridge
+/// gave up after ~4 s with the dialog still on screen — and a blackholed link
+/// outlived the companion's old 90 s reaper, which destroyed the window
+/// mid-fill. Now: retry for up to this long, whatever the failures look like,
+/// and the companion's `SLOT_ABANDONED_AFTER` (300 s) sits above the worst
+/// case (this + one GET + one backoff = 228 s). The Python bridge uses the
+/// same numbers. A successful poll ends the streak.
+pub(crate) const POLL_OUTAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Backoff between two failed polls of the same render id.
-const POLL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+/// Per-GET timeout of the poll loop: longer than the companion's ~25 s
+/// long-poll window, so a healthy server always answers first.
+pub(crate) const POLL_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// How long past the advertised TTL the bridge keeps polling before it ends
+/// the call itself as `ttl_expired` — the companion's own TTL result normally
+/// arrives first (E-05, matching the Python bridge's 40 s).
+const POLL_TTL_GRACE: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// Ceiling of the capped exponential backoff between failed polls (1, 2, 4,
+/// 8, 8, … s).
+pub(crate) const POLL_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Fallback when a 202 body carries no `ttl_secs` — mirrors the companion's
 /// `DIALOG_TTL` (2 h).
 const DEFAULT_POLL_TTL_SECS: u64 = 7200;
 
-/// Retry budget for the async-render poll loop (#202).
+/// Retry budget for the async-render poll loop (#202, A-01/E-01).
 ///
 /// The async-render design exists so that a connection failure cannot cost
 /// the user's think-time: the dialog stays on screen for the whole server-side
 /// TTL, so a transport error on one poll is a blip, not an answer. This bounds
-/// how long the bridge keeps re-polling the same id — by consecutive failures
-/// *and* by the TTL the companion advertised, so we never poll an id that is
-/// certainly gone.
+/// how long the bridge keeps re-polling the same id — by the wall-clock length
+/// of the current outage ([`POLL_OUTAGE_BUDGET`]) *and* by the TTL the
+/// companion advertised, so we never poll an id that is certainly gone.
 struct PollBudget {
-    consecutive: u32,
+    streak_started: Option<std::time::Instant>,
+    failures: u32,
     deadline: std::time::Instant,
 }
 
 impl PollBudget {
     fn new(ttl_secs: u64) -> Self {
+        Self::starting_at(std::time::Instant::now(), ttl_secs)
+    }
+
+    fn starting_at(now: std::time::Instant, ttl_secs: u64) -> Self {
+        // Review A-10: `Instant + Duration` panics on overflow, and
+        // `ttl_secs` comes off the wire. An absurd TTL means "no TTL bound".
+        let deadline = now
+            .checked_add(std::time::Duration::from_secs(ttl_secs))
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         PollBudget {
-            consecutive: 0,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+            streak_started: None,
+            failures: 0,
+            deadline,
         }
     }
 
-    /// A poll came back: the link is healthy again, so forget past failures.
+    /// A poll came back: the link is healthy again, so the outage is over.
     fn on_success(&mut self) {
-        self.consecutive = 0;
+        self.streak_started = None;
+        self.failures = 0;
     }
 
-    /// Count a failed poll. `true` → sleep and re-poll the same id.
-    fn may_retry(&mut self) -> bool {
-        self.consecutive += 1;
-        self.consecutive < POLL_MAX_CONSECUTIVE_FAILURES
-            && std::time::Instant::now() < self.deadline
+    /// Count a failed poll observed at `now`. `Some(backoff)` → sleep that
+    /// long and re-poll the same id; `None` → the outage budget or the TTL is
+    /// spent.
+    fn on_failure(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let started = *self.streak_started.get_or_insert(now);
+        self.failures += 1;
+        if now >= self.deadline || now.duration_since(started) >= POLL_OUTAGE_BUDGET {
+            return None;
+        }
+        Some(poll_backoff(self.failures))
     }
 
-    fn consecutive(&self) -> u32 {
-        self.consecutive
+    fn failures(&self) -> u32 {
+        self.failures
     }
+
+    /// Past the advertised TTL plus [`POLL_TTL_GRACE`]? Checked on EVERY
+    /// iteration, not only after a failure (review E-05): a companion that
+    /// keeps answering `pending` past the TTL must not hold the agent forever.
+    fn past_ttl(&self, now: std::time::Instant) -> bool {
+        now >= self.deadline + POLL_TTL_GRACE
+    }
+
+    fn outage(&self, now: std::time::Instant) -> std::time::Duration {
+        self.streak_started
+            .map(|s| now.duration_since(s))
+            .unwrap_or_default()
+    }
+}
+
+/// Capped exponential backoff for the `n`th consecutive failure: 1, 2, 4, 8,
+/// 8, … seconds.
+fn poll_backoff(n: u32) -> std::time::Duration {
+    let secs = 1u64 << n.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(secs).min(POLL_BACKOFF_CAP)
 }
 
 async fn render_dialog(
@@ -1440,8 +1493,8 @@ async fn render_dialog(
     }
     crate::imageresolve::resolve_local_paths(&mut spec);
     // Step 4 (I8): forward the optional caller `session` label. This is the
-    // local bridge, so there is no `session_origin` (the companion treats an
-    // absent origin as local).
+    // local bridge, so there is no `session_origin`; locality is proven by
+    // the `x-aiui-local-proof` header below, not by the absent field.
     let body = json!({ "spec": spec, "session": session });
     // Async render (Step 3): POST opts in via `x-aiui-async`; the companion
     // registers + surfaces the dialog and returns immediately with
@@ -1454,12 +1507,22 @@ async fn render_dialog(
     // Backward-compatible: an older companion ignores the unknown header and
     // answers synchronously (200 with the terminal `{cancelled, …}` shape) —
     // detected after the status checks below and used directly, no polling.
-    let resp = http
+    // Review C-01: prove locality. The token is shared with every registered
+    // remote; this file never leaves the machine, so only a bridge running
+    // here can present it — and only then does the companion perform target
+    // writes itself.
+    let mut post = http
         .post(&url)
         .bearer_auth(&token)
-        .header("x-aiui-async", "1")
+        .header("x-aiui-async", "1");
+    if let Some(proof) = cfg.read_local_proof() {
+        post = post.header(crate::http::LOCAL_PROOF_HEADER, proof);
+    }
+    // 120 s like the Python bridge (A-09): registration includes fetching
+    // and inlining http(s) images on the companion side (A-07).
+    let resp = post
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
@@ -1501,10 +1564,17 @@ async fn render_dialog(
         return Err(RenderError::Transport(msg));
     }
     if !resp.status().is_success() {
-        return Err(RenderError::Transport(format!(
-            "render http {}",
-            resp.status()
-        )));
+        // A-09: surface the companion's `detail` (e.g. 500 `window_failed`
+        // naming a broken WebView runtime, #193) instead of the bare status
+        // line, as the Python bridge does.
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let detail = error_detail(&raw);
+        return Err(RenderError::Transport(if detail.trim().is_empty() {
+            format!("render http {status}")
+        } else {
+            format!("render http {status}: {}", detail.chars().take(300).collect::<String>())
+        }));
     }
     let accepted = resp.status() == reqwest::StatusCode::ACCEPTED;
     let first = resp
@@ -1550,33 +1620,37 @@ async fn render_dialog(
         let pr = match http
             .get(&poll_url)
             .bearer_auth(&token)
-            .timeout(std::time::Duration::from_secs(40))
+            .timeout(POLL_GET_TIMEOUT)
             .send()
             .await
         {
             Ok(pr) => pr,
             Err(e) => {
-                if budget.may_retry() {
+                let now = std::time::Instant::now();
+                if let Some(backoff) = budget.on_failure(now) {
                     trace(&format!(
-                        "render_dialog: poll {id} failed ({e}), retry {}/{}",
-                        budget.consecutive(),
-                        POLL_MAX_CONSECUTIVE_FAILURES
+                        "render_dialog: poll {id} failed ({e}), failure {} after {}s of \
+                         outage — retrying in {}s",
+                        budget.failures(),
+                        budget.outage(now).as_secs(),
+                        backoff.as_secs()
                     ));
-                    tokio::time::sleep(POLL_RETRY_BACKOFF).await;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 return Err(RenderError::Transport(format!(
-                    "GET /render/{id}: {e} (gave up after {} consecutive poll \
-                     failures — the dialog may still be open on the user's \
-                     machine)",
-                    budget.consecutive()
+                    "GET /render/{id}: {e} (gave up after {}s without reaching aiui — \
+                     the dialog may still be open on the user's machine; check it \
+                     before re-asking)",
+                    budget.outage(now).as_secs()
                 )));
             }
         };
-        budget.on_success();
         if pr.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RenderError::Transport(format!(
-                "aiui lost track of render {id} (expired or never registered)"
+                "aiui lost track of render {id} — it expired, was never registered, \
+                 or the companion closed it after it went unpolled for too long. \
+                 Ask again if the answer is still needed."
             )));
         }
         if !pr.status().is_success() {
@@ -1585,11 +1659,48 @@ async fn render_dialog(
                 pr.status()
             )));
         }
-        let pv = pr
-            .json::<Value>()
-            .await
+        // Codex review: the body read is part of the transport too. A reset
+        // or timeout after the headers used to end the call through `?` —
+        // outside the outage budget, with the slot still retryable. The
+        // budget resets only once a complete response has arrived; malformed
+        // JSON stays a hard error.
+        let body = match pr.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if let Some(backoff) = budget.on_failure(now) {
+                    trace(&format!(
+                        "render_dialog: poll {id} body read failed ({e}) — retrying in {}s",
+                        backoff.as_secs()
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(RenderError::Transport(format!(
+                    "GET /render/{id}: {e} (gave up after {}s without reaching aiui — \
+                     the dialog may still be open on the user's machine; check it \
+                     before re-asking)",
+                    budget.outage(now).as_secs()
+                )));
+            }
+        };
+        budget.on_success();
+        let pv: Value = serde_json::from_slice(&body)
             .map_err(|e| RenderError::Transport(format!("parse /render/{id}: {e}")))?;
         if pv.get("pending").and_then(|v| v.as_bool()) == Some(true) {
+            if budget.past_ttl(std::time::Instant::now()) {
+                // E-05: retract and report the timeout ourselves.
+                let _ = http
+                    .delete(&poll_url)
+                    .bearer_auth(&token)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await;
+                return Ok(attach_media_warnings(
+                    json!({"id": id, "cancelled": true, "result": null, "reason": "ttl_expired"}),
+                    media_warnings,
+                ));
+            }
             continue;
         }
         return Ok(attach_media_warnings(pv, media_warnings));
@@ -1664,29 +1775,59 @@ async fn get_json(
 /// bug #179 fixes — `aiui_health` promises to tell a cold companion apart from
 /// a rogue process holding the port. `/render`, `/version` and `/update` keep
 /// the strict [`get_json`], where a non-2xx genuinely is a failed call.
-async fn get_json_allow_status(
+/// GET `path` and return `(status, body)` — the body on ANY status, since a
+/// 503 from `/health` carries the diagnosis (#179).
+async fn get_json_with_status(
     http: &reqwest::Client,
     cfg: &AppConfig,
     path: &str,
-) -> Result<Value, String> {
+) -> Result<(u16, Value), String> {
     let token = load_token(cfg)?;
     let url = format!("{}{}", base_url(cfg), path);
     let resp = http
         .get(&url)
         .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("GET {path}: {e}"))?;
-    let status = resp.status();
-    match resp.json::<Value>().await {
-        Ok(v) => Ok(v),
-        // No JSON to relay — fall back to the status line, which is all we
-        // have and still beats an empty error.
-        Err(e) if !status.is_success() => {
-            Err(format!("{path} http {status} (unparseable body: {e})"))
-        }
-        Err(e) => Err(format!("parse {path}: {e}")),
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| format!("read {path}: {e}"))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Ok((status, v)),
+        Err(_) => Err(format!(
+            "{path} answered HTTP {status} with a non-JSON body: {}",
+            text.chars().take(200).collect::<String>()
+        )),
     }
+}
+
+/// The `aiui_health` tool result, in the Python bridge's shape (review A-09):
+/// `ok` says whether the companion answered 200, the companion's body is
+/// spread in (so a 503's `reason`/`hint` reach the agent), `http_status` is
+/// added when it is not 200 — a 401 body alone is just
+/// `{"error":"unauthorized"}` — and a transport failure is `ok: false` with
+/// the error, never a tool error.
+fn health_result(res: Result<(u16, Value), String>, endpoint: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    match res {
+        Ok((status, body)) => {
+            out.insert("ok".into(), json!(status == 200));
+            if let Value::Object(map) = body {
+                out.extend(map);
+            }
+            if status != 200 {
+                out.insert("http_status".into(), json!(status));
+            }
+        }
+        Err(e) => {
+            out.insert("ok".into(), json!(false));
+            out.insert("error".into(), json!(e));
+        }
+    }
+    out.insert("endpoint".into(), json!(endpoint));
+    out.insert("server".into(), json!(crate::logging::BUILD_INFO));
+    Value::Object(out)
 }
 
 async fn post_empty(
@@ -1819,7 +1960,42 @@ fn format_confirm_result(render: Value) -> Value {
     value_to_tool_text(payload)
 }
 
+/// The per-tool keys a cancelled dialog still carries, so an agent can read
+/// `result["values"]` without guarding for it (`docs/skill.md`, "Every dialog
+/// tool returns `cancelled` plus that tool's own keys"). Shared with the
+/// Python bridge's tests through `schemas/dialog-results.json` — review E-02
+/// found the two bridges pinning different shapes.
+const DIALOG_RESULTS_FIXTURE: &str = include_str!("../../../schemas/dialog-results.json");
+
+fn cancel_defaults(kind: &str) -> serde_json::Map<String, Value> {
+    serde_json::from_str::<Value>(DIALOG_RESULTS_FIXTURE)
+        .ok()
+        .and_then(|v| v.get("cancel_defaults")?.get(kind)?.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn format_ask_result(render: Value) -> Value {
+    format_dialog_result_for("ask", render)
+}
+
+fn format_form_result(render: Value) -> Value {
+    format_dialog_result_for("form", render)
+}
+
+fn format_gallery_result(render: Value) -> Value {
+    format_dialog_result_for("gallery", render)
+}
+
+fn format_compare_result(render: Value) -> Value {
+    format_dialog_result_for("compare", render)
+}
+
+#[cfg(test)]
 fn format_dialog_result(render: Value) -> Value {
+    format_dialog_result_for("", render)
+}
+
+fn format_dialog_result_for(kind: &str, render: Value) -> Value {
     // Passthrough: just return what the frontend delivered. The agent gets
     // whatever shape the widget produced (values for form, answers for ask).
     let cancelled = render
@@ -1834,6 +2010,15 @@ fn format_dialog_result(render: Value) -> Value {
         obj.insert("cancelled".into(), json!(cancelled));
     } else {
         payload = json!({ "cancelled": cancelled });
+    }
+    // E-02: a cancel comes back with `result: null`; fill the tool's own
+    // keys with their empty values, exactly like the Python bridge.
+    if cancelled {
+        if let Some(obj) = payload.as_object_mut() {
+            for (k, v) in cancel_defaults(kind) {
+                obj.entry(k).or_insert(v);
+            }
+        }
     }
     // #180: forward WHY a dialog was cancelled. The companion sets
     // `host_exiting`, `ttl_expired`, `evicted` and `channel_dropped`;
@@ -2104,33 +2289,82 @@ mod tests {
     /// yes and return `RenderError::Transport` once it says no.
     #[test]
     fn poll_retries_transient_transport_error() {
-        let mut budget = PollBudget::new(DEFAULT_POLL_TTL_SECS);
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, DEFAULT_POLL_TTL_SECS);
 
         // One failed poll then a success: the dialog survives, and the
-        // success wipes the slate so a flaky link never accumulates its way
+        // success ends the outage so a flaky link never accumulates its way
         // to a false give-up.
-        assert!(budget.may_retry(), "a single blip must be retried");
-        assert_eq!(budget.consecutive(), 1);
+        assert!(budget.on_failure(t0).is_some(), "a single blip must be retried");
+        assert_eq!(budget.failures(), 1);
         budget.on_success();
-        assert_eq!(budget.consecutive(), 0);
+        assert_eq!(budget.failures(), 0);
+    }
 
-        // N *consecutive* failures exhaust it — that is the only give-up.
-        for i in 1..POLL_MAX_CONSECUTIVE_FAILURES {
-            assert!(budget.may_retry(), "failure {i} is still within budget");
+    #[test]
+    fn an_instant_failure_streak_survives_a_tunnel_restart() {
+        // A-01/E-01: refused connections fail in milliseconds. Counting them
+        // gave up after ~4 s; the budget is wall-clock, so a 2-minute tunnel
+        // re-establish of instant failures is ridden out.
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, DEFAULT_POLL_TTL_SECS);
+        let mut t = t0;
+        for _ in 0..30 {
+            let backoff = budget.on_failure(t).expect("still inside the outage budget");
+            t += backoff;
+            if t.duration_since(t0) > std::time::Duration::from_secs(120) {
+                break;
+            }
         }
+        assert!(budget.failures() > 5, "far more than the old five-failure cap");
+        // …and the budget does end.
+        let late = t0 + POLL_OUTAGE_BUDGET;
+        assert!(budget.on_failure(late).is_none(), "the outage budget is spent");
+    }
+
+    #[test]
+    fn poll_backoff_is_capped_exponential() {
+        let secs: Vec<u64> = (1..=7).map(|n| poll_backoff(n).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(poll_backoff(u32::MAX), POLL_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn the_reaper_outlasts_the_bridge_outage_budget() {
+        // A-01: the companion must not destroy a dialog its bridge is still
+        // entitled to come back for. Worst case: the outage budget, plus a
+        // GET that started just before it ran out, plus one backoff.
+        let worst = POLL_OUTAGE_BUDGET + POLL_GET_TIMEOUT + POLL_BACKOFF_CAP;
         assert!(
-            !budget.may_retry(),
-            "the {POLL_MAX_CONSECUTIVE_FAILURES}th consecutive failure gives up"
+            crate::http::SLOT_ABANDONED_AFTER > worst,
+            "SLOT_ABANDONED_AFTER {:?} must exceed the bridge worst case {worst:?}",
+            crate::http::SLOT_ABANDONED_AFTER
         );
-        assert_eq!(budget.consecutive(), POLL_MAX_CONSECUTIVE_FAILURES);
     }
 
     #[test]
     fn poll_stops_once_the_advertised_ttl_has_elapsed() {
         // The id from the 202 is only valid for `ttl_secs`; past that the slot
         // is gone on the companion side and retrying it just burns the budget.
-        let mut budget = PollBudget::new(0);
-        assert!(!budget.may_retry(), "an expired id must not be re-polled");
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, 0);
+        assert!(budget.on_failure(t0).is_none(), "an expired id must not be re-polled");
+    }
+
+    #[test]
+    fn the_ttl_bounds_even_a_healthy_poll_loop() {
+        // E-05: the deadline used to be consulted only after a failure.
+        let t0 = std::time::Instant::now();
+        let budget = PollBudget::starting_at(t0, 60);
+        assert!(!budget.past_ttl(t0 + std::time::Duration::from_secs(60)));
+        assert!(budget.past_ttl(t0 + std::time::Duration::from_secs(60) + POLL_TTL_GRACE));
+    }
+
+    #[test]
+    fn an_absurd_advertised_ttl_does_not_panic() {
+        // A-10: `Instant + Duration::from_secs(u64::MAX)` panicked.
+        let mut budget = PollBudget::new(u64::MAX);
+        assert!(budget.on_failure(std::time::Instant::now()).is_some());
     }
 
     /// #202: `/ping` is unauthenticated and returns a static "pong" whatever
@@ -2405,6 +2639,25 @@ mod tests {
     /// #203: the companion answers a bad `/notify` with a structured
     /// `{"error","detail"}`; the agent should get the sentence, not the JSON.
     #[test]
+    fn health_result_matches_the_python_shape() {
+        // A-09: a 401 came back as a successful bare `{"error":"unauthorized"}`.
+        let out = health_result(Ok((401, json!({"error": "unauthorized"}))), "http://127.0.0.1:7777");
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["http_status"], json!(401));
+        assert_eq!(out["error"], json!("unauthorized"));
+        // A degraded-but-serving companion: ok (200) with its own fields.
+        let out = health_result(Ok((200, json!({"ready": false, "reason": "x"}))), "e");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["ready"], json!(false));
+        assert!(out.get("http_status").is_none());
+        // Unreachable is a result, not a tool error.
+        let out = health_result(Err("GET /health: connection refused".into()), "e");
+        assert_eq!(out["ok"], json!(false));
+        assert!(out["error"].as_str().unwrap().contains("refused"));
+        assert!(out["server"].is_string());
+    }
+
+    #[test]
     fn error_detail_prefers_the_structured_message() {
         assert_eq!(
             error_detail(r#"{"error":"invalid_request","detail":"title must not be empty"}"#),
@@ -2434,6 +2687,18 @@ mod tests {
             ("HEALTH_PROMPT", HEALTH_PROMPT.to_string()),
             ("TEST_DIALOG_PROMPT", TEST_DIALOG_PROMPT.to_string()),
             ("REMOTES_PROMPT", REMOTES_PROMPT.to_string()),
+            // F-14: the skill catalog reaches every agent too (`/aiui:teach`,
+            // the installed SKILL.md) and #252 had put "the user's Mac" back
+            // into it. The one genuine macOS-only behaviour — the
+            // notification permission prompt — is allowlisted by line.
+            (
+                "SKILL_MD",
+                SKILL_MD
+                    .lines()
+                    .filter(|l| !l.contains("On macOS the first call triggers the one-time"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             ("tools_list", tools_list().to_string()),
             ("prompts_list", prompts_list().to_string()),
             (
@@ -2659,6 +2924,31 @@ mod tests {
         let out = format_dialog_result(json!({"id": "d1", "cancelled": true, "result": null}));
         assert_envelope_is_consistent(&out);
         assert_eq!(out["structuredContent"], json!({"cancelled": true}));
+    }
+
+    #[test]
+    fn a_cancel_carries_each_tools_documented_keys() {
+        // E-02: docs/skill.md promises `cancelled` plus the tool's own keys on
+        // a cancel. The Python bridge did that; this bridge returned a bare
+        // `{cancelled: true}`, so `result["values"]` raised on local sessions.
+        let fixture: Value = serde_json::from_str(DIALOG_RESULTS_FIXTURE).unwrap();
+        let cancel = || json!({"id": "d1", "cancelled": true, "result": null});
+        for (kind, fmt) in [
+            ("ask", format_ask_result as fn(Value) -> Value),
+            ("form", format_form_result),
+            ("gallery", format_gallery_result),
+            ("compare", format_compare_result),
+        ] {
+            let out = tool_payload(fmt(cancel()));
+            let mut want = fixture["cancel_defaults"][kind].as_object().unwrap().clone();
+            want.insert("cancelled".into(), json!(true));
+            assert_eq!(out, Value::Object(want), "{kind}");
+        }
+        // A submit is left exactly as the widget produced it.
+        let out = tool_payload(format_form_result(json!({
+            "id": "d1", "cancelled": false, "result": {"values": {"a": 1}}
+        })));
+        assert_eq!(out, json!({"values": {"a": 1}, "cancelled": false}));
     }
 
     #[test]

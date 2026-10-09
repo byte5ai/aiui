@@ -1,15 +1,21 @@
 # macOS release pipeline for aiui — CI port of scripts/release.sh.
 #
 # Why CI and not the maintainer's Mac: signing + notarization run
-# exclusively in GitHub Actions per the global convention
-# (~/.claude/references/macos_signing.md — Developer ID Application
-# certificate + App Store Connect API key, no Apple-ID password, no 2FA).
-# The keychain/notary steps below are inlined from the reusable template
-# `iret77/host-admin skills/devhost-setup/templates/macos-sign.yml`
-# instead of called via `workflow_call`, because aiui signs and notarizes
-# THREE artifacts in sequence (app → zip, dmg, updater bundle) and the
-# DMG must be built from the already-stapled .app — a single
-# `artifact-path` invocation in a separate job cannot express that.
+# exclusively in GitHub Actions (Developer ID Application certificate +
+# App Store Connect API key, no Apple-ID password, no 2FA). The
+# keychain/notary steps are inlined rather than called via
+# `workflow_call`, because aiui signs and notarizes THREE artifacts in
+# sequence (app → zip, dmg, updater bundle) and the DMG must be built from
+# the already-stapled .app — a single `artifact-path` invocation in a
+# separate job cannot express that.
+#
+# Secret exposure (F-02): everything that executes third-party code — `npm
+# ci`, the vite build, cargo's build scripts and proc-macros, the Tauri
+# bundler — runs BEFORE the Developer ID certificate is imported and
+# without the minisign key in its environment. The app is built unsigned
+# with `tauri.release.conf.json` (no updater artifacts, so no key needed),
+# then codesigned explicitly; the minisign key reaches only the
+# `tauri signer sign` step that signs the stapled updater bundle.
 #
 # Manually triggered (workflow_dispatch) — never on push. macOS runners
 # bill at 10× Linux; a release run is a deliberate, single-job spend.
@@ -40,7 +46,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: "Mark as GitHub pre-release (updater clients skip it; promote later)"
+        description: "Mark as GitHub pre-release (updater clients skip it). Promote ONLY via release-promote.yml, which refuses without the PyPI artifact"
         required: false
         type: boolean
         default: false
@@ -52,7 +58,7 @@ on:
 
 permissions:
   contents: write # tag push + release creation
-  actions: write # dispatch release-windows.yml (#190)
+  actions: write # dispatch release-windows.yml (#190); read ci.yml runs (F-03)
 
 concurrency:
   group: release-macos
@@ -100,6 +106,11 @@ jobs:
       # replaces could never fire: actions/checkout@v4 fetches depth 1 and
       # no tags, so the ref was never present locally (#209).
       - name: Check version sync
+        env:
+          # F-04: an existing remote tag is accepted iff it points at this
+          # very commit — the recovery re-run of a release that pushed the
+          # tag and then failed. Anywhere else it is still refused.
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           ./scripts/check-release-preconditions.sh "$VERSION"
@@ -116,6 +127,27 @@ jobs:
             echo "remote to a version that does not exist."
             exit 1
           fi
+
+      # F-03: a release is cut only from a commit whose CI is green. v0.11.0
+      # was dispatched 29 s after its merge, while that commit's CI run was
+      # still going — the release's own pre-checks below are a subset (no
+      # clippy, vitest, svelte-check, npm audit, i18n parity, pin guard,
+      # ruff or Windows leg). Fail fast instead of signing an unverified
+      # commit; re-dispatch once CI has finished.
+      - name: Guard — CI is green for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUNS="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --commit "$GITHUB_SHA" --event push --limit 20 \
+            --json status,conclusion,databaseId)"
+          echo "ci.yml runs for $GITHUB_SHA: $RUNS"
+          GREEN="$(printf '%s' "$RUNS" | python3 -c 'import json,sys; runs=json.load(sys.stdin); print(sum(1 for r in runs if r["status"]=="completed" and r["conclusion"]=="success"))')"
+          [ "$GREEN" -ge 1 ] || {
+            echo "no successful ci.yml run for $GITHUB_SHA yet — wait for CI on main to finish green, then re-dispatch"
+            exit 1
+          }
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -135,7 +167,7 @@ jobs:
         working-directory: companion/src-tauri
         run: bash ../../scripts/assert-rust-toolchain.sh
 
-      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
           key: release-aarch64-apple-darwin
@@ -163,13 +195,54 @@ jobs:
 
       # test_integration_live.py is opt-in (AIUI_LIVE=1) and skips itself
       # otherwise, so the default selection needs no exclusion here.
+      # `--locked` (F-12): an unlocked `uv run` silently re-locks a stale
+      # uv.lock, which then made the `uv lock --check` below always pass.
       - name: Pre-release checks (Python)
         working-directory: python
-        run: uv run --extra dev pytest tests/ -q
+        run: uv run --locked --extra dev pytest tests/ -q
 
+      # `--locked` (F-01): v0.11.0 was built from a Cargo.lock that did not
+      # record 34 of its crates, each resolved from crates.io at dispatch
+      # time. A stale lock now fails here, before anything is built; the
+      # `tauri build` below then compiles exactly the recorded resolution.
       - name: Pre-release checks (Rust)
         working-directory: companion/src-tauri
-        run: cargo test --lib --release --target aarch64-apple-darwin
+        run: cargo test --locked --lib --release --target aarch64-apple-darwin
+
+      - name: Build frontend
+        working-directory: companion
+        run: npm ci && npm run build
+
+      # #192: this job's `npx tauri` produces the .app that is signed and
+      # shipped, so which CLI ran is part of the release record. Assert it
+      # is the one package-lock.json locks.
+      - name: Assert the locked Tauri CLI
+        shell: bash
+        working-directory: companion
+        run: bash ../scripts/assert-tauri-cli.sh
+
+      # F-02: built UNSIGNED and without updater artifacts, with no signing
+      # material anywhere in the environment — the certificate is imported
+      # only after this step, and the minisign key is handed to the single
+      # `tauri signer sign` step below. `tauri build` runs the vite build
+      # (beforeBuildCommand), every cargo build script and proc-macro and
+      # the bundler; none of that needs a key, so none of it gets one. The
+      # explicit `codesign` step signs the bundle (it always re-signed with
+      # `--force` anyway).
+      - name: Tauri build (aarch64, unsigned)
+        working-directory: companion
+        run: npx tauri build --target aarch64-apple-darwin --config src-tauri/tauri.release.conf.json
+
+      # The in-app updater reads CFBundleShortVersionString to decide
+      # what's "current" — a drifted bundle reproduces #82 on the next
+      # update. Fail here, before signing or notarization.
+      - name: Verify bundled Info.plist version
+        run: |
+          set -euo pipefail
+          APP="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          [ "$PLIST_VERSION" = "$VERSION" ] \
+            || { echo "Info.plist is ${PLIST_VERSION}, expected ${VERSION}"; exit 1; }
 
       # Ephemeral keychain + Developer ID import — from the macos-sign.yml
       # template. The keychain password is generated per run and never a
@@ -200,38 +273,6 @@ jobs:
           echo "SIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
           rm -f "$CERT_PATH"
 
-      - name: Build frontend
-        working-directory: companion
-        run: npm ci && npm run build
-
-      # #192: this job's `npx tauri` produces both the signed .app and the
-      # minisign-signed updater bundle, so which CLI ran is part of the
-      # release record. Assert it is the one package-lock.json locks.
-      - name: Assert the locked Tauri CLI
-        shell: bash
-        working-directory: companion
-        run: bash ../scripts/assert-tauri-cli.sh
-
-      # APPLE_SIGNING_IDENTITY is picked up by the Tauri bundler (signs the
-      # .app during build); TAURI_SIGNING_PRIVATE_KEY produces the signed
-      # updater artifacts (createUpdaterArtifacts: true).
-      - name: Tauri build (aarch64, signed + updater artifacts)
-        working-directory: companion
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --target aarch64-apple-darwin
-
-      # The in-app updater reads CFBundleShortVersionString to decide
-      # what's "current" — a drifted bundle reproduces #82 on the next
-      # update. Fail here, before notarization spends minutes.
-      - name: Verify bundled Info.plist version
-        run: |
-          set -euo pipefail
-          APP="companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app"
-          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-          [ "$PLIST_VERSION" = "$VERSION" ] \
-            || { echo "Info.plist is ${PLIST_VERSION}, expected ${VERSION}"; exit 1; }
 
       - name: Codesign with entitlements
         run: |
@@ -393,18 +434,29 @@ jobs:
             git tag -a "$TAG" -m "Release $TAG"
             git push origin "$TAG"
           fi
+          # F-13 / #188: aiui DETECTS updates and offers a one-click install;
+          # it never installs one by itself. SECURITY.md and the README say
+          # so, and the release page — the one users are linked to — must not
+          # contradict them. `scripts/check-doc-claims.sh` guards this text.
           cat > notes.md <<NOTES_EOF
           ## aiui ${TAG}
 
-          Signed + notarized by byte5 GmbH. From v0.1.2 on, existing installations
-          update themselves in place via the in-app updater.
+          **Updating:** aiui checks for new versions and offers a one-click install in Settings; nothing is installed without that click.
 
-          **Fresh install:** Download \`aiui-${VERSION}-arm64.dmg\`, double-click, drag aiui.app into Applications, launch once.
+          **macOS (Apple Silicon, signed and notarized by byte5 GmbH):** download \`aiui-${VERSION}-arm64.dmg\`, double-click, drag aiui.app into Applications, launch once. (A zip is also provided for scripted installs: \`ditto -xk aiui-${VERSION}-arm64.zip /Applications/\`.)
 
-          (Zip also provided for scripted installs: \`ditto -xk aiui-${VERSION}-arm64.zip /Applications/\`.)
+          **Windows (x64):** download \`aiui_${VERSION}_x64-setup.exe\` and run it. The installer is not Authenticode-signed, so SmartScreen asks for confirmation ("More info" → "Run anyway"); in-app updates are verified against aiui's update signing key.
 
           See the [full diff](https://github.com/byte5ai/aiui/commits/${TAG}).
           NOTES_EOF
+          # F-05: a run that published no bridge must say so where an operator
+          # would promote it — every remote pins \`aiui-mcp==<version>\`.
+          if [ "${{ inputs.publish-pypi }}" != "true" ]; then
+            {
+              echo ""
+              echo "> **NOT PROMOTABLE** — \`aiui-mcp ${VERSION}\` was not published to PyPI by this run. Promote only via \`release-promote.yml\`, which refuses until the bridge is on PyPI."
+            } >> notes.md
+          fi
           PRERELEASE_FLAG=""
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             PRERELEASE_FLAG="--prerelease"

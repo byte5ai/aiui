@@ -51,14 +51,23 @@ Out of scope (report upstream instead):
 
 ## Our commitments
 
-- Releases are signed with the byte5 Developer ID (`VG5X6JCLGF`) and
-  notarised by Apple.
-- Updater artifacts are signed with an Ed25519 key and verified on the
-  client before installation.
-- No telemetry and no analytics. aiui makes exactly two kinds of
-  outbound request: the GitHub-hosted updater feed, and a `GET` for any
-  `http(s)://` image URL a dialog spec asks it to render — publicly
-  routable destinations only; loopback, private, link-local, CGNAT and
-  ULA targets are refused before a socket is opened, resolved addresses
-  are pinned so a second DNS answer cannot slip past that check, and
-  redirects are not followed. Nothing else leaves your machine.
+- macOS releases are signed with the byte5 Developer ID (`VG5X6JCLGF`)
+  and notarised by Apple. The Windows installer is **not**
+  Authenticode-signed yet; SmartScreen asks before the first run.
+- Updater artifacts for both platforms are signed with an Ed25519
+  (minisign) key and verified on the client before installation.
+- No telemetry and no analytics. aiui's outbound connections are:
+  - the GitHub-hosted updater feed;
+  - a `GET` for any `http(s)://` image URL a dialog spec asks it to
+    render — publicly routable destinations only; loopback, private,
+    link-local, CGNAT and ULA targets are refused before a socket is
+    opened, resolved addresses are pinned so a second DNS answer cannot
+    slip past that check, proxies are bypassed, and redirects are not
+    followed;
+  - an `http(s)://` video or audio URL a dialog plays, fetched by the
+    dialog's own player;
+  - **SSH to the hosts you register in Settings**: the reverse tunnel
+    that carries every dialog spec and answer for those hosts, the copy
+    of the auth token to them, and the scripts that patch or remove
+    aiui's entry in their Claude Code config. Nothing goes to a host you
+    did not register.

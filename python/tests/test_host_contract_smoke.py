@@ -3,9 +3,9 @@
 `aiui-mcp` is a standard MCP server: it renders dialogs by POSTing specs to the
 companion over `127.0.0.1:7777`. That contract is what makes aiui host-agnostic
 — Claude Desktop, OpenAI **Codex**, or any other MCP client that reaches the
-companion gets the same `confirm`/`ask`/`form` round-trip. "Codex is officially
-supported" (see the README "Using aiui with Codex / ChatGPT" section) stays
-honest only while that contract holds.
+companion gets the same `confirm`/`ask`/`form` round-trip. Any claim that a
+host other than Claude is supported stays honest only while that contract
+holds.
 
 This test proves it end to end WITHOUT a real companion or a GUI — impossible in
 CI anyway (the companion needs a live macOS desktop; it can't render headless).
@@ -29,21 +29,32 @@ really does answer that way and the bridge must keep handling it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import socket
 import threading
+import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+
+import httpx
 
 import pytest
 
 import aiui_mcp.server as server
-from aiui_mcp.server import EXPECTED_WIRE_VERSION, ask, confirm, form
+from aiui_mcp.server import EXPECTED_WIRE_VERSION, ask, compare, confirm, form, gallery
+from companion_auth import auth_ok
 
 # A real aiui token is 64 hex chars; the bridge rejects any other
 # shape (#185), so the fixture has to look like the real thing.
 TOKEN = "ab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1eab1e"
+
+# The cross-bridge result-shape fixture (E-02); both bridges' tests read it.
+DIALOG_RESULTS = Path(__file__).resolve().parents[2] / "schemas" / "dialog-results.json"
 
 # Canned terminal results per dialog kind, in the companion's wire shape
 # ({cancelled, result}). `_format_result` in the bridge flattens these into the
@@ -89,6 +100,7 @@ class _FakeCompanion(ThreadingHTTPServer):
         self.terminal_override: dict[str, Any] | None = None
         self.render_posts = 0
         self.poll_gets = 0
+        self.deletes: list[str] = []
         # id → {"terminal": <body>, "served_pending": bool}
         self.pending: dict[str, dict[str, Any]] = {}
 
@@ -110,7 +122,13 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
     def _authed(self) -> bool:
-        return self.headers.get("Authorization") == f"Bearer {TOKEN}"
+        return auth_ok(
+            self.headers.get("Authorization"),
+            self.command,
+            self.path,
+            TOKEN,
+            async_hdr=self.headers.get("x-aiui-async", ""),
+        )
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
         self.send_response(code)
@@ -126,6 +144,16 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/ping":  # unauthenticated readiness probe
             self.server.hits.add("ping")
             self._send(200, b"pong", "text/plain")
+            return
+        if self.path.startswith("/probe?"):
+            # B1-01: the credential-less challenge the bridge sends before its
+            # token — answered the way the real companion does.
+            nonce = urllib.parse.parse_qs(self.path.split("?", 1)[1]).get("nonce", [""])[0]
+            pid, sha = 4242, "fakesha"
+            msg = f"aiui-probe-v1|{nonce}|{pid}|{sha}".encode()
+            mac = hmac.new(TOKEN.encode(), msg, hashlib.sha256).hexdigest()
+            self.server.hits.add("probe")
+            self._json(200, {"aiui": True, "pid": pid, "build_sha": sha, "mac": mac})
             return
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
@@ -206,6 +234,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(404, {"error": "not_found"})
 
+    def do_DELETE(self) -> None:  # noqa: N802 — stdlib naming
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        if self.path.startswith("/render/"):
+            render_id = self.path[len("/render/") :]
+            self.server.deletes.append(render_id)
+            self.server.pending.pop(render_id, None)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
 
 @pytest.fixture()
 def companion(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
@@ -218,9 +258,14 @@ def companion(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     monkeypatch.setattr(server, "ENDPOINT", f"http://127.0.0.1:{srv.server_address[1]}")
     monkeypatch.setattr(server, "TOKEN_PATH", token_file)
     monkeypatch.setattr(server, "_wire_checked", False)  # re-run the wire check per test
-    # Keep the retry budget's semantics but not its wall-clock: the give-up
-    # path would otherwise spend 5 s sleeping between dropped polls.
+    # A fresh port per test, but ports get reused — never carry a verified
+    # listener over from another test (B1-01).
+    monkeypatch.setattr(server, "_LISTENER_VERIFIED", {}, raising=False)
+    # Keep the outage budget's semantics but not its wall-clock: the give-up
+    # path would otherwise spend 3 minutes retrying dropped polls.
     monkeypatch.setattr(server, "ASYNC_POLL_RETRY_BACKOFF_S", 0.01)
+    monkeypatch.setattr(server, "ASYNC_POLL_MAX_BACKOFF_S", 0.05, raising=False)
+    monkeypatch.setattr(server, "POLL_OUTAGE_BUDGET_S", 0.5, raising=False)
     monkeypatch.setattr(server, "ASYNC_POLL_MIN_INTERVAL_S", 0.0)
     try:
         yield srv
@@ -279,27 +324,38 @@ def test_form_roundtrip_over_loopback(companion: _FakeCompanion) -> None:
     assert companion.last_render["spec"]["kind"] == "form"
 
 
+@pytest.mark.skipif(not DIALOG_RESULTS.is_file(), reason="needs a repo checkout")
 def test_cancel_keeps_documented_shape(companion: _FakeCompanion) -> None:
-    """#202: a cancel must still carry the tool's documented keys.
+    """#202 / E-02: a cancel must still carry the tool's documented keys.
 
     `_format_result` answered a bare `{"cancelled": True}`, contradicting
     `confirm`'s own docstring (`{cancelled, confirmed}`) and the Rust bridge,
     whose `format_confirm_result` always emits both. An agent reading
-    `result["confirmed"]` therefore worked on a Mac-local session and raised
+    `result["confirmed"]` therefore worked on a local session and raised
     `KeyError` only on a remote — the worst place for a contract to fork.
+
+    The per-kind shapes come from `schemas/dialog-results.json`, the fixture
+    the Rust bridge's tests read too, so the two cannot drift apart again.
     """
+    defaults = json.loads(DIALOG_RESULTS.read_text(encoding="utf-8"))["cancel_defaults"]
     companion.force_cancel = True
+    # `confirm` has its own formatter on the Rust side and is not in the
+    # fixture; `docs/skill.md` documents `confirmed: false` on cancel.
     assert asyncio.run(confirm(title="Proceed?")) == {
         "cancelled": True,
         "confirmed": False,
     }
-    assert asyncio.run(ask(question="Which?", options=[{"label": "A"}])) == {
-        "cancelled": True,
-        "answers": [],
+    calls = {
+        "ask": lambda: ask(question="Which?", options=[{"label": "A"}]),
+        "form": lambda: form(
+            title="New user", fields=[{"kind": "text", "name": "name", "label": "Name"}]
+        ),
+        "gallery": lambda: gallery(items=[{"value": "a", "src": "https://x.test/a.png"}]),
+        "compare": lambda: compare(variants=[{"value": "a"}, {"value": "b"}]),
     }
-    assert asyncio.run(
-        form(title="New user", fields=[{"kind": "text", "name": "name", "label": "Name"}])
-    ) == {"cancelled": True, "values": {}}
+    assert set(calls) == set(defaults), "every kind in the fixture is exercised"
+    for kind, call in calls.items():
+        assert asyncio.run(call()) == {"cancelled": True, **defaults[kind]}, kind
 
 
 def test_ttl_expired_reason_reaches_agent(companion: _FakeCompanion) -> None:
@@ -361,6 +417,55 @@ def test_poll_survives_dropped_connection(companion: _FakeCompanion) -> None:
     out = asyncio.run(confirm(title="Drop the orders table?"))
     assert out == {"cancelled": False, "confirmed": True}
     assert companion.render_posts == 1, "the blip must never re-POST /render"
+
+
+def test_poll_survives_a_refused_port_then_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """E-01 over a real socket: nothing listens on the port for a while (the
+    SSH reverse-tunnel restarting → ECONNREFUSED in microseconds), then the
+    companion is back. The dialog's answer must still arrive.
+
+    Time is scaled ×1/10 (backoff 0.1 → 0.8 s, budget 18 s) so the test runs
+    in about a second; a refusal window of 0.6 s already outlasts the old
+    "5 failures, one backoff apart" budget (0.4 s at this scale)."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()  # nothing listens here now: connections are refused
+
+    token_file = tmp_path / "token"
+    token_file.write_text(TOKEN)
+    monkeypatch.setattr(server, "ENDPOINT", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(server, "TOKEN_PATH", token_file)
+    monkeypatch.setattr(server, "ASYNC_POLL_RETRY_BACKOFF_S", 0.1)
+    monkeypatch.setattr(server, "ASYNC_POLL_MAX_BACKOFF_S", 0.8, raising=False)
+    monkeypatch.setattr(server, "POLL_OUTAGE_BUDGET_S", 18.0, raising=False)
+    monkeypatch.setattr(server, "ASYNC_POLL_MIN_INTERVAL_S", 0.0)
+
+    started: dict[str, _FakeCompanion] = {}
+
+    def come_back() -> None:
+        time.sleep(0.6)
+        srv = _FakeCompanion(("127.0.0.1", port))
+        srv.pending["r1"] = {"terminal": _TERMINAL["confirm"], "served_pending": True}
+        started["srv"] = srv
+        srv.serve_forever()
+
+    threading.Thread(target=come_back, daemon=True).start()
+
+    async def run() -> dict[str, Any]:
+        async with httpx.AsyncClient() as client:
+            return await server._poll_render(client, "r1", None)
+
+    try:
+        out = asyncio.run(run())
+    finally:
+        if "srv" in started:
+            started["srv"].shutdown()
+            started["srv"].server_close()
+    assert out == _TERMINAL["confirm"]
+    assert started["srv"].poll_gets >= 1
 
 
 def test_poll_gives_up_after_consecutive_failures(companion: _FakeCompanion) -> None:

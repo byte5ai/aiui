@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { _ } from "svelte-i18n";
   import { onMount } from "svelte";
@@ -65,7 +65,8 @@
   // Auto-cancel 5 seconds before the backend sweep so the dialog ends
   // cleanly on the frontend side first; the still-running `/render` HTTP
   // call then returns the cancellation to the agent. Without this lead, the
-  // backend's TTL_EXPIRED sweep races the user's last-second submit.
+  // backend's TTL_EXPIRED sweep races the user's last-second submit. The
+  // cancel carries `reason: "ttl_expired"`, same as the sweep's (D-02).
   const AUTO_CANCEL_LEAD_SECS = 5;
   // One IPC call per half-minute per open dialog, plus one whenever the
   // window becomes visible again.
@@ -121,9 +122,53 @@
     remainingSecs = left;
     yellowBanner = left <= YELLOW_LEAD_SECS;
     redBanner = left <= RED_LEAD_SECS;
-    if (left <= AUTO_CANCEL_LEAD_SECS) {
-      // Auto-cancel — same code path as the ESC key / Cancel button.
-      void handleCancel();
+    if (left <= AUTO_CANCEL_LEAD_SECS) void expireIfDue(ttlDialogId);
+  }
+
+  /** The dialog whose expiry is being double-checked with Rust right now —
+   *  ticks keep coming every second while that IPC call is in flight. */
+  let expiryCheckFor: string | null = null;
+
+  /**
+   * Review finding D-02. The local deadline only says the TTL is *probably*
+   * up; Rust's clock is the one that counts, so ask it before cancelling.
+   *
+   * The local deadline is wall-clock (`Date.now()`); Rust's `Instant` is
+   * monotonic and on macOS does not advance while the machine sleeps. Waking
+   * from a night with the lid closed, the overdue 1 s tick used to fire
+   * before the async resync could land and cancel a dialog the backend still
+   * had hours left on. Now an expired local deadline only triggers the
+   * check; the cancel happens when Rust agrees.
+   */
+  async function expireIfDue(dialogId: string) {
+    if (expiryCheckFor === dialogId) return;
+    expiryCheckFor = dialogId;
+    try {
+      let left: number | null;
+      try {
+        left = await invoke<number | null>("get_dialog_remaining", { id: dialogId });
+      } catch (e) {
+        // Cannot confirm. Leave it to the backend sweep, which expires the
+        // dialog itself a few seconds later with the same `ttl_expired`
+        // reason; the next tick tries again meanwhile.
+        console.error(`[aiui] get_dialog_remaining failed for ${dialogId}: ${e}`);
+        return;
+      }
+      if (ttlDialogId !== dialogId) return;
+      if (left === null) {
+        // The backend already resolved this dialog and owns window teardown.
+        clearTtlTimers();
+        return;
+      }
+      if (left > AUTO_CANCEL_LEAD_SECS) {
+        // The wall clock jumped (sleep, clock change): rebase, keep going.
+        deadlineMs = Date.now() + left * 1000;
+        tick();
+        return;
+      }
+      await handleExpire();
+    } finally {
+      if (expiryCheckFor === dialogId) expiryCheckFor = null;
     }
   }
 
@@ -215,7 +260,13 @@
     // "the dialog is open and the user hasn't answered". This listener is the
     // return half — without it the probe can only ever time out, which is why
     // the Rust side must never be repaired on its own.
-    const unPing = listen<string>("ui:ping", (e) => {
+    //
+    // Review finding A-08: on THIS window only. The global `listen` from
+    // `@tauri-apps/api/event` targets Any, and Tauri hands an event emitted
+    // to one window to every Any-listener in every webview — so whichever
+    // dialog answered first ponged for the window `/health` asked about, and
+    // a frozen newest window hid behind a healthy older one.
+    const unPing = getCurrentWebviewWindow().listen<string>("ui:ping", (e) => {
       void invoke("ui_pong", { id: e.payload }).catch((err) => {
         console.error(`[aiui] ui_pong failed: ${err}`);
       });
@@ -368,6 +419,30 @@
       await invoke("dialog_submit", { id, result });
     } catch (e) {
       console.error(`[aiui] dialog_submit failed for ${id}: ${e}`);
+    }
+    try {
+      await invoke("close_window");
+    } catch (e) {
+      console.error(`[aiui] close_window failed: ${e}`);
+    }
+  }
+
+  /**
+   * The TTL ran out (D-02). Not `handleCancel`: that is the user saying no —
+   * ESC, Cancel, the window's close button — and an agent is told to treat a
+   * reason-less cancel as exactly that, a decision not to re-ask. A dialog
+   * nobody answered in two hours is the opposite, so it says so.
+   */
+  async function handleExpire() {
+    clearTtlTimers();
+    if (current) {
+      const id = current.id;
+      current = null;
+      try {
+        await invoke("dialog_cancel", { id, reason: "ttl_expired" });
+      } catch (e) {
+        console.error(`[aiui] dialog_cancel (ttl_expired) failed for ${id}: ${e}`);
+      }
     }
     try {
       await invoke("close_window");

@@ -6,17 +6,16 @@ name: Dependency refresh (unlocked)
 # aiui-mcp` on a remote host resolves `mcp>=1.26.0,<2` fresh at spawn time,
 # so a breaking release reaches them before it reaches any PR.
 #
-# This job is the other half of that trade. Once a week it throws the
-# resolution away, takes the newest versions the ranges allow, and runs the
-# suite. A failure here means "the next `uvx` on a remote will break", days
-# before a release would have found out — and it fails a scheduled run,
-# never someone's PR.
+# This job is the other half of that trade. It throws the resolution away,
+# takes the newest versions the ranges allow, and runs the suite. A failure
+# here means "the next `uvx` on a remote will break" — before a release
+# would have found out — and it fails this run, never someone's PR.
+#
+# Manually dispatched only (F-08): scheduled workflows are not used in this
+# repo — they start runners with no change and no approval. Dispatch it
+# before a release, or alongside a batch CI run.
 
 on:
-  schedule:
-    # Mondays, 04:17 UTC — off the hour, so it is not queued behind the
-    # crowd of cron jobs that fire at :00.
-    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -25,7 +24,7 @@ permissions:
 jobs:
   unlocked:
     name: aiui-mcp against the newest resolvable deps
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -34,8 +33,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
-          # Exact, not `latest`: this job holds UV_PUBLISH_TOKEN, so the uv
-          # binary is part of the trusted set (matches ci.yml / release, #192).
+          # Exact, not `latest` (#192), matching ci.yml and the release. This
+          # job holds no secret (`contents: read`); the pin keeps it testing
+          # with the same uv the release publishes with.
           version: "0.12.17"
 
       - name: Re-resolve every dependency to its newest allowed version

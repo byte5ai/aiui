@@ -51,7 +51,7 @@ run() { # dir [version]
   rc=$?
 }
 
-check() { # name expected_exit dir [version]
+check() { # name expected_exit dir [version]   (env RELEASE_SHA passes through)
   local name="$1" expect="$2"
   shift 2
   run "$@"
@@ -133,6 +133,24 @@ check "a matching dispatched version passes" 0 "$TMP/dispatch" 9.9.9
 make_tree "$TMP/tagged" 9.9.9 9.9.9 "$TMP/origin-tagged"
 check "an already-released tag on origin is refused" 1 "$TMP/tagged" 9.9.9 \
   && expect_stderr "existing-tag message" "v9.9.9" "origin"
+
+# test_recovery_rerun_same_commit_passes (F-04) — a run that pushed the tag
+# and then failed must be re-dispatchable from the tagged commit; before this
+# case existed, the tag check refused every such re-run and the whole
+# "reuse the existing tag / release" branch of release-macos.yml was dead.
+TAGGED_SHA="$(git -C "$TMP/origin-tagged" log -1 --format=%H)"
+RELEASE_SHA="$TAGGED_SHA" check "a recovery re-run of the tagged commit passes" 0 "$TMP/tagged" 9.9.9
+RELEASE_SHA="0000000000000000000000000000000000000000" \
+  check "an existing tag at a different commit is still refused" 1 "$TMP/tagged" 9.9.9 \
+  && expect_stderr "foreign-tag message" "v9.9.9" "$TAGGED_SHA"
+
+# The same for an ANNOTATED tag, whose ref points at a tag object: the guard
+# must compare the peeled commit (`^{}`), not the tag object's own SHA.
+make_origin "$TMP/origin-annotated"
+git -C "$TMP/origin-annotated" "${GIT_ID[@]}" tag -a v9.9.9 -m "Release v9.9.9"
+ANNOTATED_SHA="$(git -C "$TMP/origin-annotated" log -1 --format=%H)"
+make_tree "$TMP/annotated" 9.9.9 9.9.9 "$TMP/origin-annotated"
+RELEASE_SHA="$ANNOTATED_SHA" check "a recovery re-run against an annotated tag passes" 0 "$TMP/annotated" 9.9.9
 
 # test_tag_probe_uses_ls_remote — a textual regression guard. Reintroducing
 # `git rev-parse` for the tag probe would reinstate a check that cannot fire

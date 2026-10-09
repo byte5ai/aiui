@@ -17,6 +17,8 @@
     token_path: string;
     http_port: number;
     claude_config_ok: boolean;
+    hosts_config_ok: boolean;
+    claude_desktop_installed: boolean;
     claude_code_config_ok: boolean;
     skill_installed: boolean;
     claude_desktop_running: boolean;
@@ -67,7 +69,13 @@
   let busy = $state(false);
   let log = $state<{ text: string; ok: boolean }[]>([]);
   let confirmUninstall = $state(false);
-  let uninstallDone = $state(false);
+  /** `uninstall_all` has run. A latch: nothing in this window un-sets it.
+   *  Every post-uninstall guard (poll, banner, wizard) keys on this, never on
+   *  whether the done-modal happens to be open — dismissing that modal by
+   *  its backdrop used to re-arm all three at once (review finding D-06). */
+  let uninstalled = $state(false);
+  /** Whether the uninstall done-modal is on screen. */
+  let showUninstallDone = $state(false);
   let demoCopied = $state(false);
   /** Both clipboard routes failed — the prompt is rendered inline in a
    *  read-only textarea instead, so step 3 of the wizard always has a way
@@ -127,7 +135,7 @@
    * (`docs/architecture/self-healing.md`).
    */
   function startPolling() {
-    if (timer !== undefined || uninstallDone) return;
+    if (timer !== undefined || uninstalled) return;
     timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
   }
 
@@ -143,7 +151,7 @@
   }
 
   function onWindowVisible() {
-    if (uninstallDone) return;
+    if (uninstalled) return;
     void refresh();
     startPolling();
   }
@@ -225,7 +233,8 @@
       const results = await invoke<StepResult[]>("uninstall_all");
       pushLog(results);
       confirmUninstall = false;
-      uninstallDone = true;
+      uninstalled = true;
+      showUninstallDone = true;
       // #208: uninstall deletes the token file and `first_run_done`. With
       // the poll still running behind the done-modal, the next tick's probe
       // failed on the token read and `welcome_pending` flipped back to
@@ -456,8 +465,8 @@
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
-          <span class="status-dot" class:ok={status.claude_config_ok}></span>
-          {#if status.claude_config_ok}
+          <span class="status-dot" class:ok={status.hosts_config_ok}></span>
+          {#if status.hosts_config_ok}
             {$_("app.status.connected", { values: { port: status.http_port } })}
           {:else}
             {$_("app.status.not_connected")}
@@ -469,7 +478,7 @@
             the very predicate that now reports it red. No point offering it
             while the app runs from a temporary location — the banner above
             names the only fix there. -->
-          {#if !status.claude_config_ok && !status.ephemeral_install}
+          {#if !status.hosts_config_ok && !status.ephemeral_install}
             <button class="header-action" onclick={repairClaudeConfig} disabled={busy}>
               {$_("settings.config.repair")}
             </button>
@@ -548,7 +557,7 @@
       flash the banner), and never after an uninstall — which deletes the
       token file the probe reads, so every post-uninstall sample reports
       dead while the server is still listening. -->
-    {#if !status.http_alive && !uninstallDone && failedProbes >= BANNER_MIN_CONSECUTIVE_FAILURES}
+    {#if !status.http_alive && !uninstalled && failedProbes >= BANNER_MIN_CONSECUTIVE_FAILURES}
       <section class="http-error">
         <strong>{$_("settings.http_error.title")}</strong>
         {#if status.http_error}
@@ -574,11 +583,11 @@
       </section>
     {/if}
 
-    <!-- `!uninstallDone` (#208): `uninstall_all` deletes `first_run_done`,
+    <!-- `!uninstalled` (#208): `uninstall_all` deletes `first_run_done`,
       so `welcome_pending` flips back to true the moment the user removes
       aiui — re-arming the onboarding wizard on a machine they are walking
       away from. -->
-    {#if status.welcome_pending && !uninstallDone}
+    {#if status.welcome_pending && !uninstalled}
       <!-- Welcome banner is a 3-step wizard on a single pane. Each step
         is its own visually-distinct row with a numbered marker, a title,
         a one-line body, and (for steps 2-3) a primary CTA button.
@@ -586,7 +595,9 @@
         avoids vertical bloat in the common case. Issue raised by tester
         2026-04-27: "viel zu scrollen … vielleicht wäre ein Wizard". -->
       {@const checks = [
-        { ok: status.claude_config_ok, key: "desktop" },
+        ...(status.claude_desktop_installed
+          ? [{ ok: status.claude_config_ok, key: "desktop" }]
+          : []),
         { ok: status.claude_code_config_ok, key: "code" },
         { ok: status.skill_installed, key: "skill" },
         { ok: !status.http_error, key: "http" },
@@ -834,14 +845,32 @@
   </main>
 {/if}
 
-{#if uninstallDone}
+<!-- Escape dismisses the uninstall done-modal, like its backdrop. -->
+<svelte:window
+  onkeydown={(e) => {
+    if (showUninstallDone && e.key === "Escape") showUninstallDone = false;
+  }}
+/>
+
+{#if showUninstallDone}
   <!-- Modal overlay confirming the cleanup ran and pointing the user at the
     Finder for the actual app removal. We deliberately do NOT auto-trash the
     .app — see RFC discussion: a running app moving its own bundle to Trash
     is fragile, and the user expectation set by the "Uninstall" button is
     "configuration removed", not "self-destruct". -->
-  <div class="modal-backdrop" role="presentation" onclick={() => (uninstallDone = false)}>
-    <div class="modal" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+  <!-- D-06: the backdrop only hides the modal; `uninstalled` stays set.
+       Only a click on the backdrop itself closes it — a check on the target
+       rather than `stopPropagation()` on the modal, which needed a click
+       handler (and a keyboard twin) on a non-interactive element. Escape
+       closes it too, see `<svelte:window>` below. -->
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) showUninstallDone = false;
+    }}
+  >
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
       <h2>{$_("settings.uninstall.done.title")}</h2>
       <!-- The uninstall-removal hint is OS-specific: drag to Trash on macOS,
         Apps & Features on Windows, etc. The backend reports `status.os` so

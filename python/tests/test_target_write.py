@@ -427,10 +427,22 @@ def test_substitute_preserves_non_ascii_bytes(tmp_path: Path, monkeypatch) -> No
     """A UTF-8 file round-trips byte-identical apart from the placeholder even
     when the host locale is not UTF-8. The old code read with the locale
     encoding and wrote back UTF-8, mangling every non-ASCII byte in a file the
-    user asked to touch on exactly one line."""
-    import locale
+    user asked to touch on exactly one line.
 
-    monkeypatch.setattr(locale, "getpreferredencoding", lambda *a, **k: "latin-1")
+    C-12: the locale is simulated at `Path.read_text` itself. Patching
+    `locale.getpreferredencoding` (the previous approach) does not reach the
+    encoding lookup on Python >= 3.11, so a read without `encoding=` passed the
+    test there anyway — the test could not fail for the bug it names. Here an
+    encoding-less read decodes as latin-1, exactly what a latin-1 host does.
+    """
+    real_read_text = Path.read_text
+    encodings: list[object] = []
+
+    def latin1_locale_read_text(self: Path, encoding=None, *args, **kwargs):
+        encodings.append(encoding)
+        return real_read_text(self, encoding or "latin-1", *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", latin1_locale_read_text)
     path = tmp_path / "conf"
     path.write_bytes("user=André\ntoken=__PAT__\n".encode())
     out = _write_local_target(
@@ -438,6 +450,7 @@ def test_substitute_preserves_non_ascii_bytes(tmp_path: Path, monkeypatch) -> No
     )
     assert out["written"], out
     assert path.read_bytes() == "user=André\ntoken=ghp_x\n".encode()
+    assert encodings == ["utf-8"], f"the read must name its encoding: {encodings}"
 
 
 def test_write_without_fchmod_does_not_crash(tmp_path: Path, monkeypatch) -> None:
@@ -452,9 +465,9 @@ def test_write_without_fchmod_does_not_crash(tmp_path: Path, monkeypatch) -> Non
 
 
 def test_malformed_target_returns_structured_error() -> None:
-    """`"target": "~/.github_tokens/byte5ai"` (a string, not an object) used to
+    """`"target": "~/.config/demo/token"` (a string, not an object) used to
     raise `AttributeError: 'str' object has no attribute 'get'`."""
-    out = _write_local_target("v", "not-a-dict")
+    out = _write_local_target("v", "~/.config/demo/token")
     assert out == {
         "written": False,
         "target": "",
@@ -557,3 +570,114 @@ def test_annotate_target_paths_stamps_the_destination(tmp_path: Path) -> None:
     assert spec["tabs"][0]["fields"][0]["target"]["resolved_path"] == str(real.resolve()), (
         "a symlinked target shows the file that really changes"
     )
+
+
+@pytest.mark.parametrize("result", [None, ["x"], "text"])
+def test_apply_target_writes_survives_a_non_object_result(tmp_path: Path, result: object) -> None:
+    """E-04: the user has already submitted when this runs. A companion that
+    answers `result: null` (or a list/string) used to abort the write
+    bookkeeping with `AttributeError: 'NoneType' object has no attribute
+    'setdefault'`. Every target field must still get an outcome, and nothing
+    is written for a value that never arrived."""
+    dest = tmp_path / "pat"
+    spec = {
+        "kind": "form",
+        "fields": [
+            {
+                "kind": "secret",
+                "name": "pat",
+                "target": {"mode": "create", "path": str(dest)},
+            }
+        ],
+    }
+    data = {"cancelled": False, "result": result}
+    _apply_target_writes(spec, data)
+    outcome = data["result"]["values"]["pat"]
+    assert outcome["written"] is False
+    assert "no value submitted" in outcome["error"]
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("overwrite", ["false", "true", 1, "no"])
+def test_create_overwrite_must_be_the_boolean_true(tmp_path: Path, overwrite: object) -> None:
+    """C-05: `"overwrite": "false"` is a non-empty string — truthy — and used
+    to clobber the user's existing file. Only the boolean `true` opts in; any
+    other type is refused before anything is touched (the companion now
+    rejects it up front as `invalid_spec`; this guards an older companion)."""
+    dest = tmp_path / "token"
+    dest.write_text("original")
+    out = _write_local_target(
+        "ghp_new", {"mode": "create", "path": str(dest), "overwrite": overwrite}
+    )
+    assert out["written"] is False, out
+    assert out.get("error")
+    assert dest.read_text() == "original", "the existing file must be untouched"
+
+
+def test_create_overwrite_true_still_clobbers(tmp_path: Path) -> None:
+    dest = tmp_path / "token"
+    dest.write_text("original")
+    out = _write_local_target("ghp_new", {"mode": "create", "path": str(dest), "overwrite": True})
+    assert out["written"] is True, out
+    assert dest.read_text() == "ghp_new"
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"), [("perm", 600), ("perm", 0o600), ("placeholder", 1), ("overwrite", "false")]
+)
+def test_mistyped_target_keys_are_refused(tmp_path: Path, key: str, bad: object) -> None:
+    """C-05: a numeric `perm` (600 read as octal "600" by accident, 384 not at
+    all) and a non-string `placeholder` are refused with a structured error,
+    the same rule the companion's validator applies."""
+    dest = tmp_path / "new-file"
+    target = {"mode": "create", "path": str(dest), key: bad}
+    out = _write_local_target("v", target)
+    assert out["written"] is False
+    assert f"target.{key}" in out["error"]
+    assert not dest.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_create_refuses_to_write_through_a_symlink(tmp_path: Path) -> None:
+    """C-04: `create` followed a final-component symlink, so a link planted at
+    the destination turned the write into one onto whatever it points at — a
+    shell rc, an ssh config — while the approval line named only the link.
+    Refused even with `overwrite: true`; same text as the Rust writer."""
+    victim = tmp_path / "bashrc"
+    victim.write_text("original")
+    link = tmp_path / "token"
+    link.symlink_to(victim)
+    out = _write_local_target("ghp_x", {"mode": "create", "path": str(link), "overwrite": True})
+    assert out["written"] is False, out
+    assert "create mode does not write through links" in out["error"]
+    assert victim.read_text() == "original", "the link target must be untouched"
+    assert link.is_symlink(), "the link itself is left alone too"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_resolved_path_is_mode_aware(tmp_path: Path) -> None:
+    """C-04: the approval line must name what the writer will touch — the link
+    target for `substitute` (which edits it), the link itself for `create`
+    (which refuses it rather than following)."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real = real_dir / "conf"
+    real.write_text("x")
+    link = tmp_path / "conf-link"
+    link.symlink_to(real)
+    spec = {
+        "kind": "form",
+        "fields": [
+            {"kind": "text", "name": "c", "target": {"mode": "create", "path": str(link)}},
+            {
+                "kind": "text",
+                "name": "s",
+                "target": {"mode": "substitute", "path": str(link), "placeholder": "x"},
+            },
+        ],
+    }
+    _annotate_target_paths(spec)
+    created = spec["fields"][0]["target"]["resolved_path"]
+    substituted = spec["fields"][1]["target"]["resolved_path"]
+    assert created == str(tmp_path.resolve() / "conf-link"), created
+    assert substituted == str(real.resolve()), substituted

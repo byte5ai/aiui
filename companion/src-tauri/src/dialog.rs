@@ -34,8 +34,12 @@ pub struct DialogRequest {
     pub session: Option<String>,
     /// Origin host of the caller, auto-injected by the remote Python bridge
     /// (its `hostname`) since the Mac can't distinguish remotes sharing
-    /// `:7777`. `None`/absent for local callers. Shown in the window chrome
-    /// alongside `session` (I8).
+    /// `:7777`. Shown in the window chrome alongside `session` (I8).
+    ///
+    /// `None` ONLY for a render that proved locality (`x-aiui-local-proof`,
+    /// review C-01): `/render` sets "unverified host" on any other render
+    /// that names no origin, and `write_dialog_targets` writes on this
+    /// machine only when this is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_origin: Option<String>,
 }
@@ -496,7 +500,16 @@ impl DialogState {
     /// does, so a deadline derived once at mount drifts in either direction
     /// (#207).
     pub fn remaining_secs(&self, id: &str) -> Option<u64> {
-        self.get_request(id).map(|r| r.remaining_secs)
+        // A-07: computed from the entry directly. Going through `get_request`
+        // deep-cloned the whole spec — inlined images included — under the
+        // registry lock, on the main thread, every 30 s per window, to read
+        // one integer.
+        let map = self.pending.lock().unwrap();
+        let entry = map.get(id)?;
+        Some(remaining_ttl_secs(
+            Duration::from_secs(entry.request.ttl_secs),
+            Instant::now().saturating_duration_since(entry.created_at),
+        ))
     }
 
     /// Registration instant of `id`. Test-only: it is the anchor the
@@ -518,14 +531,23 @@ impl DialogState {
         }
     }
 
+    /// A cancel with no reason — the agent-facing meaning is "the user said
+    /// no" (`docs/skill.md`). Use [`DialogState::cancel_with_reason`] for
+    /// every cancel the user did not make.
     pub fn cancel(&self, id: &str) {
+        self.cancel_with_reason(id, None);
+    }
+
+    /// Cancel with an explicit reason (`ttl_expired`, `abandoned`, …), so the
+    /// agent can tell a dialog that ended without an answer from a refusal.
+    pub fn cancel_with_reason(&self, id: &str, reason: Option<&str>) {
         let entry = self.pending.lock().unwrap().remove(id);
         if let Some(entry) = entry {
             let _ = entry.result_tx.send(DialogResult {
                 id: id.to_string(),
                 cancelled: true,
                 result: serde_json::Value::Null,
-                reason: None,
+                reason: reason.map(str::to_string),
             });
         }
     }
@@ -581,6 +603,21 @@ impl DialogState {
     /// pick, so consecutive probes would flap between windows and an RTT
     /// series would measure nothing in particular. `None` when nothing is
     /// pending. Issue #179.
+    /// The newest dialog registered at least `min_age` before `now` — one
+    /// whose window has had time to load and mount its `ui:ping` listener
+    /// (review A-08: probing a just-built window reported a frozen WebView
+    /// that was merely still loading — a false 503 for every other session).
+    pub fn newest_settled_id(&self, min_age: Duration, now: Instant) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| now.saturating_duration_since(e.created_at) >= min_age)
+            .max_by_key(|(_, e)| e.created_at)
+            .map(|(id, _)| id.clone())
+    }
+
+    #[cfg(test)]
     pub fn newest_id(&self) -> Option<String> {
         self.pending
             .lock()
@@ -612,6 +649,20 @@ impl DialogState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_health_probe_skips_a_dialog_that_is_still_mounting() {
+        let ds = DialogState::new();
+        let (first, _rx1) = ds.register_dialog(serde_json::json!({"kind":"confirm"}), None, None, 60);
+        let t0 = ds.created_at(&first).unwrap();
+        let (second, _rx2) = ds.register_dialog(serde_json::json!({"kind":"confirm"}), None, None, 60);
+        let grace = Duration::from_secs(3);
+        // Right after the second registers, nothing is settled yet…
+        assert_eq!(ds.newest_settled_id(grace, t0), None);
+        // …and once both are old enough, the newest one is probed.
+        let later = ds.created_at(&second).unwrap() + grace;
+        assert_eq!(ds.newest_settled_id(grace, later), Some(second));
+    }
 
     fn reg(s: &DialogState) -> (String, oneshot::Receiver<DialogResult>) {
         s.register_dialog(serde_json::json!({"kind": "confirm", "title": "?"}), None, None, 0)

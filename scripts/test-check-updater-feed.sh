@@ -37,16 +37,44 @@ json.dump(d, open(sys.argv[2], 'w'))
 " "$1" "$2"
 }
 
-cat > "$TMP/good.json" <<'JSON'
+# F-19: signatures are real-shaped minisign files carrying the key ID of the
+# pubkey in tauri.conf.json, so the key-ID check is exercised.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+sig_for() { # key-id-hex
+  python3 - "$1" <<'PYEOF'
+import base64, sys
+key_id = bytes.fromhex(sys.argv[1])
+line = base64.b64encode(b"ED" + key_id + bytes(64)).decode()
+text = (
+    "untrusted comment: signature from tauri secret key\n"
+    + line
+    + "\ntrusted comment: timestamp:0\tfile:x\n"
+    + base64.b64encode(bytes(64)).decode()
+    + "\n"
+)
+print(base64.b64encode(text.encode()).decode())
+PYEOF
+}
+KEY_ID="$(python3 - "$ROOT/companion/src-tauri/tauri.conf.json" <<'PYEOF'
+import base64, json, sys
+pub = json.load(open(sys.argv[1]))["plugins"]["updater"]["pubkey"]
+line = base64.b64decode(pub).decode().strip().split("\n")[1]
+print(base64.b64decode(line)[2:10].hex())
+PYEOF
+)"
+SIG="$(sig_for "$KEY_ID")"
+OTHER_SIG="$(sig_for 0000000000000000)"
+
+cat > "$TMP/good.json" <<JSON
 {
   "version": "0.11.0",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVk...",
+      "signature": "$SIG",
       "url": "https://github.com/byte5ai/aiui/releases/download/v0.11.0/aiui-0.11.0-updater-arm64.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVk...",
+      "signature": "$SIG",
       "url": "https://github.com/byte5ai/aiui/releases/download/v0.11.0/aiui_0.11.0_x64-setup.exe"
     }
   }
@@ -92,6 +120,15 @@ check "wrong argument count exits 2" 2 "$TMP/good.json" v0.11.0
 mutate "$TMP/good.json" "$TMP/extra.json" \
   "d['platforms']['linux-x86_64'] = {'signature': 's', 'url': 'https://github.com/byte5ai/aiui/releases/download/v0.11.0/x'}"
 check "an unknown platform is a note, not a failure" 0 "$TMP/extra.json" v0.11.0 0.11.0
+
+# F-19: a signature from a key the app does not trust (a rotated secret).
+mutate "$TMP/good.json" "$TMP/wrongkey.json" "d['platforms']['windows-x86_64']['signature'] = '$OTHER_SIG'"
+check "a signature by another key is refused" 1 "$TMP/wrongkey.json" v0.11.0 0.11.0
+mutate "$TMP/good.json" "$TMP/notsig.json" "d['platforms']['darwin-aarch64']['signature'] = 'bm90IGEgc2lnbmF0dXJl'"
+check "a non-minisign signature is refused" 1 "$TMP/notsig.json" v0.11.0 0.11.0
+# F-19: the right path on the wrong host.
+mutate "$TMP/good.json" "$TMP/wronghost.json" "d['platforms']['darwin-aarch64']['url'] = 'https://elsewhere.example/releases/download/v0.11.0/x.tar.gz'"
+check "a url on another host is refused" 1 "$TMP/wronghost.json" v0.11.0 0.11.0
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -32,8 +32,9 @@ function tr(key: string, values?: Record<string, string | number>): string {
  * Checks the configured endpoint for a new version.
  *
  * Two modes:
- *  • `silent: true` (auto-triggered on mount and window-focus from
- *    `setup.ts` and `dialog.ts`). No prompts, no surfaced UI, and — since
+ *  • `silent: true` (auto-triggered on mount and window-focus of the
+ *    setup window, via `lifecycle.ts`; dialog windows no longer run update
+ *    checks since #195). No prompts, no surfaced UI, and — since
  *    v0.4.44 — **no install**: it records the available version via
  *    `set_pending_update` and returns. The settings banner and the system
  *    notification from the headless Rust check are what tell the user.
@@ -54,7 +55,7 @@ function tr(key: string, values?: Record<string, string | number>): string {
 export async function checkForUpdates(
   opts: { silent?: boolean } = {},
 ): Promise<UpdateOutcome> {
-  // The dialog windows call this early in mount, so the locale may not be
+  // The setup window calls this early in mount, so the locale may not be
   // resolved yet — and every string below lands in a *native OS modal*,
   // the most prominent text the product shows (#197).
   // Never let a locale hiccup take the update path down with it — a
@@ -165,11 +166,41 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
       return { ok: true };
     }
 
-    await update.downloadAndInstall();
+    // Download and install are separate steps (Codex review of D-08): on
+    // Windows `install()` launches the installer and exits this process from
+    // inside the call, so a check placed after `downloadAndInstall()` could
+    // never run there. The download (signature-verified by the plugin) can
+    // take tens of seconds, and an agent can open a dialog in that time —
+    // installing then would destroy it with whatever the user has typed, the
+    // exact I5 violation the first check exists to prevent. So ask again
+    // between the two, and if a dialog is pending, install nothing: the
+    // banner stays, and "Install" again once the dialog is done finishes it.
+    await update.download();
+    if (!(await updateIsSafeToInstall())) {
+      await message(tr("settings.updates.downloaded_install_later", { version: update.version }), {
+        title: "aiui",
+        kind: "info",
+      });
+      return { ok: true };
+    }
+    await update.install();
+
+    // On macOS/Linux `install()` returns — after extracting the bundle and
+    // possibly waiting for an admin prompt, which is again time an agent can
+    // open a dialog in. Relaunching then would destroy it (Codex review), so
+    // check once more before latching the exit: the new version is already
+    // on disk and takes effect on the next start either way.
+    if (!(await updateIsSafeToInstall())) {
+      await message(tr("settings.updates.installed_restart_later", { version: update.version }), {
+        title: "aiui",
+        kind: "info",
+      });
+      return { ok: true };
+    }
 
     // Everything below runs on macOS/Linux ONLY. On Windows
     // `tauri-plugin-updater` hands the NSIS installer to `ShellExecuteW` and
-    // then calls `std::process::exit(0)` *inside* the await above, so this
+    // then calls `std::process::exit(0)` *inside* `install()` above, so this
     // process is already gone before it can run. The Windows equivalents
     // (latching the exit authority, sweeping the ssh-NTR children) have no
     // pre-exit hook on the pinned tauri-plugin-updater to attach to, so they
@@ -198,6 +229,11 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
       kind: "error",
     });
     return { ok: false, error };
+  } finally {
+    // The downloaded archive lives in a Rust-side resource until closed
+    // (Codex review): every deferred or failed attempt used to leave one
+    // behind. After a successful relaunch the process is gone anyway.
+    await update.close().catch(() => {});
   }
 }
 

@@ -27,64 +27,43 @@ import pytest
 SETUP_RS = Path(__file__).resolve().parents[2] / "companion" / "src-tauri" / "src" / "setup.rs"
 
 
+def _rust_const(name: str) -> str:
+    """A raw-string constant, read verbatim out of `setup.rs`.
+
+    The test runs the exact text the companion ships — never a hand-copied
+    twin. The copy this file used to carry could drift from `setup.rs`
+    without any test noticing (review B1-13).
+    """
+    if not SETUP_RS.exists():  # installed wheel, no repo checkout
+        pytest.skip("setup.rs not available outside the repo")
+    m = re.search(rf'const {name}: &str = r#"(.*?)"#;', SETUP_RS.read_text(encoding="utf-8"), re.S)
+    assert m, f"{name} not found in setup.rs — did the constant get renamed?"
+    return m.group(1)
+
+
 def patch_body(uvx_path: str | None = None, version: str = "9.9.9") -> str:
-    """The patch script as `setup.rs` renders it, for a given probe result.
+    """The patch script body as `render_remote_patch_script` fills it in.
 
     `uvx_path=None` is what the startup resync and the Resync button pass
     when no absolute path is known for the host — the case that used to
     downgrade a working pin (#184).
     """
-    cmd_lit = json.dumps(uvx_path if uvx_path else "uvx")
-    known = "True" if uvx_path else "False"
-    pkg_lit = json.dumps(f"aiui-mcp=={version}")
-    return f"""
-servers = data.get("mcpServers") or {{}}
-existing = servers.get("aiui") or {{}}
-current_cmd = existing.get("command") if isinstance(existing, dict) else None
-
-want_cmd = {cmd_lit}
-if not {known}:
-    if isinstance(current_cmd, str) and current_cmd.startswith("/") \\
-            and current_cmd.rstrip("/").endswith("/uvx"):
-        want_cmd = current_cmd
-
-if (current_cmd == want_cmd and existing.get("args") == [{pkg_lit}]):
-    print("ok:current")
-    raise SystemExit(0)
-backup()
-entry = dict(existing) if isinstance(existing, dict) else {{}}
-entry["command"] = want_cmd
-entry["args"] = [{pkg_lit}]
-servers["aiui"] = entry
-data["mcpServers"] = servers
-save(data)
-print("ok:patched")
-"""
+    return (
+        _rust_const("REMOTE_PATCH_BODY")
+        .replace("__UVX_COMMAND__", json.dumps(uvx_path if uvx_path else "uvx"))
+        .replace("__COMMAND_IS_KNOWN__", "True" if uvx_path else "False")
+        .replace("__PKG_SPEC__", json.dumps(f"aiui-mcp=={version}"))
+    )
 
 
-PATCH_BODY = patch_body()
-
-REMOVE_BODY = """
-if not p.exists():
-    print("ok")
-else:
-    servers = data.get("mcpServers") or {}
-    if "aiui" in servers:
-        backup()
-        servers.pop("aiui", None)
-        data["mcpServers"] = servers
-        save(data)
-    print("ok")
-"""
+# Empty outside a repo checkout; every test then skips via `_preamble()`.
+PATCH_BODY = patch_body() if SETUP_RS.exists() else ""
+REMOVE_BODY = _rust_const("REMOTE_REMOVE_BODY") if SETUP_RS.exists() else ""
 
 
 def _preamble() -> str:
     """The `REMOTE_JSON_PREAMBLE` constant, read from the Rust source."""
-    if not SETUP_RS.exists():  # installed wheel, no repo checkout
-        pytest.skip("setup.rs not available outside the repo")
-    m = re.search(r'const REMOTE_JSON_PREAMBLE: &str = r#"(.*?)"#;', SETUP_RS.read_text(), re.S)
-    assert m, "REMOTE_JSON_PREAMBLE not found — did the constant get renamed?"
-    return m.group(1)
+    return _rust_const("REMOTE_JSON_PREAMBLE")
 
 
 def _run(body: str, home: Path) -> subprocess.CompletedProcess[str]:
@@ -118,7 +97,9 @@ def test_malformed_config_is_left_byte_identical(body: str, tmp_path: Any) -> No
     _cfg(tmp_path).write_text(original)
     r = _run(body, tmp_path)
     assert r.stdout.strip() == "err:malformed", r.stderr
-    assert r.returncode == 2
+    # Exit 0: the marker IS the verdict. A non-zero exit made the companion
+    # report a bare "failed" before it ever read the marker (B1-03).
+    assert r.returncode == 0
     assert _cfg(tmp_path).read_text() == original, "file must not be touched"
 
 
@@ -177,6 +158,65 @@ def test_absent_config_is_handled_by_both(tmp_path: Any) -> None:
     r = _run(PATCH_BODY, tmp_path)
     assert r.stdout.strip() == "ok:patched", r.stderr
     assert _cfg(tmp_path).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+@pytest.mark.parametrize("body", [PATCH_BODY, REMOVE_BODY], ids=["patch", "remove"])
+def test_save_keeps_a_0600_config_at_0600(body: str, tmp_path: Any) -> None:
+    """B1-02: the rewrite must not widen the file's mode. A fresh temp file
+    plus `os.replace` used to land at the umask default (0644), so every
+    release's resync made a remote's 0600 `~/.claude.json` — MCP server env
+    keys, project history — readable by every local user."""
+    _cfg(tmp_path).write_text(json.dumps(HEALTHY, indent=2))
+    os.chmod(_cfg(tmp_path), 0o600)
+    old_umask = os.umask(0o022)
+    try:
+        r = _run(body, tmp_path)
+    finally:
+        os.umask(old_umask)
+    assert r.stdout.strip() in {"ok", "ok:patched"}, r.stderr
+    assert (_cfg(tmp_path).stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_a_new_config_is_created_0600(tmp_path: Any) -> None:
+    old_umask = os.umask(0o022)
+    try:
+        r = _run(PATCH_BODY, tmp_path)
+    finally:
+        os.umask(old_umask)
+    assert r.stdout.strip() == "ok:patched", r.stderr
+    assert (_cfg(tmp_path).stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks")
+@pytest.mark.parametrize("body", [PATCH_BODY, REMOVE_BODY], ids=["patch", "remove"])
+def test_save_writes_through_a_symlinked_config(body: str, tmp_path: Any) -> None:
+    """B1-02: a dotfiles-managed `~/.claude.json` symlink must stay a symlink;
+    `os.replace` on the link path used to swap it for a regular file."""
+    real = tmp_path / "dotfiles" / "claude.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps(HEALTHY, indent=2))
+    os.chmod(real, 0o600)
+    _cfg(tmp_path).symlink_to(real)
+    r = _run(body, tmp_path)
+    assert r.stdout.strip() in {"ok", "ok:patched"}, r.stderr
+    assert _cfg(tmp_path).is_symlink(), "the link itself was replaced"
+    assert (real.stat().st_mode & 0o777) == 0o600
+    d = json.loads(real.read_text())
+    assert d["mcpServers"]["other"]["command"] == "keep-me"
+
+
+def test_backup_pruning_spares_user_backups(tmp_path: Any) -> None:
+    """Only `<name>.bak.<millis>` files are aiui's to prune (B1-09)."""
+    manual = tmp_path / ".claude.json.bak.before-upgrade"
+    manual.write_text("{}")
+    for i in range(9):
+        d = json.loads(json.dumps(HEALTHY))
+        d["mcpServers"]["aiui"]["args"] = [f"aiui-mcp==0.{i}.0"]
+        _cfg(tmp_path).write_text(json.dumps(d, indent=2))
+        _run(PATCH_BODY, tmp_path)
+    assert manual.exists(), "a user's own backup was deleted"
 
 
 def test_no_temp_file_is_left_behind(tmp_path: Any) -> None:

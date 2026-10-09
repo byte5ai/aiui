@@ -48,6 +48,8 @@ function statusReport(over: StatusOverrides = {}) {
     token_path: "/Users/u/.config/aiui/token",
     http_port: 7777,
     claude_config_ok: true,
+    hosts_config_ok: true,
+    claude_desktop_installed: true,
     claude_code_config_ok: true,
     skill_installed: true,
     claude_desktop_running: true,
@@ -252,12 +254,66 @@ describe("the health banner", () => {
     expect(container.querySelector(".http-error")).toBeNull();
     expect(container.querySelector(".welcome")).toBeNull();
   });
+
+  // D-06: the test above never dismissed the done-modal, and dismissing it
+  // by its backdrop — the repro in #208 — cleared the very flag every guard
+  // keyed on: wizard back at once, poll and red banner back on next focus.
+  it("stays uninstalled once the done-modal is dismissed by its backdrop", async () => {
+    const { getByText, container } = await mounted({ welcome_pending: true });
+
+    await fireEvent.click(getByText("Uninstall"));
+    await fireEvent.click(getByText("Remove everything"));
+    await settle();
+    const backdrop = container.querySelector(".modal-backdrop");
+    expect(backdrop).not.toBeNull();
+
+    await fireEvent.click(backdrop!);
+    await settle();
+    expect(container.querySelector(".modal-backdrop")).toBeNull();
+
+    // Every way the window can come back into view.
+    const before = statusCalls();
+    setHidden(true);
+    setHidden(false);
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+    eventListeners.get("setup:visibility")?.({ payload: true });
+    await settle();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(statusCalls()).toBe(before);
+    expect(container.querySelector(".welcome")).toBeNull();
+    expect(container.querySelector(".http-error")).toBeNull();
+  });
+
+  it("lets Escape dismiss the done-modal", async () => {
+    const { getByText, container } = await mounted();
+    await fireEvent.click(getByText("Uninstall"));
+    await fireEvent.click(getByText("Remove everything"));
+    await settle();
+    expect(container.querySelector(".modal-backdrop")).not.toBeNull();
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await settle();
+    expect(container.querySelector(".modal-backdrop")).toBeNull();
+  });
+
+  it("keeps the modal open when the click lands inside it", async () => {
+    const { getByText, container } = await mounted();
+    await fireEvent.click(getByText("Uninstall"));
+    await fireEvent.click(getByText("Remove everything"));
+    await settle();
+
+    await fireEvent.click(container.querySelector(".modal h2")!);
+    await settle();
+    expect(container.querySelector(".modal-backdrop")).not.toBeNull();
+  });
 });
 
 describe("removing a remote host", () => {
   const withHost = {
-    remotes: ["devhost"],
-    tunnels: { devhost: { state: "connected" } },
+    remotes: ["example-host"],
+    tunnels: { "example-host": { state: "connected" } },
   };
 
   it("takes two clicks, and Back cancels", async () => {
@@ -266,11 +322,11 @@ describe("removing a remote host", () => {
     await fireEvent.click(getByText("Remove"));
     await settle();
     expect(invoke.mock.calls.some((c) => c[0] === "remove_remote")).toBe(false);
-    expect(queryByText(/Really remove devhost/)).not.toBeNull();
+    expect(queryByText(/Really remove example-host/)).not.toBeNull();
 
     await fireEvent.click(getByText("Back"));
     await settle();
-    expect(queryByText(/Really remove devhost/)).toBeNull();
+    expect(queryByText(/Really remove example-host/)).toBeNull();
     expect(invoke.mock.calls.some((c) => c[0] === "remove_remote")).toBe(false);
 
     await fireEvent.click(getByText("Remove"));
@@ -280,7 +336,7 @@ describe("removing a remote host", () => {
 
     const removals = invoke.mock.calls.filter((c) => c[0] === "remove_remote");
     expect(removals).toHaveLength(1);
-    expect(removals[0][1]).toEqual({ hostAlias: "devhost" });
+    expect(removals[0][1]).toEqual({ hostAlias: "example-host" });
   });
 });
 

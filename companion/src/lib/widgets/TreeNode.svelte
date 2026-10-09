@@ -58,7 +58,8 @@
     </button>
   </div>
   {#if hasChildren && isExpanded}
-    {#each item.children ?? [] as child (child.value)}
+    <!-- D-05 / A-02: by position — a repeated `value` must not blank the window. -->
+    {#each item.children ?? [] as child, i (i)}
       <Self
         item={child}
         depth={depth + 1}

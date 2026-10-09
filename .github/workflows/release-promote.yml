@@ -1,0 +1,67 @@
+# Promote a validate-first pre-release to a full release (#191 / F-05).
+#
+# `release-macos.yml -f prerelease=true -f publish-pypi=false` produces a
+# pre-release WITHOUT the `aiui-mcp` artifact on PyPI. Promoting that with a
+# bare `gh release edit --prerelease=false` would serve it on
+# `releases/latest`, and every companion that updates would rewrite each
+# registered remote to `aiui-mcp==<version>` — a version that does not
+# exist, so every remote loses all aiui tools.
+#
+# This workflow is the only supported promote path: it refuses unless the
+# bridge for exactly that version resolves on PyPI and the release carries
+# both platforms' feed entries.
+#
+# Usage: gh workflow run release-promote.yml -f tag=vX.Y.Z --repo byte5ai/aiui
+
+name: release-promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Pre-release tag to promote (e.g. v0.12.0). Refused unless aiui-mcp <version> is on PyPI."
+        required: true
+        type: string
+
+permissions:
+  contents: write # gh release edit
+
+concurrency:
+  group: release-promote-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Promote only with the bridge on PyPI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "tag '$TAG' is not of the form vX.Y.Z"; exit 1; }
+          VERSION="${TAG#v}"
+          STATE="$(gh release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
+          [ "$STATE" = "false true" ] \
+            || { echo "$TAG is not a published pre-release (isDraft isPrerelease = $STATE)"; exit 1; }
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/aiui-mcp/${VERSION}/json" || echo 000)"
+          [ "$CODE" = "200" ] || {
+            echo "aiui-mcp ${VERSION} is not on PyPI (HTTP $CODE). Publish it first —"
+            echo "a promoted release would pin every remote to a version that does not exist."
+            exit 1
+          }
+          rm -rf feed && mkdir feed
+          gh release download "$TAG" --repo "$REPO" --pattern latest.json --dir feed
+          python3 - feed/latest.json <<'PYEOF'
+          import json, sys
+          plat = json.load(open(sys.argv[1])).get("platforms", {})
+          missing = {"darwin-aarch64", "windows-x86_64"} - set(plat)
+          if missing:
+              sys.exit(f"latest.json lacks {sorted(missing)} — refusing to promote a half feed")
+          PYEOF
+          gh release edit "$TAG" --repo "$REPO" --prerelease=false --latest
+          echo "promoted $TAG"
