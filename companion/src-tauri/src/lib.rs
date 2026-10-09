@@ -2351,7 +2351,7 @@ pub fn run() {
     // default-deny gate so those, and only those, Tauri-initiated terminations
     // are honoured while Claude Desktop is alive.
     let exit_authority = Arc::new(lifetime::ExitAuthority::new());
-    let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port);
+    let tunnel_mgr = tunnel::TunnelManager::new(cfg.http_port, &cfg.token);
     // Shared cell that records a fatal HTTP-server bind/serve failure (e.g.
     // port 7777 held by another process). Read by the `status` command and
     // surfaced as a banner in the Settings UI — without it, a stale

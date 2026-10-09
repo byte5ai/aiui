@@ -1685,7 +1685,13 @@ echo "STAGE:OK"
         if s.len() <= truncate_at {
             s.to_string()
         } else {
-            format!("{}\n... (truncated, {} bytes total)", &s[..truncate_at], s.len())
+            // On a char boundary: a byte cut inside a multi-byte character
+            // (a UTF-8 login banner) panicked here (B1-10).
+            let mut end = truncate_at;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}\n... (truncated, {} bytes total)", &s[..end], s.len())
         }
     };
     let (msg, hint) = match exit {

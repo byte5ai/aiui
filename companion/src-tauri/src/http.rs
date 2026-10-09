@@ -495,10 +495,46 @@ async fn ping() -> &'static str {
 /// that produced the 2026-05-04 connection-reset incident — two
 /// companions, both with the user's token, indistinguishable from
 /// `aiui: true` alone).
+///
+/// Review B1-01: a caller that wants to know whether the listener holds the
+/// token must not have to SEND the token to find out. The remote end of a
+/// reverse tunnel is a first-come loopback port on a possibly shared host; a
+/// co-tenant squatting it used to receive `Authorization: Bearer <token>` on
+/// every probe cycle. With `?nonce=<hex>` the probe needs no credentials and
+/// answers with `mac = HMAC-SHA256(token, "aiui-probe-v1|nonce|pid|build_sha")`
+/// ([`probe_mac`]); the caller, who knows the token, verifies it locally. A
+/// squatter can neither answer the challenge nor learn anything from it.
+/// Without a nonce the endpoint keeps its old, authenticated contract.
+#[derive(Deserialize)]
+struct ProbeQuery {
+    nonce: Option<String>,
+}
+
 async fn probe(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<ProbeQuery>,
 ) -> impl IntoResponse {
+    let pid = std::process::id();
+    let build_sha = env!("AIUI_GIT_SHA");
+    if let Some(nonce) = q.nonce.as_deref() {
+        if !is_probe_nonce(nonce) || state.cfg.token.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "bad_nonce"})),
+            )
+                .into_response();
+        }
+        return Json(serde_json::json!({
+            "aiui": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "wire_version": WIRE_VERSION,
+            "pid": pid,
+            "build_sha": build_sha,
+            "mac": probe_mac(&state.cfg.token, nonce, pid, build_sha),
+        }))
+        .into_response();
+    }
     if !auth_ok(&headers, &state.cfg.token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -510,10 +546,48 @@ async fn probe(
         "aiui": true,
         "version": env!("CARGO_PKG_VERSION"),
         "wire_version": WIRE_VERSION,
-        "pid": std::process::id(),
-        "build_sha": env!("AIUI_GIT_SHA"),
+        "pid": pid,
+        "build_sha": build_sha,
     }))
     .into_response()
+}
+
+/// A challenge nonce: 32–128 lowercase hex characters. Bounded so the MAC
+/// input stays small, hex so it is safe to splice into a remote shell URL.
+pub(crate) fn is_probe_nonce(nonce: &str) -> bool {
+    (32..=128).contains(&nonce.len())
+        && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `HMAC-SHA256(token, "aiui-probe-v1|<nonce>|<pid>|<build_sha>")`, hex. Binds
+/// the answer to the challenge and to the identity fields the tunnel manager
+/// compares, so neither can be replayed or swapped. The Python bridge
+/// computes the same value with `hmac.new(token, msg, sha256)`.
+pub(crate) fn probe_mac(token: &str, nonce: &str, pid: u32, build_sha: &str) -> String {
+    let msg = format!("aiui-probe-v1|{nonce}|{pid}|{build_sha}");
+    hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
+}
+
+/// RFC 2104 HMAC over SHA-256, written out rather than pulling in a crate:
+/// `sha2` is already in the tree via Tauri.
+pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha256::new().chain_update(ipad).chain_update(msg).finalize();
+    let outer = Sha256::new().chain_update(opad).chain_update(inner).finalize();
+    hex::encode(outer)
 }
 
 /// A redacted, loggable description of a render spec.
@@ -574,7 +648,7 @@ fn spec_summary(spec: &serde_json::Value) -> String {
 /// the work independent of *where* the first difference is. Lengths are
 /// compared first and deliberately: a length mismatch is not secret, and
 /// leaking it is unavoidable in any fixed-work comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -3421,6 +3495,34 @@ mod auth_tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer ".parse().unwrap());
         assert!(!auth_ok(&h, ""));
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        // RFC 4231 test case 2 — the probe MAC is only as good as this.
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Test case 6: a key longer than the block size is hashed first.
+        assert_eq!(
+            hmac_sha256_hex(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn probe_nonce_shape_is_bounded_hex() {
+        assert!(is_probe_nonce(&"a1".repeat(16)));
+        assert!(is_probe_nonce(&"0".repeat(128)));
+        assert!(!is_probe_nonce(&"0".repeat(31)), "too short");
+        assert!(!is_probe_nonce(&"0".repeat(129)), "too long");
+        assert!(!is_probe_nonce(&format!("{}G", "0".repeat(40))), "not hex");
+        assert!(!is_probe_nonce(&"A".repeat(40)), "uppercase is not ours");
+        assert!(!is_probe_nonce(&format!("{}';rm", "0".repeat(40))), "shell metachar");
     }
 
     #[test]

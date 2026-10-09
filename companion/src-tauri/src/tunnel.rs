@@ -46,13 +46,17 @@ struct TunnelEntry {
 pub struct TunnelManager {
     entries: Mutex<HashMap<String, TunnelEntry>>,
     port: u16,
+    /// Our API token — used only to VERIFY a shared-forward probe's answer,
+    /// never sent anywhere (review B1-01).
+    token: Arc<str>,
 }
 
 impl TunnelManager {
-    pub fn new(port: u16) -> Arc<Self> {
+    pub fn new(port: u16, token: &str) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             port,
+            token: Arc::from(token),
         })
     }
 
@@ -83,8 +87,9 @@ impl TunnelManager {
         drop(entries);
 
         let port = self.port;
+        let token = self.token.clone();
         tokio::spawn(async move {
-            run_tunnel(host, port, cancel_rx, status).await;
+            run_tunnel(host, port, token, cancel_rx, status).await;
         });
     }
 
@@ -147,42 +152,36 @@ const SHARED_FORWARD_POLL_SECS: u64 = 30;
 /// to decide.
 /// The shell command the probe runs on the remote.
 ///
-/// #187: the token is fed to curl over STDIN, not as an argument. It used
-/// to be interpolated into `-H "Authorization: Bearer $T"`, which the
-/// remote shell expanded before exec — so the live API token sat in curl's
-/// argv, visible in `ps` to every user on that host, once per poll (every
-/// 30 s in shared-forward mode). Whoever read it could render dialogs on
-/// the user's desktop through the tunnel. `curl -H @-` reads headers from
-/// stdin, so the secret never becomes an argv element of any process.
+/// Review B1-01: the probe no longer touches the token at all. It used to
+/// read `~/.config/aiui/token` and send it as a bearer header to whatever
+/// listened on the remote port — and the probe runs exactly when our own
+/// forward is DOWN (after every `ssh -NTR` death, then every 30 s in shared
+/// mode), so a co-tenant squatting the port collected the token on every
+/// cycle. Now the companion sends a fresh random nonce and verifies the
+/// answer's HMAC itself ([`probe_response_is_self`]); nothing secret leaves
+/// the Mac. (#187's argv concern is moot for the same reason.)
 ///
-/// The heredoc delimiter is deliberately UNQUOTED so the remote shell
-/// expands `$T`. Not `printf … | curl -H @-`: where printf is an external
-/// binary rather than a builtin, that just moves the token into *its* argv.
-/// Not the environment either — `/proc/<pid>/environ` is readable by the
-/// same set of users as `cmdline`.
-///
-/// `-f` makes curl fail on 4xx/5xx (so a 401 reads as not-shared) and
-/// `-m 3` caps its time. The missing-token case gets its own exit code so
-/// the classifier can tell it apart from a real answer.
+/// `nonce` is lowercase hex generated here, so it is safe in the URL. `-f`
+/// makes curl fail on 4xx/5xx (a foreign service, or an older aiui that does
+/// not know the challenge, reads as not-shared) and `-m 3` caps its time.
 ///
 /// A function rather than an inline `format!` so the tests exercise the
-/// string that actually ships. A malformed heredoc would break the probe
-/// on every remote at once, and Rust's line continuations make the layout
-/// easy to get wrong — a test against a re-typed copy would stay green
-/// through exactly that mistake.
-fn probe_command(port: u16) -> String {
-    let url = format!("http://localhost:{port}/probe");
-    format!(
-        "T=$(cat ~/.config/aiui/token 2>/dev/null); \
-         [ -n \"$T\" ] || exit {NO_TOKEN_EXIT}; \
-         curl -sS -f -m 3 -H @- {url} <<AIUI_HDR\n\
-         Authorization: Bearer $T\n\
-         AIUI_HDR\n"
-    )
+/// string that actually ships.
+fn probe_command(port: u16, nonce: &str) -> String {
+    format!("curl -sS -f -m 3 'http://localhost:{port}/probe?nonce={nonce}'")
 }
 
-async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
-    let cmd = probe_command(port);
+/// A fresh challenge nonce: 32 random bytes as 64 hex characters.
+fn new_probe_nonce() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+async fn probe_remote_shared_forward(host: &str, port: u16, token: &str) -> Option<bool> {
+    let nonce = new_probe_nonce();
+    let cmd = probe_command(port, &nonce);
     let fut = no_window_tokio(
         Command::new("ssh")
             .args([
@@ -219,7 +218,7 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
     match out {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
-            let verdict = classify_probe_exit(o.status.code(), &stdout);
+            let verdict = classify_probe_exit(o.status.code(), &stdout, &nonce, token);
             if verdict.is_none() {
                 // #187: the `2>/dev/null` that used to swallow this made
                 // `-S` pointless and threw away the one line explaining an
@@ -247,11 +246,6 @@ async fn probe_remote_shared_forward(host: &str, port: u16) -> Option<bool> {
 /// remote shell, a stalled curl — was unbounded.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Exit status the remote probe script uses to say "no usable token here"
-/// (#187). Outside curl's own range, and not 126/127 (shell errors) or 255
-/// (ssh transport failure), so it cannot be confused with any of them.
-const NO_TOKEN_EXIT: i32 = 111;
-
 /// Turn the remote command's exit status into a probe verdict.
 ///
 /// `Some(true)`/`Some(false)` are claims the tunnel manager acts on
@@ -263,12 +257,10 @@ const NO_TOKEN_EXIT: i32 = 111;
 /// one extra 30 s poll. So when in doubt, `None`.
 ///
 /// Pure, so the table below is unit-testable without ssh.
-fn classify_probe_exit(code: Option<i32>, stdout: &str) -> Option<bool> {
+fn classify_probe_exit(code: Option<i32>, stdout: &str, nonce: &str, token: &str) -> Option<bool> {
     match code {
-        // curl got a 2xx — the body decides whether it is us.
-        Some(0) => Some(probe_response_is_self(stdout)),
-        // Our own marker: no token on the remote, so we cannot even ask.
-        Some(NO_TOKEN_EXIT) => None,
+        // curl got a 2xx — the body (and its MAC) decides whether it is us.
+        Some(0) => Some(probe_response_is_self(stdout, nonce, token)),
         // curl: 7 = connection refused (nothing listening), 22 = HTTP error
         // under -f (401, or a foreign service). Both are real answers.
         Some(7) | Some(22) => Some(false),
@@ -310,6 +302,29 @@ fn tail_for_reason(raw: &str, max_lines: usize, max_bytes: usize) -> String {
         joined.push('…');
     }
     joined
+}
+
+/// Truncate `buf` to at most `max` bytes, keeping the TAIL and cutting on a
+/// char boundary. Byte-index slicing panicked when the cut fell inside a
+/// multi-byte character — a long UTF-8 ssh banner was enough (B1-10).
+fn keep_tail(buf: &mut String, max: usize) {
+    if buf.len() <= max {
+        return;
+    }
+    let mut cut = buf.len() - max;
+    while !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
+}
+
+/// Pause after an authentication failure (B1-15).
+const AUTH_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Did ssh fail on authentication rather than on the link? Those failures
+/// need the user (a key, `known_hosts`), not a retry.
+fn is_auth_failure(stderr_tail: &str) -> bool {
+    stderr_tail.contains("Permission denied") || stderr_tail.contains("Host key verification failed")
 }
 
 /// How long an ssh child must survive before the link counts as having
@@ -354,7 +369,15 @@ fn jittered_secs(secs: u64) -> Duration {
 ///
 /// Pulled out as a pure function so it can be unit-tested without
 /// running ssh.
-fn probe_response_is_self(body: &str) -> bool {
+fn probe_response_is_self(body: &str, nonce: &str, token: &str) -> bool {
+    probe_response_is_from(body, nonce, token, std::process::id(), env!("AIUI_GIT_SHA"))
+}
+
+/// Pure core of [`probe_response_is_self`]: the body must name `our_pid` and
+/// `our_sha` AND carry the MAC only a holder of `token` can compute for this
+/// `nonce` (review B1-01). Without the MAC, any listener could echo our pid
+/// and build sha back — both are visible to every local user on the Mac.
+fn probe_response_is_from(body: &str, nonce: &str, token: &str, our_pid: u32, our_sha: &str) -> bool {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
     };
@@ -363,10 +386,15 @@ fn probe_response_is_self(body: &str) -> bool {
     }
     let body_pid = parsed.get("pid").and_then(|v| v.as_u64());
     let body_sha = parsed.get("build_sha").and_then(|v| v.as_str());
-    let our_pid = std::process::id() as u64;
-    let our_sha = env!("AIUI_GIT_SHA");
-    matches!(body_pid, Some(p) if p == our_pid)
-        && matches!(body_sha, Some(s) if s == our_sha)
+    let body_mac = parsed.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(body_pid, Some(p) if p == our_pid as u64)
+        || !matches!(body_sha, Some(s) if s == our_sha)
+        || token.is_empty()
+    {
+        return false;
+    }
+    let want = crate::http::probe_mac(token, nonce, our_pid, our_sha);
+    crate::http::constant_time_eq(body_mac.as_bytes(), want.as_bytes())
 }
 
 /// The full argv of the reverse-tunnel spawn, **including `"ssh"` at index
@@ -408,6 +436,7 @@ pub(crate) fn ssh_ntr_args(host: &str, port: u16) -> Vec<String> {
 async fn run_tunnel(
     host: String,
     port: u16,
+    token: Arc<str>,
     cancel: oneshot::Receiver<()>,
     status: Arc<Mutex<TunnelStatus>>,
 ) {
@@ -457,9 +486,10 @@ async fn run_tunnel(
         // cannot grow it without limit. Taken before `wait()`, because the
         // pipe must be read while the child lives.
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let mut drain: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(mut err) = child.stderr.take() {
             let sink = stderr_tail.clone();
-            tokio::spawn(async move {
+            drain = Some(tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 1024];
                 loop {
@@ -470,14 +500,11 @@ async fn run_tunnel(
                             guard.push_str(&String::from_utf8_lossy(&buf[..n]));
                             // Keep only the tail: 4 KB is far more than the
                             // 4 lines we ever render, and bounds the buffer.
-                            if guard.len() > 4096 {
-                                let cut = guard.len() - 4096;
-                                *guard = guard[cut..].to_string();
-                            }
+                            keep_tail(&mut guard, 4096);
                         }
                     }
                 }
-            });
+            }));
         }
 
         // #187: how long the link lived decides whether the backoff resets.
@@ -495,6 +522,13 @@ async fn run_tunnel(
         tokio::select! {
             wait_res = child.wait() => {
                 probe.abort();
+                // B1-10: `wait()` can resolve before the drain has read
+                // ssh's last stderr bytes — the very line ("remote port
+                // forwarding failed …") the reason exists to show. Give the
+                // drain a moment to reach EOF.
+                if let Some(h) = drain.take() {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
+                }
                 let base = match wait_res {
                     Ok(s) => s
                         .code()
@@ -514,6 +548,24 @@ async fn run_tunnel(
                 };
                 trace(&format!("tunnel[{host}]: ssh died: {msg}"));
 
+                // B1-15: a rejected key or a changed host key will not fix
+                // itself in 30 s. Retrying at the normal cadence — plus the
+                // shared-forward probe, a second login — meant ~4 failed
+                // logins a minute forever, enough for fail2ban to ban the
+                // Mac. No probe, and a long pause; Resync restarts at once.
+                if is_auth_failure(&tail) {
+                    *status.lock().await = TunnelStatus::Failed { reason: msg };
+                    tokio::select! {
+                        _ = tokio::time::sleep(AUTH_FAILURE_BACKOFF) => {}
+                        _ = &mut cancel_pin => {
+                            *status.lock().await = TunnelStatus::Stopped;
+                            return;
+                        }
+                    }
+                    backoff_secs = 1;
+                    continue;
+                }
+
                 // Before falling into the backoff loop, check if the remote
                 // actually has our port forwarded by somebody else. If so,
                 // degrade gracefully to shared-forward polling instead of
@@ -522,7 +574,7 @@ async fn run_tunnel(
                 // #187: cancellable. A `remove_remote` during this probe
                 // used to be ignored until it finished.
                 let shared = tokio::select! {
-                    v = probe_remote_shared_forward(&host, port) => v,
+                    v = probe_remote_shared_forward(&host, port, &token) => v,
                     _ = &mut cancel_pin => {
                         *status.lock().await = TunnelStatus::Stopped;
                         return;
@@ -533,7 +585,7 @@ async fn run_tunnel(
                         "tunnel[{host}]: shared forward detected — switching to poll mode"
                     ));
                     *status.lock().await = TunnelStatus::ConnectedShared;
-                    match shared_forward_poll_loop(&host, port, &status, &mut cancel_pin).await {
+                    match shared_forward_poll_loop(&host, port, &token, &status, &mut cancel_pin).await {
                         PollOutcome::LostShare => {
                             // External forward disappeared; drop back to the
                             // normal `-NTR` retry path with a short backoff.
@@ -587,6 +639,7 @@ enum PollOutcome {
 async fn shared_forward_poll_loop(
     host: &str,
     port: u16,
+    token: &str,
     status: &Arc<Mutex<TunnelStatus>>,
     cancel_pin: &mut std::pin::Pin<Box<oneshot::Receiver<()>>>,
 ) -> PollOutcome {
@@ -603,7 +656,7 @@ async fn shared_forward_poll_loop(
         // probe was in flight waited for it — and before the probe had its
         // own timeout, that could be forever.
         let verdict = tokio::select! {
-            v = probe_remote_shared_forward(host, port) => v,
+            v = probe_remote_shared_forward(host, port, token) => v,
             _ = &mut *cancel_pin => {
                 return PollOutcome::Cancelled;
             }
@@ -636,45 +689,58 @@ mod probe_cmd_tests {
     /// ships rather than a re-typed copy that could drift away from it.
     use super::probe_command as probe_cmd;
 
+    const NONCE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     #[test]
-    fn the_token_is_never_an_argument() {
-        // #187 in one assertion: the command may reference the shell
-        // variable, but must never place it where argv can be read by
-        // another user on the remote host.
-        let cmd = probe_cmd(7777);
-        assert!(
-            !cmd.contains("-H \"Authorization"),
-            "no -H with an inline value: {cmd}"
-        );
-        assert!(cmd.contains("-H @-"), "headers come from stdin: {cmd}");
+    fn the_probe_never_reads_or_sends_the_token() {
+        // B1-01: the probe runs exactly while our forward is down, so the
+        // listener it reaches may be anyone's. Nothing secret may go there —
+        // not as an argument (#187), not as a header, not at all.
+        let cmd = probe_cmd(7777, NONCE);
+        assert!(!cmd.contains("token"), "{cmd}");
+        assert!(!cmd.contains("Authorization"), "{cmd}");
+        assert!(!cmd.contains("Bearer"), "{cmd}");
+        assert!(cmd.contains(&format!("/probe?nonce={NONCE}")), "{cmd}");
     }
 
     #[test]
-    fn the_heredoc_is_well_formed() {
-        // A malformed heredoc breaks the probe on every remote at once, and
-        // Rust's line continuations make the layout easy to get wrong: `\`
-        // at end of line eats the newline AND the next line's indentation.
-        let cmd = probe_cmd(7777);
-        let lines: Vec<&str> = cmd.lines().collect();
-        assert_eq!(lines.len(), 3, "three lines exactly: {lines:?}");
-        assert!(lines[0].ends_with("<<AIUI_HDR"), "line 0: {:?}", lines[0]);
-        assert_eq!(
-            lines[1], "Authorization: Bearer $T",
-            "the header body must start at column 0, unindented"
-        );
-        assert_eq!(lines[2], "AIUI_HDR", "the terminator must be alone on its line");
-        assert!(
-            !cmd.contains("<<'AIUI_HDR'"),
-            "the delimiter must be UNQUOTED so the remote shell expands $T"
-        );
+    fn a_fresh_nonce_is_a_valid_challenge() {
+        let a = new_probe_nonce();
+        let b = new_probe_nonce();
+        assert!(crate::http::is_probe_nonce(&a), "{a}");
+        assert_ne!(a, b, "nonces must not repeat");
     }
 
-    // #210: the three tests below run the probe through the *local* shell.
-    // The script itself only ever executes on the remote, which is a POSIX
-    // host by construction (it is reached over ssh), and a Windows runner
-    // guarantees neither `sh` nor `curl` nor tilde-expansion against a
-    // drive-lettered `HOME`. Gating them keeps the Windows leg honest — the
-    // two string-shape tests above still assert the shipped command there.
+    fn answer(nonce: &str, token: &str, pid: u32, sha: &str) -> String {
+        serde_json::json!({
+            "aiui": true,
+            "pid": pid,
+            "build_sha": sha,
+            "mac": crate::http::probe_mac(token, nonce, pid, sha),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn only_a_holder_of_the_token_passes_the_challenge() {
+        let ok = answer(NONCE, "tok", 42, "abc");
+        assert!(probe_response_is_from(&ok, NONCE, "tok", 42, "abc"));
+        // Echoing our pid and build sha is not enough: both are visible to
+        // every local user. This is what the old body-only check accepted.
+        let echo = serde_json::json!({"aiui": true, "pid": 42, "build_sha": "abc"}).to_string();
+        assert!(!probe_response_is_from(&echo, NONCE, "tok", 42, "abc"));
+        // A MAC under another token, or for another nonce (a replay).
+        assert!(!probe_response_is_from(&answer(NONCE, "other", 42, "abc"), NONCE, "tok", 42, "abc"));
+        let other_nonce = "ff".repeat(32);
+        assert!(!probe_response_is_from(&answer(&other_nonce, "tok", 42, "abc"), NONCE, "tok", 42, "abc"));
+        // A genuine aiui, but a different process (a second instance).
+        assert!(!probe_response_is_from(&answer(NONCE, "tok", 43, "abc"), NONCE, "tok", 42, "abc"));
+        // No token configured: never "us".
+        assert!(!probe_response_is_from(&answer(NONCE, "", 42, "abc"), NONCE, "", 42, "abc"));
+    }
+
+    // The probe itself only ever executes on the remote, which is a POSIX
+    // host by construction (it is reached over ssh).
     #[cfg(unix)]
     #[test]
     fn the_command_is_valid_shell() {
@@ -682,7 +748,7 @@ mod probe_cmd_tests {
         let out = std::process::Command::new("sh")
             .arg("-n")
             .arg("-c")
-            .arg(probe_cmd(7777))
+            .arg(probe_cmd(7777, NONCE))
             .output()
             .expect("sh is available");
         assert!(
@@ -690,40 +756,6 @@ mod probe_cmd_tests {
             "sh -n rejected the probe command: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn no_token_exits_with_our_marker() {
-        // Run the real command with HOME pointed at an empty dir: no token
-        // file, so it must exit with the reserved code rather than running
-        // curl and having its failure misread as "the port is free".
-        let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(probe_cmd(7777))
-            .env("HOME", &dir)
-            .output()
-            .expect("sh is available");
-        assert_eq!(out.status.code(), Some(NO_TOKEN_EXIT));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_empty_token_file_also_exits_with_the_marker() {
-        let dir = std::env::temp_dir().join(format!("aiui-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join(".config").join("aiui")).unwrap();
-        std::fs::write(dir.join(".config").join("aiui").join("token"), "").unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(probe_cmd(7777))
-            .env("HOME", &dir)
-            .output()
-            .expect("sh is available");
-        assert_eq!(out.status.code(), Some(NO_TOKEN_EXIT));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -769,7 +801,7 @@ mod probe_cmd_tests {
     #[test]
     fn tail_for_reason_keeps_the_useful_last_words() {
         // The failure users hit most, and least understand.
-        let raw = "Warning: Permanently added 'devhost' to the list of known hosts.\n\
+        let raw = "Warning: Permanently added 'example-host' to the list of known hosts.\n\
                    Warning: remote port forwarding failed for listen port 7777\n";
         let out = tail_for_reason(raw, 4, 200);
         assert!(out.contains("remote port forwarding failed for listen port 7777"));
@@ -806,6 +838,29 @@ mod probe_cmd_tests {
     }
 
     #[test]
+    fn keep_tail_cuts_on_a_char_boundary() {
+        // B1-10: a 4 KB cut inside "ä" (2 bytes) or "—" (3 bytes) panicked.
+        let mut s = "ä".repeat(3000); // 6000 bytes
+        keep_tail(&mut s, 4095);
+        assert!(s.len() <= 4095);
+        assert!(s.chars().all(|c| c == 'ä'));
+        let mut t = "—".repeat(2000);
+        keep_tail(&mut t, 4096);
+        assert!(t.len() <= 4096 && t.chars().all(|c| c == '—'));
+        let mut short = String::from("ok");
+        keep_tail(&mut short, 4096);
+        assert_eq!(short, "ok");
+    }
+
+    #[test]
+    fn auth_failures_are_recognised() {
+        assert!(is_auth_failure("user@example-host: Permission denied (publickey)."));
+        assert!(is_auth_failure("Host key verification failed."));
+        assert!(!is_auth_failure("Warning: remote port forwarding failed for listen port 7777"));
+        assert!(!is_auth_failure(""));
+    }
+
+    #[test]
     fn tail_for_reason_handles_empty_and_blank_input() {
         assert_eq!(tail_for_reason("", 4, 200), "");
         assert_eq!(tail_for_reason("\n\n   \n", 4, 200), "");
@@ -816,17 +871,19 @@ mod probe_cmd_tests {
         // Exits that prove nothing must not be reported as a decision: in
         // ConnectedShared mode a wrong `Some(false)` costs a retry storm
         // against a port that is still occupied.
-        assert_eq!(classify_probe_exit(Some(NO_TOKEN_EXIT), ""), None, "no token");
-        assert_eq!(classify_probe_exit(Some(28), ""), None, "curl timeout");
-        assert_eq!(classify_probe_exit(Some(127), ""), None, "no curl on the remote");
-        assert_eq!(classify_probe_exit(Some(126), ""), None, "curl not executable");
-        assert_eq!(classify_probe_exit(Some(255), ""), None, "ssh transport");
-        assert_eq!(classify_probe_exit(None, ""), None, "killed by a signal");
-        assert_eq!(classify_probe_exit(Some(35), ""), None, "an unmapped curl error");
+        let c = |code| classify_probe_exit(code, "", NONCE, "tok");
+        assert_eq!(c(Some(28)), None, "curl timeout");
+        assert_eq!(c(Some(127)), None, "no curl on the remote");
+        assert_eq!(c(Some(126)), None, "curl not executable");
+        assert_eq!(c(Some(255)), None, "ssh transport");
+        assert_eq!(c(None), None, "killed by a signal");
+        assert_eq!(c(Some(35)), None, "an unmapped curl error");
 
         // …and the ones that do prove something still do.
-        assert_eq!(classify_probe_exit(Some(7), ""), Some(false), "refused");
-        assert_eq!(classify_probe_exit(Some(22), ""), Some(false), "401 / foreign");
+        assert_eq!(c(Some(7)), Some(false), "refused");
+        assert_eq!(c(Some(22)), Some(false), "400 / 401 / foreign");
+        // A 2xx from a listener that cannot answer the challenge.
+        assert_eq!(c(Some(0)), Some(false), "2xx without our MAC");
     }
 }
 
@@ -845,14 +902,17 @@ mod tests {
         env!("AIUI_GIT_SHA")
     }
 
+    const N: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     #[test]
     fn probe_self_match_returns_true() {
         let body = format!(
-            r#"{{"aiui": true, "version": "0.4.x", "pid": {}, "build_sha": "{}"}}"#,
+            r#"{{"aiui": true, "version": "0.4.x", "pid": {}, "build_sha": "{}", "mac": "{}"}}"#,
             our_pid(),
-            our_sha()
+            our_sha(),
+            crate::http::probe_mac("tok", N, our_pid(), our_sha())
         );
-        assert!(probe_response_is_self(&body));
+        assert!(probe_response_is_self(&body, N, "tok"));
     }
 
     #[test]
@@ -863,7 +923,7 @@ mod tests {
             bogus_pid,
             our_sha()
         );
-        assert!(!probe_response_is_self(&body));
+        assert!(!probe_response_is_self(&body, N, "tok"));
     }
 
     #[test]
@@ -872,7 +932,7 @@ mod tests {
             r#"{{"aiui": true, "pid": {}, "build_sha": "0000000000000000000000000000000000000000"}}"#,
             our_pid()
         );
-        assert!(!probe_response_is_self(&body));
+        assert!(!probe_response_is_self(&body, N, "tok"));
     }
 
     #[test]
@@ -883,7 +943,7 @@ mod tests {
         // shared-forward owners. Otherwise a v0.4.32 zombie + v0.4.33
         // primary would still race.
         let body = r#"{"aiui": true, "version": "0.4.32"}"#;
-        assert!(!probe_response_is_self(body));
+        assert!(!probe_response_is_self(body, N, "tok"));
     }
 
     #[test]
@@ -893,13 +953,13 @@ mod tests {
             our_pid(),
             our_sha()
         );
-        assert!(!probe_response_is_self(&body));
+        assert!(!probe_response_is_self(&body, N, "tok"));
     }
 
     #[test]
     fn probe_invalid_json_returns_false() {
-        assert!(!probe_response_is_self("not json"));
-        assert!(!probe_response_is_self(""));
+        assert!(!probe_response_is_self("not json", N, "tok"));
+        assert!(!probe_response_is_self("", N, "tok"));
     }
 
     /// `remotes.json` is deserialised as a bare `Vec<String>` with no
@@ -914,7 +974,7 @@ mod tests {
     /// spawned and no `ssh` ever runs — an empty snapshot is the proof.
     #[tokio::test]
     async fn ensure_rejects_option_like_alias() {
-        let mgr = TunnelManager::new(7777);
+        let mgr = TunnelManager::new(7777, "test-token");
         for alias in ["-oProxyCommand=touch /tmp/pwned", "user@-evil", "a b"] {
             // The control: these are rejected because the validator rejects
             // them, not because `ensure` refuses everything.
