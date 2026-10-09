@@ -67,6 +67,7 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 /// Mutates `spec` in place. Logs failures via `eprintln!` (picked up by
 /// the Tauri logger). Never panics on malformed specs — a non-image
 /// `src` value is simply ignored.
+#[cfg(test)]
 pub async fn resolve_image_srcs(spec: &mut Value) {
     let _ = resolve_image_srcs_within(spec, usize::MAX).await;
 }

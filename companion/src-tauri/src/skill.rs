@@ -83,16 +83,19 @@ pub fn install_to_remote(host_alias: &str) -> StepResult {
         };
     }
 
-    let mkdir = no_window(
-        Command::new("ssh").args([
+    let mkdir = crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
             "--",
             host_alias,
             "mkdir -p ~/.claude/skills/aiui",
-        ]),
-    )
-    .output();
+        ])),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     // #198: this was `if let Ok(o) = &mkdir`, which inspects the failure only
     // on the success branch — when `ssh` itself could not be spawned (no
     // OpenSSH client on Windows, say) execution fell through to `scp` and the
@@ -119,7 +122,16 @@ pub fn install_to_remote(host_alias: &str) -> StepResult {
     }
 
     let dest = format!("{host_alias}:.claude/skills/aiui/SKILL.md");
-    let out = no_window(Command::new("scp").arg(&stage).arg(&dest)).output();
+    let out = crate::proc_ext::output_within(
+        no_window(
+            Command::new("scp")
+                .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+                .arg(&stage)
+                .arg(&dest),
+        ),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     let _ = fs::remove_file(&stage);
     match out {
         Err(e) => StepResult {
@@ -176,6 +188,10 @@ pub(crate) fn remove_locally_at(dir: &std::path::Path) -> StepResult {
 }
 
 /// Counterpart remote cleanup, used from uninstall_all and remove_remote.
+/// The remote removal command (C-07): its exit status is `rm`'s.
+const REMOTE_SKILL_REMOVE_CMD: &str =
+    "rm -f ~/.claude/skills/aiui/SKILL.md && { rmdir ~/.claude/skills/aiui 2>/dev/null; true; }";
+
 pub fn remove_from_remote(host_alias: &str) -> StepResult {
     if !crate::setup::is_valid_host_alias(host_alias) {
         return StepResult {
@@ -184,16 +200,23 @@ pub fn remove_from_remote(host_alias: &str) -> StepResult {
             details: None,
         };
     }
-    let out = no_window(
-        Command::new("ssh").args([
+    // C-07: `…; true` made this exit 0 whatever happened, so a failed
+    // removal (permissions, read-only home) reported success. `rm -f` already
+    // succeeds on an absent file; only the `rmdir` of a non-empty dir is
+    // tolerated.
+    let out = crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
             "--",
             host_alias,
-            "rm -f ~/.claude/skills/aiui/SKILL.md; rmdir ~/.claude/skills/aiui 2>/dev/null; true",
-        ]),
-    )
-    .output();
+            REMOTE_SKILL_REMOVE_CMD,
+        ])),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     match out {
         Err(e) => StepResult {
             ok: false,

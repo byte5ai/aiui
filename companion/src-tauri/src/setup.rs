@@ -222,6 +222,17 @@ fn patch_claude_desktop_config_at(path: &Path, app_binary_path: &str) -> StepRes
         }
     };
 
+    // #198 A.3 / B1-05: nothing to do (and no `.bak` to pile up) when the
+    // entry is already exactly ours and no legacy key needs migrating.
+    let legacy_present = existing.pointer("/mcpServers/aiui-local").is_some();
+    if !legacy_present && aiui_entry_is_current(existing.pointer("/mcpServers/aiui"), app_binary_path) {
+        return StepResult {
+            ok: true,
+            message: "Claude Desktop: aiui entry already current".into(),
+            details: None,
+        };
+    }
+
     let mut root = existing.as_object().cloned().unwrap_or_default();
     let mut servers = root
         .get("mcpServers")
@@ -382,16 +393,19 @@ pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
     }
     // ensure remote dir. `--` keeps host_alias out of ssh option position
     // even if validation regresses one day.
-    let out1 = no_window(
-        Command::new("ssh").args([
+    let out1 = crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
             "--",
             host_alias,
             "mkdir -p ~/.config/aiui && chmod 700 ~/.config/aiui",
-        ]),
-    )
-    .output();
+        ])),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     match out1 {
         Err(e) => {
             return StepResult {
@@ -411,7 +425,16 @@ pub fn push_token_to_remote(host_alias: &str, token_path: &str) -> StepResult {
     }
 
     let dest = format!("{host_alias}:.config/aiui/token");
-    let out2 = no_window(Command::new("scp").arg(token_path).arg(&dest)).output();
+    let out2 = crate::proc_ext::output_within(
+        no_window(
+            Command::new("scp")
+                .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+                .arg(token_path)
+                .arg(&dest),
+        ),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     match out2 {
         Err(e) => StepResult {
             ok: false,
@@ -535,14 +558,10 @@ fn is_claude_config_current_at(path: &Path, app_binary_path: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&s) else {
         return false;
     };
-    let Some(entry) = v.pointer("/mcpServers/aiui") else {
-        return false;
-    };
-    entry
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(|c| c == app_binary_path)
-        .unwrap_or(false)
+    // B1-05: command AND args. An entry without `--mcp-stdio` makes Claude
+    // Desktop spawn the GUI binary and wait forever for MCP — it showed
+    // green here, was never healed at launch, and got no repair button.
+    aiui_entry_is_current(v.pointer("/mcpServers/aiui"), app_binary_path)
 }
 
 /// Same shape as `is_claude_config_current`, but for Claude Code's
@@ -655,32 +674,44 @@ fn codex_toml_upsert(
     let mut args = Array::new();
     args.push("--mcp-stdio");
 
-    // Ensure a `[mcp_servers]` parent table exists — implicit, so we never emit
-    // an empty `[mcp_servers]` header.
-    if doc.get("mcp_servers").and_then(|i| i.as_table()).is_none() {
+    // Ensure a `[mcp_servers]` parent exists — implicit, so we never emit an
+    // empty `[mcp_servers]` header. Review B1-06: "exists" means TABLE-LIKE.
+    // `as_table()` matches `[mcp_servers]` only, so a valid inline
+    // `mcp_servers = { github = {…} }` read as absent and was replaced —
+    // every other Codex MCP server gone, reported as "Updated aiui entry".
+    if !doc.get("mcp_servers").map(Item::is_table_like).unwrap_or(false) {
         let mut parent = Table::new();
         parent.set_implicit(true);
         doc.insert("mcp_servers", Item::Table(parent));
     }
+    let inline_container = doc["mcp_servers"].is_inline_table();
+    let servers = doc["mcp_servers"]
+        .as_table_like_mut()
+        .expect("mcp_servers is table-like by construction");
 
-    // #182: if an `[mcp_servers.aiui]` table is already there, set only the
-    // two keys we own so the user's other keys — and toml_edit's decor, i.e.
-    // their comments and spacing — survive. Build a fresh table only when
-    // there is none.
-    let has_table = doc["mcp_servers"]
-        .get("aiui")
-        .map(|i| i.is_table())
-        .unwrap_or(false);
-    if has_table {
-        doc["mcp_servers"]["aiui"]["command"] = value(app_binary_path);
-        doc["mcp_servers"]["aiui"]["args"] = value(args);
-    } else {
-        // Explicit table so it serializes as `[mcp_servers.aiui]` (the
-        // conventional, readable form) rather than dotted keys.
-        let mut aiui = Table::new();
-        aiui["command"] = value(app_binary_path);
-        aiui["args"] = value(args);
-        doc["mcp_servers"]["aiui"] = Item::Table(aiui);
+    // #182: if an aiui entry is already there — `[mcp_servers.aiui]` or an
+    // inline `aiui = {…}` — set only the two keys we own so the user's other
+    // keys and toml_edit's decor (comments, spacing) survive. Build a fresh
+    // entry only when there is none, in the container's own style.
+    match servers.get_mut("aiui").and_then(Item::as_table_like_mut) {
+        Some(entry) => {
+            entry.insert("command", value(app_binary_path));
+            entry.insert("args", value(args));
+        }
+        None if inline_container => {
+            let mut aiui = toml_edit::InlineTable::new();
+            aiui.insert("command", app_binary_path.into());
+            aiui.insert("args", toml_edit::Value::Array(args));
+            servers.insert("aiui", Item::Value(toml_edit::Value::InlineTable(aiui)));
+        }
+        None => {
+            // Explicit table so it serializes as `[mcp_servers.aiui]` (the
+            // conventional, readable form) rather than dotted keys.
+            let mut aiui = Table::new();
+            aiui["command"] = value(app_binary_path);
+            aiui["args"] = value(args);
+            servers.insert("aiui", Item::Table(aiui));
+        }
     }
 
     Ok(doc.to_string())
@@ -791,12 +822,21 @@ pub fn remove_codex_config() -> StepResult {
             }
         }
     };
+    // B1-06: table-LIKE, so an inline `mcp_servers = {…}` is handled too.
     let had = doc
         .get("mcp_servers")
-        .and_then(|i| i.as_table())
+        .and_then(|i| i.as_table_like())
         .map(|t| t.contains_key("aiui"))
         .unwrap_or(false);
-    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
+    // B1-11: nothing to remove → no backup, no rewrite of the user's file.
+    if !had {
+        return StepResult {
+            ok: true,
+            message: "aiui was not registered in ~/.codex/config.toml".into(),
+            details: None,
+        };
+    }
+    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_like_mut()) {
         servers.remove("aiui");
     }
     let bak = match backup(&path) {
@@ -1228,21 +1268,30 @@ fn strip_aiui_forward_lines(existing: &str, match_name: &str, port: u16) -> Opti
         if !matches {
             continue;
         }
+        // Review B1-07: only a block that still carries aiui's own
+        // `RemoteForward <port> localhost:<port>` is ours to clean, and then
+        // only exact whole-line matches go. The old prefix test also took the
+        // user's `ServerAliveInterval 300` (and any `30`/`no` line in a block
+        // aiui never touched) — on every launch, since it ran each start.
+        let is_aiui_forward = |l: &String| {
+            let t = l.trim().to_lowercase();
+            let mut words = t.split_whitespace();
+            words.next() == Some("remoteforward")
+                && words.next() == Some(port.to_string().as_str())
+                && words.next() == Some(format!("localhost:{port}").as_str())
+                && words.next().is_none()
+        };
+        if !block.iter().any(is_aiui_forward) {
+            continue;
+        }
         let before = block.len();
         block.retain(|l| {
-            let t = l.trim_start().to_lowercase();
-            if t.starts_with("remoteforward")
-                && t.contains(&format!("{port} localhost:{port}"))
-            {
+            if is_aiui_forward(l) {
                 return false;
             }
-            if t.starts_with("serveraliveinterval 30") {
-                return false;
-            }
-            if t.starts_with("exitonforwardfailure no") {
-                return false;
-            }
-            true
+            let t = l.trim().to_lowercase();
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            !(t == "serveraliveinterval 30" || t == "exitonforwardfailure no")
         });
         if block.len() != before {
             changed = true;
@@ -1508,8 +1557,7 @@ pub struct RemoteUvxLocation {
 /// bash login shell has a minimal PATH (the common case — `/opt/homebrew/bin`
 /// is added by `brew shellenv` to `~/.zprofile`, not `~/.profile`).
 pub fn check_remote_aiui_mcp(host_alias: &str) -> (StepResult, Option<RemoteUvxLocation>) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     if !is_valid_host_alias(host_alias) {
         return (
@@ -1587,28 +1635,38 @@ echo "STAGE:OK"
     //                    `--` interpretation of the first script byte
     //   -T               disable TTY allocation; ssh would refuse PTY when
     //                    stdin is a pipe anyway, but this is explicit
-    let mut child = match no_window(
-        Command::new("ssh")
-            .args([
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "--",
-                host_alias,
-                "/bin/bash",
-                "--login",
-                "-s",
-                "--",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .spawn()
-    {
-        Ok(c) => c,
+    // B1-08: bounded — a login shell whose profile blocks, or a home dir on
+    // a dead NFS server, used to hang Add/Resync forever.
+    let out = match crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "--",
+            host_alias,
+            "/bin/bash",
+            "--login",
+            "-s",
+            "--",
+        ])),
+        Some(probe_script.as_bytes()),
+        crate::proc_ext::SSH_SCRIPT_TIMEOUT,
+    ) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return (
+                StepResult {
+                    ok: false,
+                    message: format!("SSH zu {host_alias}: keine Antwort"),
+                    details: Some(format!(
+                        "{e}. Prüfe, ob eine Login-Shell auf dem Host hängt (Profil-Skript, Home auf einem nicht erreichbaren Netzlaufwerk)."
+                    )),
+                },
+                None,
+            );
+        }
         Err(e) => {
             return (
                 StepResult {
@@ -1617,31 +1675,6 @@ echo "STAGE:OK"
                     details: Some(format!(
                         "Konnte ssh nicht starten: {e}. Prüfe ~/.ssh/config und Schlüssel-Auth zum Host."
                     )),
-                },
-                None,
-            );
-        }
-    };
-
-    // Take stdin out of the Child explicitly and drop it after writing.
-    // Dropping closes the pipe write-side, so bash sees EOF and exits
-    // its read loop. wait_with_output() *should* drop stdin too via the
-    // owned Self argument, but `as_mut()` keeps it alive in some
-    // versions/configurations and that's the kind of subtle pipe-stays-
-    // open bug that produces hangs or empty-output mysteries.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(probe_script.as_bytes());
-        drop(stdin);
-    }
-
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            return (
-                StepResult {
-                    ok: false,
-                    message: format!("SSH zu {host_alias} brach ab"),
-                    details: Some(format!("ssh wait error: {e}")),
                 },
                 None,
             );
@@ -1754,9 +1787,6 @@ fn run_remote_python(
     op: &str,
     on_success: impl FnOnce(&str) -> StepResult,
 ) -> StepResult {
-    use std::io::Write;
-    use std::process::Stdio;
-
     if !is_valid_host_alias(host_alias) {
         return StepResult {
             ok: false,
@@ -1765,50 +1795,32 @@ fn run_remote_python(
         };
     }
 
-    let child = no_window(
-        Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "--",
-                host_alias,
-                "python3 -",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .spawn();
-
-    let mut child = match child {
-        Ok(c) => c,
+    // B1-08: bounded, and with a connect timeout it never had.
+    let out = match crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "--",
+            host_alias,
+            "python3 -",
+        ])),
+        Some(script.as_bytes()),
+        crate::proc_ext::SSH_SCRIPT_TIMEOUT,
+    ) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return StepResult {
+                ok: false,
+                message: format!("{op} on {host_alias} did not finish"),
+                details: Some(e.to_string()),
+            };
+        }
         Err(e) => {
             return StepResult {
                 ok: false,
                 message: format!("ssh {host_alias} could not start"),
-                details: Some(e.to_string()),
-            };
-        }
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(script.as_bytes()) {
-            return StepResult {
-                ok: false,
-                message: format!("{op} on {host_alias}: stdin write failed"),
-                details: Some(e.to_string()),
-            };
-        }
-        // Drop stdin so python3 sees EOF and starts executing.
-        drop(stdin);
-    }
-
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            return StepResult {
-                ok: false,
-                message: format!("{op} on {host_alias}: wait failed"),
                 details: Some(e.to_string()),
             };
         }
@@ -1995,16 +2007,21 @@ pub fn host_reachable(host_alias: &str) -> bool {
     if !is_valid_host_alias(host_alias) {
         return false;
     }
-    no_window(Command::new("ssh").args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=6",
-        "--",
-        host_alias,
-        "true",
-    ]))
-    .output()
+    // B1-08: a host that accepts and then wedges is unreachable for our
+    // purposes — it used to hang Uninstall forever.
+    crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=6",
+            "--",
+            host_alias,
+            "true",
+        ])),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    )
     .map(|o| matches!(o.status.code(), Some(c) if c != 255))
     .unwrap_or(false)
 }
@@ -2037,16 +2054,19 @@ pub fn remove_token_from_remote(host_alias: &str) -> StepResult {
             details: None,
         };
     }
-    let out = no_window(
-        Command::new("ssh").args([
+    let out = crate::proc_ext::output_within(
+        no_window(Command::new("ssh").args([
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
             "--",
             host_alias,
             "rm -f ~/.config/aiui/token",
-        ]),
-    )
-    .output();
+        ])),
+        None,
+        crate::proc_ext::SSH_STEP_TIMEOUT,
+    );
     match out {
         Err(e) => StepResult {
             ok: false,
@@ -2103,6 +2123,9 @@ fn remotes_path() -> PathBuf {
 /// registered hosts. On macOS/Linux both paths are the same file, so it is a
 /// no-op by construction.
 pub fn migrate_remotes_if_needed(config_dir: &Path) -> std::io::Result<bool> {
+    // B1-04: the uvx sidecar moves with it. Best-effort — a stuck sidecar
+    // only costs the absolute uvx path, which the next probe rediscovers.
+    let _ = migrate_remotes_from(&legacy_remote_uvx_path(), &remote_uvx_path_in(config_dir));
     migrate_remotes_from(&legacy_remotes_path(), &remotes_path_in(config_dir))
 }
 
@@ -2146,7 +2169,20 @@ pub fn save_remotes(list: &[String]) -> std::io::Result<()> {
 /// `load_remotes` ends in `unwrap_or_default()`, so a downgrade would wipe
 /// the user's registered hosts. An extra file costs one `read_to_string`;
 /// an older build simply ignores it and is back to today's behaviour.
+/// The #184 sidecar, next to `remotes.json` in the per-OS config dir (review
+/// B1-04). It was built from `$HOME`, so on Windows it re-created the stray
+/// `%USERPROFILE%\.config\aiui` that #196 migrated away from — and survived
+/// an uninstall that swept `%APPDATA%\aiui` and reported green.
+pub(crate) fn remote_uvx_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("remote-uvx.json")
+}
+
 fn remote_uvx_path() -> PathBuf {
+    remote_uvx_path_in(&config_dir_or_legacy())
+}
+
+/// Where the sidecar lived before B1-04 (identical on macOS/Linux).
+fn legacy_remote_uvx_path() -> PathBuf {
     home().join(".config").join("aiui").join("remote-uvx.json")
 }
 
@@ -2201,6 +2237,78 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn ssh_cleanup_leaves_the_users_own_keepalive_alone() {
+        // B1-07: `ServerAliveInterval 300` matched the `30` prefix, and a
+        // block without aiui's forward was cleaned anyway.
+        let user_only = "Host myhost\n  HostName example-host\n  ServerAliveInterval 300\n  ExitOnForwardFailure no\n";
+        assert_eq!(strip_aiui_forward_lines(user_only, "myhost", 7777), None);
+        let mixed = "Host myhost\n  RemoteForward 7777 localhost:7777\n  ServerAliveInterval 30\n  ServerAliveInterval 300\n";
+        let out = strip_aiui_forward_lines(mixed, "myhost", 7777).unwrap();
+        assert!(!out.contains("RemoteForward"));
+        assert!(!out.contains("ServerAliveInterval 30\n"));
+        assert!(out.contains("ServerAliveInterval 300"), "{out}");
+    }
+
+    #[test]
+    fn codex_upsert_keeps_servers_in_an_inline_table() {
+        // B1-06: an inline `mcp_servers` read as absent and was replaced.
+        let src = "mcp_servers = { github = { command = \"gh-mcp\", env = { TOKEN = \"t\" } } }\n";
+        let out = codex_toml_upsert(Some(src), "/opt/aiui").unwrap();
+        let doc: toml_edit::DocumentMut = out.parse().unwrap();
+        let servers = doc["mcp_servers"].as_table_like().unwrap();
+        assert_eq!(servers.get("github").unwrap()["command"].as_str(), Some("gh-mcp"), "{out}");
+        assert_eq!(servers.get("aiui").unwrap()["command"].as_str(), Some("/opt/aiui"), "{out}");
+        // Idempotent in the inline form too.
+        assert_eq!(codex_toml_upsert(Some(&out), "/opt/aiui").unwrap(), out);
+    }
+
+    #[test]
+    fn codex_upsert_keeps_foreign_keys_on_an_inline_aiui_entry() {
+        let src = "[mcp_servers]\naiui = { command = \"/old\", env = { DEBUG = \"1\" } }\n";
+        let out = codex_toml_upsert(Some(src), "/opt/aiui").unwrap();
+        let doc: toml_edit::DocumentMut = out.parse().unwrap();
+        let aiui = doc["mcp_servers"]["aiui"].as_table_like().unwrap();
+        assert_eq!(aiui.get("command").unwrap().as_str(), Some("/opt/aiui"));
+        assert!(aiui.get("env").is_some(), "the user's env survived: {out}");
+    }
+
+    #[test]
+    fn a_claude_desktop_entry_without_mcp_stdio_is_not_current() {
+        // B1-05: the predicate compared `command` only.
+        let dir = std::env::temp_dir().join(format!("aiui-b105-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("claude_desktop_config.json");
+        let bin = "/Applications/aiui.app/Contents/MacOS/aiui";
+        std::fs::write(&cfg, format!(r#"{{"mcpServers":{{"aiui":{{"command":"{bin}"}}}}}}"#)).unwrap();
+        assert!(!is_claude_config_current_at(&cfg, bin), "no args → not current");
+        // Patching heals it, and the predicate then agrees.
+        assert!(patch_claude_desktop_config_at(&cfg, bin).ok);
+        assert!(is_claude_config_current_at(&cfg, bin));
+        // A second patch is a no-op: no second backup.
+        let baks = |d: &std::path::Path| {
+            std::fs::read_dir(d).unwrap().filter(|e| {
+                e.as_ref().unwrap().file_name().to_string_lossy().contains(".bak")
+            }).count()
+        };
+        let before = baks(&dir);
+        assert!(patch_claude_desktop_config_at(&cfg, bin).ok);
+        assert_eq!(baks(&dir), before, "an already-current entry is not rewritten");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_uvx_sidecar_lives_in_the_config_dir() {
+        // B1-04: the sidecar must be where uninstall's sweep looks.
+        let dir = std::path::Path::new("/tmp/aiui-config-example");
+        assert_eq!(remote_uvx_path_in(dir), dir.join("remote-uvx.json"));
+        assert_eq!(
+            remote_uvx_path_in(dir).parent(),
+            remotes_path_in(dir).parent(),
+            "next to remotes.json"
+        );
     }
 
     #[test]

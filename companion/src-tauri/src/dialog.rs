@@ -617,6 +617,7 @@ impl DialogState {
             .map(|(id, _)| id.clone())
     }
 
+    #[cfg(test)]
     pub fn newest_id(&self) -> Option<String> {
         self.pending
             .lock()

@@ -2003,6 +2003,7 @@ fn validate_spec_for(spec: &serde_json::Value, bridge_served: bool) -> Result<()
 /// `invalid_spec` — still made the user's machine `GET` every URL in it,
 /// turning `/render` into a network probe that leaves nothing on screen.
 /// Validating first means a probe costs the prober a real dialog (#201).
+#[cfg(test)]
 async fn validate_then_resolve(
     spec: &mut serde_json::Value,
     bridge_served: bool,

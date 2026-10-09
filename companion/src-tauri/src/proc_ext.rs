@@ -133,3 +133,107 @@ mod tests {
         );
     }
 }
+
+/// Wall-clock bound for a short setup-side ssh/scp step (mkdir, token copy,
+/// reachability probe, cleanup). Review B1-08.
+pub const SSH_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wall-clock bound for a setup-side ssh step that runs a script on the
+/// remote (config patch, `uvx aiui-mcp` probe through a login shell).
+pub const SSH_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Command::output()` with a wall-clock bound, optionally feeding `stdin`
+/// (review B1-08).
+///
+/// Every setup-side `ssh`/`scp` call was a bare `output()` inside an async
+/// Tauri command. `ConnectTimeout` bounds only the TCP connect — a host whose
+/// NFS home is down accepts the connection and then wedges in `chdir($HOME)`,
+/// so Uninstall never finished and Settings stayed `busy` with every button
+/// disabled. On expiry the child is killed and the error kind is `TimedOut`.
+///
+/// stdout and stderr are drained on their own threads while waiting, so a
+/// chatty child can never block on a full pipe.
+pub fn output_within(
+    cmd: &mut std::process::Command,
+    stdin: Option<&[u8]>,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_t = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err_t = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A write error (the child exited early) surfaces as its exit status.
+        let _ = pipe.write_all(bytes);
+        drop(pipe);
+    }
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_t.join();
+            let _ = err_t.join();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {} s — the host accepted the connection but did not finish",
+                    limit.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    })
+}
+
+#[cfg(all(test, unix))]
+mod output_within_tests {
+    use super::*;
+
+    #[test]
+    fn a_wedged_child_is_killed_at_the_limit() {
+        // B1-08: an ssh session that never finishes must not hang the caller.
+        let started = std::time::Instant::now();
+        let err = output_within(
+            std::process::Command::new("sleep").arg("30"),
+            None,
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_and_stdin_round_trip() {
+        let out = output_within(
+            &mut std::process::Command::new("cat"),
+            Some(b"hello"),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hello");
+    }
+}
