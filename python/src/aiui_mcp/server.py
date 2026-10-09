@@ -323,28 +323,25 @@ def _token() -> str:
 # with `mac = HMAC-SHA256(token, "aiui-probe-v1|<nonce>|<pid>|<build_sha>")`.
 # A squatter can neither answer it nor learn anything from it.
 #
-# A verified listener stays verified for `LISTENER_VERIFY_TTL_S` while requests
-# keep succeeding; any transport error (refused, reset, timed out) forgets it,
-# so the first token-bearing request after an outage verifies again.
+# EVERY token-bearing request is preceded by its own challenge, sent through
+# the same transport (and so, as a rule, the same pooled connection). An
+# earlier version trusted a verified address for 60 s across clients, but each
+# `_client()` has its own pool: once the tunnel dropped and something else
+# bound the port, the next client opened a fresh connection to it and sent the
+# token without any failed request having invalidated the trust (Codex
+# review). The extra loopback round-trip per request is the price.
 # ---------------------------------------------------------------------------
 
-LISTENER_VERIFY_TTL_S = 60.0
 # Opt-in for a companion that predates the challenge (it answers the
 # credential-less probe with 401): send the token unverified. Off by default —
 # an unverified listener may just as well be a squatter.
 ALLOW_UNVERIFIED_ENV = "AIUI_ALLOW_UNVERIFIED_COMPANION"
 _PROBE_MAC_CONTEXT = "aiui-probe-v1"
-# listener (`scheme://host:port`) → monotonic time it last proved itself.
-_LISTENER_VERIFIED: dict[str, float] = {}
 
 
 class CompanionUnverifiedError(RuntimeError):
     """The process on the companion port could not prove it holds our token,
     so the token was not sent to it."""
-
-
-def _listener_key(url: httpx.URL) -> str:
-    return f"{url.scheme}://{url.host}:{url.port}"
 
 
 def _probe_mac(token: str, nonce: str, pid: int, build_sha: str) -> str:
@@ -376,16 +373,10 @@ def _probe_failure(status: int, body: bytes, token: str, nonce: str) -> str | No
 
 
 async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, token: str) -> None:
-    """Make sure the listener behind `url` proved it holds `token` within the
-    last `LISTENER_VERIFY_TTL_S`; challenge it otherwise. Raises
-    `CompanionUnverifiedError` instead of letting the token go out. Transport
-    errors of the probe itself propagate unchanged, so callers diagnose a dead
-    port exactly as before."""
-    key = _listener_key(url)
-    verified_at = _LISTENER_VERIFIED.get(key)
-    if verified_at is not None and time.monotonic() - verified_at < LISTENER_VERIFY_TTL_S:
-        return
-    _LISTENER_VERIFIED.pop(key, None)
+    """Challenge the listener behind `url` right now: it must prove it holds
+    `token`. Raises `CompanionUnverifiedError` instead of letting the token go
+    out. Transport errors of the probe itself propagate unchanged, so callers
+    diagnose a dead port exactly as before."""
     nonce = secrets.token_hex(32)
     probe = httpx.Request(
         "GET",
@@ -406,7 +397,6 @@ async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, toke
                 where,
                 ALLOW_UNVERIFIED_ENV,
             )
-            _LISTENER_VERIFIED[key] = time.monotonic()
             return
         raise CompanionUnverifiedError(
             f"aiui did not send its token to {where}: the listener there answered the "
@@ -427,30 +417,24 @@ async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, toke
             f"(aiui Settings → Connections on the user's machine re-establishes it). If "
             f"the user's aiui holds a different token, re-register this host there."
         )
-    _LISTENER_VERIFIED[key] = time.monotonic()
 
 
 class _CompanionTransport(httpx.AsyncBaseTransport):
     """The transport every companion client uses (B1-01).
 
-    A request carrying a bearer token goes out only after the listener passed
-    `_verify_listener`; a transport error on any request forgets the listener,
-    so the next token-bearing request re-verifies. Living in the transport, the
-    check cannot be skipped by a call site that forgets it.
+    A request carrying a bearer token goes out only right after the listener
+    passed `_verify_listener` through this same transport. Living in the
+    transport, the check cannot be skipped by a call site that forgets it.
     """
 
     def __init__(self) -> None:
         self._inner = httpx.AsyncHTTPTransport()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        try:
-            auth = request.headers.get("authorization", "")
-            if auth.startswith("Bearer "):
-                await _verify_listener(self._inner, request.url, auth[len("Bearer ") :])
-            return await self._inner.handle_async_request(request)
-        except httpx.TransportError:
-            _LISTENER_VERIFIED.pop(_listener_key(request.url), None)
-            raise
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            await _verify_listener(self._inner, request.url, auth[len("Bearer ") :])
+        return await self._inner.handle_async_request(request)
 
     async def aclose(self) -> None:
         await self._inner.aclose()

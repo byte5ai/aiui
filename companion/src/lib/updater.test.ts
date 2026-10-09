@@ -31,8 +31,11 @@ import "../i18n";
 import { checkForUpdates } from "./updater";
 
 /** A pending update the user then confirms in the native prompt. */
-function availableUpdate(downloadAndInstall: () => Promise<void>) {
-  return { version: "0.10.2", body: "release notes", downloadAndInstall };
+function availableUpdate(
+  download: () => Promise<void>,
+  install: () => Promise<void> = vi.fn().mockResolvedValue(undefined),
+) {
+  return { version: "0.10.2", body: "release notes", download, install };
 }
 
 /** Rust commands answer `undefined` unless a test says otherwise; the I5
@@ -57,10 +60,10 @@ beforeEach(() => {
 
 describe("checkForUpdates — manual path", () => {
   it("surfaces a failed install instead of swallowing it", async () => {
-    const downloadAndInstall = vi
+    const download = vi
       .fn()
       .mockRejectedValue(new Error("signature mismatch"));
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    tauri.check.mockResolvedValue(availableUpdate(download));
 
     const outcome = await checkForUpdates({ silent: false });
 
@@ -107,14 +110,14 @@ describe("checkForUpdates — manual path", () => {
   });
 
   it("does not install while a dialog is still pending", async () => {
-    const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    const download = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(download));
     tauri.invoke.mockImplementation(invokeReturning(false));
 
     const outcome = await checkForUpdates({ silent: false });
 
     expect(outcome.ok).toBe(true);
-    expect(downloadAndInstall).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
     expect(tauri.relaunch).not.toHaveBeenCalled();
     // Banner stays: the user is told to finish the dialog and come back.
     expect(invokedCommands()).not.toContain("clear_pending_update");
@@ -123,10 +126,13 @@ describe("checkForUpdates — manual path", () => {
 
   it("checks the dialog gate before downloading, and again before relaunching", async () => {
     const order: string[] = [];
-    const downloadAndInstall = vi.fn(async () => {
-      order.push("downloadAndInstall");
+    const download = vi.fn(async () => {
+      order.push("download");
     });
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    const install = vi.fn(async () => {
+      order.push("install");
+    });
+    tauri.check.mockResolvedValue(availableUpdate(download, install));
     tauri.invoke.mockImplementation(async (cmd: string) => {
       order.push(cmd);
       return cmd === "is_update_safe_to_install" ? true : undefined;
@@ -137,28 +143,32 @@ describe("checkForUpdates — manual path", () => {
 
     await checkForUpdates({ silent: false });
 
-    const download = order.indexOf("downloadAndInstall");
+    const downloaded = order.indexOf("download");
     const gates = order.flatMap((c, i) => (c === "is_update_safe_to_install" ? [i] : []));
     expect(gates).toHaveLength(2);
     // Before the download, so a pending dialog costs no download at all…
-    expect(gates[0]).toBeLessThan(download);
+    expect(gates[0]).toBeLessThan(downloaded);
     // …and after it (D-08): a download can take long enough for an agent
     // to open a dialog in the meantime.
-    expect(gates[1]).toBeGreaterThan(download);
-    expect(gates[1]).toBeLessThan(order.indexOf("authorize_exit_for_update"));
+    expect(gates[1]).toBeGreaterThan(downloaded);
+    // …and BEFORE the install: on Windows `install()` exits the process, so
+    // a check after it would never run.
+    expect(gates[1]).toBeLessThan(order.indexOf("install"));
+    expect(order.indexOf("install")).toBeLessThan(order.indexOf("authorize_exit_for_update"));
     // And the exit authority is latched only after the install returned —
     // it is irreversible, so arming it earlier would disarm the host's
     // default-deny exit gate for good (Invariant I1).
-    expect(download).toBeLessThan(order.indexOf("authorize_exit_for_update"));
+    expect(downloaded).toBeLessThan(order.indexOf("authorize_exit_for_update"));
     expect(order.indexOf("authorize_exit_for_update")).toBeLessThan(order.indexOf("relaunch"));
   });
 
   // D-08: user clicks Install with no dialog open; while the update
   // downloads, an agent opens a form and the user starts typing. Relaunching
   // when the download finishes would destroy the window and the answer.
-  it("does not relaunch over a dialog that opened during the download", async () => {
-    const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+  it("does not install over a dialog that opened during the download", async () => {
+    const download = vi.fn().mockResolvedValue(undefined);
+    const install = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(download, install));
     let gateCalls = 0;
     tauri.invoke.mockImplementation(async (cmd: string) => {
       if (cmd !== "is_update_safe_to_install") return undefined;
@@ -169,7 +179,8 @@ describe("checkForUpdates — manual path", () => {
     const outcome = await checkForUpdates({ silent: false });
 
     expect(outcome.ok).toBe(true);
-    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(install).not.toHaveBeenCalled();
     expect(tauri.relaunch).not.toHaveBeenCalled();
     // The irreversible exit latch stays unarmed, and the banner stays as the
     // way back to a restart once the dialog is done.
@@ -179,50 +190,50 @@ describe("checkForUpdates — manual path", () => {
     const [text, options] = tauri.message.mock.calls[0];
     expect(options).toMatchObject({ kind: "info" });
     expect(text).toContain("0.10.2");
-    expect(text).toContain("next time aiui starts");
+    expect(text).toContain("not installed it yet");
   });
 
   it("does not start a second install while one is in flight", async () => {
     let release: () => void = () => {};
-    const downloadAndInstall = vi.fn(
+    const download = vi.fn(
       () => new Promise<void>((resolve) => (release = resolve)),
     );
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    tauri.check.mockResolvedValue(availableUpdate(download));
 
     const first = checkForUpdates({ silent: false });
     // Let the first call get as far as the (blocked) install.
-    await vi.waitFor(() => expect(downloadAndInstall).toHaveBeenCalled());
+    await vi.waitFor(() => expect(download).toHaveBeenCalled());
 
     await checkForUpdates({ silent: false });
-    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(download).toHaveBeenCalledTimes(1);
 
     release();
     await first;
   });
 
   it("leaves the update untouched when the user declines", async () => {
-    const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    const download = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(download));
     tauri.ask.mockResolvedValue(false);
 
     const outcome = await checkForUpdates({ silent: false });
 
     expect(outcome.ok).toBe(true);
-    expect(downloadAndInstall).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
     expect(invokedCommands()).not.toContain("clear_pending_update");
   });
 });
 
 describe("checkForUpdates — silent path", () => {
   it("records the pending update and installs nothing", async () => {
-    const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
-    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    const download = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(download));
 
     const outcome = await checkForUpdates({ silent: true });
 
     expect(outcome.ok).toBe(true);
     expect(invokedCommands()).toEqual(["set_pending_update"]);
-    expect(downloadAndInstall).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
     expect(tauri.ask).not.toHaveBeenCalled();
     expect(tauri.message).not.toHaveBeenCalled();
   });

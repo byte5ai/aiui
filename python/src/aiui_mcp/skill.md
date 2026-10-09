@@ -178,8 +178,12 @@ notification-permission prompt; a denied permission comes back as
   `skip_validation: true` is non-committing: pressing it writes no `target`
   field to disk, and each such field comes back as
   `{written: false, error: "action '<value>' does not commit target writes"}`.
-  The built-in submit button always commits. If an action needs both — skip
-  validation *and* write — set `writes_targets: true` on it explicitly.
+  The built-in submit button always commits — and so does an action with
+  `value: "__submit__"`, whatever flags it carries. If an action needs both —
+  skip validation *and* write — set `writes_targets: true` on it explicitly.
+- Every action needs a unique, non-empty string `value` — it is how the
+  pressed button is identified, so a missing or repeated one is refused with
+  `invalid_spec`.
   An action value the spec never declared is refused (fail closed).
 - ≤ 3 actions. If you're tempted to add a fourth, rethink the flow.
 

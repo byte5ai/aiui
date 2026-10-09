@@ -166,28 +166,28 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
       return { ok: true };
     }
 
-    await update.downloadAndInstall();
-
-    // D-08: the gate above ran before a download that can take tens of
-    // seconds on a slow link, and an agent can open a dialog in that time.
-    // Relaunching now would destroy it with whatever the user has typed, the
-    // exact I5 violation the first check exists to prevent. So ask again,
-    // and if a dialog is pending do not relaunch: the new version is already
-    // on disk and takes effect on the next start. The exit authority is not
-    // latched either, so the host's default-deny exit gate stays armed. The
-    // banner stays too; "Install" again, once the dialog is done, restarts
-    // into the new version.
+    // Download and install are separate steps (Codex review of D-08): on
+    // Windows `install()` launches the installer and exits this process from
+    // inside the call, so a check placed after `downloadAndInstall()` could
+    // never run there. The download (signature-verified by the plugin) can
+    // take tens of seconds, and an agent can open a dialog in that time —
+    // installing then would destroy it with whatever the user has typed, the
+    // exact I5 violation the first check exists to prevent. So ask again
+    // between the two, and if a dialog is pending, install nothing: the
+    // banner stays, and "Install" again once the dialog is done finishes it.
+    await update.download();
     if (!(await updateIsSafeToInstall())) {
-      await message(tr("settings.updates.installed_restart_later", { version: update.version }), {
+      await message(tr("settings.updates.downloaded_install_later", { version: update.version }), {
         title: "aiui",
         kind: "info",
       });
       return { ok: true };
     }
+    await update.install();
 
     // Everything below runs on macOS/Linux ONLY. On Windows
     // `tauri-plugin-updater` hands the NSIS installer to `ShellExecuteW` and
-    // then calls `std::process::exit(0)` *inside* the await above, so this
+    // then calls `std::process::exit(0)` *inside* `install()` above, so this
     // process is already gone before it can run. The Windows equivalents
     // (latching the exit authority, sweeping the ssh-NTR children) have no
     // pre-exit hook on the pinned tauri-plugin-updater to attach to, so they

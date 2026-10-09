@@ -260,6 +260,17 @@ describe("Form — a file write is shown before it happens (C-02)", () => {
     expect(onsubmit).toHaveBeenCalledTimes(1);
   });
 
+  it("holds a __submit__ action even when it carries skip_validation", async () => {
+    // The writers see `action: null` for __submit__ and always commit, so
+    // the review gate must hold it too.
+    const { onsubmit } = renderTargets([
+      { label: "Send", value: "__submit__", skip_validation: true },
+    ]);
+    await fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onsubmit).not.toHaveBeenCalled();
+    expect(tabButtons()[1].getAttribute("aria-selected")).toBe("true");
+  });
+
   it("holds an escape-hatch action that opts back into writing", async () => {
     const { onsubmit } = renderTargets([
       { label: "Save draft", value: "draft", skip_validation: true, writes_targets: true },

@@ -164,9 +164,12 @@ def test_a_verified_listener_gets_the_token(bridge: Any) -> None:
     assert len(nonce) == 64 and all(c in "0123456789abcdef" for c in nonce)
     assert ("GET", "/health", f"Bearer {TOKEN}") in srv.requests
 
-    # Cached while requests keep succeeding: a second call does not re-probe.
+    # No cross-request trust: every token-bearing request is directly
+    # preceded by its own challenge (Codex review of the 60 s cache).
     asyncio.run(_preflight())
-    assert len([r for r in srv.requests if r[1].startswith("/probe")]) == 1
+    for i, (_, _path, auth) in enumerate(srv.requests):
+        if auth is not None:
+            assert i > 0 and srv.requests[i - 1][1].startswith("/probe"), srv.requests
 
 
 @pytest.mark.parametrize("mode", ["wrong", "no_mac", "missing"])
@@ -225,6 +228,22 @@ def test_a_port_that_changes_hands_after_an_outage_is_challenged_again(bridge: A
     assert out["ok"] is False
 
     # …and a squatter takes the free port.
+    squatter = bridge("wrong", port)
+    with pytest.raises(RuntimeError, match="could not prove it is aiui"):
+        asyncio.run(_preflight())
+    assert squatter.auth_headers == [], f"token leaked to the squatter: {squatter.requests}"
+
+
+def test_a_port_taken_over_between_two_calls_never_sees_the_token(bridge: Any) -> None:
+    """Codex review: with no failed request in between, an address-level cache
+    trusted the port for 60 s across clients — the next client's fresh
+    connection then went to the squatter WITH the token. Every token-bearing
+    request is now challenged on its own."""
+    good = bridge("good")
+    asyncio.run(_preflight())
+    port = good.server_address[1]
+    _stop(good)
+    # No call in between: the squatter binds at once.
     squatter = bridge("wrong", port)
     with pytest.raises(RuntimeError, match="could not prove it is aiui"):
         asyncio.run(_preflight())

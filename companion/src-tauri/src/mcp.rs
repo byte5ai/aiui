@@ -1646,7 +1646,6 @@ async fn render_dialog(
                 )));
             }
         };
-        budget.on_success();
         if pr.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RenderError::Transport(format!(
                 "aiui lost track of render {id} — it expired, was never registered, \
@@ -1660,9 +1659,33 @@ async fn render_dialog(
                 pr.status()
             )));
         }
-        let pv = pr
-            .json::<Value>()
-            .await
+        // Codex review: the body read is part of the transport too. A reset
+        // or timeout after the headers used to end the call through `?` —
+        // outside the outage budget, with the slot still retryable. The
+        // budget resets only once a complete response has arrived; malformed
+        // JSON stays a hard error.
+        let body = match pr.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if let Some(backoff) = budget.on_failure(now) {
+                    trace(&format!(
+                        "render_dialog: poll {id} body read failed ({e}) — retrying in {}s",
+                        backoff.as_secs()
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(RenderError::Transport(format!(
+                    "GET /render/{id}: {e} (gave up after {}s without reaching aiui — \
+                     the dialog may still be open on the user's machine; check it \
+                     before re-asking)",
+                    budget.outage(now).as_secs()
+                )));
+            }
+        };
+        budget.on_success();
+        let pv: Value = serde_json::from_slice(&body)
             .map_err(|e| RenderError::Transport(format!("parse /render/{id}: {e}")))?;
         if pv.get("pending").and_then(|v| v.as_bool()) == Some(true) {
             if budget.past_ttl(std::time::Instant::now()) {

@@ -509,6 +509,12 @@
    *  `writes_targets` always does, otherwise `skip_validation` opts out. */
   function commitsTargets(a: Action): boolean {
     if (a.value === "__cancel__") return false;
+    // `__submit__` is submitted as `action: null` (see `runAction`), and
+    // both writers treat null as the built-in submit, which always commits —
+    // whatever flags the agent put on it. Deciding from the flags here let
+    // `{value: "__submit__", skip_validation: true}` skip the unseen-tab
+    // review and still write (Codex review of C-02).
+    if (a.value === "__submit__") return true;
     if (a.writes_targets) return true;
     return !a.skip_validation;
   }

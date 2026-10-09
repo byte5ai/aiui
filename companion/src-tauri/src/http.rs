@@ -521,6 +521,13 @@ pub(crate) const LOCAL_PROOF_HEADER: &str = "x-aiui-local-proof";
 /// its host. Shown on the approval line ("on unverified host").
 const UNVERIFIED_ORIGIN: &str = "unverified host";
 
+/// Refuse a target-bearing render that neither proved locality nor named its
+/// host (Codex review of C-01): nobody would write its `target` fields, and a
+/// `secret` would come back to the agent in plaintext.
+fn must_refuse_unproven(proven_local: bool, origin: Option<&str>, has_targets: bool) -> bool {
+    !proven_local && origin.unwrap_or("").is_empty() && has_targets
+}
+
 fn local_proof_ok(headers: &HeaderMap, cfg: &AppConfig) -> bool {
     let Some(want) = cfg.read_local_proof() else {
         return false;
@@ -1280,7 +1287,33 @@ async fn update(
         ));
     }
 
-    let updater = match state.app.updater() {
+    // Codex review of B2-13: the Windows install exits the process from
+    // inside `install()`. Latching the exit authority and draining BEFORE
+    // calling it left both armed when the install then failed (writing the
+    // installer, launching it) and aiui kept running. The plugin's
+    // `on_before_exit` hook runs only after the installer is prepared, right
+    // before `process::exit` — so the latch, drain and sweep go there. It
+    // replaces the plugin's default hook, so `cleanup_before_exit` is called
+    // explicitly. macOS/Linux never run the hook.
+    let hook_app = state.app.clone();
+    let hook_port = state.cfg.http_port;
+    let updater = match state
+        .app
+        .updater_builder()
+        .on_before_exit(move || {
+            if let Some(auth) = hook_app.try_state::<Arc<crate::lifetime::ExitAuthority>>() {
+                auth.authorize();
+            }
+            crate::lifetime::drain_and_sweep(
+                &hook_app,
+                "update-install",
+                hook_port,
+                crate::housekeeping::SweepScope::All,
+            );
+            hook_app.cleanup_before_exit();
+        })
+        .build()
+    {
         Ok(u) => u,
         Err(e) => {
             trace(&format!("update: updater unavailable: {e}"));
@@ -1388,29 +1421,17 @@ async fn update(
             }));
         }
         let version_for_task = to_version.clone();
-        let app = state.app.clone();
-        let port = state.cfg.http_port;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             trace(&format!(
                 "update: launching installer for {version_for_task} (response already flushed)"
             ));
-            if let Some(auth) = app.try_state::<Arc<crate::lifetime::ExitAuthority>>() {
-                auth.authorize();
-            }
-            let app_drain = app.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::lifetime::drain_and_sweep(
-                    &app_drain,
-                    "update-install",
-                    port,
-                    crate::housekeeping::SweepScope::All,
-                )
-            })
-            .await;
-            if let Err(e) = update.install(bytes) {
-                // Only reachable if launching the installer fails — a
-                // successful Windows install never returns.
+            // The latch, drain and sweep run in the `on_before_exit` hook
+            // above, only once the installer is ready to launch.
+            let res = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+            if let Ok(Err(e)) = res {
+                // Only reachable if preparing or launching the installer
+                // fails — nothing was latched or drained, aiui keeps serving.
                 trace(&format!("update: install failed: {e}"));
             }
         });
@@ -1885,6 +1906,29 @@ fn validate_spec_for(spec: &serde_json::Value, bridge_served: bool) -> Result<()
     }
     if let Some(fs) = flat {
         fields.extend(fs.iter());
+    }
+    // Codex review of C-02: form actions are matched by `value` — the
+    // writers take the first match, the frontend the one pressed. A missing,
+    // non-string or repeated value let the two disagree about whether an
+    // action commits `target` writes.
+    if kind == "form" {
+        match spec.get("actions") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(actions)) => {
+                require_entry_values("form action", actions, false)?;
+                reject_duplicate_keys(
+                    "form action",
+                    "value",
+                    actions.iter().filter_map(entry_value),
+                )?;
+            }
+            Some(_) => {
+                return Err((
+                    "form 'actions' is not an array".into(),
+                    "actions: [{label, value, primary?, success?, destructive?, skip_validation?, writes_targets?}, …] — or omit it for Cancel + Submit.".into(),
+                ));
+            }
+        }
     }
     // #178: `fields` and `tabs` are both optional, so `form(title="x")` used
     // to open a window with nothing but Submit/Cancel — the agent then got
@@ -2539,6 +2583,32 @@ async fn render(
     // and the approval line says the write happens elsewhere.
     let proven_local = local_proof_ok(&headers, &state.cfg);
     if !proven_local && req.session_origin.as_deref().unwrap_or("").is_empty() {
+        // Codex review: a render with neither a locality proof nor an origin
+        // is an older native bridge mid-upgrade, a native bridge whose proof
+        // file could not be created, or a remote pretending to be local.
+        // None of them writes `target` fields — and the frontend strips a
+        // secret only for writes it performs itself — so a `secret` typed
+        // there would travel back to the agent in plaintext. Refuse
+        // target-bearing specs outright instead of rendering them.
+        if must_refuse_unproven(
+            proven_local,
+            req.session_origin.as_deref(),
+            !crate::collect_target_fields(&req.spec).is_empty(),
+        ) {
+            trace("render: rejected — target fields without a locality proof or origin");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "locality_unproven",
+                    "detail": "this dialog writes files (`target` fields), but the request \
+                               neither proved it comes from this machine nor named its host",
+                    "hint": "Restart the aiui MCP server so it matches the running aiui \
+                             version (a server started before an update cannot prove \
+                             locality), and check that aiui's config directory is writable.",
+                })),
+            )
+                .into_response();
+        }
         req.session_origin = Some(UNVERIFIED_ORIGIN.to_string());
     }
     let bridge_served = !req.session_origin.as_deref().unwrap_or("").is_empty();
@@ -2931,6 +3001,20 @@ mod validate_tests {
         let fieldless = json!({"kind":"form","tabs":[
             {"label":"A","fields":[{"kind":"text","name":"a"}]},{"label":"B"}]});
         assert!(validate_spec(&fieldless).is_err());
+    }
+
+    #[test]
+    fn rejects_form_actions_without_or_with_duplicate_values() {
+        let base = || json!({"kind":"form","fields":[{"kind":"text","name":"a"}]});
+        let mut dup = base();
+        dup["actions"] = json!([{"label":"Go","value":"go"},{"label":"Also","value":"go","skip_validation":true}]);
+        assert!(validate_spec(&dup).is_err());
+        let mut missing = base();
+        missing["actions"] = json!([{"label":"Go"}]);
+        assert!(validate_spec(&missing).is_err());
+        let mut ok = base();
+        ok["actions"] = json!([{"label":"Cancel","value":"__cancel__","skip_validation":true},{"label":"Send","value":"__submit__","primary":true}]);
+        assert!(validate_spec(&ok).is_ok());
     }
 
     #[test]
@@ -3988,6 +4072,15 @@ mod auth_tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer ".parse().unwrap());
         assert!(!auth_ok(&h, ""));
+    }
+
+    #[test]
+    fn an_unproven_render_with_targets_is_refused() {
+        assert!(must_refuse_unproven(false, None, true));
+        assert!(must_refuse_unproven(false, Some(""), true));
+        assert!(!must_refuse_unproven(false, None, false), "no targets: render as unverified");
+        assert!(!must_refuse_unproven(true, None, true), "proven local writes itself");
+        assert!(!must_refuse_unproven(false, Some("devbox"), true), "a bridge writes on its host");
     }
 
     #[tokio::test]

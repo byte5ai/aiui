@@ -122,9 +122,15 @@ impl AppConfig {
             token_path,
             http_port: 7777,
         };
-        // Review C-01: best-effort — a missing proof only means local target
-        // writes fall back to "unverified", never that a remote gains one.
-        let _ = cfg.ensure_local_proof();
+        // Review C-01: best-effort — a missing proof never lets a remote gain
+        // a local write; `/render` then refuses target-bearing specs with an
+        // actionable error. Trace the cause so that error can be explained.
+        if let Err(e) = cfg.ensure_local_proof() {
+            crate::logging::trace(&format!(
+                "[aiui] could not create the locality proof at {}: {e}",
+                cfg.local_proof_path().display()
+            ));
+        }
         Ok(cfg)
     }
 

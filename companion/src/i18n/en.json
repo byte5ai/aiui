@@ -96,7 +96,7 @@
     "pending_update.install": "Install",
     "report.button": "Report issue",
     "report.hint": "Opens a new GitHub issue with version and build pre-filled.",
-    "updates.installed_restart_later": "aiui {version} has been downloaded and installed. A dialog opened while it was downloading, so aiui did not restart: the update takes effect the next time aiui starts. Finish the dialog, then click Install again to restart right away."
+    "updates.downloaded_install_later": "aiui {version} has been downloaded. A dialog opened while it was downloading, so aiui has not installed it yet. Finish the dialog, then click Install again."
   },
   "dialog": {
     "cancel": "Cancel",

@@ -320,7 +320,7 @@ fn action_commits_targets(spec: &serde_json::Value, action: Option<&str>) -> boo
 
 /// Collect every form field that carries a non-null `target`, walking both the
 /// flat `fields` array and any `tabs[].fields`.
-fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn collect_target_fields(spec: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut consider = |fields: &serde_json::Value| {
         if let Some(arr) = fields.as_array() {
