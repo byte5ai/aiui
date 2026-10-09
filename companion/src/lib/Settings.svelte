@@ -17,6 +17,8 @@
     token_path: string;
     http_port: number;
     claude_config_ok: boolean;
+    hosts_config_ok: boolean;
+    claude_desktop_installed: boolean;
     claude_code_config_ok: boolean;
     skill_installed: boolean;
     claude_desktop_running: boolean;
@@ -463,8 +465,8 @@
       <img src={iconUrl} alt="aiui" class="app-icon" />
       <div class="header-meta">
         <div class="header-status-line">
-          <span class="status-dot" class:ok={status.claude_config_ok}></span>
-          {#if status.claude_config_ok}
+          <span class="status-dot" class:ok={status.hosts_config_ok}></span>
+          {#if status.hosts_config_ok}
             {$_("app.status.connected", { values: { port: status.http_port } })}
           {:else}
             {$_("app.status.not_connected")}
@@ -476,7 +478,7 @@
             the very predicate that now reports it red. No point offering it
             while the app runs from a temporary location — the banner above
             names the only fix there. -->
-          {#if !status.claude_config_ok && !status.ephemeral_install}
+          {#if !status.hosts_config_ok && !status.ephemeral_install}
             <button class="header-action" onclick={repairClaudeConfig} disabled={busy}>
               {$_("settings.config.repair")}
             </button>
@@ -593,7 +595,9 @@
         avoids vertical bloat in the common case. Issue raised by tester
         2026-04-27: "viel zu scrollen … vielleicht wäre ein Wizard". -->
       {@const checks = [
-        { ok: status.claude_config_ok, key: "desktop" },
+        ...(status.claude_desktop_installed
+          ? [{ ok: status.claude_config_ok, key: "desktop" }]
+          : []),
         { ok: status.claude_code_config_ok, key: "code" },
         { ok: status.skill_installed, key: "skill" },
         { ok: !status.http_error, key: "http" },

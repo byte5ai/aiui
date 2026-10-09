@@ -1,7 +1,7 @@
 {
   "app": {
-    "status.connected": "In Claude Desktop eingetragen · Port {port}",
-    "status.not_connected": "Claude Desktop Config wird beim nächsten Start automatisch gesetzt",
+    "status.connected": "In deinen MCP-Hosts registriert · Port {port}",
+    "status.not_connected": "Eine MCP-Host-Config fehlt oder ist veraltet — Reparieren behebt das",
     "status.background": "Läuft im Hintergrund — Fenster jederzeit schließbar"
   },
   "settings": {

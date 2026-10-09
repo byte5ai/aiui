@@ -1507,6 +1507,12 @@ const RENDER_BODY_HARD_CAP: usize = 64 * 1024 * 1024;
 /// instead of axum's opaque "Failed to buffer the request body". (#178)
 const RENDER_SPEC_SOFT_CAP: usize = 48 * 1024 * 1024;
 
+// The soft cap must sit strictly below the route layer's hard cap: if they
+// were equal (as /media's used to be) axum would reject first and the
+// structured `spec_too_large` body would be dead code. A compile-time check —
+// as a runtime test it was a constant assertion clippy rejects.
+const _: () = assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
+
 /// `true` when a `/render` body is past the soft cap and must be refused by
 /// the handler. Split out so the ceiling is unit-testable without a router.
 fn render_body_too_large(body_len: usize) -> bool {
@@ -1618,7 +1624,7 @@ fn require_array<'a>(
 }
 
 /// Every node of a `tree` forest, recursively.
-fn tree_nodes<'a>(items: &'a [serde_json::Value], out: &mut Vec<serde_json::Value>) {
+fn tree_nodes(items: &[serde_json::Value], out: &mut Vec<serde_json::Value>) {
     for it in items {
         out.push(it.clone());
         if let Some(children) = it.get("children").and_then(|c| c.as_array()) {
@@ -3462,18 +3468,11 @@ mod validate_tests {
 
 #[cfg(test)]
 mod render_body_cap_tests {
-    use super::{render_body_too_large, RENDER_BODY_HARD_CAP, RENDER_SPEC_SOFT_CAP};
+    use super::{render_body_too_large, RENDER_SPEC_SOFT_CAP};
 
     // #178: axum's 2 MiB default killed a routine 2 MB screenshot before the
     // handler ever ran — a sixth of the 10 MB per-image cap the docs promise,
     // with an opaque 413 and nothing in the trace log.
-
-    #[test]
-    fn soft_cap_is_strictly_below_the_hard_cap() {
-        // If they were equal (as on /media) axum would reject first and the
-        // structured `spec_too_large` body would be dead code.
-        assert!(RENDER_SPEC_SOFT_CAP < RENDER_BODY_HARD_CAP);
-    }
 
     #[test]
     fn accepts_a_spec_above_the_old_axum_default() {

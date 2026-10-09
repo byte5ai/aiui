@@ -883,6 +883,15 @@ struct StatusReport {
     /// this binary. Separate from `claude_config_ok` because Claude Desktop
     /// and Claude Code read different config files.
     claude_code_config_ok: bool,
+    /// Review B1-14: the header's "is aiui wired in?" signal. True iff at
+    /// least one MCP host is installed and every installed host's config is
+    /// current. `claude_config_ok` alone (Claude Desktop only) kept the
+    /// header red — "will be set automatically on next launch", which never
+    /// happens — for every Claude-Code-only Mac and most Windows boxes.
+    hosts_config_ok: bool,
+    /// Whether Claude Desktop is installed — the welcome checklist shows its
+    /// row only then.
+    claude_desktop_installed: bool,
     /// True iff `~/.claude/skills/aiui/SKILL.md` exists and is non-empty.
     /// Drives the skill-status row in Settings — replaces the old
     /// "Skill installieren" button which suggested optionality.
@@ -997,6 +1006,11 @@ async fn status(
         http_port: cfg.http_port,
         claude_config_ok: setup::is_claude_config_current(&bin),
         claude_code_config_ok: setup::is_claude_code_config_current(&bin),
+        hosts_config_ok: hosts_config_ok(
+            setup::is_claude_desktop_installed().then(|| setup::is_claude_config_current(&bin)),
+            setup::is_claude_code_installed().then(|| setup::is_claude_code_config_current(&bin)),
+        ),
+        claude_desktop_installed: setup::is_claude_desktop_installed(),
         skill_installed: skill::is_installed_locally(),
         claude_desktop_running: expensive.claude_desktop_running,
         remotes: setup::load_remotes(),
@@ -1696,7 +1710,11 @@ async fn add_remote(
     let mut list = setup::load_remotes();
     if !list.contains(&host_alias) {
         list.push(host_alias.clone());
-        let _ = setup::save_remotes(&list);
+        // B1-12: a failed write used to be swallowed — all steps green, the
+        // tunnel started, and the host gone from the list after a restart.
+        if let Err(e) = setup::save_remotes(&list) {
+            results.push(remotes_save_failed(&host_alias, &e));
+        }
     }
     // #184: remember the absolute uvx path the probe just found. Without
     // this it was discovered, pinned once, and then thrown away — so the
@@ -1801,11 +1819,32 @@ async fn remove_remote(
         .into_iter()
         .filter(|h| h != &host_alias)
         .collect();
-    let _ = setup::save_remotes(&list);
+    // B1-12: if the alias cannot be dropped, the next launch rebuilds a
+    // tunnel to a host whose token was just deleted — say so.
+    if let Err(e) = setup::save_remotes(&list) {
+        results.push(remotes_save_failed(&host_alias, &e));
+    }
     // #184: forget the host's uvx path too, so a later re-add starts from a
     // fresh probe rather than a stale path to a uvx that may have moved.
     let _ = setup::save_remote_uvx(&host_alias, None);
     Ok(results)
+}
+
+/// Header status (B1-14): `Some(ok)` per installed host, `None` when the
+/// host is not installed. Green only when something is installed and every
+/// installed host is current.
+fn hosts_config_ok(desktop: Option<bool>, code: Option<bool>) -> bool {
+    let installed: Vec<bool> = [desktop, code].into_iter().flatten().collect();
+    !installed.is_empty() && installed.iter().all(|ok| *ok)
+}
+
+/// The step that reports a failed `remotes.json` write (review B1-12).
+fn remotes_save_failed(host_alias: &str, e: &std::io::Error) -> setup::StepResult {
+    setup::StepResult {
+        ok: false,
+        message: format!("Could not update the list of remote hosts for {host_alias}"),
+        details: Some(format!("remotes.json: {e}")),
+    }
 }
 
 /// Uninstall hint shown after the cleanup sweep — tells the user how to
@@ -3290,6 +3329,19 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod hosts_config_ok_tests {
+    #[test]
+    fn a_claude_code_only_machine_can_be_green() {
+        // B1-14: the header read Claude Desktop's config only.
+        assert!(super::hosts_config_ok(None, Some(true)));
+        assert!(!super::hosts_config_ok(None, Some(false)));
+        assert!(!super::hosts_config_ok(Some(false), Some(true)), "every installed host");
+        assert!(super::hosts_config_ok(Some(true), None));
+        assert!(!super::hosts_config_ok(None, None), "nothing installed is not 'connected'");
+    }
 }
 
 #[cfg(test)]

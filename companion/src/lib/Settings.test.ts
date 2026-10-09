@@ -48,6 +48,8 @@ function statusReport(over: StatusOverrides = {}) {
     token_path: "/Users/u/.config/aiui/token",
     http_port: 7777,
     claude_config_ok: true,
+    hosts_config_ok: true,
+    claude_desktop_installed: true,
     claude_code_config_ok: true,
     skill_installed: true,
     claude_desktop_running: true,

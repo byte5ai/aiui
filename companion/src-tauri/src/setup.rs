@@ -108,12 +108,18 @@ fn prune_backups(path: &Path) {
     let mut found: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
+        // Review B1-09: only aiui's own `<name>.bak.<millis>` (and the legacy
+        // `<stem>.bak.<millis>`) — never a user's `.bak.before-cleanup`, which
+        // the prefix match rotated out after five releases.
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| {
-                    n.starts_with(&new_prefix)
-                        || (!stem.is_empty() && n.starts_with(&legacy_prefix))
+                    let ours = |prefix: &str| {
+                        n.strip_prefix(prefix)
+                            .is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()))
+                    };
+                    ours(&new_prefix) || (!stem.is_empty() && ours(&legacy_prefix))
                 })
                 .unwrap_or(false)
         })
@@ -190,9 +196,17 @@ fn read_json_config(path: &Path) -> Result<Option<Value>, String> {
     if raw.trim().is_empty() {
         return Ok(Some(Value::Object(Map::new())));
     }
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    // Review B1-11: valid JSON of the wrong shape is refused like a parse
+    // error. A `[]`/`null` root or a non-object `mcpServers` used to be
+    // coerced to `{}` and written back — the user's content replaced.
+    if !v.is_object() {
+        return Err("the top level is not a JSON object".into());
+    }
+    if v.get("mcpServers").is_some_and(|m| !m.is_object() && !m.is_null()) {
+        return Err("`mcpServers` is not a JSON object".into());
+    }
+    Ok(Some(v))
 }
 
 pub fn patch_claude_desktop_config(app_binary_path: &str) -> StepResult {
@@ -1143,6 +1157,14 @@ fn remove_claude_code_config_at(path: &Path) -> StepResult {
         }
     };
     let had = v.pointer("/mcpServers/aiui").is_some();
+    // B1-11: nothing to remove → no backup and no rewrite of the user's file.
+    if !had {
+        return StepResult {
+            ok: true,
+            message: "aiui was not registered in ~/.claude.json".into(),
+            details: None,
+        };
+    }
     if let Some(servers) = v.get_mut("mcpServers").and_then(|x| x.as_object_mut()) {
         servers.remove("aiui");
     }
@@ -1219,6 +1241,14 @@ fn remove_claude_desktop_config_at(path: &Path) -> StepResult {
     // wrote the entry.
     let had = v.pointer("/mcpServers/aiui").is_some()
         || v.pointer("/mcpServers/aiui-local").is_some();
+    // B1-11: nothing to remove → no backup and no rewrite of the user's file.
+    if !had {
+        return StepResult {
+            ok: true,
+            message: "aiui was not registered in claude_desktop_config.json".into(),
+            details: None,
+        };
+    }
     if let Some(servers) = v.get_mut("mcpServers").and_then(|x| x.as_object_mut()) {
         servers.remove("aiui");
         servers.remove("aiui-local");
@@ -2457,10 +2487,10 @@ mod tests {
             "4711 /Applications/Claude.app/Contents/MacOS/Claude"
         ));
         assert!(
-            is_claude_desktop_proc(
+            !is_claude_desktop_proc(
                 "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app\
                  /Contents/MacOS/Claude Helper --type=renderer"
-            ) == false,
+            ),
             "a helper's own executable path is not the main binary"
         );
     }
@@ -2648,6 +2678,22 @@ mod tests {
     }
 
     // ─── #182: never destroy a user config we could not parse ───────────
+
+    #[test]
+    fn read_json_config_refuses_the_wrong_shape() {
+        // B1-11: valid JSON that is not an object was replaced by `{}`.
+        let dir = std::env::temp_dir().join(format!("aiui-rjc-shape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [("arr.json", "[]"), ("null.json", "null"), ("srv.json", r#"{"mcpServers": [1]}"#)] {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            assert!(read_json_config(&p).is_err(), "{name}");
+            let r = patch_claude_desktop_config_at(&p, "/x/aiui");
+            assert!(!r.ok, "{name} must be left untouched");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), body, "{name} unchanged");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn read_json_config_distinguishes_absent_empty_and_broken() {
