@@ -485,7 +485,7 @@ fn find_orphaned_mcp_stdio_to_kill(snap: &[ProcSnap], own_pid: u32) -> Vec<Stale
 /// `kill_all_mcp_stdio_children` is the uninstall-only path for that.
 pub fn kill_orphaned_mcp_stdio_children() -> usize {
     let own_pid = std::process::id();
-    let (sys, snap) = snapshot_processes();
+    let (mut sys, snap) = snapshot_processes();
     let victims = find_orphaned_mcp_stdio_to_kill(&snap, own_pid);
 
     let mut killed = 0usize;
@@ -495,7 +495,7 @@ pub fn kill_orphaned_mcp_stdio_children() -> usize {
              (parent gone — abandoned leak)",
             victim.pid, victim.exe
         ));
-        if terminate_victim(&sys, victim.pid, VictimKind::McpStdio) {
+        if terminate_victim(&mut sys, victim.pid, VictimKind::McpStdio) {
             killed += 1;
         }
     }
@@ -559,7 +559,7 @@ fn find_pre_gui_mcp_stdio_to_kill(
 /// See `find_pre_gui_mcp_stdio_to_kill` for the rationale.
 pub fn kill_mcp_stdio_started_before_self() -> usize {
     let own_pid = std::process::id();
-    let (sys, snap) = snapshot_processes();
+    let (mut sys, snap) = snapshot_processes();
     let own_start_time = snap
         .iter()
         .find(|p| p.pid == own_pid)
@@ -583,7 +583,7 @@ pub fn kill_mcp_stdio_started_before_self() -> usize {
              (older than GUI cutoff={} AND parent gone)",
             victim.pid, victim.exe, own_start_time
         ));
-        if terminate_victim(&sys, victim.pid, VictimKind::McpStdio) {
+        if terminate_victim(&mut sys, victim.pid, VictimKind::McpStdio) {
             killed += 1;
         }
     }
@@ -614,6 +614,12 @@ enum VictimKind {
 /// "Does the pid still exist" is deliberately *not* the test: pid recycling
 /// means *exists* is not *is the same process*. The argv/exe re-assertion is
 /// the load-bearing part.
+/// Same process as the one the sweep enumerated? Same pid is not enough —
+/// only the start time tells a recycled pid apart (B2-07).
+fn same_process(snapshot_start: u64, live_start: u64) -> bool {
+    snapshot_start == live_start
+}
+
 fn victim_identity_matches(kind: VictimKind, exe: &str, args: &[String]) -> bool {
     match kind {
         VictimKind::McpStdio => is_aiui_binary(exe) && has_mcp_stdio_flag(args),
@@ -641,13 +647,35 @@ fn victim_identity_matches(kind: VictimKind, exe: &str, args: &[String]) -> bool
 /// asymmetry is deliberate (there is no graceful equivalent available here),
 /// but it is not "the equivalent terminate-by-handle" the old docstring
 /// claimed.
-fn terminate_victim(sys: &System, pid: u32, expect: VictimKind) -> bool {
-    let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) else {
+fn terminate_victim(sys: &mut System, pid: u32, expect: VictimKind) -> bool {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let Some(snap_start) = sys.process(spid).map(|p| p.start_time()) else {
         trace(&format!(
             "housekeeping: pid={pid} no longer in the snapshot — nothing signalled"
         ));
         return false;
     };
+    // Review B2-07: re-read THIS pid from the OS before signalling. The
+    // "identity re-check" used to compare the cached snapshot with itself,
+    // so a pid recycled since the sweep enumerated could never be refused.
+    // The start time is what separates a recycled pid from the same process.
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        true,
+        process_fields(),
+    );
+    let Some(p) = sys.process(spid) else {
+        trace(&format!("housekeeping: pid={pid} exited before the signal — nothing signalled"));
+        return false;
+    };
+    if !same_process(snap_start, p.start_time()) {
+        trace(&format!(
+            "housekeeping: refusing to signal pid={pid} — it was recycled since the \
+             sweep enumerated it (start time {snap_start} → {})",
+            p.start_time()
+        ));
+        return false;
+    }
     let (exe, _) = resolve_exe(p);
     let args: Vec<String> = p
         .cmd()
@@ -694,7 +722,7 @@ fn terminate_victim(sys: &System, pid: u32, expect: VictimKind) -> bool {
 /// Desktop do not respawn a child we take down.
 pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
     let own_pid = std::process::id();
-    let (sys, snap) = snapshot_processes();
+    let (mut sys, snap) = snapshot_processes();
     let stale = find_stale(&snap, current_exe_path, own_pid);
 
     let mut killed = 0usize;
@@ -704,7 +732,7 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
              (different path AND parent gone)",
             child.pid, child.exe
         ));
-        if terminate_victim(&sys, child.pid, VictimKind::McpStdio) {
+        if terminate_victim(&mut sys, child.pid, VictimKind::McpStdio) {
             killed += 1;
         }
     }
@@ -725,7 +753,7 @@ pub fn kill_stale_mcp_stdio_children(current_exe_path: &str) -> usize {
 /// the moment we call `app.exit(0)`.
 pub fn kill_all_mcp_stdio_children() -> usize {
     let own_pid = std::process::id();
-    let (sys, snap) = snapshot_processes();
+    let (mut sys, snap) = snapshot_processes();
     let children = find_all_children(&snap, own_pid);
 
     let mut killed = 0usize;
@@ -734,7 +762,7 @@ pub fn kill_all_mcp_stdio_children() -> usize {
             "housekeeping: killing mcp-stdio child pid={} exe={} (uninstall sweep)",
             child.pid, child.exe
         ));
-        if terminate_victim(&sys, child.pid, VictimKind::McpStdio) {
+        if terminate_victim(&mut sys, child.pid, VictimKind::McpStdio) {
             killed += 1;
         }
     }
@@ -883,7 +911,7 @@ pub fn exit_cleanup(port: u16, reason: &str, scope: SweepScope) {
 /// matches found). Logs each kill to the trace for post-mortem
 /// debuggability of the v0.4.36 orphan-tunnel-loop.
 pub fn kill_aiui_ssh_ntr(port: u16, only_orphans: bool) -> usize {
-    let (sys, snap) = snapshot_processes();
+    let (mut sys, snap) = snapshot_processes();
     let pids = find_aiui_ssh_ntr(&snap, port, only_orphans);
     let mode = if only_orphans { "orphan" } else { "all" };
     let mut killed = 0usize;
@@ -891,7 +919,7 @@ pub fn kill_aiui_ssh_ntr(port: u16, only_orphans: bool) -> usize {
         trace(&format!(
             "housekeeping: killing {mode} ssh-NTR tunnel pid={pid}"
         ));
-        if terminate_victim(&sys, *pid, VictimKind::SshNtr(port)) {
+        if terminate_victim(&mut sys, *pid, VictimKind::SshNtr(port)) {
             killed += 1;
         }
     }
@@ -1003,6 +1031,14 @@ pub(crate) fn is_exe_mtime_stale(baseline: Option<u64>, current: Option<u64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recycled_pid_is_not_the_same_process() {
+        // B2-07: same pid, different start time → a different process; the
+        // re-check used to compare the cached snapshot with itself.
+        assert!(same_process(1_700_000_000, 1_700_000_000));
+        assert!(!same_process(1_700_000_000, 1_700_000_042));
+    }
     use crate::tunnel::ssh_ntr_args;
 
     #[cfg(windows)]

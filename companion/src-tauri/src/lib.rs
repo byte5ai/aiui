@@ -2234,6 +2234,13 @@ fn is_auto_launch() -> bool {
 /// attaches to the GUI process via the lifetime socket so the GUI knows we're
 /// alive (and can self-terminate when we die).
 pub fn run_mcp_stdio_only() {
+    // Review B2-06 (#181, Windows): our stdin/stdout are the host's pipe ends,
+    // created inheritable so the host could hand them to us. Rust's `std`
+    // spawns with `bInheritHandles = TRUE`, so the GUI we resurrect inherited
+    // duplicates of them even with its own std handles set to NUL — and the
+    // host never saw EOF after this process exited, hanging its transport
+    // until the GUI quit. Clear inheritance before anything is spawned.
+    proc_ext::clear_std_handle_inheritance();
     // Stale-binary self-check (runs before any state is touched). On
     // macOS, an in-place `.app` replacement (in-app updater, manual DMG
     // drop) leaves any already-running mcp-stdio child holding the

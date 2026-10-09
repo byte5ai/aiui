@@ -117,4 +117,6 @@ libc = "0.2"
 # listener and answer the bridges in our place (#185).
 [target.'cfg(windows)'.dependencies]
 # 0.59, not 0.52: SO_EXCLUSIVEADDRUSE is only defined from 0.59 on.
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+# Win32_Foundation + Win32_System_Console: clearing handle inheritance on the
+# --mcp-stdio path (review B2-06).
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_Console"] }

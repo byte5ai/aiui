@@ -237,3 +237,30 @@ mod output_within_tests {
         assert_eq!(out.stdout, b"hello");
     }
 }
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's standard handles (review
+/// B2-06). Called first thing on the `--mcp-stdio` path; a no-op elsewhere.
+#[cfg(windows)]
+pub fn clear_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions; SetHandleInformation is
+        // called only on a handle GetStdHandle returned as valid.
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// Unix: `spawn_detached` `dup2`s over fds 0/1/2, which drops the originals
+/// for real, so there is nothing to clear.
+#[cfg(not(windows))]
+pub fn clear_std_handle_inheritance() {}
