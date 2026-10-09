@@ -75,6 +75,13 @@ pub fn wirt_gone(cd_is_wirt: bool, cd_running: bool) -> bool {
     cd_is_wirt && !cd_running
 }
 
+/// Is Claude Desktop this host's Wirt? Only if it is installed AND this
+/// process has seen it running at least once (review B2-09) — not merely
+/// installed. Pure, so the rule is pinned by a test.
+pub fn cd_is_wirt(installed: bool, seen_running: bool) -> bool {
+    installed && seen_running
+}
+
 /// May an update be installed right now?
 ///
 /// Installing means `downloadAndInstall` + relaunch, which tears down every
@@ -709,8 +716,17 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
     let wake_w = wake.clone();
     // #180: decided once, at startup. If Claude Desktop is not installed it
     // is not our Wirt, and its absence must never be read as "the Wirt left".
-    let cd_is_wirt = crate::setup::is_claude_desktop_installed();
+    let cd_installed = crate::setup::is_claude_desktop_installed();
+    // Seed the "seen running" latch at startup (B2-09).
+    let _ = crate::setup::is_claude_desktop_running();
     tokio::spawn(async move {
+        // Review B2-12: while the ONLY thing holding the host is an open
+        // dialog, the watcher re-arms every grace period. Recording each
+        // round (4 ring entries + 2 trace lines) replaced the whole 256-entry
+        // lifecycle ring in ~5 min — exactly the forensics that explain how
+        // the host got there. Quiet re-arms log nothing until the outcome
+        // or its reason changes.
+        let mut quiet_rearm = false;
         loop {
             wake_w.notified().await;
             // Edge: the last MCP-stdio child just disconnected. The counter is
@@ -734,39 +750,52 @@ fn make_shutdown_watcher(conns: Arc<AtomicUsize>, app: AppHandle, http_port: u16
             // with no further edge ever firing, stranding the host alive after
             // its Wirt is gone (a Step-2 regression). The cost is a single 5 s
             // timer + one `pgrep` per disconnect edge — no continuous poll.
-            trace(&format!(
-                "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
-            ));
-            crate::lifecycle_log::transition(crate::lifecycle_log::Phase::GracePending);
-            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceArmed {
-                secs: SHUTDOWN_GRACE_SECS,
-            });
+            if !quiet_rearm {
+                trace(&format!(
+                    "lifetime: last child gone — grace {SHUTDOWN_GRACE_SECS}s then re-check Claude Desktop liveness"
+                ));
+                crate::lifecycle_log::transition(crate::lifecycle_log::Phase::GracePending);
+                crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceArmed {
+                    secs: SHUTDOWN_GRACE_SECS,
+                });
+            }
             tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
             let child_returned = conns_w.load(Ordering::SeqCst) > 0;
             let cd_running = crate::setup::is_claude_desktop_running();
-            // #180: "Claude Desktop is not my Wirt" means stay, not exit.
+            // #180: "Claude Desktop is not my Wirt" means stay, not exit —
+            // and an installed CD this process never saw running is not it
+            // (B2-09).
+            let cd_is_wirt = cd_is_wirt(cd_installed, crate::setup::claude_desktop_seen_running());
             let gone = wirt_gone(cd_is_wirt, cd_running);
             let pending = app
                 .try_state::<Arc<crate::dialog::DialogState>>()
                 .map(|s| s.pending_count())
                 .unwrap_or(0);
             let outcome = grace_outcome(child_returned, gone, pending);
-            crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
-                outcome: match outcome {
-                    GraceOutcome::Stay => "stay",
-                    GraceOutcome::Exit => "exit",
-                },
-                claude_desktop_running: cd_running,
-                child_returned,
-            });
+            let held_by_dialog_only =
+                outcome == GraceOutcome::Stay && gone && !child_returned && pending > 0;
+            let quiet = quiet_rearm && held_by_dialog_only;
+            if !quiet {
+                crate::lifecycle_log::record(crate::lifecycle_log::LifecycleEvent::GraceResolved {
+                    outcome: match outcome {
+                        GraceOutcome::Stay => "stay",
+                        GraceOutcome::Exit => "exit",
+                    },
+                    claude_desktop_running: cd_running,
+                    child_returned,
+                });
+            }
+            quiet_rearm = held_by_dialog_only;
             match outcome {
                 GraceOutcome::Stay => {
-                    crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
-                    trace(&format!(
-                        "lifetime: staying after grace (cd_is_wirt={cd_is_wirt}, \
-                         claude_desktop_running={cd_running}, child_returned={child_returned}, \
-                         pending_dialogs={pending})"
-                    ));
+                    if !quiet {
+                        crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Serving);
+                        trace(&format!(
+                            "lifetime: staying after grace (cd_is_wirt={cd_is_wirt}, \
+                             claude_desktop_running={cd_running}, child_returned={child_returned}, \
+                             pending_dialogs={pending})"
+                        ));
+                    }
                     // #180: if the ONLY thing holding us is an open dialog,
                     // decide again when it is gone. Otherwise the host could
                     // outlive its Wirt indefinitely, waiting for a child edge
@@ -1036,9 +1065,9 @@ async fn rotate_pipe_with_retry(pipe_name: &str) -> std::io::Result<NamedPipeSer
 fn spawn_gui_detached() {
     #[cfg(target_os = "macos")]
     {
-        let _ = crate::proc_ext::spawn_detached(
+        reap_in_background(crate::proc_ext::spawn_detached(
             std::process::Command::new("open").args(["-g", "-a", "aiui", "--args", "--auto"]),
-        );
+        ));
     }
     #[cfg(target_os = "windows")]
     {
@@ -1058,10 +1087,25 @@ fn spawn_gui_detached() {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = crate::proc_ext::spawn_detached(
+            reap_in_background(crate::proc_ext::spawn_detached(
                 std::process::Command::new(exe).arg("--auto"),
-            );
+            ));
         }
+    }
+}
+
+/// Wait for a spawned child on a detached thread (review B2-10). `std` does
+/// not reap a dropped `Child`, and tokio reaps only its own children, so every
+/// resurrect spawn used to leave a zombie in the long-lived `--mcp-stdio`
+/// process — about 25 an hour per session while the GUI cannot start, enough
+/// over days to exhaust the per-user process limit. (On Windows there are no
+/// zombies, so the Windows branch keeps dropping the handle.)
+#[cfg(unix)]
+fn reap_in_background(spawned: std::io::Result<std::process::Child>) {
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
@@ -1134,6 +1178,17 @@ mod tests {
         // must read as "not my Wirt", never as "my Wirt died".
         assert!(!wirt_gone(false, false));
         assert!(!wirt_gone(false, true));
+    }
+
+    #[test]
+    fn a_claude_desktop_never_seen_running_is_not_the_wirt() {
+        // B2-09: installed-but-closed made the host exit (and drop every
+        // tunnel) when the last local Claude Code session closed.
+        assert!(!cd_is_wirt(true, false));
+        assert!(!wirt_gone(cd_is_wirt(true, false), false), "never there, cannot leave");
+        assert!(cd_is_wirt(true, true));
+        assert!(wirt_gone(cd_is_wirt(true, true), false), "seen, now gone → follow it out");
+        assert!(!cd_is_wirt(false, true));
     }
 
     #[test]

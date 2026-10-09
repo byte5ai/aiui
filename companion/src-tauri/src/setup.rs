@@ -920,6 +920,28 @@ pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
 /// If the probe errors out we assume "not running" rather than blocking
 /// the UI.
 pub fn is_claude_desktop_running() -> bool {
+    let running = probe_claude_desktop_running();
+    if running {
+        CLAUDE_DESKTOP_SEEN_RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    running
+}
+
+/// Set the first time this process sees Claude Desktop running (review
+/// B2-09). "Installed" alone made an installed-but-closed Claude Desktop a
+/// Wirt that had "left" — so a Mac working through Claude Code and remote
+/// sessions lost the companion, and every tunnel, the moment its last local
+/// session closed. A Wirt that was never there cannot leave.
+static CLAUDE_DESKTOP_SEEN_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has this process ever seen Claude Desktop running? See
+/// [`CLAUDE_DESKTOP_SEEN_RUNNING`].
+pub fn claude_desktop_seen_running() -> bool {
+    CLAUDE_DESKTOP_SEEN_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn probe_claude_desktop_running() -> bool {
     #[cfg(target_os = "macos")]
     {
         // #180: match the bundle EXECUTABLE, not a fixed install prefix. The

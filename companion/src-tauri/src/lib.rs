@@ -123,8 +123,8 @@ fn mark_dialog_teardown() {
 }
 
 /// Only the macOS `RunEvent::Reopen` handler reads this — every other
-/// platform either has no equivalent event (Windows surfaces a second
-/// instance via tauri-plugin-single-instance instead) or treats reopen
+/// platform either has no equivalent event (a second launch elsewhere asks
+/// the running instance via `POST /show-settings`, B2-04) or treats reopen
 /// without the dialog-teardown discrimination. Keeping the function
 /// `cfg`-gated avoids a `dead_code` warning under
 /// `clippy --target x86_64-pc-windows-msvc -- -D warnings`. The
@@ -698,8 +698,8 @@ pub(crate) fn destroy_dialog_window(app: &tauri::AppHandle, id: &str) {
 /// user would otherwise notice a leftover empty frame.
 ///
 /// Currently wired only to macOS `RunEvent::Reopen`; other platforms have no
-/// trigger yet (Windows surfaces the existing window via the single-instance
-/// plugin), so allow it to be unused there instead of `#[cfg]`-gating the
+/// trigger yet (elsewhere a second launch asks the running instance via
+/// `POST /show-settings`, B2-04), so allow it to be unused there instead of `#[cfg]`-gating the
 /// whole fn — keeps it ready for a future Windows hook without tripping CI's
 /// `-D warnings` dead-code check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1388,6 +1388,12 @@ async fn quit_app(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result
         .map(|c| c.http_port)
         .unwrap_or(7777);
     housekeeping::pre_exit_cleanup(port, "quit_app/uninstall");
+    // B2-14: the files this process held go only now, as it exits.
+    if let Some(cfg) = app.try_state::<Arc<config::AppConfig>>() {
+        for name in PROCESS_HELD_FILES {
+            let _ = remove_if_present(&cfg.config_dir.join(name));
+        }
+    }
     app.exit(0);
     Ok(())
 }
@@ -1825,7 +1831,7 @@ fn uninstall_app_removal_hint() -> String {
 /// The local state aiui owns inside its config dir, in removal order. The
 /// media cache lives outside it (under the Tauri app-cache dir) and is
 /// handled separately.
-const LOCAL_STATE_FILES: [&str; 7] = [
+const LOCAL_STATE_FILES: [&str; 5] = [
     "token",
     // Review C-01: the locality proof the local bridge presents.
     "local-proof",
@@ -1833,9 +1839,15 @@ const LOCAL_STATE_FILES: [&str; 7] = [
     "remotes.json",
     // #184: the uvx sidecar is local state too.
     "remote-uvx.json",
-    "gui.lock",
-    "gui.sock",
 ];
+
+/// Files the RUNNING GUI holds: its process lock and its lifetime socket.
+/// Review B2-14: unlinking them during the uninstall sweep succeeds on Unix
+/// while this process still holds them (locks and sockets are per inode),
+/// so a reattaching MCP child could start a SECOND GUI that took a fresh
+/// lock — two GUIs, one of them without the HTTP port. They are removed in
+/// `quit_app`, right before the uninstalling process exits.
+const PROCESS_HELD_FILES: [&str; 2] = ["gui.lock", "gui.sock"];
 
 /// `remove_file`, with "was not there anyway" counting as success — the
 /// point of the sweep is the end state, not who did the removing.
@@ -1915,8 +1927,7 @@ fn sweep_step_result(
                 failures.len()
             ),
             details: Some(format!(
-                "Nicht entfernt:\n{}\n\n(gui.lock/gui.sock hält dieser Prozess noch offen — \
-                 sie verschwinden spätestens beim Beenden.)\n\n{hint}",
+                "Nicht entfernt:\n{}\n\n{hint}",
                 failures.join("\n")
             )),
         }
@@ -2180,6 +2191,40 @@ fn no_visible_windows(app: &tauri::AppHandle) -> bool {
         .all(|w| !w.is_visible().unwrap_or(false))
 }
 
+/// `POST /show-settings` to the running instance (review B2-04). Plain
+/// HTTP/1.1 over a short-timeout TCP socket — this runs before any runtime
+/// exists, and pulling one up to send a single request is not worth it.
+fn request_show_settings(port: u16, token: &str) -> Result<u16, String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+        .map_err(|e| format!("connect: {e}"))?;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    sock.write_all(show_settings_request(token).as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut head = [0u8; 64];
+    let n = sock.read(&mut head).map_err(|e| format!("read: {e}"))?;
+    let line = String::from_utf8_lossy(&head[..n]);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| format!("unexpected response: {line:?}"))
+}
+
+fn show_settings_request(token: &str) -> String {
+    format!(
+        "POST /show-settings HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// Surface Settings on behalf of a second launch (B2-04). Runs the same path
+/// as the single-instance callback and the macOS `Reopen`.
+pub(crate) fn show_settings_from_second_launch(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_settings_window(&handle));
+}
+
 fn is_auto_launch() -> bool {
     std::env::args().any(|a| a == "--auto")
 }
@@ -2332,8 +2377,8 @@ pub fn run() {
     // the whole session. So we keep running without the lock and say so in
     // the UI. That trade is sound: the lock is a fast-path guard against the
     // v0.4.43 two-GUIs-in-the-same-millisecond bind race, not the last line
-    // of defence — `tauri_plugin_single_instance` still covers the
-    // second-launch case, and an HTTP bind collision already degrades
+    // of defence — a second user launch still surfaces Settings through
+    // `POST /show-settings` below (B2-04), and an HTTP bind collision degrades
     // instead of exiting.
     let lock_path = cfg.config_dir.join("gui.lock");
     let mut lock_error_message: Option<String> = None;
@@ -2348,6 +2393,19 @@ pub fn run() {
                  exiting without binding socket/http",
                 lock_path.display()
             ));
+            // Review B2-04: a USER launch (Start menu, double-click) must
+            // still surface Settings. `tauri_plugin_single_instance` would
+            // forward the launch, but it runs inside `Builder::build`, which
+            // this process never reaches — on Windows/Linux, with no tray and
+            // no Dock `Reopen`, a headless aiui had no way back to Settings.
+            // Ask the running instance over its own API instead. An
+            // auto-launch (`--auto`, an MCP child's resurrect) stays silent.
+            if !is_auto_launch() {
+                let asked = request_show_settings(cfg.http_port, &cfg.token);
+                logging::trace(&format!(
+                    "[aiui] gui-lock-busy: asked the running instance to show Settings: {asked:?}"
+                ));
+            }
             // No pre_exit_cleanup here: we never opened tunnels nor
             // mounted the HTTP server, so there's nothing to sweep.
             std::process::exit(0);
@@ -2524,10 +2582,14 @@ pub fn run() {
             // `ssh -NTR` child, and the relaunched instance finds the remote
             // port already forwarded and pins itself to `ConnectedShared`.
             //
-            // tauri-plugin-updater 2.10.1's `Builder` exposes no pre-exit hook
-            // to wire that sweep into (the `on_before_exit` API this once
-            // reached for does not exist on the pinned version), so the
-            // Windows-only leak is a known gap tracked as a follow-up. On
+            // The plugin-level `Builder` has no pre-exit hook (the
+            // `on_before_exit` hook exists only on `UpdaterBuilder`). The
+            // agent-driven `/update` path therefore downloads first and then
+            // latches, drains and sweeps itself before `install()` (review
+            // B2-13, http.rs `update`). The Settings *Install* button on
+            // Windows still goes through the plugin's JS `downloadAndInstall`
+            // and skips that cleanup — a known gap; the next start's orphan
+            // sweep reclaims the tunnel. On
             // macOS/Linux `downloadAndInstall()` returns normally and
             // `updater.ts` latches the exit authority + relaunches via
             // `authorize_exit_for_update` — after the install, because
@@ -3109,9 +3171,13 @@ pub fn run() {
                 // close used to pay for a subprocess it then ignored).
                 let needs_probe = !explicit && code.is_some();
                 let (cd_is_wirt, cd_running) = if needs_probe {
+                    let running = setup::is_claude_desktop_running();
                     (
-                        setup::is_claude_desktop_installed(),
-                        setup::is_claude_desktop_running(),
+                        lifetime::cd_is_wirt(
+                            setup::is_claude_desktop_installed(),
+                            setup::claude_desktop_seen_running(),
+                        ),
+                        running,
                     )
                 } else {
                     (false, false)
@@ -3187,11 +3253,11 @@ pub fn run() {
             // → Settings-Fenster nach vorn holen. `RunEvent::Reopen` is
             // a Mac-only variant, so this whole branch is gated.
             //
-            // Windows has no analogous "reopen" semantics — clicking the
-            // installed `.exe` while it's already running is handled by
-            // tauri-plugin-single-instance, which surfaces the existing
-            // window through its own callback (wired up at plugin init,
-            // not here).
+            // Windows has no analogous "reopen" semantics. Clicking the
+            // installed `.exe` while it already runs starts a second process
+            // that exits on `gui.lock` before the single-instance plugin
+            // runs, so it asks the running instance via `POST /show-settings`
+            // instead (B2-04).
             #[cfg(target_os = "macos")]
             {
                 if let tauri::RunEvent::Reopen { .. } = event {
@@ -3217,6 +3283,18 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod show_settings_request_tests {
+    #[test]
+    fn the_second_launch_request_is_well_formed_http() {
+        let req = super::show_settings_request("abc");
+        assert!(req.starts_with("POST /show-settings HTTP/1.1\r\n"));
+        assert!(req.contains("\r\nAuthorization: Bearer abc\r\n"));
+        assert!(req.contains("\r\nContent-Length: 0\r\n"));
+        assert!(req.ends_with("\r\n\r\n"), "headers end with an empty line");
+    }
 }
 
 #[cfg(test)]
@@ -3963,6 +4041,19 @@ mod tests {
     fn seed_local_state(config_dir: &Path) {
         for name in LOCAL_STATE_FILES {
             std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn the_uninstall_sweep_leaves_the_running_guis_lock_and_socket() {
+        // B2-14: removing them while held let a second GUI take a fresh lock.
+        let config_dir = sweep_test_dir("held");
+        for name in PROCESS_HELD_FILES {
+            std::fs::write(config_dir.join(name), b"x").unwrap();
+        }
+        let _ = sweep_local_state(&config_dir, None);
+        for name in PROCESS_HELD_FILES {
+            assert!(config_dir.join(name).exists(), "{name} must survive the live sweep");
         }
     }
 

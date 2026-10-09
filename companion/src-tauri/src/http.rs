@@ -394,6 +394,9 @@ pub async fn serve(
         .route("/notify", post(notify).layer(token_gate.clone()))
         .route("/version", get(version))
         .route("/update", post(update).layer(token_gate.clone()))
+        // B2-04: a second, user-started aiui asks the running one to show
+        // Settings before it exits on the GUI lock.
+        .route("/show-settings", post(show_settings).layer(token_gate.clone()))
         .route("/ping", get(ping))
         .route("/probe", get(probe))
         // Bridge pushes media bytes here; capped well above the per-file
@@ -527,6 +530,15 @@ fn local_proof_ok(headers: &HeaderMap, cfg: &AppConfig) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|got| constant_time_eq(got.trim().as_bytes(), want.as_bytes()))
         .unwrap_or(false)
+}
+
+async fn show_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !auth_ok(&headers, &state.cfg.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    trace("show-settings: requested by a second launch");
+    crate::show_settings_from_second_launch(&state.app);
+    StatusCode::NO_CONTENT
 }
 
 /// Route layer for every body-consuming endpoint: 401 before any body byte
@@ -1333,29 +1345,72 @@ async fn update(
 
     // #197: on Windows the updater plugin hands the NSIS installer to
     // `ShellExecuteW` and then calls `std::process::exit(0)` — the process
-    // dies *inside* `download_and_install`, so nothing after it ever runs.
-    // Building the response afterwards meant the `{updated, current,
-    // available}` JSON was never flushed and `aiui-mcp`'s `update_tool`
-    // raised a transport error instead of reporting the version delta —
-    // `/aiui:update` was structurally broken there. So on Windows: answer
-    // first, install after the same 500 ms settle delay the macOS restart
-    // path uses. Exit-time cleanup (latching `ExitAuthority`, sweeping the
-    // ssh-NTR children) is covered by the updater plugin's `on_before_exit`
-    // hook in `lib.rs`, which the plugin invokes only on that branch.
+    // dies *inside* the install, so nothing after it ever runs and the
+    // response has to be written first.
+    //
+    // Review B2-13: it used to be written before the DOWNLOAD, too, so a
+    // download, signature or disk failure still reached the agent as
+    // `updated: true, "installer launched"`. And the plugin's exit skips our
+    // own exit path: no ExitAuthority latch, no `host_exiting` for a dialog
+    // that registered meanwhile, no tunnel sweep. Now: download and verify
+    // first (`download()` checks the minisign signature), re-check the I5
+    // gate (a dialog may have opened during the download — D-08's Windows
+    // half), answer, and only then latch, drain, sweep and install.
     //
     // `cfg!` rather than `#[cfg]` on purpose: both arms then type-check on
     // every target, so the Windows path is compiled — and reviewed — by the
     // macOS CI leg too.
     if cfg!(windows) {
+        let bytes = match update.download(|_, _| {}, || {}).await {
+            Ok(b) => b,
+            Err(e) => {
+                trace(&format!("update: download failed: {e}"));
+                return Ok(Json(UpdateResponse {
+                    updated: false,
+                    current,
+                    available: Some(to_version),
+                    error: Some(format!("download failed: {e}")),
+                    note: None,
+                }));
+            }
+        };
+        let pending_dialogs = state.dialog.stats().orphan_count;
+        if !crate::lifetime::update_install_is_safe(pending_dialogs) {
+            trace(&format!(
+                "update: a dialog opened during the download — deferring install of {to_version}"
+            ));
+            return Ok(Json(UpdateResponse {
+                updated: false,
+                current,
+                available: Some(to_version),
+                error: None,
+                note: Some("dialog in flight — update deferred".into()),
+            }));
+        }
         let version_for_task = to_version.clone();
+        let app = state.app.clone();
+        let port = state.cfg.http_port;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             trace(&format!(
                 "update: launching installer for {version_for_task} (response already flushed)"
             ));
-            if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-                // Only reachable if the download or the signature check
-                // fails — a successful Windows install never returns.
+            if let Some(auth) = app.try_state::<Arc<crate::lifetime::ExitAuthority>>() {
+                auth.authorize();
+            }
+            let app_drain = app.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::lifetime::drain_and_sweep(
+                    &app_drain,
+                    "update-install",
+                    port,
+                    crate::housekeeping::SweepScope::All,
+                )
+            })
+            .await;
+            if let Err(e) = update.install(bytes) {
+                // Only reachable if launching the installer fails — a
+                // successful Windows install never returns.
                 trace(&format!("update: install failed: {e}"));
             }
         });
@@ -1365,7 +1420,10 @@ async fn update(
             current,
             available: Some(to_version),
             error: None,
-            note: Some("installer launched — aiui restarts into the new version".into()),
+            note: Some(
+                "downloaded and verified — installer launching; aiui restarts into the new version"
+                    .into(),
+            ),
         }));
     }
 
