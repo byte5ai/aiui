@@ -2331,7 +2331,12 @@ fn sweep_async_slots(state: &AppState) {
                 SlotVerdict::Abandon => abandoned.push(id.clone()),
             }
         }
-        for id in dropped.iter().chain(abandoned.iter()) {
+        // An abandoned slot is NOT removed: cancelling resolves the dialog,
+        // the resolver writes `{cancelled, reason: "abandoned"}` back into the
+        // slot, and a bridge that does come back (an outage longer than its
+        // budget) reads that instead of a 404 — the reason used to be set and
+        // then never reachable. The finished slot ages out like any other.
+        for id in dropped.iter() {
             slots.remove(id);
         }
         evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
