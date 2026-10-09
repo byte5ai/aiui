@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-09
+
 Fixes from the 2026-10 review of the 0.11.0 audit closure: 24 of the 37
 audit issues closed for 0.11.0 were only partly fixed, and the fix series
 introduced regressions of its own.
