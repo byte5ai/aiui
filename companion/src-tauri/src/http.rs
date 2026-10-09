@@ -494,6 +494,25 @@ async fn ping() -> &'static str {
     "pong"
 }
 
+/// Header carrying the locality proof (`config::AppConfig::local_proof_path`)
+/// that only a bridge on this machine can present (review C-01).
+pub(crate) const LOCAL_PROOF_HEADER: &str = "x-aiui-local-proof";
+
+/// `session_origin` given to a render that neither proved locality nor named
+/// its host. Shown on the approval line ("on unverified host").
+const UNVERIFIED_ORIGIN: &str = "unverified host";
+
+fn local_proof_ok(headers: &HeaderMap, cfg: &AppConfig) -> bool {
+    let Some(want) = cfg.read_local_proof() else {
+        return false;
+    };
+    headers
+        .get(LOCAL_PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|got| constant_time_eq(got.trim().as_bytes(), want.as_bytes()))
+        .unwrap_or(false)
+}
+
 /// Authenticated probe used by the tunnel-manager's shared-forward
 /// detection. Unlike /ping, this requires the bearer token, so it
 /// distinguishes "another aiui with our token is forwarding the port"
@@ -1425,6 +1444,83 @@ fn entry_value(v: &serde_json::Value) -> Option<&str> {
         .or_else(|| v.get("value").and_then(|x| x.as_str()))
 }
 
+/// The platform-neutral half of the target-path rule, for a bridge-served
+/// dialog (review C-11): absolute in POSIX or Windows syntax, or `~/`/`~\`
+/// rooted. The bridge, which knows its own OS, applies the exact rule.
+fn bridge_target_path_error(p: &str) -> Option<String> {
+    if p.is_empty() || p.len() > 4096 || !p.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return Some("invalid target path".into());
+    }
+    let b = p.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    if p.starts_with('/') || p.starts_with("\\\\") || p.starts_with("~/") || p.starts_with("~\\") || drive {
+        return None;
+    }
+    Some(format!("target path must be an absolute or ~/-rooted path, got '{p}'"))
+}
+
+/// Review A-02: every entry of a keyed collection must carry a non-empty
+/// STRING `value` (a bare non-empty string counts where the widget accepts
+/// one, `allow_bare`). `entry_value` simply skipped anything else, so a list
+/// of `{label}` items or numeric row values sailed past the duplicate check
+/// and crashed the keyed `{#each}` at mount — a blank, always-on-top window,
+/// for what the tool description itself calls the most common stumble.
+fn require_entry_values(
+    what: &str,
+    entries: &[serde_json::Value],
+    allow_bare: bool,
+) -> Result<(), (String, String)> {
+    for (i, e) in entries.iter().enumerate() {
+        let ok = match e.as_str() {
+            Some(s) => allow_bare && !s.is_empty(),
+            None => e
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+        };
+        if !ok {
+            return Err((
+                format!("{what} #{i} has no non-empty string 'value'"),
+                format!(
+                    "Each {what} needs a unique, non-empty string 'value' — it keys the \
+                     rendered list and the returned result. A missing or numeric value \
+                     is not accepted."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A required collection key of a form field (review A-03): the renderer
+/// dereferences it unconditionally, so a missing or misspelt key threw at
+/// init and blanked the window.
+fn require_array<'a>(
+    f: &'a serde_json::Value,
+    name: &str,
+    fk: &str,
+    key: &str,
+    shape: &str,
+) -> Result<&'a Vec<serde_json::Value>, (String, String)> {
+    f.get(key).and_then(|v| v.as_array()).ok_or_else(|| {
+        (
+            format!("{fk} field '{name}' is missing the '{key}' array"),
+            format!("A `{fk}` field needs {key}: {shape}."),
+        )
+    })
+}
+
+/// Every node of a `tree` forest, recursively.
+fn tree_nodes<'a>(items: &'a [serde_json::Value], out: &mut Vec<serde_json::Value>) {
+    for it in items {
+        out.push(it.clone());
+        if let Some(children) = it.get("children").and_then(|c| c.as_array()) {
+            tree_nodes(children, out);
+        }
+    }
+}
+
 /// Flatten a `tree` field's forest into every `value` it contains.
 ///
 /// One flat pass covers both failure modes: repeated *siblings* crash
@@ -1484,7 +1580,15 @@ fn annotate_target_paths(spec: &mut serde_json::Value) {
 /// only rejects what the frontend genuinely cannot render (bad
 /// top-level kind, unknown field kind), never well-formed-but-unusual
 /// specs.
+#[cfg(test)]
 fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
+    validate_spec_for(spec, false)
+}
+
+/// `bridge_served`: the dialog's `target` writes happen on the bridge's host,
+/// whose OS may differ from this one — so the OS-specific absoluteness test
+/// is the bridge's to make, and only a platform-neutral one runs here (C-11).
+fn validate_spec_for(spec: &serde_json::Value, bridge_served: bool) -> Result<(), (String, String)> {
     let kind = spec.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if !matches!(kind, "ask" | "form" | "confirm" | "gallery" | "compare") {
         return Err((
@@ -1571,6 +1675,26 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                 )?;
             }
         }
+        // A-02 / D-05: per-item decision buttons are keyed `(a.value)` too,
+        // and were never looked at — a missing or repeated value blanked the
+        // window just like an item's.
+        match spec.get("actions") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(actions)) => {
+                require_entry_values("gallery action", actions, false)?;
+                reject_duplicate_keys(
+                    "gallery action",
+                    "value",
+                    actions.iter().filter_map(entry_value),
+                )?;
+            }
+            Some(_) => {
+                return Err((
+                    "gallery 'actions' is not an array".into(),
+                    "actions: [{value, label}, …] — or omit it for Approve / Revise / Skip.".into(),
+                ));
+            }
+        }
         return Ok(());
     }
     // #178: an `ask` with no options opens a window carrying the question and
@@ -1595,16 +1719,17 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
             }
             Some(arr) => {
                 for (i, opt) in arr.iter().enumerate() {
-                    let labelled = ["label", "value"].into_iter().any(|k| {
-                        opt.get(k)
-                            .and_then(|v| v.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                    });
+                    // A-03: the button renders `label` only, so a value-only
+                    // option was a blank button the user picked blind.
+                    let labelled = opt
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
                     if !labelled {
                         return Err((
-                            format!("ask option #{i} has neither a non-empty 'label' nor 'value'"),
-                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A bare 'description' renders as a blank button."
+                            format!("ask option #{i} has no non-empty 'label'"),
+                            "Each option needs a 'label' to show (a 'value' is what comes back — it falls back to the label). A value-only or description-only option renders as a blank button."
                                 .into(),
                         ));
                     }
@@ -1614,14 +1739,38 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
         return Ok(());
     }
     let mut fields: Vec<&serde_json::Value> = Vec::new();
-    if let Some(tabs) = spec.get("tabs").and_then(|v| v.as_array()) {
-        for t in tabs {
-            if let Some(fs) = t.get("fields").and_then(|v| v.as_array()) {
-                fields.extend(fs.iter());
-            }
+    let tabs = spec
+        .get("tabs")
+        .and_then(|v| v.as_array())
+        .filter(|t| !t.is_empty());
+    let flat = spec
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .filter(|f| !f.is_empty());
+    // A-03: with `tabs` the form renders ONLY the tabs, so flat `fields`
+    // next to them were validated and then silently dropped — the agent got
+    // an answer without them and no error.
+    if tabs.is_some() && flat.is_some() {
+        return Err((
+            "form spec has both 'tabs' and 'fields'".into(),
+            "Use `fields` for a single page OR `tabs` (each with its own `fields`), not both — with tabs, top-level fields are not shown."
+                .into(),
+        ));
+    }
+    if let Some(tabs) = tabs {
+        for (i, t) in tabs.iter().enumerate() {
+            // A-03: a tab without `fields` made the renderer's `flatMap`
+            // yield `undefined` and blanked the window.
+            let Some(fs) = t.get("fields").and_then(|v| v.as_array()) else {
+                return Err((
+                    format!("form tab #{i} has no 'fields' array"),
+                    "Each tab is {label, fields: […]}.".into(),
+                ));
+            };
+            fields.extend(fs.iter());
         }
     }
-    if let Some(fs) = spec.get("fields").and_then(|v| v.as_array()) {
+    if let Some(fs) = flat {
         fields.extend(fs.iter());
     }
     // #178: `fields` and `tabs` are both optional, so `form(title="x")` used
@@ -1677,42 +1826,33 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
         let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
         match fk {
             "list" => {
-                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("list field '{name}' item"),
-                        "value",
-                        items.iter().filter_map(entry_value),
-                    )?;
-                }
+                let items = require_array(f, name, fk, "items", "[{label, value}, …] (or bare strings)")?;
+                let what = format!("list field '{name}' item");
+                require_entry_values(&what, items, true)?;
+                reject_duplicate_keys(&what, "value", items.iter().filter_map(entry_value))?;
             }
             "table" => {
-                if let Some(rows) = f.get("rows").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("table field '{name}' row"),
-                        "value",
-                        rows.iter().filter_map(entry_value),
-                    )?;
-                }
+                require_array(f, name, fk, "columns", "[{key, label}, …]")?;
+                let rows = require_array(f, name, fk, "rows", "[{value, values: {…}}, …]")?;
+                let what = format!("table field '{name}' row");
+                require_entry_values(&what, rows, false)?;
+                reject_duplicate_keys(&what, "value", rows.iter().filter_map(entry_value))?;
             }
             "image_grid" => {
-                if let Some(images) = f.get("images").and_then(|v| v.as_array()) {
-                    reject_duplicate_keys(
-                        &format!("image_grid field '{name}' image"),
-                        "value",
-                        images.iter().filter_map(entry_value),
-                    )?;
-                }
+                let images = require_array(f, name, fk, "images", "[{value, src, label?}, …]")?;
+                let what = format!("image_grid field '{name}' image");
+                require_entry_values(&what, images, false)?;
+                reject_duplicate_keys(&what, "value", images.iter().filter_map(entry_value))?;
             }
             "tree" => {
-                if let Some(items) = f.get("items").and_then(|v| v.as_array()) {
-                    let mut values = Vec::new();
-                    collect_tree_values(items, &mut values);
-                    reject_duplicate_keys(
-                        &format!("tree field '{name}' node"),
-                        "value",
-                        values.into_iter(),
-                    )?;
-                }
+                let items = require_array(f, name, fk, "items", "[{label, value, children?}, …]")?;
+                let mut nodes = Vec::new();
+                tree_nodes(items, &mut nodes);
+                let what = format!("tree field '{name}' node");
+                require_entry_values(&what, &nodes, false)?;
+                let mut values = Vec::new();
+                collect_tree_values(items, &mut values);
+                reject_duplicate_keys(&what, "value", values.into_iter())?;
             }
             _ => {}
         }
@@ -1753,8 +1893,31 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
                     hint,
                 ));
             };
-            if let Some(why) = crate::filewrite::target_path_error(path) {
+            let path_err = if bridge_served {
+                bridge_target_path_error(path)
+            } else {
+                crate::filewrite::target_path_error(path)
+            };
+            if let Some(why) = path_err {
                 return Err((format!("form field '{name}': {why}"), hint));
+            }
+            // C-05: the optional keys are typed too. `"overwrite": "false"`
+            // (a string) used to fail the local writer's deserialisation only
+            // after the user had typed the secret — and the Python bridge
+            // read it as truthy and clobbered the file.
+            let typed = [
+                ("perm", obj.get("perm").map(|v| v.is_null() || v.is_string())),
+                ("overwrite", obj.get("overwrite").map(|v| v.is_null() || v.is_boolean())),
+                ("placeholder", obj.get("placeholder").map(|v| v.is_null() || v.is_string())),
+            ];
+            for (key, ok) in typed {
+                if ok == Some(false) {
+                    let want = if key == "overwrite" { "a boolean" } else { "a string" };
+                    return Err((
+                        format!("form field '{name}' has target.{key} that is not {want}"),
+                        hint,
+                    ));
+                }
             }
         }
     }
@@ -1793,8 +1956,9 @@ fn validate_spec(spec: &serde_json::Value) -> Result<(), (String, String)> {
 /// Validating first means a probe costs the prober a real dialog (#201).
 async fn validate_then_resolve(
     spec: &mut serde_json::Value,
+    bridge_served: bool,
 ) -> Result<(), (String, String)> {
-    validate_spec(spec)?;
+    validate_spec_for(spec, bridge_served)?;
     crate::imageresolve::resolve_image_srcs(spec).await;
     Ok(())
 }
@@ -2215,13 +2379,23 @@ async fn render(
     };
     trace(&format!("render: auth ok, {}", spec_summary(&req.spec)));
 
+    // Review C-01: who performs a `target` write is decided by PROOF, not by
+    // an absent field. A render without a valid locality proof and without a
+    // declared origin is bridge-served: nothing is written on this machine,
+    // and the approval line says the write happens elsewhere.
+    let proven_local = local_proof_ok(&headers, &state.cfg);
+    if !proven_local && req.session_origin.as_deref().unwrap_or("").is_empty() {
+        req.session_origin = Some(UNVERIFIED_ORIGIN.to_string());
+    }
+    let bridge_served = !req.session_origin.as_deref().unwrap_or("").is_empty();
+
     // Spec validation (v0.4.46, Bug B+): reject anything the frontend
     // can't render *before* creating a window, and tell the agent
     // exactly what to fix. Without this, a bad `kind` opened a window
     // showing the "unknown_kind" placeholder — a confusing surface the
     // user had to dismiss. Now the agent gets `invalid_spec` + detail
     // and can correct the call; nothing is shown to the user.
-    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec).await {
+    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec, bridge_served).await {
         trace(&format!("render: rejected — invalid_spec: {detail}"));
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2511,6 +2685,122 @@ mod validate_tests {
     use super::{validate_spec, validate_then_resolve};
     use serde_json::json;
 
+    // ---------- review A-02 / A-03 / C-05 / C-11 ----------
+
+    #[test]
+    fn rejects_list_items_without_value() {
+        // A-02: `{label}`-only items crashed the keyed {#each} at mount.
+        let spec = json!({"kind":"form","fields":[{"kind":"list","name":"rank","sortable":true,
+            "items":[{"label":"A"},{"label":"B"}]}]});
+        let (detail, _) = validate_spec(&spec).unwrap_err();
+        assert!(detail.contains("rank") && detail.contains("value"), "{detail}");
+        // Bare strings stay allowed for list (the widget uses them as both).
+        let bare = json!({"kind":"form","fields":[{"kind":"list","name":"l","items":["a","b"]}]});
+        assert!(validate_spec(&bare).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_string_values() {
+        // A-02: numeric values slipped past the duplicate check entirely.
+        let spec = json!({"kind":"form","fields":[{"kind":"table","name":"t",
+            "columns":[{"key":"n","label":"N"}],
+            "rows":[{"value":1,"values":{}},{"value":1,"values":{}}]}]});
+        assert!(validate_spec(&spec).is_err());
+        let grid = json!({"kind":"form","fields":[{"kind":"image_grid","name":"g",
+            "images":[{"value":"","src":"data:image/png;base64,AA"}]}]});
+        assert!(validate_spec(&grid).is_err(), "empty string value");
+        let tree = json!({"kind":"form","fields":[{"kind":"tree","name":"t","items":[
+            {"label":"root","value":"r","children":[{"label":"leaf"}]}]}]});
+        let (detail, _) = validate_spec(&tree).unwrap_err();
+        assert!(detail.contains("tree"), "a nested node without value: {detail}");
+    }
+
+    #[test]
+    fn rejects_gallery_actions_without_or_with_duplicate_value() {
+        // A-02 / D-05: gallery `actions` were never validated.
+        let base = || json!({"kind":"gallery","items":[{"value":"a","src":"data:image/png;base64,AA"}]});
+        let mut missing = base();
+        missing["actions"] = json!([{"label":"Keep"},{"label":"Redo"}]);
+        assert!(validate_spec(&missing).is_err());
+        let mut dup = base();
+        dup["actions"] = json!([{"label":"Keep","value":"k"},{"label":"Also","value":"k"}]);
+        assert!(validate_spec(&dup).is_err());
+        let mut ok = base();
+        ok["actions"] = json!([{"label":"Keep","value":"keep"},{"label":"Redo","value":"redo"}]);
+        assert!(validate_spec(&ok).is_ok());
+        let mut not_array = base();
+        not_array["actions"] = json!("keep");
+        assert!(validate_spec(&not_array).is_err());
+        assert!(validate_spec(&base()).is_ok(), "omitted actions use the defaults");
+    }
+
+    #[test]
+    fn rejects_missing_required_collections() {
+        // A-03: the renderer dereferences these unconditionally.
+        for (kind, extra) in [
+            ("list", json!({})),
+            ("tree", json!({})),
+            ("image_grid", json!({})),
+            ("table", json!({"columns":[{"key":"a","label":"A"}],"data":[]})),
+            ("table", json!({"rows":[]})),
+        ] {
+            let mut f = json!({"kind": kind, "name": "x"});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            let spec = json!({"kind":"form","fields":[f]});
+            assert!(validate_spec(&spec).is_err(), "{kind} {extra}");
+        }
+    }
+
+    #[test]
+    fn rejects_tabs_next_to_fields_and_tabs_without_fields() {
+        // A-03: with tabs, flat fields were validated and then never shown.
+        let both = json!({"kind":"form",
+            "fields":[{"kind":"text","name":"why"}],
+            "tabs":[{"label":"Adv","fields":[{"kind":"checkbox","name":"force"}]}]});
+        assert!(validate_spec(&both).is_err());
+        let fieldless = json!({"kind":"form","tabs":[
+            {"label":"A","fields":[{"kind":"text","name":"a"}]},{"label":"B"}]});
+        assert!(validate_spec(&fieldless).is_err());
+    }
+
+    #[test]
+    fn rejects_value_only_ask_options() {
+        // A-03: the button renders the label only — a value-only option was a
+        // blank button.
+        let spec = json!({"kind":"ask","question":"Strategy?","options":[
+            {"value":"blue-green","description":"…"},{"value":"rolling","description":"…"}]});
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_mistyped_target_keys() {
+        // C-05: these failed only after submit (Rust) or clobbered (Python).
+        for (key, bad) in [("overwrite", json!("false")), ("perm", json!(600)), ("placeholder", json!(1))] {
+            let mut target = json!({"mode":"create","path":"~/x"});
+            target[key] = bad.clone();
+            let spec = json!({"kind":"form","fields":[{"kind":"password","name":"p","target":target}]});
+            let (detail, _) = validate_spec(&spec).unwrap_err();
+            assert!(detail.contains(key), "{key}={bad}: {detail}");
+        }
+        let good = json!({"kind":"form","fields":[{"kind":"password","name":"p",
+            "target":{"mode":"create","path":"~/x","overwrite":true,"perm":"600"}}]});
+        assert!(validate_spec(&good).is_ok());
+    }
+
+    #[test]
+    fn a_bridge_served_target_path_is_judged_platform_neutrally() {
+        // C-11: a Windows bridge behind a macOS companion sends a drive path.
+        let spec = |p: &str| json!({"kind":"form","fields":[{"kind":"password","name":"p",
+            "target":{"mode":"create","path":p}}]});
+        assert!(super::validate_spec_for(&spec("C:\\Users\\me\\x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("/home/me/x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("~\\x"), true).is_ok());
+        assert!(super::validate_spec_for(&spec("relative/x"), true).is_err());
+        assert!(super::validate_spec_for(&spec("~other/x"), true).is_err());
+    }
+
     #[tokio::test]
     async fn invalid_spec_is_rejected_before_any_fetch() {
         // #201: `resolve_image_srcs` used to run first, so a spec that was
@@ -2522,7 +2812,7 @@ mod validate_tests {
             "kind": "not-a-real-kind",
             "image": {"src": "http://93.184.216.34/probe.png"}
         });
-        let (detail, _hint) = validate_then_resolve(&mut spec).await.unwrap_err();
+        let (detail, _hint) = validate_then_resolve(&mut spec, false).await.unwrap_err();
         assert!(detail.contains("top-level 'kind'"), "got: {detail}");
         assert_eq!(
             crate::imageresolve::fetch_attempts(),

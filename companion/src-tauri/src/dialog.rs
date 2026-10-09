@@ -34,8 +34,12 @@ pub struct DialogRequest {
     pub session: Option<String>,
     /// Origin host of the caller, auto-injected by the remote Python bridge
     /// (its `hostname`) since the Mac can't distinguish remotes sharing
-    /// `:7777`. `None`/absent for local callers. Shown in the window chrome
-    /// alongside `session` (I8).
+    /// `:7777`. Shown in the window chrome alongside `session` (I8).
+    ///
+    /// `None` ONLY for a render that proved locality (`x-aiui-local-proof`,
+    /// review C-01): `/render` sets "unverified host" on any other render
+    /// that names no origin, and `write_dialog_targets` writes on this
+    /// machine only when this is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_origin: Option<String>,
 }

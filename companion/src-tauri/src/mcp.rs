@@ -1482,8 +1482,8 @@ async fn render_dialog(
     }
     crate::imageresolve::resolve_local_paths(&mut spec);
     // Step 4 (I8): forward the optional caller `session` label. This is the
-    // local bridge, so there is no `session_origin` (the companion treats an
-    // absent origin as local).
+    // local bridge, so there is no `session_origin`; locality is proven by
+    // the `x-aiui-local-proof` header below, not by the absent field.
     let body = json!({ "spec": spec, "session": session });
     // Async render (Step 3): POST opts in via `x-aiui-async`; the companion
     // registers + surfaces the dialog and returns immediately with
@@ -1496,10 +1496,18 @@ async fn render_dialog(
     // Backward-compatible: an older companion ignores the unknown header and
     // answers synchronously (200 with the terminal `{cancelled, …}` shape) —
     // detected after the status checks below and used directly, no polling.
-    let resp = http
+    // Review C-01: prove locality. The token is shared with every registered
+    // remote; this file never leaves the machine, so only a bridge running
+    // here can present it — and only then does the companion perform target
+    // writes itself.
+    let mut post = http
         .post(&url)
         .bearer_auth(&token)
-        .header("x-aiui-async", "1")
+        .header("x-aiui-async", "1");
+    if let Some(proof) = cfg.read_local_proof() {
+        post = post.header(crate::http::LOCAL_PROOF_HEADER, proof);
+    }
+    let resp = post
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
         .send()

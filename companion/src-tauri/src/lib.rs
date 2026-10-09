@@ -150,6 +150,13 @@ fn dialog_cancel(
     Ok(())
 }
 
+/// Does this dialog's `target` write happen on THIS machine? Only for a
+/// render that proved locality — `/render` gives every other one a
+/// `session_origin` (review C-01).
+fn writes_on_this_host(req: &dialog::DialogRequest) -> bool {
+    req.session_origin.as_deref().unwrap_or("").is_empty()
+}
+
 /// The reasons a dialog window may attach to its own cancel (review D-02).
 /// A reason-less cancel means "the user declined" to the agent
 /// (`docs/skill.md`), so the window's TTL countdown firing must say
@@ -190,6 +197,15 @@ fn write_dialog_targets(
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
+    // Review C-01: only a render that PROVED it came from the local bridge
+    // (`x-aiui-local-proof`) may write on this machine. `/render` stamps every
+    // other one with a `session_origin`, so the frontend never asks — and if
+    // it does anyway, the stored request decides, not the window.
+    if !writes_on_this_host(&req) {
+        return Err(
+            "target writes for a bridge-served dialog happen on the bridge's host".to_string(),
+        );
+    }
 
     let commits = action_commits_targets(&req.spec, action.as_deref());
 
@@ -1777,8 +1793,10 @@ fn uninstall_app_removal_hint() -> String {
 /// The local state aiui owns inside its config dir, in removal order. The
 /// media cache lives outside it (under the Tauri app-cache dir) and is
 /// handled separately.
-const LOCAL_STATE_FILES: [&str; 6] = [
+const LOCAL_STATE_FILES: [&str; 7] = [
     "token",
+    // Review C-01: the locality proof the local bridge presents.
+    "local-proof",
     "first_run_done",
     "remotes.json",
     // #184: the uvx sidecar is local state too.
@@ -3171,7 +3189,24 @@ pub fn run() {
 
 #[cfg(test)]
 mod dialog_cancel_reason_tests {
-    use super::frontend_cancel_reason;
+    use super::{frontend_cancel_reason, writes_on_this_host};
+
+    #[test]
+    fn only_a_proven_local_render_writes_on_this_host() {
+        // C-01: `/render` stamps every render without a locality proof with a
+        // `session_origin`; the write command must refuse those.
+        let req = |origin: Option<&str>| crate::dialog::DialogRequest {
+            id: "d".into(),
+            spec: serde_json::json!({}),
+            ttl_secs: 60,
+            remaining_secs: 60,
+            session: None,
+            session_origin: origin.map(String::from),
+        };
+        assert!(writes_on_this_host(&req(None)));
+        assert!(!writes_on_this_host(&req(Some("unverified host"))));
+        assert!(!writes_on_this_host(&req(Some("devbox"))));
+    }
 
     #[test]
     fn only_the_ttl_reason_passes_from_a_window() {

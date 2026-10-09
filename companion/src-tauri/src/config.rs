@@ -116,18 +116,87 @@ impl AppConfig {
             }
         };
 
-        Ok(AppConfig {
+        let cfg = AppConfig {
             token,
             config_dir,
             token_path,
             http_port: 7777,
-        })
+        };
+        // Review C-01: best-effort — a missing proof only means local target
+        // writes fall back to "unverified", never that a remote gains one.
+        let _ = cfg.ensure_local_proof();
+        Ok(cfg)
+    }
+
+    /// Where the locality proof lives: next to the token, but — unlike the
+    /// token — never copied to a remote (`setup::push_token_to_remote` copies
+    /// `token` by name).
+    pub fn local_proof_path(&self) -> PathBuf {
+        self.config_dir.join("local-proof")
+    }
+
+    /// The locality proof, if one exists and is well-formed. Read fresh on
+    /// every use rather than cached: the GUI and its `--mcp-stdio` children
+    /// are separate processes, and the file is the one value they share.
+    pub fn read_local_proof(&self) -> Option<String> {
+        fs::read_to_string(self.local_proof_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_well_formed_token(s))
+    }
+
+    /// Create the locality proof (0600) if it does not exist yet.
+    ///
+    /// Review C-01: every caller of `127.0.0.1:7777` — the local bridge and
+    /// every tunnelled remote — presents the same bearer token, so the token
+    /// cannot say who is local. The companion used to infer "local writer"
+    /// from an ABSENT `session_origin` field, which any remote could simply
+    /// omit to have its `target` write performed on this machine. The local
+    /// Rust bridge now presents this file's content as `x-aiui-local-proof`;
+    /// a render without it is treated as bridge-served.
+    pub fn ensure_local_proof(&self) -> io::Result<String> {
+        if let Some(p) = self.read_local_proof() {
+            return Ok(p);
+        }
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let p = hex::encode(bytes);
+        atomic_write_with_mode(&self.local_proof_path(), p.as_bytes(), Some(0o600))?;
+        // Two processes racing on first start each write a value; the file is
+        // the authority, so return what it holds now.
+        Ok(self.read_local_proof().unwrap_or(p))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_local_proof_is_created_once_and_is_not_the_token() {
+        let dir = std::env::temp_dir().join(format!("aiui-proof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AppConfig {
+            token: "t".repeat(64),
+            config_dir: dir.clone(),
+            token_path: dir.join("token"),
+            http_port: 7777,
+        };
+        assert_eq!(cfg.read_local_proof(), None);
+        let a = cfg.ensure_local_proof().unwrap();
+        let b = cfg.ensure_local_proof().unwrap();
+        assert_eq!(a, b, "created once, then reused");
+        assert!(is_well_formed_token(&a));
+        assert_ne!(a, cfg.token);
+        assert_ne!(cfg.local_proof_path().file_name().unwrap(), "token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(cfg.local_proof_path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn token_shape_is_validated() {
