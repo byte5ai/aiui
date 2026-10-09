@@ -81,16 +81,31 @@ fn pending_update_notification(version: &str) -> (String, String) {
 ///
 /// Pure, so the matrix is unit-testable without a window.
 pub(crate) fn is_allowed_app_navigation(url: &tauri::Url) -> bool {
+    is_allowed_app_navigation_in(url, cfg!(debug_assertions))
+}
+
+/// Review D-07: `localhost` used to be allowed on ANY port and path in
+/// release builds too, so a Mermaid `click … href "http://localhost:5173/"`
+/// or an SVG link navigated a dialog — with the user's typed input — to a
+/// local dev server. Only a debug build, and only the `devUrl` port, may.
+fn is_allowed_app_navigation_in(url: &tauri::Url, dev: bool) -> bool {
     match url.scheme() {
         // macOS / Linux production.
         "tauri" => true,
         // Windows production (`useHttpsScheme` unset → http) and the dev server.
-        "http" => matches!(url.host_str(), Some("tauri.localhost") | Some("localhost")),
+        "http" => match url.host_str() {
+            Some("tauri.localhost") => true,
+            Some("localhost") => dev && url.port() == Some(DEV_SERVER_PORT),
+            _ => false,
+        },
         // Windows production with `useHttpsScheme: true`.
         "https" => url.host_str() == Some("tauri.localhost"),
         _ => false,
     }
 }
+
+/// `build.devUrl`'s port in `tauri.conf.json`.
+const DEV_SERVER_PORT: u16 = 5173;
 
 /// Timestamp of the most recent dialog-window teardown (X-close, submit/cancel
 /// close, or programmatic destroy). The macOS `RunEvent::Reopen` handler reads
@@ -353,9 +368,12 @@ fn get_dialog_spec(
 /// deadline derived once at mount drifts in both directions (#207).
 #[tauri::command]
 fn get_dialog_remaining(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<Option<u64>, String> {
+    // D-10: a window may only ask about its own dialog (#195).
+    require_own_dialog(&window, &id, "get_dialog_remaining")?;
     Ok(state.remaining_secs(&id))
 }
 
@@ -368,9 +386,13 @@ fn get_dialog_remaining(
 /// (#207).
 #[tauri::command]
 fn resolve_dialog_targets(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
 ) -> Result<std::collections::HashMap<String, String>, String> {
+    // D-10: another session's dialog would disclose its target field names
+    // and absolute paths.
+    require_own_dialog(&window, &id, "resolve_dialog_targets")?;
     let req = state
         .get_request(&id)
         .ok_or_else(|| "dialog no longer active".to_string())?;
@@ -1244,7 +1266,9 @@ fn repair_skill(window: tauri::WebviewWindow) -> Result<setup::StepResult, Strin
 /// runs from an ephemeral location: registering a path that disappears is
 /// exactly the state the banner is asking the user to leave.
 #[tauri::command]
-fn repair_claude_config() -> Result<Vec<setup::StepResult>, String> {
+fn repair_claude_config(window: tauri::WebviewWindow) -> Result<Vec<setup::StepResult>, String> {
+    // D-10 / B1-09: rewrites the user's MCP host configs — Settings only.
+    require_privileged_window(&window, "repair_claude_config")?;
     let bin = setup::app_binary_path();
     if setup::is_ephemeral_install() {
         return Ok(vec![setup::StepResult {
@@ -1323,7 +1347,14 @@ fn open_url(url: String) -> Result<(), String> {
 /// Granting `clipboard-manager:allow-write-text` would hand clipboard access
 /// to the dialog window too, which renders agent-supplied content.
 #[tauri::command]
-fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
+fn copy_to_clipboard(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    text: String,
+) -> Result<(), String> {
+    // D-10: a dialog window renders agent content; it must not be able to
+    // swap what the user is about to paste into a terminal.
+    require_privileged_window(&window, "copy_to_clipboard")?;
     use tauri_plugin_clipboard_manager::ClipboardExt;
     app.clipboard()
         .write_text(text)
@@ -3189,6 +3220,46 @@ pub fn run() {
 }
 
 #[cfg(test)]
+mod command_gate_wiring_tests {
+    /// Commands any window — a dialog window included — may call. Every
+    /// other registered command must call a #195 gate. Default-deny: a new
+    /// command that forgets its gate fails here instead of shipping open,
+    /// which is how four commands from one merge did (review D-10). The
+    /// #195 tests checked the predicates, never the wiring.
+    const ANY_WINDOW: [&str; 4] = [
+        "ui_pong",                   // acks a health ping, carries no data
+        "close_window",              // closes the CALLING window only
+        "is_update_safe_to_install", // a boolean
+        "open_url",                  // validates the scheme itself; opens externally
+    ];
+
+    #[test]
+    fn every_registered_command_is_gated_or_explicitly_open() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").expect("handler list");
+        let list = &src[start + "generate_handler![".len()..];
+        let list = &list[..list.find("])").expect("end of handler list")];
+        let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        assert!(names.len() > 10, "parsed the handler list: {names:?}");
+        for name in names {
+            if ANY_WINDOW.contains(&name) {
+                continue;
+            }
+            let decl = [format!("\nfn {name}("), format!("\nasync fn {name}(")]
+                .into_iter()
+                .find_map(|d| src.find(&d))
+                .unwrap_or_else(|| panic!("no fn {name} in lib.rs"));
+            let body = &src[decl..];
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("require_privileged_window(") || body.contains("require_own_dialog("),
+                "command `{name}` calls no window gate — add one, or list it in ANY_WINDOW with a reason"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dialog_cancel_reason_tests {
     use super::{frontend_cancel_reason, writes_on_this_host};
 
@@ -3274,9 +3345,19 @@ mod navigation_tests {
             "Windows with useHttpsScheme"
         );
         assert!(
-            is_allowed_app_navigation(&url("http://localhost:5173/dialog.html")),
+            is_allowed_app_navigation_in(&url("http://localhost:5173/dialog.html"), true),
             "npm run tauri:dev, per tauri.conf.json build.devUrl"
         );
+    }
+
+    #[test]
+    fn a_release_build_never_navigates_to_localhost() {
+        // D-07: any localhost port and path was a valid destination in
+        // release builds — a local dev server or admin UI included.
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:5173/"), false));
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:3000/admin"), false));
+        assert!(!is_allowed_app_navigation_in(&url("http://localhost:3000/admin"), true), "dev: only the devUrl port");
+        assert!(is_allowed_app_navigation_in(&url("http://tauri.localhost/dialog.html"), false));
     }
 
     #[test]
