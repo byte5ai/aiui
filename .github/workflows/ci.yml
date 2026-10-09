@@ -226,6 +226,12 @@ jobs:
           ./scripts/check-doc-claims.sh --self-test
           ./scripts/check-doc-claims.sh
 
+      # The Tauri CLI refuses to bundle when an @tauri-apps/* npm package is
+      # on another major.minor than its crate — but only the Windows leg
+      # bundles, ten minutes in. Checked here from the lockfiles in seconds.
+      - name: Check @tauri-apps npm packages match their crates
+        run: ./scripts/check-tauri-versions.sh
+
       # F-16: the repo is public. Concrete internal names come from the
       # repository variable AIUI_LEAK_PATTERNS, never from the script itself.
       - name: Guard against private-infrastructure leaks

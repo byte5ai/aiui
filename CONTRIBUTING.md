@@ -31,6 +31,7 @@ aiui/
 │   ├── check-release-preconditions.sh  manifests + CHANGELOG agree before a release
 │   ├── check-skill-drift.sh            keeps both skill.md copies in sync
 │   ├── check-svelte-warnings.sh        svelte-check warning ratchet
+│   ├── check-tauri-versions.sh         @tauri-apps npm packages match their crates' minor
 │   ├── check-updater-feed.sh           validates a release's latest.json
 │   ├── check-workflow-pins.sh          every `uses:` pinned by SHA
 │   ├── diagnose-session-startup.sh     session-startup troubleshooting dump
