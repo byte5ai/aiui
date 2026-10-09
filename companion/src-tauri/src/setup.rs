@@ -1979,7 +1979,11 @@ def save(data):
         pass
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        os.fchmod(fd, mode)  # O_CREAT's mode is filtered by the umask
+        # O_CREAT's mode is filtered by the umask. POSIX only — the remotes
+        # this runs on are POSIX, but the contract test also runs it on a
+        # Windows CI leg, where `os.fchmod` does not exist.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = -1
             f.write(json.dumps(data, indent=2))

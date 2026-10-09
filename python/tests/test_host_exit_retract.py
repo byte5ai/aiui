@@ -142,6 +142,10 @@ def test_host_exit_mid_dialog_retracts_the_dialog(tmp_path: Path) -> None:
         "AIUI_COLDSTART_WAIT_S": "5",
         "AIUI_LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
+        # The child's stderr goes to a file; on Windows it would otherwise be
+        # written in the ANSI code page (cp1252: the em dashes in the log
+        # become 0x97) and the UTF-8 read below fails.
+        "PYTHONIOENCODING": "utf-8",
     }
     with stderr_path.open("w", encoding="utf-8") as stderr:
         proc = subprocess.Popen(
