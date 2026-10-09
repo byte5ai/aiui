@@ -14,10 +14,12 @@ You don't normally need to touch this package directly.
 app. `~/.claude.json` points directly at the app binary. No `uv`, no
 `uvx`, no Python on the onboarding path.
 
-**On a remote SSH host** (no aiui.app there), this package is the right
-tool. aiui registers it automatically when you add the remote in
-settings — `{command: "uvx", args: ["aiui-mcp"]}`. All dialogs tunnel
-back through aiui on your own machine.
+**On a remote SSH host** (no aiui companion there), this package is the
+right tool. aiui registers it automatically when you add the remote in
+settings — `{command: "uvx", args: ["aiui-mcp==<version>"]}`, pinned to the
+version of your companion so the two always speak the same contract (`uvx`
+may be an absolute path when aiui found one on the remote). All dialogs
+tunnel back through aiui on your own machine.
 
 See the main repo for the full install flow and companion download:
 <https://github.com/byte5ai/aiui>
@@ -46,11 +48,12 @@ these must not turn into "the aiui MCP server failed to start".
 | --- | --- | --- |
 | `AIUI_ENDPOINT` | `http://127.0.0.1:7777` | Companion base URL — the local end of the SSH reverse-tunnel. |
 | `AIUI_TOKEN_PATH` | `~/.config/aiui/token` (`%APPDATA%\aiui\token` on Windows) | Pairing token file, written by the companion and copied to each registered remote. |
-| `AIUI_TIMEOUT_S` | `120` | Seconds for a held request (`/notify`, `/update`). |
+| `AIUI_TIMEOUT_S` | `120` | Client timeout for the companion requests that are not polls: opening a dialog (`POST /render`), pushing local video/audio to the media cache (`/media`), `/notify` and `/update`. |
 | `AIUI_HEALTH_TIMEOUT_S` | `3` | Seconds for `aiui_health` and `/version` — deliberately short; it is the diagnostic. |
 | `AIUI_COLDSTART_WAIT_S` | `30` | Seconds to poll `/ping` before the first call, so a companion that is still starting gets time to serve. |
 | `AIUI_UPLOAD_TIMEOUT_S` | `900` | Seconds for the held `POST /upload` — generous, because the user browses a file picker inside it. |
 | `AIUI_LOG_LEVEL` | `INFO` | Any standard `logging` level name. |
+| `AIUI_ALLOW_UNVERIFIED_COMPANION` | unset | Set to `1` to send the token to a companion too old to answer the challenge probe. Before its token leaves this host, the bridge makes the listener on the companion port prove it holds the same token (`GET /probe?nonce=…`, HMAC answer); a listener that cannot is refused, because on a shared host anything may hold that port while the SSH tunnel is down. Only an older companion answering 401 can be let through, and only with this opt-in — better: update aiui. |
 | `AIUI_LIVE` | unset | Test-only: set to `1` to run the integration tests against a real companion. |
 
 ## Prompts

@@ -19,16 +19,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import hashlib
+import hmac
 import importlib.metadata
 import importlib.resources as resources
+import json
 import logging
 import mimetypes
 import os
+import secrets
 import socket
 import sys
 import tempfile
 import time
 import urllib.parse
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -170,19 +176,42 @@ COLDSTART_WAIT_S = _env_float("AIUI_COLDSTART_WAIT_S", 30.0)
 # before we time out, letting us re-poll cleanly.
 ASYNC_POLL_TIMEOUT_S = 40.0
 
-# Poll-retry budget for the async render (#202). The whole point of the async
+# Poll-outage budget for the async render (#202). The whole point of the async
 # design is that a dropped connection cannot cost the user's think-time: the
-# dialog stays on the Mac's screen for the full server-side TTL, so a transport
-# error on one poll is a blip, not an answer. Aborting on the first one
-# abandoned an answered window and made the agent's natural retry open a
-# *second* dialog for the same question. Five consecutive failures a second
-# apart tolerate roughly three minutes of outage once the 40 s per-GET timeout
-# is counted in — an SSH reverse-tunnel re-establish or a WebView restart during
-# an in-app update fits comfortably. The counter resets on every successful
-# poll, so a flaky link never accumulates its way to a false give-up. Only
-# transport errors are retried: a 404 means the slot is genuinely gone.
-ASYNC_POLL_MAX_CONSECUTIVE_FAILURES = 5
+# dialog stays on the user's screen for the full server-side TTL, so a
+# transport error on one poll is a blip, not an answer. Aborting on the first
+# one abandoned an answered window and made the agent's natural retry open a
+# *second* dialog for the same question.
+#
+# The budget is WALL-CLOCK time, measured from the first failure of the current
+# streak — not a failure count. A count is meaningless across failure classes:
+# a refused connection (the SSH reverse-tunnel restarting) fails in
+# milliseconds, so five of them a second apart gave up after ~4 s, while five
+# 40 s timeouts (a blackholed link) outlived the companion's abandonment reaper.
+# The streak resets on every successful poll, so a flaky link never accumulates
+# its way to a false give-up. Only transport errors are retried: a 404 means
+# the slot is genuinely gone.
+#
+# Cross-bridge contract, mirrored by the Rust bridge: the companion reaps a slot
+# nobody has polled for `SLOT_ABANDONED_AFTER` (companion/src-tauri/src/http.rs)
+# and closes its dialog. The worst case between two polls that reach the
+# companion is the whole budget plus one backoff plus one timed-out GET, so
+#     POLL_OUTAGE_BUDGET_S + ASYNC_POLL_MAX_BACKOFF_S + ASYNC_POLL_TIMEOUT_S
+#     (180 + 8 + 40 = 228)  <  SLOT_ABANDONED_AFTER (300)
+# must hold, or a bridge that is still trying comes back to a closed dialog.
+# `tests/test_poll_outage_budget.py` parses the Rust constant and asserts this.
+POLL_OUTAGE_BUDGET_S = 180.0
+# Capped exponential backoff between retries of the same id: 1, 2, 4, 8, 8, … s.
 ASYNC_POLL_RETRY_BACKOFF_S = 1.0
+ASYNC_POLL_MAX_BACKOFF_S = 8.0
+
+# How far past the advertised TTL the poll loop keeps going before it stops on
+# its own (E-05). The companion's TTL sweep normally answers first with a
+# `ttl_expired` cancel; this is the backstop for a companion that never does, so
+# a string of `{pending: true}` answers can no longer hold the tool call open
+# forever. One poll timeout of slack keeps the companion's own answer the one
+# that normally arrives.
+ASYNC_POLL_TTL_GRACE_S = ASYNC_POLL_TIMEOUT_S
 
 # Floor between two poll iterations. A real companion holds each GET for its
 # ~25 s poll window so the loop cannot spin today, but a companion that answers
@@ -194,6 +223,13 @@ ASYNC_POLL_MIN_INTERVAL_S = 0.2
 # `DIALOG_TTL` (2 h). The advertised TTL is the wall-clock ceiling on retrying:
 # past it the id is gone on the companion side.
 DEFAULT_POLL_TTL_S = 7200.0
+
+# The poll loop reads its clock and sleeps through these two names rather than
+# `time.monotonic` / `asyncio.sleep` directly, so a test can drive the
+# outage budget on a fake clock. Patching `time.monotonic` itself would move
+# the event loop's own clock too.
+_now = time.monotonic
+_sleep = asyncio.sleep
 
 # Budget for the best-effort `DELETE /render/{id}` that retracts a dialog whose
 # caller was cancelled (#193). Short: cleanup must never outlive the thing it
@@ -229,11 +265,29 @@ Type `/aiui:teach` for the full widget catalog when composing a \
 complex form.
 """
 
+
+@contextlib.asynccontextmanager
+async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    """Retract the dialogs still open when the MCP host goes away (E-07).
+
+    The SDK (mcp >= 1.27) cancels in-flight tool handlers when stdin closes,
+    and each `_poll_render` then starts a retracting DELETE — as a detached
+    task, which nothing awaits and loop teardown may cancel before the request
+    has crossed a slow tunnel. The lifespan exits after the handlers' task
+    group and while the loop is still alive, so the DELETEs are awaited
+    (bounded) here.
+    """
+    try:
+        yield None
+    finally:
+        await _retract_live_renders()
+
+
 # `instructions` is the spec-sanctioned way to push a top-level hint
 # into every session at the MCP handshake — Claude Code (and Claude
 # Desktop) feed it to the agent before the first turn.  Kept short on
 # purpose; the full catalog lives in the `widgets`/`teach` prompts.
-mcp = FastMCP("aiui", instructions=_INSTRUCTIONS)
+mcp = FastMCP("aiui", instructions=_INSTRUCTIONS, lifespan=_lifespan)
 
 
 def _token() -> str:
@@ -255,6 +309,156 @@ def _token() -> str:
             "to write a fresh token."
         )
     return tok
+
+
+# ---------------------------------------------------------------------------
+# Review B1-01: prove the listener is aiui BEFORE the token leaves this host.
+#
+# On a remote host the bridge talks to `127.0.0.1:<port>`, the near end of an
+# SSH reverse-tunnel. While that tunnel is down the port is free, and on a
+# shared host a co-tenant can bind it and collect `Authorization: Bearer
+# <token>` from the next request. So before the token goes to a listener, the
+# listener has to answer a challenge only the token holder can answer:
+# `GET /probe?nonce=<fresh hex>` — sent WITHOUT credentials — must come back
+# with `mac = HMAC-SHA256(token, "aiui-probe-v1|<nonce>|<pid>|<build_sha>")`.
+# A squatter can neither answer it nor learn anything from it.
+#
+# A verified listener stays verified for `LISTENER_VERIFY_TTL_S` while requests
+# keep succeeding; any transport error (refused, reset, timed out) forgets it,
+# so the first token-bearing request after an outage verifies again.
+# ---------------------------------------------------------------------------
+
+LISTENER_VERIFY_TTL_S = 60.0
+# Opt-in for a companion that predates the challenge (it answers the
+# credential-less probe with 401): send the token unverified. Off by default —
+# an unverified listener may just as well be a squatter.
+ALLOW_UNVERIFIED_ENV = "AIUI_ALLOW_UNVERIFIED_COMPANION"
+_PROBE_MAC_CONTEXT = "aiui-probe-v1"
+# listener (`scheme://host:port`) → monotonic time it last proved itself.
+_LISTENER_VERIFIED: dict[str, float] = {}
+
+
+class CompanionUnverifiedError(RuntimeError):
+    """The process on the companion port could not prove it holds our token,
+    so the token was not sent to it."""
+
+
+def _listener_key(url: httpx.URL) -> str:
+    return f"{url.scheme}://{url.host}:{url.port}"
+
+
+def _probe_mac(token: str, nonce: str, pid: int, build_sha: str) -> str:
+    """Mirror of the companion's `probe_mac` (http.rs)."""
+    msg = f"{_PROBE_MAC_CONTEXT}|{nonce}|{pid}|{build_sha}"
+    return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def _probe_failure(status: int, body: bytes, token: str, nonce: str) -> str | None:
+    """Why a `/probe?nonce=` answer does not prove the listener holds `token`,
+    or None when it does."""
+    if status != 200:
+        return f"/probe answered HTTP {status}"
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return "/probe did not answer JSON"
+    if not isinstance(data, dict):
+        return "/probe did not answer a JSON object"
+    mac, pid, build_sha = data.get("mac"), data.get("pid"), data.get("build_sha")
+    if not isinstance(mac, str) or not mac:
+        return "/probe carried no challenge answer (`mac`)"
+    if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(build_sha, str):
+        return "/probe lacks the `pid`/`build_sha` the answer is bound to"
+    expected = _probe_mac(token, nonce, pid, build_sha)
+    if not hmac.compare_digest(expected.encode(), mac.encode()):
+        return "its challenge answer does not match this host's token"
+    return None
+
+
+async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, token: str) -> None:
+    """Make sure the listener behind `url` proved it holds `token` within the
+    last `LISTENER_VERIFY_TTL_S`; challenge it otherwise. Raises
+    `CompanionUnverifiedError` instead of letting the token go out. Transport
+    errors of the probe itself propagate unchanged, so callers diagnose a dead
+    port exactly as before."""
+    key = _listener_key(url)
+    verified_at = _LISTENER_VERIFIED.get(key)
+    if verified_at is not None and time.monotonic() - verified_at < LISTENER_VERIFY_TTL_S:
+        return
+    _LISTENER_VERIFIED.pop(key, None)
+    nonce = secrets.token_hex(32)
+    probe = httpx.Request(
+        "GET",
+        url.copy_with(path="/probe", query=f"nonce={nonce}".encode("ascii")),
+        extensions={"timeout": httpx.Timeout(HEALTH_TIMEOUT_S).as_dict()},
+    )
+    resp = await inner.handle_async_request(probe)
+    try:
+        body = await resp.aread()
+    finally:
+        await resp.aclose()
+    where = f"{url.host}:{url.port}"
+    if resp.status_code == 401:
+        if os.environ.get(ALLOW_UNVERIFIED_ENV, "").strip() == "1":
+            log.warning(
+                "listener %s cannot be verified (older companion?) — sending the token "
+                "anyway because %s=1",
+                where,
+                ALLOW_UNVERIFIED_ENV,
+            )
+            _LISTENER_VERIFIED[key] = time.monotonic()
+            return
+        raise CompanionUnverifiedError(
+            f"aiui did not send its token to {where}: the listener there answered the "
+            f"credential-less challenge probe with 401. An aiui companion older than this "
+            f"bridge does that — update aiui on the user's machine — but so could a "
+            f"foreign process holding the port, which is why the token was withheld. To "
+            f"use an older companion unverified meanwhile, set {ALLOW_UNVERIFIED_ENV}=1 "
+            f"in this MCP server's environment (the token then goes to whatever holds "
+            f"the port)."
+        )
+    why = _probe_failure(resp.status_code, body, token, nonce)
+    if why is not None:
+        raise CompanionUnverifiedError(
+            f"aiui did not send its token to {where}: the companion on that port could "
+            f"not prove it is aiui ({why}). It may be an older aiui companion — update "
+            f"aiui on the user's machine — or a foreign process holding the port: on a "
+            f"shared remote host anyone can bind it while the SSH reverse-tunnel is down "
+            f"(aiui Settings → Connections on the user's machine re-establishes it). If "
+            f"the user's aiui holds a different token, re-register this host there."
+        )
+    _LISTENER_VERIFIED[key] = time.monotonic()
+
+
+class _CompanionTransport(httpx.AsyncBaseTransport):
+    """The transport every companion client uses (B1-01).
+
+    A request carrying a bearer token goes out only after the listener passed
+    `_verify_listener`; a transport error on any request forgets the listener,
+    so the next token-bearing request re-verifies. Living in the transport, the
+    check cannot be skipped by a call site that forgets it.
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                await _verify_listener(self._inner, request.url, auth[len("Bearer ") :])
+            return await self._inner.handle_async_request(request)
+        except httpx.TransportError:
+            _LISTENER_VERIFIED.pop(_listener_key(request.url), None)
+            raise
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def _client(timeout: float) -> httpx.AsyncClient:
+    """An `httpx.AsyncClient` for the companion, on `_CompanionTransport`."""
+    return httpx.AsyncClient(timeout=timeout, transport=_CompanionTransport())
 
 
 def _explain_exc(e: BaseException) -> str:
@@ -292,58 +496,60 @@ async def _preflight() -> None:
     accept our bearer token. Guards against stale local aiui instances that
     would otherwise hijack the SSH reverse-forward and hang dialogs silently.
     """
-    async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
+    async with _client(HEALTH_TIMEOUT_S) as client:
         try:
             r = await client.get(
                 f"{ENDPOINT}/health",
                 headers={"Authorization": f"Bearer {_token()}"},
             )
+        # E-06: the causes named below are the two that can actually silence
+        # the companion — aiui not running on the user's machine, or the SSH
+        # reverse-tunnel down — worded like the Rust bridge's
+        # `aiui_unreachable_result`. The companion does not depend on Claude
+        # Desktop (Claude-Code-only, Codex and other hosts are first-class),
+        # and a bridge on a remote host cannot trigger the companion-local
+        # auto-resurrect, so neither is offered as a cause or a fix here.
         except httpx.ConnectError as e:
             raise RuntimeError(
-                f"aiui companion not reachable at {ENDPOINT}. "
-                f"Is Claude Desktop running on the machine with the aiui companion? "
-                f"For remote projects, the "
-                f"SSH reverse-tunnel must also be active (companion handles it "
-                f"automatically if this host is registered in its settings). "
-                f"Underlying error: {e}"
+                f"aiui companion not reachable at {ENDPOINT} (nothing is listening). "
+                f"Either aiui is not running on the user's machine — ask them to open "
+                f"aiui — or, on a remote host, the SSH reverse-tunnel that forwards "
+                f"this port is down: point the user to aiui Settings → Connections on "
+                f"their machine to re-establish it. Underlying error: {_explain_exc(e)}"
             ) from e
         except httpx.ReadTimeout as e:
+            # On a remote whose tunnel is blackholed, the TCP connect to sshd's
+            # local listener succeeds and the read times out — the tunnel
+            # failure, not a stale process on this host.
             raise RuntimeError(
-                f"aiui companion at {ENDPOINT} timed out on /health — likely a stale "
-                f"local aiui instance holding the port. Run `pkill -f '^aiui$'` on "
-                f"this host. ({_explain_exc(e)})"
+                f"aiui companion at {ENDPOINT} accepted the connection but did not "
+                f"answer /health within {HEALTH_TIMEOUT_S:g} s. On a remote host this is "
+                f"usually a stalled SSH reverse-tunnel: point the user to aiui Settings "
+                f"→ Connections on their machine. Otherwise aiui on the user's machine "
+                f"may be hung — ask them to restart aiui. ({_explain_exc(e)})"
             ) from e
         except httpx.ReadError as e:
             # Connected at the TCP layer but the stream closed with no HTTP
-            # response — the classic remote signature of "tunnel is up but the
-            # Mac side isn't serving" (stale SSH reverse-forward bound to :7777
-            # with a dead aiui behind it). Distinct from ConnectError (nothing
+            # response — the classic remote signature of "tunnel is up but
+            # nothing serves behind it". Distinct from ConnectError (nothing
             # listening) and from a clean 401/5xx.
             raise RuntimeError(
                 f"aiui companion at {ENDPOINT} accepted the connection but sent no "
-                f"response (ReadError). On a remote this means the SSH reverse-tunnel "
-                f"is up but the companion-side aiui isn't serving — Claude Desktop may be "
-                f"closed, or a stale tunnel is squatting :7777. Open Claude Desktop on "
-                f"the companion host; if it persists, re-register this remote in aiui.app settings. "
-                f"({_explain_exc(e)})"
+                f"response (ReadError). On a remote host this means the SSH "
+                f"reverse-tunnel is up but nothing serves behind it: aiui may not be "
+                f"running on the user's machine (ask them to open aiui), or a stale "
+                f"tunnel holds the port (aiui Settings → Connections on their machine "
+                f"re-establishes it). ({_explain_exc(e)})"
             ) from e
         except httpx.RemoteProtocolError as e:
-            # Connection reset / closed mid-response. The on-Mac mcp-stdio
-            # child's auto-resurrect normally brings aiui.app back on the
-            # next tool call, so a one-off reset is usually self-healing —
-            # we name the most common stuck-state causes (stale SSH tunnel
-            # squatting :7777, token mismatch from a parallel install)
-            # rather than telling the user to manually restart aiui.app.
-            # httpx leaves str(e) empty for this class of error — the
-            # `_explain_exc` fallback surfaces the class name so the user
-            # at least sees *something* concrete.
+            # Connection reset / closed mid-response. httpx leaves str(e) empty
+            # for this class of error — the `_explain_exc` fallback surfaces
+            # the class name so the user at least sees *something* concrete.
             raise RuntimeError(
-                f"aiui companion at {ENDPOINT} reset the connection. "
-                f"The companion-side mcp-stdio normally auto-resurrects aiui.app on "
-                f"the next call — if this persists, a stale process may hold "
-                f"the port. Verify that Claude Desktop is open on the companion host and, "
-                f"on remotes, re-register the host in aiui.app settings to "
-                f"re-sync the token. "
+                f"aiui companion at {ENDPOINT} reset the connection. aiui on the "
+                f"user's machine may be restarting (an update or a relaunch) — retry "
+                f"once. If it persists, the SSH reverse-tunnel may be stale: point the "
+                f"user to aiui Settings → Connections on their machine. "
                 f"({_explain_exc(e)})"
             ) from e
         except httpx.HTTPError as e:
@@ -352,18 +558,17 @@ async def _preflight() -> None:
             # exception with an empty message.
             raise RuntimeError(
                 f"aiui companion request to {ENDPOINT} failed: {_explain_exc(e)}. "
-                f"Verify Claude Desktop is open on the companion host; auto-resurrect "
-                f"normally restores the GUI on the next call. If repeated, "
-                f"check the SSH reverse-tunnel and re-register this remote "
-                f"in aiui.app settings to re-sync the token."
+                f"Check that aiui is running on the user's machine; on a remote host, "
+                f"check the SSH reverse-tunnel in aiui Settings → Connections there."
             ) from e
 
         if r.status_code == 401:
             raise RuntimeError(
-                f"aiui companion at {ENDPOINT} rejected our token (401). "
-                f"Another aiui process may be listening on this port with a different "
-                f"token. Run `pkill -f '^aiui$'` on this host, then re-register it "
-                f"from the companion's settings window to re-sync the token."
+                f"aiui companion at {ENDPOINT} rejected our token (401). The token on "
+                f"this host does not match the companion's: re-register this host from "
+                f"aiui Settings → Connections on the user's machine to re-sync it. Only "
+                f"if that does not help: a stray aiui process on THIS host may be "
+                f"holding the port — stop it (`pkill -f '^aiui$'`) as a last resort."
             )
         body = _health_body(r)
 
@@ -869,6 +1074,31 @@ def _resolve_target_path(path: Path) -> Path:
     return cur
 
 
+def _resolve_parent_only(path: Path) -> Path:
+    """`create`'s destination (C-04): the parent canonicalised, the final
+    component taken as given — never followed. Mirror of the Rust
+    `filewrite::resolve_parent_only`.
+
+    #199 needed link-following for `substitute` (read-modify-write of the real
+    file). Extending it to `create` turned a symlink planted at the destination
+    into a write-through onto whatever it points at — a shell rc, an ssh
+    config — with an approval line naming only the link.
+    """
+    try:
+        return path.parent.resolve(strict=True) / path.name
+    except OSError:
+        return path  # parent doesn't exist yet — nothing to resolve
+
+
+def _resolve_for_mode(path: Path, mode: Any) -> Path:
+    """Where a write in `mode` lands for `path` (already tilde-expanded).
+    Anything but `substitute` is treated as `create`, like the Rust
+    `resolve_for_mode` / `resolve_display`."""
+    if mode == "substitute":
+        return _resolve_target_path(path)
+    return _resolve_parent_only(path)
+
+
 def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     """Mirror of the Rust `filewrite::write_local`: a LOCAL file write on THIS
     host (the bridge runs where the agent runs, so the file is always local).
@@ -894,8 +1124,11 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
     why = _target_path_error(raw_path)
     if why:
         return {"written": False, "target": raw_path, "bytes": 0, "error": why}
+    mode = target.get("mode")
     try:
-        path = _resolve_target_path(Path(raw_path).expanduser())
+        # C-04: mode-aware — `substitute` follows a final symlink, `create`
+        # never does (and refuses one below).
+        path = _resolve_for_mode(Path(raw_path).expanduser(), mode)
     except Exception:  # noqa: BLE001  # pragma: no cover - expanduser on an exotic home
         path = Path(raw_path)
     display = str(path)
@@ -912,10 +1145,34 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
             "bytes": 0,
             "error": "refusing to write an empty value",
         }
-    mode = target.get("mode")
+    # C-05: the optional keys are typed, as the companion's validator now
+    # demands up front. An older companion in front of this bridge would not
+    # refuse them, so the writer must not guess either: `"overwrite": "false"`
+    # is a non-empty string — truthy — and used to clobber the file; a numeric
+    # `perm` like 600 was silently reinterpreted.
+    for key, ok, want in (
+        ("perm", target.get("perm") is None or isinstance(target.get("perm"), str), "a string"),
+        (
+            "overwrite",
+            target.get("overwrite") is None or isinstance(target.get("overwrite"), bool),
+            "a boolean",
+        ),
+        (
+            "placeholder",
+            target.get("placeholder") is None or isinstance(target.get("placeholder"), str),
+            "a string",
+        ),
+    ):
+        if not ok:
+            return {
+                "written": False,
+                "target": display,
+                "bytes": 0,
+                "error": f"target.{key} is not {want}",
+            }
     perm_s = target.get("perm")
     try:
-        perm: int | None = int(str(perm_s), 8) if perm_s else None
+        perm: int | None = int(perm_s, 8) if perm_s else None
     except ValueError:
         perm = None
     if perm is None:
@@ -955,7 +1212,20 @@ def _write_local_target(value: str, target: Any) -> dict[str, Any]:
 
     try:
         if mode == "create":
-            if path.exists() and not target.get("overwrite"):
+            # C-04: never write THROUGH a symlink in create mode — not even
+            # with `overwrite: true`. Same refusal text as the Rust writer.
+            if path.is_symlink():
+                return {
+                    "written": False,
+                    "target": display,
+                    "bytes": 0,
+                    "error": (
+                        "the destination is a symlink — create mode does not write "
+                        "through links (use substitute to edit the file it points at)"
+                    ),
+                }
+            # C-05: `is True`, never truthiness — only the boolean opts in.
+            if path.exists() and target.get("overwrite") is not True:
                 return {
                     "written": False,
                     "target": display,
@@ -1063,7 +1333,11 @@ def _annotate_target_paths(spec: dict[str, Any]) -> None:
             if not isinstance(raw, str) or _target_path_error(raw):
                 continue
             try:
-                f["target"]["resolved_path"] = str(_resolve_target_path(Path(raw).expanduser()))
+                # C-04: the same mode-aware resolution the writer uses, so the
+                # approved path IS the written one.
+                f["target"]["resolved_path"] = str(
+                    _resolve_for_mode(Path(raw).expanduser(), f["target"].get("mode"))
+                )
             except Exception:  # noqa: BLE001  # pragma: no cover - display only, never fatal
                 pass
 
@@ -1092,8 +1366,16 @@ def _apply_target_writes(spec: dict[str, Any], data: dict[str, Any]) -> None:
     # `if not targets: return` short-circuited past, leaking the plaintext.
     if not targets and not secrets:
         return
-    result = data.setdefault("result", {})
-    values = result.setdefault("values", {})
+    # E-04: the user has already submitted, so a companion that answers a
+    # non-object `result` (or `values`) must not abort the write bookkeeping
+    # with an AttributeError. Treat it as "nothing submitted": every target
+    # field then reports "no value submitted" instead of the call dying.
+    result = data.get("result")
+    if not isinstance(result, dict):
+        result = data["result"] = {}
+    values = result.get("values")
+    if not isinstance(values, dict):
+        values = result["values"] = {}
     action = result.get("action")
     commits = _action_commits_targets(spec, action)
     for field in targets:
@@ -1188,6 +1470,13 @@ def _upload_expand_dir(raw: str) -> Path | None:
     return p if p.is_absolute() else None
 
 
+# Mode of every file `upload` creates (C-09). The bytes come from the user's
+# own machine and may be a credential; owner-only on every write path, so the
+# no-hard-link fallback can no longer land a file world-readable (and
+# executable) where the common path lands it 0600.
+UPLOAD_FILE_MODE = 0o600
+
+
 def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
     """Atomically write the uploaded bytes to `dest_dir/<filename>` on THIS host,
     never overwriting an existing file. Mirrors `do_upload`'s write half in the
@@ -1197,6 +1486,10 @@ def _upload_write(dest_dir: Path, filename: str, data: bytes) -> dict[str, Any]:
     try:
         fd, tmp = tempfile.mkstemp(prefix=".aiui-upload-", dir=str(dest_dir))
         try:
+            # `mkstemp` happens to create 0600 today; state it rather than rely
+            # on it. No mode bits off POSIX (no `os.fchmod` there).
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, UPLOAD_FILE_MODE)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
                 f.flush()
@@ -1240,8 +1533,11 @@ def _upload_write_exclusive(dest: Path, data: bytes) -> None:
     signal `os.link` gives — and cleans up a partially written file it created
     itself, so a retry doesn't trip over our own debris. Mirrors
     `fsutil::write_new_unlinked` in the Rust bridge.
+
+    C-09: the explicit mode is the point — without it `os.open` creates the
+    file `0o777 & ~umask`, i.e. 0755 on a typical host.
     """
-    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, UPLOAD_FILE_MODE)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -1278,14 +1574,14 @@ async def _wait_for_aiui() -> None:
     """Poll the unauthenticated `/ping` until the companion answers or
     `COLDSTART_WAIT_S` elapses (Step 3, parity with the Rust bridge).
 
-    Gives a cold companion (Claude Desktop just launched, SSH tunnel just came
-    up) time to start serving before the first render, instead of failing the
-    call outright. Tolerant: on timeout we simply fall through to `_preflight`,
+    Gives a cold companion (aiui just launched, SSH tunnel just came up) time
+    to start serving before the first render, instead of failing the call
+    outright. Tolerant: on timeout we simply fall through to `_preflight`,
     which produces the precise reachability diagnosis. `/ping` is cheap and
     needs no token, so this is a light readiness gate, not a full health check.
     """
     deadline = time.monotonic() + COLDSTART_WAIT_S
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    async with _client(2.0) as client:
         while time.monotonic() < deadline:
             try:
                 r = await client.get(f"{ENDPOINT}/ping")
@@ -1307,7 +1603,7 @@ async def _cancel_render(render_id: str) -> None:
     route — nothing to do, never an error.
     """
     try:
-        async with httpx.AsyncClient(timeout=CANCEL_RENDER_TIMEOUT_S) as client:
+        async with _client(CANCEL_RENDER_TIMEOUT_S) as client:
             r = await client.delete(
                 f"{ENDPOINT}/render/{render_id}",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -1318,6 +1614,57 @@ async def _cancel_render(render_id: str) -> None:
                 log.info("cancelled render %s (http %s)", render_id, r.status_code)
     except Exception as e:  # noqa: BLE001
         log.debug("cancel render %s failed: %s", render_id, _explain_exc(e))
+
+
+# Render ids this process is still polling for (E-07). A tool call that ends
+# normally removes its id; one that is cancelled keeps it until its retracting
+# DELETE has finished. Whatever is left when the MCP host goes away (stdin
+# EOF) is retracted by `_lifespan` — awaited, while the event loop is still
+# alive — instead of being left to a detached task that loop teardown may
+# cancel before the request has crossed the tunnel.
+_LIVE_RENDERS: set[str] = set()
+# The in-flight retract per render id, so a host exit racing a cancelled
+# handler's cleanup awaits that DELETE instead of sending a second one.
+_RETRACTS: dict[str, asyncio.Future[None]] = {}
+
+
+async def _retract_render(render_id: str) -> None:
+    """Bounded `DELETE /render/{id}`, then stop tracking the id. Never raises
+    an ordinary exception — this is cleanup."""
+    try:
+        await asyncio.wait_for(_cancel_render(render_id), CANCEL_RENDER_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001 — includes asyncio.TimeoutError
+        log.debug("render cancel cleanup %s: %s", render_id, _explain_exc(e))
+    finally:
+        _LIVE_RENDERS.discard(render_id)
+        _RETRACTS.pop(render_id, None)
+
+
+def _start_retract(render_id: str) -> asyncio.Future[None]:
+    """The retract for `render_id`: the one already in flight on this loop, or
+    a newly started one."""
+    task = _RETRACTS.get(render_id)
+    if task is None or task.done() or task.get_loop() is not asyncio.get_running_loop():
+        task = asyncio.ensure_future(_retract_render(render_id))
+        _RETRACTS[render_id] = task
+    return task
+
+
+async def _retract_live_renders() -> None:
+    """Retract every dialog this process still polls for (E-07), concurrently
+    and bounded by `CANCEL_RENDER_TIMEOUT_S`. Called on the way out, so a host
+    that quits mid-dialog does not leave the window on the user's desktop until
+    the companion's abandonment reaper notices."""
+    ids = sorted(_LIVE_RENDERS)
+    if not ids:
+        return
+    log.info("host gone — retracting %d open dialog(s)", len(ids))
+    await asyncio.gather(*(_start_retract(i) for i in ids))
+
+
+def _poll_backoff(failures: int) -> float:
+    """Delay before retry number `failures` (1-based): 1, 2, 4, 8, 8, … s."""
+    return min(ASYNC_POLL_RETRY_BACKOFF_S * 2 ** (failures - 1), ASYNC_POLL_MAX_BACKOFF_S)
 
 
 async def _poll_render(
@@ -1343,54 +1690,76 @@ async def _poll_render(
     than ending the call. The dialog is already on the user's screen and stays
     there for `ttl_secs`; aborting here abandons it and makes the agent's retry
     open a second window for the same question. Never re-POST `/render` — the
-    id from the 202 is the whole point. Bounded by
-    `ASYNC_POLL_MAX_CONSECUTIVE_FAILURES` and by the advertised TTL.
+    id from the 202 is the whole point. A failure streak is bounded by
+    `POLL_OUTAGE_BUDGET_S` of wall-clock time and by the advertised TTL.
+
+    E-05: the TTL is checked on every iteration, not only after a failure. A
+    companion that keeps answering `{pending: true}` past the TTL (plus
+    `ASYNC_POLL_TTL_GRACE_S`) gets its dialog retracted, and the call ends as
+    the documented `ttl_expired` cancel instead of never returning.
     """
     poll_url = f"{ENDPOINT}/render/{render_id}"
     iteration = 0
-    consecutive_failures = 0
-    deadline = time.monotonic() + ttl_secs
+    failures = 0  # consecutive, in the current streak
+    outage_started: float | None = None
+    had_outage = False
+    deadline = _now() + ttl_secs
+    cancelled = False
+    _LIVE_RENDERS.add(render_id)
     try:
         while True:
+            if _now() >= deadline + ASYNC_POLL_TTL_GRACE_S:
+                log.warning("render %s outlived its TTL — retracting it", render_id)
+                await _start_retract(render_id)
+                return {"id": render_id, "cancelled": True, "result": None, "reason": "ttl_expired"}
             try:
                 pr = await client.get(
                     poll_url,
                     headers={"Authorization": f"Bearer {_token()}"},
                     timeout=ASYNC_POLL_TIMEOUT_S,
                 )
+            except CompanionUnverifiedError as e:
+                # B1-01: the port changed hands mid-dialog. Not transient, and
+                # the token must not follow it — end the call, and say the
+                # real dialog may still be waiting.
+                raise CompanionUnverifiedError(
+                    f"{e} (while waiting for render {render_id}) {_STILL_OPEN}"
+                ) from e
             except httpx.HTTPError as e:
-                consecutive_failures += 1
-                if (
-                    consecutive_failures >= ASYNC_POLL_MAX_CONSECUTIVE_FAILURES
-                    or time.monotonic() >= deadline
-                ):
+                now = _now()
+                failures += 1
+                had_outage = True
+                if outage_started is None:
+                    outage_started = now
+                outage = now - outage_started
+                if outage >= POLL_OUTAGE_BUDGET_S or now >= deadline:
                     # `_explain_exc` guarantees a non-empty message: httpx leaves
                     # `str(e)` empty for RemoteProtocolError / ReadError, which is
                     # exactly the class that shows up on a dropped tunnel.
                     raise RuntimeError(
                         f"aiui lost contact with the companion while waiting for "
                         f"render {render_id}: {_explain_exc(e)} "
-                        f"({consecutive_failures} consecutive poll failures). "
+                        f"({failures} consecutive poll failures over {outage:.0f} s). "
                         f"The dialog may still be open on the user's machine — check it "
-                        f"before re-asking."
+                        f"before re-asking. On a remote host a dropped SSH reverse-tunnel "
+                        f"looks exactly like this: aiui Settings → Connections on the "
+                        f"user's machine re-establishes it."
                     ) from e
+                delay = min(_poll_backoff(failures), POLL_OUTAGE_BUDGET_S - outage)
                 log.warning(
-                    "poll %s failed (%s), retry %d/%d",
+                    "poll %s failed (%s), retry %d in %.1fs (outage %.0fs of %.0fs)",
                     render_id,
                     _explain_exc(e),
-                    consecutive_failures,
-                    ASYNC_POLL_MAX_CONSECUTIVE_FAILURES,
+                    failures,
+                    delay,
+                    outage,
+                    POLL_OUTAGE_BUDGET_S,
                 )
-                await asyncio.sleep(ASYNC_POLL_RETRY_BACKOFF_S)
+                await _sleep(delay)
                 continue
-            consecutive_failures = 0
-            if pr.status_code == 404:
-                raise RuntimeError(
-                    f"aiui lost track of render {render_id} (expired or never "
-                    f"registered). Restart the dialog."
-                )
-            pr.raise_for_status()
-            pv = pr.json()
+            failures = 0
+            outage_started = None
+            pv = _poll_answer(pr, render_id, had_outage)
             if pv.get("pending") is True:
                 iteration += 1
                 if ctx is not None:
@@ -1400,21 +1769,81 @@ async def _poll_render(
                         await ctx.report_progress(progress=float(iteration), total=None)
                     except Exception as e:  # noqa: BLE001
                         log.debug("progress report skipped: %s", _explain_exc(e))
-                await asyncio.sleep(ASYNC_POLL_MIN_INTERVAL_S)
+                await _sleep(ASYNC_POLL_MIN_INTERVAL_S)
                 continue
             return pv
     except asyncio.CancelledError:
+        cancelled = True
         # `shield` is load-bearing: a bare `await` inside an `except
         # CancelledError` block is re-cancelled immediately on most loop states
         # and the DELETE never goes out. `BaseException`, not `Exception`,
-        # because the shield itself re-raises `CancelledError`.
+        # because the shield itself re-raises `CancelledError`. The id stays in
+        # `_LIVE_RENDERS` until the DELETE finishes, so a host exit racing this
+        # cleanup is still covered by `_lifespan`.
         try:
-            await asyncio.shield(
-                asyncio.wait_for(_cancel_render(render_id), CANCEL_RENDER_TIMEOUT_S)
-            )
+            await asyncio.shield(_start_retract(render_id))
         except BaseException as e:  # noqa: BLE001
             log.debug("render cancel cleanup: %s", _explain_exc(e))
         raise
+    finally:
+        if not cancelled:
+            _LIVE_RENDERS.discard(render_id)
+
+
+_STILL_OPEN = "The dialog may still be open on the user's machine — check it before re-asking."
+
+
+def _poll_answer(pr: httpx.Response, render_id: str, had_outage: bool) -> dict[str, Any]:
+    """Turn one `GET /render/{id}` answer into its JSON object, or a
+    `RuntimeError` that names the render (E-03).
+
+    `raise_for_status()` and a bare `.json()` used to let a raw
+    `HTTPStatusError` / `JSONDecodeError` / `AttributeError` escape to the
+    agent — with no re-register guidance on a 401 and no word that the dialog
+    is still open.
+    """
+    status = pr.status_code
+    if status == 404:
+        if had_outage:
+            raise RuntimeError(
+                f"aiui lost track of render {render_id} after a connection outage: "
+                f"the companion most likely closed the dialog because nobody polled it "
+                f"for too long (it retracts a dialog whose caller stops polling), or it "
+                f"restarted. Whatever the user entered there is gone — ask again if you "
+                f"still need the answer."
+            )
+        raise RuntimeError(
+            f"aiui lost track of render {render_id}: the companion no longer knows "
+            f"this dialog (expired, never registered, or the companion restarted). "
+            f"Restart the dialog if you still need the answer."
+        )
+    if status == 401:
+        raise RuntimeError(
+            f"aiui companion at {ENDPOINT} rejected our token (401) while waiting for "
+            f"render {render_id}. The token on this host no longer matches the "
+            f"companion's — it was rotated, or the tunnel now reaches a different aiui. "
+            f"Re-register this host from aiui Settings → Connections on the user's "
+            f"machine. {_STILL_OPEN}"
+        )
+    if status >= 400:
+        raise RuntimeError(
+            f"aiui companion at {ENDPOINT} answered HTTP {status} while waiting for "
+            f"render {render_id}: {pr.text[:200]}. {_STILL_OPEN}"
+        )
+    try:
+        pv = pr.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"aiui companion at {ENDPOINT} sent an unreadable answer for render "
+            f"{render_id} (HTTP {status}): {pr.text[:200]!r}. Another process may be "
+            f"holding the port. {_STILL_OPEN}"
+        ) from e
+    if not isinstance(pv, dict):
+        raise RuntimeError(
+            f"aiui companion at {ENDPOINT} sent a non-object answer for render "
+            f"{render_id} (HTTP {status}): {pr.text[:200]!r}. {_STILL_OPEN}"
+        )
+    return pv
 
 
 def _session_origin() -> str:
@@ -1437,7 +1866,7 @@ async def _post_render(
     await _preflight()
     t0 = datetime.now(timezone.utc)
     log.info("render → kind=%s", spec.get("kind"))
-    async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+    async with _client(TIMEOUT_S) as client:
         # Video first: push local video files to the Mac's /media cache and
         # swap their `src` for the returned playback URL — BEFORE the image
         # inliner runs, so it never tries to base64 a huge clip.
@@ -1448,15 +1877,19 @@ async def _post_render(
         media_warnings += await _upload_local_audios(spec, client)
         # Resolve any absolute / `~/`-rooted file paths *before* shipping
         # the spec down the HTTP wire. This bridge runs on the same host
-        # as the agent — local for Mac use, remote for SSH-tunneled
-        # remotes — so this is the only point in the chain where the
-        # agent's filesystem actually exists. The Mac-side server resolver
-        # only handles HTTPS.
-        _resolve_local_paths(spec)
+        # as the agent — local or an SSH remote — so this is the only point
+        # in the chain where the agent's filesystem actually exists. The
+        # companion-side resolver only handles HTTPS.
+        #
+        # E-08: off the event loop. Reading and base64-ing a batch of local
+        # images is blocking I/O, and while it runs the loop cannot read stdin
+        # — an Esc (`notifications/cancelled`) or a `ping` waits behind it.
+        await asyncio.to_thread(_resolve_local_paths, spec)
         # #199: the write for a `target` field happens on THIS host after
         # submit, so only this side knows where it lands. Resolve it into the
-        # spec before the companion renders the approval line.
-        _annotate_target_paths(spec)
+        # spec before the companion renders the approval line. (Resolving
+        # symlinks touches the filesystem too — E-08.)
+        await asyncio.to_thread(_annotate_target_paths, spec)
         # Async render (Step 3): opt in via the header. A current companion
         # registers the dialog and answers immediately with `{id, ttl_secs}`
         # (202); we then poll for the result. An older companion ignores the
@@ -1540,7 +1973,25 @@ async def _post_render(
                 f"aiui companion at {ENDPOINT} refused the render "
                 f"(HTTP {r.status_code}): {r.text[:200]}"
             )
-        first = r.json()
+        # E-03: a 2xx whose body is not a JSON object is not the companion
+        # talking — say so instead of letting a JSONDecodeError/AttributeError
+        # escape. On a 202 a dialog may already be on screen.
+        try:
+            first = r.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} answered the render with HTTP "
+                f"{r.status_code} and an unreadable body: {r.text[:200]!r}. Another "
+                f"process may be holding the port. If a dialog opened on the user's "
+                f"machine, nobody is listening to it — check before re-asking."
+            ) from e
+        if not isinstance(first, dict):
+            raise RuntimeError(
+                f"aiui companion at {ENDPOINT} answered the render with HTTP "
+                f"{r.status_code} and a non-object body: {r.text[:200]!r}. If a dialog "
+                f"opened on the user's machine, nobody is listening to it — check "
+                f"before re-asking."
+            )
         if r.status_code == 202:
             render_id = first.get("id")
             if not isinstance(render_id, str) or not render_id:
@@ -1562,8 +2013,9 @@ async def _post_render(
     # Issue #135: this bridge runs ON the agent's host, so `target` fields are
     # written here as LOCAL file operations (the value arrived over the :7777
     # channel, never via the agent). Secret values are written and stripped
-    # before the result is handed to the agent.
-    _apply_target_writes(spec, data)
+    # before the result is handed to the agent. Off the loop (E-08): it writes
+    # and renames files.
+    await asyncio.to_thread(_apply_target_writes, spec, data)
     # #194: a clip that never reached the media cache used to produce a
     # broken player for the user and no signal at all for the agent. The key
     # only appears when something actually failed — an always-present empty
@@ -1593,6 +2045,10 @@ def _cancel_defaults(kind: str | None) -> dict[str, Any]:
     testing. `compare` is deliberately absent: `docs/skill.md` documents
     `selected` as *absent* on cancel, and inventing a falsy value there would
     read as a real selection.
+
+    E-02: the ask/form/gallery/compare shapes are a cross-bridge contract,
+    pinned by `schemas/dialog-results.json` — both bridges' tests read that
+    fixture, so a change here without a change there goes red.
     """
     if kind == "confirm":
         return {"confirmed": False}
@@ -1609,7 +2065,7 @@ def _format_result(payload: dict[str, Any], kind: str | None = None) -> dict[str
     if payload.get("cancelled"):
         out: dict[str, Any] = {"cancelled": True, **_cancel_defaults(kind)}
         # #180: forward WHY. The companion sets `host_exiting`,
-        # `ttl_expired`, `evicted` and `channel_dropped`, but the bridge
+        # `ttl_expired`, `evicted`, `channel_dropped` and `abandoned`, but the bridge
         # flattened them all into a bare
         # `{"cancelled": true}` — indistinguishable from the user pressing
         # Escape. An agent that cannot tell "the user declined" from "the
@@ -1619,7 +2075,12 @@ def _format_result(payload: dict[str, Any], kind: str | None = None) -> dict[str
             out["reason"] = reason
         _carry_media_warnings(payload, out)
         return out
-    out = {"cancelled": False, **payload.get("result", {})}
+    # E-04: `.get("result", {})` returns `None` for an explicit `null`, and
+    # `**None` raised a TypeError *after* the user had answered. A result that
+    # is not an object carries nothing addressable — same answer as the Rust
+    # `format_dialog_result`: `{cancelled: false}`.
+    result = payload.get("result")
+    out = {"cancelled": False, **(result if isinstance(result, dict) else {})}
     _carry_media_warnings(payload, out)
     return out
 
@@ -1645,32 +2106,33 @@ async def ask(
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Before listing options in chat and waiting for the user to type back
-    which one (deploy strategy, migration path, file to act on …), call
-    this tool instead. Per-option `description` carries the trade-off;
-    `multi_select` and `allow_other` cover the rest.
+    """Show a native choice dialog on the user's machine and return the pick.
+    Use it instead of listing options in chat and waiting for a typed reply
+    (deploy strategy, migration path, file to act on …). Per-option
+    `description` carries the trade-off; `multi_select` and `allow_other`
+    cover the rest.
 
     WHEN TO USE: 2–6 mutually-exclusive options where per-option context helps.
     For yes/no, use `confirm`. For mixed inputs, use `form`.
 
-    WRITE OPTIONS:
-    - Label: noun or short imperative, ≤ 5 words, no punctuation, no emoji.
-    - Description: one sentence stating the trade-off or consequence.
-    - Keep options parallel in grammar.
-    - For visual choice ("which of these images?") add `thumbnail` per
-      option — same `src` rules as everywhere else (data: URL, http(s)
-      URL, or absolute / `~/` local path on YOUR host). aiui resolves
-      paths and URLs to data: URLs before render.
-
-    ANTI-PATTERNS: > 8 options (use `form` with a `list` field); generic labels
-    like "Option 1"; redundant descriptions that just restate the label.
+    For a visual choice ("which of these images?") add `thumbnail` per
+    option — same `src` rules as everywhere else (data: URL, http(s) URL, or
+    absolute / `~/` local path on YOUR host); aiui resolves paths and URLs to
+    data: URLs before render.
 
     Returns `{cancelled, answers, other?}`. `answers` is a list of values.
+    On cancel `answers` is empty and, when the dialog ended without the user
+    answering, `reason` is set (`ttl_expired`, `evicted`, `channel_dropped`,
+    `host_exiting`, `abandoned`) — only a reason-less cancel is a user
+    decision. `media_warnings`, present only when something failed, lists
+    local video/audio that could not be shown.
 
     Args:
         question: Full question, imperative or interrogative.
         options: List of `{"label": str, "description"?: str, "value"?: str,
-            "thumbnail"?: str}`.
+            "thumbnail"?: str}`. Every option needs a non-empty `label` (a
+            value-only option is rejected); `value`, returned in `answers`,
+            defaults to the label.
         header: Short chip above the question (≤ 14 chars).
         multi_select: Allow selecting multiple options.
         allow_other: Offer a free-text fallback. Off by default — opt in when
@@ -1706,87 +2168,79 @@ async def form(
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Whenever the user needs to provide ≥ 2 related inputs, or any single
-    input that doesn't belong in chat (secret, date/datetime/range,
-    bounded number, sortable ranking, multi-select, color pick,
-    table-row triage with column context, image confirm/grid), call
-    this tool instead of typing the questions one by one.
+    """Show a native form on the user's machine and return the entered values.
+    Use it when the user needs to provide ≥ 2 related inputs, or any single
+    input that doesn't belong in chat (secret, date/datetime/range, bounded
+    number, sortable ranking, multi-select, color pick, table-row triage with
+    column context, image confirm/grid), instead of asking one by one in chat.
 
     WHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.
     For yes/no, use `confirm`. For a single choice, use `ask`.
 
-    WRITE LABELS:
-    - Imperative or noun, ≤ 6 words, no punctuation, no emoji.
-    - Consistent register across all fields.
-    - Field-level descriptions only if the label alone is ambiguous.
-
-    BE RESTRAINT:
-    - ≤ 8 fields per dialog. Split logically if you need more.
-    - `static_text` only for context the user couldn't derive from labels.
-    - Defaults that a human would actually pick.
-
-    ACTION BUTTONS:
-    - Verb-based and concrete ("Create report"), not "OK".
-    - Styling variants (pick one per button):
-      - `primary: true`  → blue, default emphasis for the main action.
-      - `success: true`  → green, for positive-outcome actions ("Approve", "Publish", "Accept").
-      - `destructive: true` → red, for deletions/force-pushes/rollbacks.
-      - none → neutral outlined button.
-      Never red a save button. Never green a delete button.
-    - `skip_validation: true` on escape hatches so required-field validation
-      doesn't trap the user.
-    - ≤ 3 actions.
+    ACTION BUTTONS: `[{label, value, primary?, success?, destructive?,
+    skip_validation?, writes_targets?}]` — at most one of primary (blue) /
+    success (green) / destructive (red). `skip_validation` bypasses required-
+    field checks and does not commit `target` writes unless `writes_targets: true`.
 
     FIELD KINDS:
     - text:        {kind, name, label, placeholder?, default?, multiline?, required?}
     - password:    {kind, name, label, placeholder?, required?}  — masked on screen only; value returns as plaintext in the response. Use for short-lived secrets; direct users to keychain/env for long-lived ones.
-    - secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you (#135). Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.
-    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.github_tokens/byte5ai", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value) and a `target` is REQUIRED: a target-less `secret` is rejected with `invalid_spec` instead of returning the plaintext — use `password` if you want the value back. A non-secret field with `target` is written AND returned. Only an affirmative action commits the write: the submit button or a plain named action — an action carrying `skip_validation:true` (Cancel / Save draft) writes nothing and returns `{written:false, error}` per field, unless you set `writes_targets:true` on it. A blank field writes nothing either (`refusing to write an empty value`), in both modes. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
-    - number:      {kind, name, label, default?, min?, max?, step?, required?}
-    - select:      {kind, name, label, options: [{label, value}], default?, required?}
+    - secret:      {kind, name, label, placeholder?, required?, target}  — masked input whose value is written to a file and NEVER returned to you. Pair with `target` (see below). Use when the user must supply a credential that should not enter this conversation at all.
+    - FILE-WRITE / `target` (any input field): add `target` to write the entered value to a file ON THE HOST YOU RUN ON when the user submits (the affirmative button is the per-write approval; the user sees the path first). Shape: `{"mode": "create"|"substitute", "path": "~/.config/demo/token", "perm"?: "0600", "overwrite"?: bool, "placeholder"?: str}`. `create` writes the raw value (needs `overwrite:true` to clobber an existing file); `substitute` replaces a `placeholder` occurring exactly once in an existing file (format-agnostic: YAML/TOML/INI/…); choose a DISTINCTIVE sentinel that can't collide with real content (e.g. `__AIUI_SECRET_GITHUB_PAT__`, not a common word) — if it occurs 0 or >1 times the write is refused with an error, never misapplied. For a `secret` field the value is write-only (result: `{written, target, bytes}` — no value) and a `target` is REQUIRED: a target-less `secret` is rejected with `invalid_spec` instead of returning the plaintext — use `password` if you want the value back. A non-secret field with `target` is written AND returned. Only an affirmative action commits the write: the submit button or a plain named action — an action carrying `skip_validation:true` (Cancel / Save draft) writes nothing and returns `{written:false, error}` per field, unless you set `writes_targets:true` on it. A blank field writes nothing either (`refusing to write an empty value`), in both modes. Destination is always your own host: the aiui module on that host (this bridge for your session) writes it as a LOCAL file operation, so `create` and `substitute` both work identically whether you run locally or on a remote SSH host — a foreign host cannot be targeted. Errors: `{written:false, error}`.
+    - number:      {kind, name, label, default?, min?, max?, step?, required?}  — an empty field returns null
+    - select:      {kind, name, label, options: [{label, value}], default?, required?}  — no `default`, or one that is not among the options, → the first option
     - checkbox:    {kind, name, label, default?}
-    - slider:      {kind, name, label, min, max, step?, default?}
+    - slider:      {kind, name, label, min?, max?, step?, default?}  — min/max default to 0–100
     - date:        {kind, name, label, default?, required?}  — ISO YYYY-MM-DD
-    - datetime:    {kind, name, label, default?, required?}  — ISO YYYY-MM-DDTHH:MM
+    - datetime:    {kind, name, label, default?, required?}  — default ISO YYYY-MM-DDTHH:MM (one with `Z`/an offset is shown in the user's local time); the result carries the user's UTC offset, e.g. 2026-06-01T09:30+02:00
     - date_range:  {kind, name, label, default?: {from, to}, required?}  — result {from, to}
     - color:       {kind, name, label, default?}  — hex "#RRGGBB"
     - static_text: {kind, text, tone?: "info"|"warn"|"muted"}  — display only
-    - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool.
+    - markdown:    {kind, text}  — read-only Markdown block; only as inline context for following inputs in the same form, NOT as a standalone display tool. `<style>`, `style=`, `<audio>`/`<video>`/`<source>`/`<track>` and `<map>`/`<area>` are stripped — use the `audio` field for playback.
     - image:       {kind, src, label?, alt?, max_height?}  — read-only image. `src` accepts an absolute / `~/` local path (read on YOUR host), an `http(s)://` URL (fetched on the companion host), or a `data:` URL. Use for visual confirmation of agent-generated previews.
     - annotated_image: {kind, name, src, label?, alt?, mode?, max_height?, required?, default?}  — let the user MARK a spot on an image (logo placement, crop hint, bug location). `src` follows the same rules as `image`. `mode` ∈ {"point" (click one marker, default), "region" (drag a rectangle), "both" (user flips a Point/Region tool)}. `default` may seed `{point?: {x, y}, region?: {x, y, w, h}}` in normalized units. Result under `name`: {point: {x, y} | null, region: {x, y, w, h} | null, natural: {width, height} | null} — all coordinates normalized 0..1; multiply by `natural` for pixels.
     - audio:       {kind, src, label?}  — read-only native `<audio controls>` player. Use for "listen to this TTS sample / voice memo / generated sound clip before deciding". `src` accepts a `data:audio/...` URL, an `http(s)://` URL, or an absolute/`~/` local path (mp3/m4a/wav/aac/ogg/flac) — local audio is pushed through the same size-unbounded `/media` cache as gallery video, never the 10 MB `data:` inliner.
-    - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders to SVG and DOMPurify-sanitises before display.
-    - wireframe:   {kind, panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}  — read-only UI-layout mockup. Real CSS-Grid panels with optional header (`title`) and multi-line monospace body (`content`, escape `\n`). `tone` ∈ {"default","muted","highlight"}. Use this for *UI-layouts* (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) instead of ASCII boxes-and-pipes — `mermaid` is for *diagrams* (graphs, sequence/state, gantt). Wireframe complements it for the layout class.
+    - mermaid:     {kind, source, label?, max_height?}  — read-only Mermaid diagram (flowchart, sequence, state, gantt, mindmap, …). `source` is a Mermaid-DSL string. Use this instead of ASCII / box-drawing art when you'd otherwise sketch a diagram in chat — aiui renders it as an image, so links inside the diagram are inert (`click … href` does nothing).
+    - wireframe:   {kind, panels: [{title?, content?, col_span?, row_span?, tone?}], columns?, gap?, label?, max_height?}  — read-only UI-layout mockup. Real CSS-Grid panels with optional header (`title`) and multi-line monospace body (`content`, escape `\\n`). `tone` ∈ {"default","muted","highlight"}. Use this for *UI-layouts* (dashboard tiles, hardware-UI panels, login screens, anything with fixed-position boxes-and-labels) instead of ASCII boxes-and-pipes — `mermaid` is for *diagrams* (graphs, sequence/state, gantt). Wireframe complements it for the layout class.
     - image_grid:  {kind, name, label?, images: [{value, src, label?}], multi_select?, columns?, default_selected?, required?}
       Result: {selected: [values]}
     - list:        {kind, name, label?, items: [{label, value, description?, thumbnail?}],
                     selectable?, multi_select?, sortable?, default_selected?: [values]}
-      Result: {selected: [values], order: [values]}. Thumbnails optional per item.
+      Result: {selected: [values], order: [values]} — `selected` is [] unless `selectable`. Every item needs a non-empty string `value`. Thumbnails optional per item.
     - table:       {kind, name, label?, columns: [{key, label, align?}], rows: [{value, values}],
                     multi_select?, sortable_by_column?, default_selected?, required?}
       Result: {selected: [values], order: [values], sort: {column, dir}}
     - tree:        {kind, name, label?, items: [{label, value, description?, children?: [...]}],
                     multi_select?, default_selected?: [values], default_expanded?: [values]}
       Result: {selected: [values]}
+    `default_selected` keeps only values the widget offers, and at most one on a single-select widget.
 
     TABS (optional grouping for long forms):
-    Pass `tabs=[{"label": ..., "fields": [...]}, ...]` instead of (or alongside,
-    but `tabs` wins) `fields`. One submit covers all tabs; validation jumps to
-    the first invalid tab. Tabs structure presentation only — they are not a
-    wizard, no per-tab confirmation.
+    Pass `tabs=[{"label": ..., "fields": [...]}, ...]` instead of `fields` —
+    `tabs` with a non-empty top-level `fields`, or a tab without a `fields`
+    array, is rejected with `invalid_spec`. One submit covers all tabs;
+    validation jumps to the first invalid tab. An action that writes files
+    first switches to any tab the user has not viewed that holds a `target`
+    field; the next press submits. Tabs structure presentation only — they
+    are not a wizard, no per-tab confirmation.
 
     Returns `{cancelled, action?, values: {name: value, ...}}`.
+    On cancel `values` is empty and, when the dialog ended without the user
+    answering, `reason` is set (`ttl_expired`, `evicted`, `channel_dropped`,
+    `host_exiting`, `abandoned`) — only a reason-less cancel is a user
+    decision. `media_warnings`, present only when something failed, lists
+    local video/audio that could not be shown.
 
     Args:
-        title: Window title. Same rules as labels.
+        title: Window title.
         fields: List of field blocks, each with a `kind` from above. Use this
             OR `tabs`, not both.
         description: Subtitle, ≤ 2 sentences.
         header: Chip above the title (≤ 14 chars).
         tabs: Tab-grouped field list `[{label, fields}]` for longer forms.
-        actions: Footer buttons `[{label, value, primary?, success?, destructive?, skip_validation?}]`.
+        actions: Footer buttons `[{label, value, primary?, success?, destructive?, skip_validation?, writes_targets?}]`.
             Styling variants are mutually exclusive; pick one of primary/success/destructive or leave all off for neutral.
-            Without actions, defaults to Cancel + Submit.
+            Without actions, defaults to Cancel + Submit. The clicked button's `value` comes back as `action`.
         submit_label: Legacy fallback for the default submit button label.
         cancel_label: Legacy fallback for the default cancel button label.
         size: Starting window size hint — "s", "m", or "l". aiui picks good
@@ -1831,26 +2285,25 @@ async def confirm(
     session: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Before writing any yes/no question into chat, call this tool instead.
-    Pass `destructive=True` (red button) for delete / drop / force-push /
-    rollback / prod-deploy — never trust loose prior approval for
-    irreversible steps; re-confirm in a dialog.
+    """Show a native yes/no dialog on the user's machine and return the decision.
+    Use it instead of a yes/no question in chat, especially before an
+    irreversible step (delete / drop / force-push / rollback / prod deploy);
+    pass `destructive=True` there for a red confirm button.
 
     WHEN TO USE: irreversible or high-stakes step where "just proceed" is
     unsafe. For pure information, respond in chat. For 3+ options, use `ask`.
     For visual sign-off ("is this generated image OK?"), pass `image`.
 
-    WRITE:
-    - Title: the decision as a question, ≤ 10 words.
-    - Message: one sentence stating the concrete consequence.
-    - `destructive=True` for deletions/force-pushes/rollbacks — never for
-      saves or creates.
-    - Custom `confirm_label`/`cancel_label` when verbs clarify.
-    - `image` for visual confirmation — same `src` rules as elsewhere
-      (data: URL, http(s) URL, or absolute / `~/` local path on YOUR host).
+    `image` follows the same `src` rules as elsewhere (data: URL, http(s) URL,
+    or absolute / `~/` local path on YOUR host).
 
-    Returns `{cancelled, confirmed}`. `cancelled=True` means Escape or window
-    close. `cancelled=False, confirmed=False` means the explicit No button.
+    Returns `{cancelled, confirmed}`. `cancelled=False, confirmed=False` means
+    the explicit No button. On cancel `confirmed` is false; a cancel without a
+    `reason` means the user pressed Escape or closed the window. When the
+    dialog ended without the user answering, `reason` is set (`ttl_expired`,
+    `evicted`, `channel_dropped`, `host_exiting`, `abandoned`) — only a
+    reason-less cancel is a user decision. `media_warnings`, present only when
+    something failed, lists local video/audio that could not be shown.
 
     Args:
         title: The decision phrased as a question.
@@ -1918,7 +2371,11 @@ async def gallery(
 
     Returns `{cancelled, decisions}` where `decisions` maps each touched
     item's `value` to `{decision, comment?}`. Items the user didn't touch
-    are omitted.
+    are omitted. On cancel `decisions` is empty and, when the dialog ended
+    without the user answering, `reason` is set (`ttl_expired`, `evicted`,
+    `channel_dropped`, `host_exiting`, `abandoned`) — only a reason-less
+    cancel is a user decision. `media_warnings`, present only when something
+    failed, lists local video/audio that could not be shown.
 
     Args:
         items: List of `{value, src?, alt?, label?, detail?, max_height?}`.
@@ -2035,11 +2492,18 @@ async def upload(
         return {"status": "error", "error": f"target directory does not exist: {dest_dir}"}
 
     await _wait_for_aiui()
-    await _preflight()
+    # E-09: the documented contract is that every failure of this tool comes
+    # back as `{status: "error", error}`. `_preflight` and `_token` raise
+    # RuntimeError (unreachable companion, 401, missing/malformed token), and
+    # that used to escape as a tool error instead.
+    try:
+        await _preflight()
+    except RuntimeError as e:
+        return {"status": "error", "error": str(e)}
 
     heartbeat = asyncio.create_task(_upload_heartbeat(ctx)) if ctx is not None else None
     try:
-        async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT_S) as client:
+        async with _client(UPLOAD_TIMEOUT_S) as client:
             r = await client.post(
                 f"{ENDPOINT}/upload",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -2050,6 +2514,8 @@ async def upload(
             )
     except httpx.HTTPError as e:
         return {"status": "error", "error": f"POST /upload failed: {_explain_exc(e)}"}
+    except RuntimeError as e:  # `_token()` — the token vanished since the preflight
+        return {"status": "error", "error": str(e)}
     finally:
         if heartbeat is not None:
             heartbeat.cancel()
@@ -2092,7 +2558,8 @@ async def upload(
     if len(data) > UPLOAD_FILE_CAP:
         return {"status": "error", "error": f"uploaded file exceeds cap: {len(data)} bytes"}
 
-    result = _upload_write(dest_dir, filename, data)
+    # E-08: up to UPLOAD_FILE_CAP written and fsynced — off the event loop.
+    result = await asyncio.to_thread(_upload_write, dest_dir, filename, data)
     log.info("upload ← filename=%s bytes=%d status=%s", filename, len(data), result.get("status"))
     return result
 
@@ -2129,7 +2596,12 @@ async def compare(
     controls). A variant may carry both — e.g. an image plus a caption.
 
     Returns `{cancelled, selected}` — `selected` is the `value` of the picked
-    variant (only set when the user actually submits).
+    variant (only set when the user actually submits; absent on a cancel).
+    When the dialog ended without the user answering, a cancel also carries
+    `reason` (`ttl_expired`, `evicted`, `channel_dropped`, `host_exiting`,
+    `abandoned`) — only a reason-less cancel is a user decision.
+    `media_warnings`, present only when something failed, lists local
+    video/audio that could not be shown.
 
     Args:
         variants: List of `{value, label?, content?, src?, alt?, detail?,
@@ -2199,10 +2671,12 @@ async def notify(
     local or reached via an SSH reverse-tunnel — same as `update`/`version`,
     the notification always renders on the companion side.
 
-    Returns `{ok: bool, error?: str}`. `ok: False` most commonly means the
-    user hasn't granted aiui notification permission on macOS yet (the OS
-    prompts for this once, on the first `notify` call) — not a bug to
-    retry around.
+    Returns `{ok: bool, error?: str}`. `ok: False` means the OS refused the
+    notification — most commonly the missing notification permission on macOS
+    (the OS prompts for it once, on the first `notify` call). Not a bug to
+    retry around. `ok: True` means the OS accepted it, not that the user saw
+    it: Do Not Disturb / Focus, or aiui's notifications being switched off in
+    the system settings (on any OS, Windows included), can hide it silently.
 
     Args:
         title: Short headline, ≤ ~40 chars — notification banners
@@ -2218,7 +2692,7 @@ async def notify(
     # against a companion that is still starting is exactly the wrong trade.
     await _wait_for_aiui()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        async with _client(TIMEOUT_S) as client:
             r = await client.post(
                 f"{ENDPOINT}/notify",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -2239,7 +2713,7 @@ async def notify(
     except Exception as e:
         raise RuntimeError(
             f"aiui /notify failed at {ENDPOINT}: {_explain_exc(e)}. "
-            f"Run `aiui_health` first to check whether aiui.app is reachable."
+            f"Run `aiui_health` first to check whether the aiui companion is reachable."
         ) from e
 
 
@@ -2387,23 +2861,25 @@ def upload_prompt() -> str:
 async def aiui_health() -> dict[str, Any]:
     """Reachability + token check against the aiui companion.
 
-    Use this first if dialogs hang or fail — it distinguishes a cold companion
-    (user needs to launch Claude Desktop, or the SSH tunnel is down) from a
-    rogue local process holding the port with the wrong token.
+    Use this first if dialogs hang or fail — it distinguishes a companion that
+    is not running or unreachable (e.g. the SSH tunnel is down) from a rogue
+    local process holding the port with the wrong token. Answers fast; does
+    not wait out a cold start.
 
-    The companion's body is returned on *any* status: a 503 carries the
+    The companion's body is returned on *any* HTTP status: a 503 carries
     ``reason``, ``hint``, ``pending``, ``oldest_age_secs`` and
-    ``lifecycle_phase`` that are the whole point of the composite response, and
-    `raise_for_status()` used to throw exactly that diagnosis away (#179).
-    ``ok`` reports whether the companion answered 200, so a degraded-but-serving
-    companion comes back as ``ok: true`` with ``ready: false``.
+    ``lifecycle_phase``. ``ok`` is true only for HTTP 200, so a
+    degraded-but-serving companion comes back as ``ok: true`` with
+    ``ready: false``.
     """
+    # #179: the body is read on any status because `raise_for_status()` used
+    # to throw exactly that diagnosis away.
     # Deliberately NOT gated by `_wait_for_aiui` (#203). Every other tool
     # waits out a cold start; this one is the diagnostic and must answer fast
     # — spending COLDSTART_WAIT_S before reporting "unreachable" would make
     # the tool people run *because* things hang hang too. Do not "fix" this.
     try:
-        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
+        async with _client(HEALTH_TIMEOUT_S) as client:
             r = await client.get(
                 f"{ENDPOINT}/health",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -2447,12 +2923,13 @@ async def aiui_health() -> dict[str, Any]:
 async def version_tool() -> dict[str, Any]:
     """Report aiui companion version, build info, binary path, and updater endpoint.
 
-    Cheap; does not hit the network. Works against both a local companion
-    (same host) and a remote one reached via SSH tunnel.
+    Not free: it asks the companion over HTTP (through the SSH tunnel on a
+    remote host) and, like the dialog tools, first waits up to 30 s for a
+    companion that is still starting. Call it once, not in a loop.
     """
     await _wait_for_aiui()  # cold-start gate, as on every other tool (#203)
     try:
-        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
+        async with _client(HEALTH_TIMEOUT_S) as client:
             r = await client.get(
                 f"{ENDPOINT}/version",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -2493,7 +2970,7 @@ async def update_tool() -> dict[str, Any]:
     # Use the long render timeout because download + install of the updater
     # bundle can take several seconds on a slow network.
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        async with _client(TIMEOUT_S) as client:
             r = await client.post(
                 f"{ENDPOINT}/update",
                 headers={"Authorization": f"Bearer {_token()}"},
@@ -2503,7 +2980,7 @@ async def update_tool() -> dict[str, Any]:
     except Exception as e:
         raise RuntimeError(
             f"aiui /update failed at {ENDPOINT}: {_explain_exc(e)}. "
-            f"Run `aiui_health` first to check whether aiui.app is reachable."
+            f"Run `aiui_health` first to check whether the aiui companion is reachable."
         ) from e
 
 

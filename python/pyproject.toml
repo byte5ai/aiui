@@ -28,8 +28,14 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: User Interfaces",
 ]
+# The `mcp` floor is 1.27.0, not 1.26.0: 1.27.0 is the first SDK whose
+# `Server.run` cancels in-flight tool handlers when stdin closes. On 1.26.0 a
+# host that quit mid-dialog left this bridge polling — keeping the dialog on
+# the user's desktop for up to the 2 h TTL — because the task-group join waited
+# for the handler forever (E-07). `<2`: mcp 2.x renamed FastMCP and fails at
+# import.
 dependencies = [
-    "mcp>=1.26.0,<2",
+    "mcp>=1.27.0,<2",
     "httpx>=0.27",
 ]
 
@@ -66,11 +72,13 @@ extend-exclude = ["*.md"]
 [tool.ruff.lint]
 select = ["E", "F", "B", "BLE", "UP", "A", "N"]
 # E501 is off, and only E501: the MCP tool docstrings are the agent-facing
-# contract — one line per field kind, kept byte-identical to `docs/skill.md`
-# by `scripts/check-skill-drift.sh`. Reflowing them to fit a column budget
-# would change what the model reads and break that guard, and `ruff format`
-# leaves strings alone anyway, so the rule could only ever be satisfied by
-# damaging the text it flags.
+# contract — the `form` field catalog is one line per field kind, and the Rust
+# bridge's `tools_list()` carries the same text. Nothing compares the two
+# byte for byte (`scripts/check-skill-drift.sh` checks tool names, field kinds
+# and section headers only), so keeping them in step is a review duty.
+# Reflowing the lines to fit a column budget would change what the model
+# reads, and `ruff format` leaves strings alone anyway, so the rule could only
+# ever be satisfied by damaging the text it flags.
 ignore = ["E501"]
 
 [build-system]

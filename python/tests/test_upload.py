@@ -14,6 +14,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import aiui_mcp.server as server
@@ -136,3 +137,95 @@ def test_write_leaves_no_temp_files(tmp_path: Path) -> None:
     _upload_write(tmp_path, "a.bin", b"\x00\x01\x02")
     names = sorted(p.name for p in tmp_path.iterdir())
     assert names == ["a.bin"], f"stray temp files: {names}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "no-link-fallback"])
+def test_uploaded_file_is_owner_only_on_every_write_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hard_links: bool
+) -> None:
+    """C-09: an upload may be a credential. The common path (mkstemp + link)
+    landed it 0600, but the exFAT/SMB fallback `os.open`ed it with no mode —
+    `0o777 & ~umask`, i.e. 0755 on a typical host: world-readable and
+    executable. The umask is pinned to 022 so a strict runner umask cannot
+    make the old code pass by accident."""
+    if not hard_links:
+
+        def no_link(src: Any, dst: Any) -> None:
+            raise OSError(errno.EPERM, "operation not permitted")
+
+        monkeypatch.setattr(os, "link", no_link)
+    old_umask = os.umask(0o022)
+    try:
+        out = _upload_write(tmp_path, "creds.env", b"TOKEN=x")
+    finally:
+        os.umask(old_umask)
+    assert out["status"] == "ok", out
+    mode = (tmp_path / "creds.env").stat().st_mode & 0o777
+    assert mode == 0o600, f"{mode:04o}"
+
+
+def _upload_companion(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A companion that answers `POST /upload` with a picked file, no network."""
+    token_file = tmp_path / "token"
+    token_file.write_text("de1e7e57" * 8)
+    monkeypatch.setattr(server, "TOKEN_PATH", token_file)
+
+    async def noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(server, "_wait_for_aiui", noop)
+    monkeypatch.setattr(server, "_preflight", noop)
+
+    async def fake_post(self: Any, url: str, **kwargs: Any) -> Any:
+        return httpx.Response(
+            200,
+            content=b"payload",
+            headers={"x-aiui-filename": "picked.txt"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+
+def test_upload_write_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """E-08: writing and fsyncing up to 512 MB inside `async def upload` blocked
+    the event loop — stdin (an Esc, a `ping`) went unread meanwhile."""
+    _upload_companion(monkeypatch, tmp_path)
+    dest = tmp_path / "in"
+    dest.mkdir()
+    on_loop: list[bool] = []
+    real_write = server._upload_write
+
+    def recording_write(*args: Any) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return real_write(*args)
+
+    monkeypatch.setattr(server, "_upload_write", recording_write)
+    out = asyncio.run(upload(target_dir=str(dest)))
+    assert out["status"] == "ok", out
+    assert (dest / "picked.txt").read_bytes() == b"payload"
+    assert on_loop == [False], "the write must run in a worker thread"
+
+
+def test_upload_reports_a_missing_token_as_a_status_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """E-09: `upload` documents `{status: "error", error}` for every failure,
+    but `_preflight`/`_token` raise RuntimeError (no token, unreachable
+    companion, 401) and that escaped as a tool error instead."""
+    monkeypatch.setattr(server, "TOKEN_PATH", tmp_path / "no-such-token")
+
+    async def noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(server, "_wait_for_aiui", noop)
+    out = asyncio.run(upload(target_dir=str(tmp_path)))
+    assert out["status"] == "error"
+    assert "token not found" in out["error"]

@@ -125,8 +125,9 @@ def test_preflight_translates_remote_protocol_error_to_actionable_runtime_error(
     msg = str(exc_info.value)
     assert msg, "the runtime error must carry a message"
     assert "reset" in msg.lower() or "RemoteProtocolError" in msg
-    # Actionable guidance the user can follow:
-    assert "aiui.app" in msg
+    # Actionable guidance the user can follow (E-06: the companion's own
+    # settings, not a Claude Desktop restart):
+    assert "Settings → Connections" in msg
 
 
 def test_preflight_catches_generic_http_error_with_class_name_fallback(
@@ -148,7 +149,43 @@ def test_preflight_catches_generic_http_error_with_class_name_fallback(
 
     msg = str(exc_info.value)
     assert "WriteError" in msg
-    assert "aiui.app" in msg
+    assert "Settings → Connections" in msg
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("[Errno 111] Connection refused"),
+        httpx.ReadTimeout("timed out"),
+        httpx.ReadError(""),
+        httpx.RemoteProtocolError(""),
+        httpx.WriteError(""),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_preflight_names_only_causes_that_can_silence_the_companion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, exc: Exception
+) -> None:
+    """E-06: the unreachable diagnostics sent users to Claude Desktop, which
+    the companion does not depend on (Claude-Code-only, Codex and other hosts
+    are first-class), promised an auto-resurrect a remote bridge cannot
+    trigger, and blamed a stale local process for a read timeout — which on a
+    remote is the blackholed tunnel. The real causes are "aiui not running"
+    and "SSH reverse-tunnel down", as the Rust bridge says."""
+    _setup_token(monkeypatch, tmp_path)
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(_preflight())
+    msg = str(exc_info.value)
+    assert "Claude Desktop" not in msg
+    assert "resurrect" not in msg
+    assert "aiui.app" not in msg
+    assert "pkill" not in msg, "a stale local process is not what silences the port"
+    assert "Settings → Connections" in msg
 
 
 # ----- #179: degraded-but-serving must not block, and 503 must carry its hint -----

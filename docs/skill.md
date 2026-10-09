@@ -97,9 +97,11 @@ Skip the dialog for content the user reads, doesn't answer:
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
 Every dialog must have something to answer: an `ask` needs at least one
-option carrying a `label` (or a `value`), a `form` at least one field.
-An empty one is rejected up front rather than opened as a window the
-user can only cancel.
+option, a `form` at least one field. Every `ask` option needs a non-empty
+`label` — the button shows only the label, so a value-only option is
+refused (`value` is what comes back, and falls back to the label). An
+empty or label-less dialog is rejected up front (`invalid_spec`) rather
+than opened as a window the user can only cancel.
 
 ## Reading the result: `cancelled` and `reason`
 
@@ -123,7 +125,8 @@ without anyone answering it, aiui adds a `reason`:
 | `ttl_expired` | Nobody answered within the dialog's TTL (2 h). | Nobody saw the question. Safe to re-ask later, or say the request timed out. |
 | `evicted` | aiui dropped this dialog to stay under its 16-dialog cap — usually your own later dialogs pushed it out. | Do **not** re-ask blindly; you are probably opening too many dialogs at once. |
 | `channel_dropped` | Internal: the result channel closed (companion restart, WebView reload). | A transient failure, not an answer. Retry once. |
-| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's Mac is back. |
+| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's machine is back. |
+| `abandoned` | aiui closed the dialog because nothing polled it for minutes — the agent's connection to the companion was gone (the agent quit, or the link was down too long). | Not an answer, and whatever the user entered is gone. Re-ask if you still need it. |
 
 Never report a `reason`-carrying cancel as a user decision. "You declined
 the migration" after a `ttl_expired` is a decision the user never made.
@@ -173,6 +176,12 @@ an expected outcome, not a bug to retry around.
 - Defaults a real user would actually pick, not `"enter value here"`.
 - `description`/`static_text` only when the label alone is ambiguous —
   avoid redundancy.
+- `ask`: 2–6 options, ≤ 5 words per option label, a one-sentence
+  `description` stating the trade-off. More than 8 options → `form` with a
+  `list` field.
+- `form`: ≤ 8 fields per dialog — split logically if you need more.
+- `confirm`: the title is the decision as a question, ≤ 10 words; `message`
+  is one sentence stating the concrete consequence.
 
 ## Action buttons (form only)
 
@@ -210,15 +219,28 @@ on the widget — an affirmative action only fires once they all hold:
   to the offending tab, shows a footer message and marks the fields.
   `skip_validation: true` is the documented way past all of it.
 
-Two things are normalised before the user ever sees them, so what comes
+Defaults are normalised before the user ever sees them, so what comes
 back is what was on screen:
 
-- A `select` without a `default` resolves to its **first option** — it no
-  longer returns `""`, a value you never offered.
+- A `select` without a `default`, or with a `default` that is not one of
+  its options, resolves to its **first option** — never `""` or a value
+  you never offered.
 - A `default` the native control cannot represent is normalised or
-  cleared rather than round-tripped: `date` / `datetime` must be ISO
-  (`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`), `color` must be `#rrggbb`, and a
-  `number` / `slider` default outside `[min, max]` is clamped into it.
+  cleared rather than round-tripped: `date` must be ISO `YYYY-MM-DD`,
+  `datetime` ISO `YYYY-MM-DDTHH:MM` (a `datetime` default carrying `Z` or
+  an offset is converted to the user's local time, not stripped of its
+  zone), `color` must be `#rrggbb`, and a `number` / `slider` default
+  outside `[min, max]` is clamped into it.
+- `slider` `min` / `max` are optional and default to 0–100.
+- `default_selected` keeps only values the widget actually offers, without
+  repeats, and at most one on a single-select widget.
+
+And the values that come back have one shape each:
+
+- `datetime` carries the user's UTC offset — `2026-06-01T09:30+02:00` —
+  so it is an instant, not a wall-clock time in an unknown zone.
+- An empty `number` field returns `null`.
+- A `list` that is not `selectable` returns `selected: []`.
 
 None of this replaces validating the returned values on your side — it is
 a UI guard, not a security control.
@@ -238,8 +260,10 @@ select, Alt+↑/↓ (Cmd+↑/↓ also works) to reorder a sortable one — so a
 sortable list is answerable without a mouse, and the reorder is announced.
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state. Each item's `value` must
-be non-empty and unique — it keys the result, and a duplicate is rejected.
+drag changes, `selected` reflects checkbox state (always `[]` for a list
+that is not `selectable`). Each item's `value` must be a non-empty string
+and unique — it keys the result, and a missing or duplicate one is
+rejected.
 Items can carry a
 `thumbnail` — see [Image sources](#image-sources-src--thumbnail) below
 for the accepted URL formats. Perfect for shotlists, mood boards,
@@ -274,6 +298,18 @@ not just siblings), `gallery` items, `compare` variants, plus `form`
 field `name`s and tab `label`s. A repeat keys two things the same, which
 either blanks the dialog or silently collapses two entries into one
 result — so aiui refuses the spec instead of rendering it.
+
+**The shape is checked too.** These are refused with `invalid_spec`
+before any window opens:
+
+- a `list`, `table`, `image_grid` or `tree` entry, or a `gallery`
+  `actions` entry, without a non-empty **string** `value` — a number or an
+  empty string does not count. Only a `list` item may instead be a bare
+  string, which then serves as both label and value;
+- a `list` or `tree` without `items`, a `table` missing `rows` or
+  `columns`, an `image_grid` without `images`;
+- `tabs` together with a non-empty top-level `fields`, and a tab without a
+  `fields` array (see *Tabs* below).
 
 ## Hierarchical picker: `tree`
 
@@ -355,8 +391,10 @@ in `+--+`-style art, or sketch a sequence diagram with `-->` and `|`,
 
 Spec: `{kind: "mermaid", source: "<DSL>", label?: string, max_height?: number}`.
 
-The `source` is a Mermaid-DSL string. aiui pipes it through `mermaid.render()`,
-DOMPurify-sanitises the resulting SVG, and embeds it inline. Covers
+The `source` is a Mermaid-DSL string. aiui pipes it through `mermaid.render()`
+and shows the resulting SVG as an image. Links inside a diagram are inert —
+`click … href` does nothing; put a link the user should follow into a
+`markdown` field instead. Covers
 flowcharts, sequence diagrams, state diagrams, class diagrams, gantt,
 ER, mind-maps, and pie charts — pick the one that fits the situation.
 
@@ -500,7 +538,10 @@ These don't ask anything — they sit between input fields to give context
 - `markdown` — rendered Markdown block (lists, code, links, tables). Use
   for "here's the diff I generated, now decide" patterns. **Not** a
   standalone display tool — if you'd be tempted to open a window just to
-  show the user a markdown blob, render it in chat instead.
+  show the user a markdown blob, render it in chat instead. Raw HTML is
+  sanitised: `<style>`, `style=` attributes, `<audio>` / `<video>` /
+  `<source>` / `<track>` and `<map>` / `<area>` are stripped — use the
+  `audio` field kind for playback.
 - `image` — read-only single image preview. `src` accepts a `data:` URL
   or any `http(s)://` URL — see [Image sources](#image-sources-src--thumbnail)
   below. Optional `label`, `alt`, `max_height`. Use when the agent
@@ -791,17 +832,24 @@ do the encoding for you.
 
 ## `datetime` field
 
-Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
+Fills the gap between `date` and `date_range`. Cron, scheduling, reminders —
 one field instead of splitting into two `text` fields with manual
-validation. Native `<input type="datetime-local">`, returns ISO
-`YYYY-MM-DDTHH:MM`.
+validation. Native `<input type="datetime-local">`; returns ISO with the
+user's UTC offset, `YYYY-MM-DDTHH:MM±HH:MM` (e.g. `2026-06-01T09:30+02:00`).
+A `default` may be a wall-clock `YYYY-MM-DDTHH:MM` or carry a zone (`Z`,
+`+02:00`); a zoned default is shown converted to the user's local time.
 
 ## Tabs — long forms without scroll fatigue
 
-Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
-One submit covers all tabs; pressing it with something invalid switches to
+Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead —
+`tabs` plus a non-empty top-level `fields` is refused (`invalid_spec`),
+because the top-level fields would never be shown, and so is a tab without
+a `fields` array. One submit covers all tabs; pressing it with something invalid switches to
 the first invalid tab, names it in a footer message and marks the offending
-fields — it never submits silently. Tabs are *display structure*, not a wizard — no per-tab
+fields — it never submits silently. An action that writes files first
+switches to any tab the user has not viewed yet that holds a `target`
+field, so every destination is seen before it is approved; the next press
+submits. Tabs are *display structure*, not a wizard — no per-tab
 confirmation, no per-tab actions, all values land in one response.
 
 Use when a single dialog naturally falls into 2-4 distinct topical
@@ -821,7 +869,7 @@ plaintext in the tool response. For long-lived or high-value secrets,
 use the `secret` field with a `target` instead (below) so the value
 never enters the conversation.
 
-## Secrets & file-write: the `secret` field + `target` (#135)
+## Secrets & file-write: the `secret` field + `target`
 
 When a value must NOT pass through this conversation — a credential the
 user pastes that should land in a file, not your transcript — use a
@@ -836,8 +884,8 @@ rather than silently handing you the plaintext. If you want the value back,
 that field is a `password`, not a `secret`.
 
 ```json
-{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
-  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+{ "kind": "secret", "name": "token", "label": "Demo API token",
+  "target": { "mode": "create", "path": "~/.config/demo/token",
               "perm": "0600", "overwrite": true } }
 ```
 
@@ -867,9 +915,11 @@ that field is a `password`, not a `secret`.
   and a `~user/` path (`~alice/key`) are rejected — a relative path has no
   stable working directory to resolve against, and `~user/` is not portable
   across the two aiui modules, so either would write somewhere the user
-  never approved. Same rule `upload`'s `target_dir` follows. Symlinks are
-  followed: `substitute` on a link edits the file the link points at and
-  leaves the link a link; the reported `target` is that resolved path.
+  never approved. Same rule `upload`'s `target_dir` follows. For
+  `substitute`, symlinks are followed: on a link it edits the file the link
+  points at and leaves the link a link; the reported `target` is that
+  resolved path. `create` never writes through a link: a symlink at the
+  destination is refused, even with `overwrite: true`.
 - **`substitute` keeps the file's existing mode** unless you pass `perm` —
   it is editing a file the user already owns, so a `0644` config stays
   `0644` and the service reading it keeps working. `create` defaults to
@@ -886,6 +936,11 @@ that field is a `password`, not a `secret`.
   submit button or a plain named action; an action carrying
   `skip_validation: true` (your Cancel / Save-draft escape hatch) does not
   write. See *Action buttons* above.
+- **The optional keys are typed.** `overwrite` must be the boolean
+  `true`/`false`, `perm` a string (`"0600"`, not `600`), `placeholder` a
+  string. Anything else is refused with `invalid_spec` before the dialog
+  opens — `"overwrite": "false"` (a string) once read as *yes* and
+  clobbered the file.
 - **Errors** come back as `{written:false, error}` — no silent success.
 
 Why it exists: it replaces the fragile "guess a shell one-liner to stash a

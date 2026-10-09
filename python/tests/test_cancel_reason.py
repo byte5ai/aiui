@@ -1,7 +1,7 @@
 """The cancel reason must reach the agent (#180).
 
-The companion sets `host_exiting`, `ttl_expired`, `evicted` and
-`channel_dropped`, but the bridge flattened every one into a bare
+The companion sets `host_exiting`, `ttl_expired`, `evicted`,
+`channel_dropped` and `abandoned`, but the bridge flattened every one into a bare
 `{"cancelled": true}` — indistinguishable from the user pressing Escape.
 Forwarding is generic, so a reason added later needs no bridge change. An agent that cannot tell "the user declined" from
 "the companion was shutting down" retries the wrong thing.
@@ -19,7 +19,7 @@ from aiui_mcp.server import _format_result
 
 @pytest.mark.parametrize(
     "reason",
-    ["host_exiting", "ttl_expired", "evicted", "channel_dropped", "future_reason"],
+    ["host_exiting", "ttl_expired", "evicted", "channel_dropped", "abandoned", "future_reason"],
 )
 def test_cancel_reason_is_forwarded(reason: str) -> None:
     out = _format_result({"id": "d1", "cancelled": True, "result": None, "reason": reason})
@@ -64,3 +64,13 @@ def test_clean_render_has_no_media_warnings_key() -> None:
     assert "media_warnings" not in out
     out = _format_result({"cancelled": False, "result": {}, "media_warnings": []})
     assert "media_warnings" not in out
+
+
+@pytest.mark.parametrize("result", [None, ["a", "b"], "plain text", 7])
+def test_non_object_result_does_not_crash_after_the_user_answered(result: object) -> None:
+    """E-04: `{**payload.get("result", {})}` raised `TypeError` for an explicit
+    `null` (and for a list or string) — *after* the user had submitted. Mirrors
+    the Rust `dialog_result_of_a_non_object_result_does_not_panic`: the answer
+    is `{cancelled: false}`."""
+    out = _format_result({"id": "d1", "cancelled": False, "result": result})
+    assert out == {"cancelled": False}

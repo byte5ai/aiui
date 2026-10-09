@@ -84,3 +84,33 @@ def test_user_facing_strings_are_platform_neutral() -> None:
             offenders.append(f"line {node.lineno}: {line.strip()}")
 
     assert not offenders, "platform-specific wording reaches the user:\n" + "\n".join(offenders)
+
+
+SKILL_MD = Path(server.__file__).resolve().parent / "skill.md"
+CANON_SKILL_MD = Path(__file__).resolve().parents[2] / "docs" / "skill.md"
+
+# macOS-only vocabulary that must not reach an agent on a Windows companion.
+SKILL_PLATFORM_RE = re.compile(r"\bMacs?\b|macOS|\bFinder\b|/Applications|aiui\.app\b")
+
+# Lines of the skill catalog that may name a platform. Only the notification
+# permission prompt is genuinely macOS-only behaviour.
+SKILL_PLATFORM_ALLOWLIST = ("On macOS the first call triggers the one-time",)
+
+
+def _skill_platform_offenders(path: Path) -> list[str]:
+    offenders = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if SKILL_PLATFORM_RE.search(line) and not any(a in line for a in SKILL_PLATFORM_ALLOWLIST):
+            offenders.append(f"{path.name}:{n}: {line.strip()}")
+    return offenders
+
+
+def test_skill_catalog_is_platform_neutral() -> None:
+    """F-14: #252 put "Retry once the user's Mac is back." into both skill
+    catalogs — the text `/aiui:teach` hands every agent — so a Windows user's
+    agent told them to wait for a Mac. Nothing scanned the catalog; only
+    `server.py`'s own strings were checked."""
+    offenders = _skill_platform_offenders(SKILL_MD)
+    if CANON_SKILL_MD.is_file():  # repo checkout: the canonical copy too
+        offenders += _skill_platform_offenders(CANON_SKILL_MD)
+    assert not offenders, "macOS-only wording in the skill catalog:\n" + "\n".join(offenders)

@@ -123,3 +123,63 @@ def test_413_without_a_json_body_still_explains_itself(
     with pytest.raises(RuntimeError) as exc_info:
         _render({"kind": "confirm", "title": "ok?"})
     assert "too large" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "content", "needle"),
+    [
+        (202, b"<html>proxy page</html>", "unreadable body"),
+        (200, b"[]", "non-object body"),
+    ],
+)
+def test_unreadable_render_answer_raises_a_named_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, status: int, content: bytes, needle: str
+) -> None:
+    """E-03: `first = r.json()` let a JSONDecodeError (or, for a JSON list, an
+    AttributeError on `.get`) escape `_post_render` raw."""
+    resp = httpx.Response(
+        status, content=content, request=httpx.Request("POST", "http://127.0.0.1:7777/render")
+    )
+    _setup(monkeypatch, tmp_path, resp)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError) as exc_info:
+        _render({"kind": "confirm", "title": "ok?"})
+    assert needle in str(exc_info.value)
+
+
+def test_render_file_io_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """E-08: inlining local images, resolving target paths and performing the
+    target writes are blocking file I/O. Run on the event loop they kept it
+    from reading stdin — an Esc or a `ping` waited behind a batch of images."""
+
+    class _Terminal:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return {"cancelled": False, "result": {"values": {"name": "Ada"}}}
+
+    _setup(monkeypatch, tmp_path, _Terminal())  # type: ignore[arg-type]
+    on_loop: dict[str, bool] = {}
+
+    def recorder(name: str, real: Any) -> Any:
+        def wrapped(*args: Any) -> Any:
+            try:
+                asyncio.get_running_loop()
+                on_loop[name] = True
+            except RuntimeError:
+                on_loop[name] = False
+            return real(*args)
+
+        return wrapped
+
+    for name in ("_resolve_local_paths", "_annotate_target_paths", "_apply_target_writes"):
+        monkeypatch.setattr(server, name, recorder(name, getattr(server, name)))
+
+    out = _render({"kind": "form", "title": "x", "fields": [{"kind": "text", "name": "name"}]})
+    assert out["cancelled"] is False
+    assert on_loop == {
+        "_resolve_local_paths": False,
+        "_annotate_target_paths": False,
+        "_apply_target_writes": False,
+    }

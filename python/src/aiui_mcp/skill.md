@@ -1,6 +1,6 @@
 ---
 name: aiui
-description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native desktop dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
+description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native desktop dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `compare` for picking one of 2–3 full variants side by side, `gallery` for a per-item verdict on a batch of images/videos, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents
@@ -39,10 +39,25 @@ instead:
   sortable `list` field.
 - Any step that wants a **date, datetime, range, color, or numeric value
   in a bounded interval** → `form` with the matching field.
+- Any step where you'd sketch a **flow, sequence, state, hierarchy or
+  schedule in ASCII** ("Step A → Step B → ...") → `form` with a
+  `mermaid` field. ASCII boxes-and-arrows look terrible in any
+  proportional-font surface; the `mermaid` field renders to clean
+  SVG. See the dedicated section below.
+- Any step that asks **"is this generated image OK?"** → `confirm`
+  with `image: {src}`. Don't fall back to a `form`-with-image-and-two-
+  buttons when the question is a plain yes/no.
 - Any step that wants the user to **listen to a TTS sample, voice memo,
   or generated sound clip** before confirming, choosing, or triaging it
   → `form` with an `audio` field (native `<audio controls>`). Don't
   paste a file path in chat and ask the user to open it themselves.
+- Any step that asks **"which of these images?"** with 2–6 candidates
+  → `ask` with `thumbnail` per option. Use `form` + `image_grid` only
+  when there are many candidates (≥ 7) or the picker needs multi-select.
+- Any step where the user needs to see **full content side by side**
+  before choosing one — two drafts, three headlines, before/after an
+  edit — → `compare`. Don't reach for `ask`+thumbnail here: a thumbnail
+  is too small to actually compare, `compare` renders the full pane.
 - Any **async-completion signal** the user doesn't need to answer — "tests
   are green", "deploy finished", "hit a merge conflict, need you" — where
   the point is exactly that they don't have to be watching this session
@@ -79,9 +94,11 @@ Skip the dialog for content the user reads, doesn't answer:
 | More than 8 fields | split into multiple `form` calls; do not cram one dialog |
 
 Every dialog must have something to answer: an `ask` needs at least one
-option carrying a `label` (or a `value`), a `form` at least one field.
-An empty one is rejected up front rather than opened as a window the
-user can only cancel.
+option, a `form` at least one field. Every `ask` option needs a non-empty
+`label` — the button shows only the label, so a value-only option is
+refused (`value` falls back to the label). An empty or label-less dialog is
+rejected up front (`invalid_spec`) rather than opened as a window the user
+can only cancel.
 
 ## Reading the result: `cancelled` and `reason`
 
@@ -105,7 +122,8 @@ without anyone answering it, aiui adds a `reason`:
 | `ttl_expired` | Nobody answered within the dialog's TTL (2 h). | Nobody saw the question. Safe to re-ask later, or say the request timed out. |
 | `evicted` | aiui dropped this dialog to stay under its 16-dialog cap — usually your own later dialogs pushed it out. | Do **not** re-ask blindly; you are probably opening too many dialogs at once. |
 | `channel_dropped` | Internal: the result channel closed (companion restart, WebView reload). | A transient failure, not an answer. Retry once. |
-| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's Mac is back. |
+| `host_exiting` | The companion was shutting down. | Transient. Retry once the user's machine is back. |
+| `abandoned` | aiui closed the dialog because nothing polled it for minutes — the agent's connection to the companion was gone (the agent quit, or the link was down too long). | Not an answer, and whatever the user entered is gone. Re-ask if you still need it. |
 
 Never report a `reason`-carrying cancel as a user decision. "You declined
 the migration" after a `ttl_expired` is a decision the user never made.
@@ -137,6 +155,12 @@ notification-permission prompt; a denied permission comes back as
 - Defaults a real user would actually pick, not `"enter value here"`.
 - `description`/`static_text` only when the label alone is ambiguous —
   avoid redundancy.
+- `ask`: 2–6 options, ≤ 5 words per option label, a one-sentence
+  `description` stating the trade-off. More than 8 options → `form` with a
+  `list` field.
+- `form`: ≤ 8 fields per dialog — split logically if you need more.
+- `confirm`: the title is the decision as a question, ≤ 10 words; `message`
+  is one sentence stating the concrete consequence.
 
 ## Action buttons (form only)
 
@@ -172,14 +196,28 @@ widget — an affirmative action only fires once they hold:
   to the offending tab, shows a footer message and marks the fields.
   `skip_validation: True` is the way past all of it.
 
-Two normalisations happen before the user sees the form, so what comes
+Defaults are normalised before the user ever sees them, so what comes
 back is what was on screen:
 
-- A `select` without a `default` resolves to its **first option**, not `""`.
-- A `default` the native control cannot represent is normalised or cleared
-  instead of round-tripped: `date` / `datetime` must be ISO
-  (`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`), `color` must be `#rrggbb`, and a
-  `number` / `slider` default outside `[min, max]` is clamped.
+- A `select` without a `default`, or with a `default` that is not one of
+  its options, resolves to its **first option** — never `""` or a value
+  you never offered.
+- A `default` the native control cannot represent is normalised or
+  cleared rather than round-tripped: `date` must be ISO `YYYY-MM-DD`,
+  `datetime` ISO `YYYY-MM-DDTHH:MM` (a `datetime` default carrying `Z` or
+  an offset is converted to the user's local time, not stripped of its
+  zone), `color` must be `#rrggbb`, and a `number` / `slider` default
+  outside `[min, max]` is clamped into it.
+- `slider` `min` / `max` are optional and default to 0–100.
+- `default_selected` keeps only values the widget actually offers, without
+  repeats, and at most one on a single-select widget.
+
+And the values that come back have one shape each:
+
+- `datetime` carries the user's UTC offset — `2026-06-01T09:30+02:00` —
+  so it is an instant, not a wall-clock time in an unknown zone.
+- An empty `number` field returns `null`.
+- A `list` that is not `selectable` returns `selected: []`.
 
 It is a UI guard, not a security control — still validate what you get.
 
@@ -197,8 +235,10 @@ Every mode is fully keyboard-operable: Tab to an item, Enter or Space to
 select, Alt+↑/↓ (Cmd+↑/↓ also works) to reorder a sortable one.
 
 Result is always `{selected: [values], order: [values]}` — `order` reflects
-drag changes, `selected` reflects checkbox state. Each item's `value` must
-be non-empty and unique — it keys the result, and a duplicate is rejected.
+drag changes, `selected` reflects checkbox state (always `[]` for a list
+that is not `selectable`). Each item's `value` must be a non-empty string
+and unique — it keys the result, and a missing or duplicate one is
+rejected.
 Items can carry a
 `thumbnail` (data: URL or path) — perfect for shotlists, mood boards,
 carousel slides where the visual anchor matters more than the label.
@@ -232,6 +272,18 @@ not just siblings), `gallery` items, `compare` variants, plus `form`
 field `name`s and tab `label`s. A repeat keys two things the same, which
 either blanks the dialog or silently collapses two entries into one
 result — so aiui refuses the spec instead of rendering it.
+
+**The shape is checked too** — refused with `invalid_spec` before any
+window opens:
+
+- a `list`, `table`, `image_grid` or `tree` entry, or a `gallery`
+  `actions` entry, without a non-empty **string** `value` (a number or an
+  empty string does not count; only a `list` item may instead be a bare
+  string, used as both label and value);
+- a `list` or `tree` without `items`, a `table` missing `rows` or
+  `columns`, an `image_grid` without `images`;
+- `tabs` together with a non-empty top-level `fields`, and a tab without a
+  `fields` array.
 
 ## Hierarchical picker: `tree`
 
@@ -286,7 +338,10 @@ These don't ask anything — they sit between input fields to give context
 - `markdown` — rendered Markdown block (lists, code, links, tables). Use
   for "here's the diff I generated, now decide" patterns. **Not** a
   standalone display tool — if you'd be tempted to open a window just to
-  show the user a markdown blob, render it in chat instead.
+  show the user a markdown blob, render it in chat instead. Raw HTML is
+  sanitised: `<style>`, `style=` attributes, `<audio>` / `<video>` /
+  `<source>` / `<track>` and `<map>` / `<area>` are stripped — use the
+  `audio` field kind for playback.
 - `image` — read-only single image preview (`src`: data: URL or path,
   optional `label`, `alt`, `max_height`). Use when the agent generated
   a chart, screenshot, or diagram and needs visual sign-off before the
@@ -317,9 +372,10 @@ For graph-shaped visualisations — flowcharts, sequence diagrams, state
 machines, gantt, ER, class diagrams, mind-maps — use the `mermaid`
 field instead of ASCII boxes-and-arrows. Spec:
 `{kind: "mermaid", source: "<DSL>", label?, max_height?}`. The `source`
-is a Mermaid-DSL string; aiui pipes it through `mermaid.render()`,
-sanitises the SVG, and embeds inline. Read-only, sits between input
-fields like `markdown` / `image`.
+is a Mermaid-DSL string; aiui renders it and shows the SVG as an image,
+so links inside a diagram are inert (`click … href` does nothing — use a
+`markdown` field for a link). Read-only, sits between input fields like
+`markdown` / `image`.
 
 ## UI-layout mockups: `wireframe`
 
@@ -543,17 +599,23 @@ the path and let the bridge do the encoding.
 
 ## `datetime` field
 
-Lückenfüller between `date` and `date_range`. Cron, scheduling, reminders —
+Fills the gap between `date` and `date_range`. Cron, scheduling, reminders —
 one field instead of splitting into two `text` fields with manual
-validation. Native `<input type="datetime-local">`, returns ISO
-`YYYY-MM-DDTHH:MM`.
+validation. Native `<input type="datetime-local">`; returns ISO with the
+user's UTC offset, `YYYY-MM-DDTHH:MM±HH:MM` (e.g. `2026-06-01T09:30+02:00`).
+A `default` may be a wall-clock `YYYY-MM-DDTHH:MM` or carry a zone (`Z`,
+`+02:00`); a zoned default is shown converted to the user's local time.
 
 ## Tabs — long forms without scroll fatigue
 
-Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead.
-One submit covers all tabs; pressing it with something invalid switches to
+Drop `fields=…` and pass `tabs=[{label, fields: [...]}, ...]` instead —
+`tabs` plus a non-empty top-level `fields` is refused (`invalid_spec`), as
+is a tab without a `fields` array. One submit covers all tabs; pressing it with something invalid switches to
 the first invalid tab, names it in a footer message and marks the offending
-fields — it never submits silently. Tabs are *display structure*, not a wizard — no per-tab
+fields — it never submits silently. An action that writes files first
+switches to any tab the user has not viewed yet that holds a `target`
+field, so every destination is seen before it is approved; the next press
+submits. Tabs are *display structure*, not a wizard — no per-tab
 confirmation, no per-tab actions, all values land in one response.
 
 Use when a single dialog naturally falls into 2-4 distinct topical
@@ -573,7 +635,7 @@ plaintext in the tool response. For long-lived or high-value secrets,
 use the `secret` field with a `target` (below) so the value never enters
 the conversation.
 
-## Secrets & file-write: `secret` field + `target` (#135)
+## Secrets & file-write: `secret` field + `target`
 
 When a value must NOT pass through this conversation — a credential the
 user pastes that should land in a file, not your transcript — use a
@@ -582,8 +644,8 @@ user pastes that should land in a file, not your transcript — use a
 bytes, mode}`, never the value).
 
 ```json
-{ "kind": "secret", "name": "pat", "label": "GitHub PAT für byte5ai",
-  "target": { "mode": "create", "path": "~/.github_tokens/byte5ai",
+{ "kind": "secret", "name": "token", "label": "Demo API token",
+  "target": { "mode": "create", "path": "~/.config/demo/token",
               "perm": "0600", "overwrite": true } }
 ```
 
@@ -602,9 +664,11 @@ bytes, mode}`, never the value).
   Errors: `{written:false, error}`.
 - `path` must be absolute or `~/`-rooted; relative (`notes/key`) and
   `~user/` (`~alice/key`) are rejected — neither names a stable
-  destination, same rule as `upload`'s `target_dir`. Symlinks are followed:
-  `substitute` edits the file the link points at, the link stays a link,
-  and the reported `target` is that resolved path.
+  destination, same rule as `upload`'s `target_dir`. `substitute` follows
+  symlinks: it edits the file the link points at, the link stays a link,
+  and the reported `target` is that resolved path. `create` never writes
+  through a link — a symlink at the destination is refused, even with
+  `overwrite: true`.
 - `substitute` keeps the file's existing mode unless you pass `perm` (it
   edits a file the user owns — a 0644 config stays 0644); `create` defaults
   to 0600. The outcome reports the octal `mode` applied.
@@ -617,6 +681,10 @@ bytes, mode}`, never the value).
 - Only an affirmative action writes: the submit button or a plain named
   action. An action with `skip_validation: true` does not commit; set
   `writes_targets: true` on it if it must.
+- The optional keys are typed: `overwrite` a boolean, `perm` a string
+  (`"0600"`, not `600`), `placeholder` a string — anything else is refused
+  (`invalid_spec`); `"overwrite": "false"` once read as *yes* and clobbered
+  the file.
 
 Replaces the fragile "guess a shell one-liner to stash a token" pattern.
 QoL + confused-deputy guard, not a hard guarantee.
