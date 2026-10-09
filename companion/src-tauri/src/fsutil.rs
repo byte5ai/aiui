@@ -63,9 +63,31 @@ fn resolve_symlink(path: &Path) -> std::io::Result<PathBuf> {
 /// destination. Issue #M-2 in v0.4.10 review.
 ///
 /// Preserves the destination's permission bits and symlink identity — see
-/// [`atomic_write_with_mode`], of which this is the no-default-mode form.
+/// [`atomic_write_with_mode`]. A file it CREATES gets `0600`, never the
+/// umask default (#185, review C-13): every caller writes a config that
+/// holds, or will hold, other MCP servers' `env` blocks and OAuth data —
+/// `~/.claude.json` created by "Register Claude Code" used to start life
+/// world-readable.
 pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    atomic_write_with_mode(path, content, None)
+    atomic_write_with_mode(path, content, Some(NEW_FILE_MODE))
+}
+
+/// Mode for files aiui creates: owner-only. Uploads, configs and tokens alike
+/// — an uploaded file is the user's own, and may be a credential (C-09).
+pub const NEW_FILE_MODE: u32 = 0o600;
+
+/// `OpenOptions` for a brand-new file at [`NEW_FILE_MODE`] (Unix). Setting
+/// the mode at `open(2)` time, not afterwards, means the file never exists
+/// under a looser mode.
+fn new_file_options() -> fs::OpenOptions {
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(NEW_FILE_MODE);
+    }
+    o
 }
 
 /// [`atomic_write`] plus an explicit mode for the **create** case.
@@ -186,10 +208,10 @@ fn write_new_with_linker(
             .unwrap_or(0)
     ));
     {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        // C-09: explicit 0600, like the Python bridge's mkstemp path — the
+        // three upload write paths used to land at 0600, the umask default
+        // and 0755 respectively.
+        let mut f = new_file_options().open(&tmp)?;
         f.write_all(content)?;
         f.sync_all()?;
     }
@@ -217,10 +239,7 @@ fn write_new_with_linker(
 /// all-or-nothing, and a partial file on a stick beats a refused transfer
 /// after the bytes already crossed the wire.
 fn write_new_unlinked(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut f = new_file_options().open(path)?;
     if let Err(e) = f.write_all(content) {
         // A half-written destination we created ourselves is worse than
         // none: the next attempt would hit AlreadyExists on our own debris.
@@ -329,6 +348,44 @@ mod tests {
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "destination mode survives the rewrite");
         assert_eq!(fs::read_to_string(&target).unwrap(), "{\"patched\": true}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_config_is_owner_only() {
+        // C-13: `atomic_write` passed no default, so a config aiui CREATED
+        // landed at the umask default (0644).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aiui-fsutil-new-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("fresh.json");
+        let _ = fs::remove_file(&target);
+        atomic_write(&target, b"{}").unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uploads_land_owner_only_on_both_write_paths() {
+        // C-09: the hard-link path and the no-link fallback both create the
+        // destination at 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aiui-fsutil-up-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let linked = dir.join("linked.bin");
+        let _ = fs::remove_file(&linked);
+        write_new(&linked, b"x").unwrap();
+        assert_eq!(fs::metadata(&linked).unwrap().permissions().mode() & 0o777, 0o600);
+        let fallback = dir.join("fallback.bin");
+        let _ = fs::remove_file(&fallback);
+        let no_links = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no links"))
+        };
+        write_new_with_linker(&fallback, b"x", no_links).unwrap();
+        assert_eq!(fs::metadata(&fallback).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 

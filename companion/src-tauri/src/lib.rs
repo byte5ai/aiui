@@ -380,18 +380,19 @@ fn resolve_dialog_targets(
             Some(n) => n.to_string(),
             None => continue,
         };
-        let path = match field
-            .get("target")
-            .and_then(|t| t.get("path"))
-            .and_then(|v| v.as_str())
-        {
+        let target = field.get("target");
+        let path = match target.and_then(|t| t.get("path")).and_then(|v| v.as_str()) {
             Some(p) => p,
             None => continue,
         };
-        out.insert(
-            name,
-            filewrite::expand_tilde(path).to_string_lossy().into_owned(),
-        );
+        let mode = target
+            .and_then(|t| t.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("create");
+        // C-03: the approval line shows the destination the writer will use
+        // — symlinks resolved for substitute, the link itself for create —
+        // not a tilde expansion that could name a different file.
+        out.insert(name, filewrite::resolve_display(path, mode));
     }
     Ok(out)
 }

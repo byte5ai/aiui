@@ -1560,7 +1560,8 @@ fn annotate_target_paths(spec: &mut serde_json::Value) {
             let Some(raw) = t.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
                 continue;
             };
-            let resolved = crate::filewrite::resolve_display(&raw);
+            let mode = t.get("mode").and_then(|v| v.as_str()).unwrap_or("create").to_owned();
+            let resolved = crate::filewrite::resolve_display(&raw, &mode);
             t.insert("resolved_path".into(), serde_json::Value::String(resolved));
         }
     }

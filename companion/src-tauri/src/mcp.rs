@@ -1058,14 +1058,9 @@ async fn upload_media(
     path: &str,
     ext: &str,
 ) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(h) => h.join(rest),
-            None => std::path::PathBuf::from(path),
-        }
-    } else {
-        std::path::PathBuf::from(path)
-    };
+    // C-10: the same expansion the collector used, `~\` included on Windows.
+    let expanded = crate::imageresolve::expand_tilde(path)
+        .ok_or_else(|| format!("cannot expand {path} (a ~user path, or no home directory)"))?;
     // Stat first, read second (#194). `tokio::fs::read` on a 3–4 GB screen
     // recording — an entirely ordinary thing to put in a `gallery` item —
     // materialised the whole file in a `Vec<u8>` before anything checked it

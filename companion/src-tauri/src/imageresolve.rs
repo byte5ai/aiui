@@ -336,7 +336,12 @@ fn build_client(pinned: &[(String, Vec<SocketAddr>)]) -> Result<reqwest::Client,
         // can bounce us to http://169.254.169.254/, and each hop re-opens the
         // gap between the address we vetted and the one we connect to. Nobody
         // has yet named an image URL that needs a hop.
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        // Review C-06: reqwest honours HTTP(S)_PROXY / ALL_PROXY by default.
+        // Through a proxy the PROXY resolves and connects, so neither the
+        // pinned addresses below nor the destination guard decide where the
+        // request goes. Always connect directly to what was vetted.
+        .no_proxy();
     for (host, addrs) in pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -505,7 +510,10 @@ fn expand_tilde_with(s: &str, home: &Path, windows: bool) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-fn expand_tilde(s: &str) -> Option<PathBuf> {
+/// `~/` (and, on Windows, `~\`) against this machine's home. Shared with
+/// the bridge's media upload, which used to expand `~/` only — a `~\` path
+/// this module had collected as local media then failed the read (C-10).
+pub(crate) fn expand_tilde(s: &str) -> Option<PathBuf> {
     if !s.starts_with('~') {
         return Some(PathBuf::from(s));
     }
