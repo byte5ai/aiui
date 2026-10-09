@@ -2355,15 +2355,15 @@ mod tests {
         let legacy = dir.join("legacy/remotes.json");
         let new = dir.join("config/remotes.json");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, br#"["dev@devhost"]"#).unwrap();
+        fs::write(&legacy, br#"["dev@example-host"]"#).unwrap();
 
         assert!(migrate_remotes_from(&legacy, &new).unwrap(), "first call migrates");
-        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@devhost"]"#);
+        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@example-host"]"#);
         assert!(!legacy.exists(), "legacy file is moved, not copied");
 
         // Second call is a no-op: nothing left to move, nothing rewritten.
         assert!(!migrate_remotes_from(&legacy, &new).unwrap());
-        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@devhost"]"#);
+        assert_eq!(fs::read_to_string(&new).unwrap(), r#"["dev@example-host"]"#);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2392,9 +2392,9 @@ mod tests {
         // migration must not read-write-delete its own file.
         let dir = migration_test_dir("same-path");
         let p = dir.join("remotes.json");
-        fs::write(&p, br#"["dev@devhost"]"#).unwrap();
+        fs::write(&p, br#"["dev@example-host"]"#).unwrap();
         assert!(!migrate_remotes_from(&p, &p).unwrap());
-        assert_eq!(fs::read_to_string(&p).unwrap(), r#"["dev@devhost"]"#);
+        assert_eq!(fs::read_to_string(&p).unwrap(), r#"["dev@example-host"]"#);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2435,9 +2435,9 @@ mod tests {
         // Removing an unreachable host is a success (deregistered locally),
         // not a failure — it must not render as a red log line, and it must
         // name the host and say what was left behind.
-        let r = remote_cleanup_skipped("dev@devhost");
+        let r = remote_cleanup_skipped("dev@example-host");
         assert!(r.ok);
-        assert!(r.message.contains("dev@devhost"));
+        assert!(r.message.contains("dev@example-host"));
         assert!(r.message.contains("nicht erreichbar"));
         assert!(r.details.is_some());
     }
@@ -3528,9 +3528,9 @@ startup_timeout_ms = 30000
     fn strip_forward_returns_none_when_no_aiui_lines() {
         // #198: `changed` used to pick the wording only — backup + write ran
         // regardless, on every registered remote, on every GUI launch.
-        let cfg = "Host devhost\n  User ada\n  Port 22\n";
+        let cfg = "Host example-host\n  User ada\n  Port 22\n";
         assert!(
-            strip_aiui_forward_lines(cfg, "devhost", 7777).is_none(),
+            strip_aiui_forward_lines(cfg, "example-host", 7777).is_none(),
             "nothing to strip must mean no backup and no write"
         );
     }
@@ -3539,30 +3539,30 @@ startup_timeout_ms = 30000
     fn strip_forward_preserves_crlf() {
         // #198: `str::lines()` drops the `\r`, so a config written by a
         // Windows editor was silently converted to LF-only.
-        let cfg = "Host devhost\r\n  RemoteForward 7777 localhost:7777\r\n  User ada\r\n";
-        let out = strip_aiui_forward_lines(cfg, "devhost", 7777).expect("a line was stripped");
-        assert_eq!(out, "Host devhost\r\n  User ada\r\n");
+        let cfg = "Host example-host\r\n  RemoteForward 7777 localhost:7777\r\n  User ada\r\n";
+        let out = strip_aiui_forward_lines(cfg, "example-host", 7777).expect("a line was stripped");
+        assert_eq!(out, "Host example-host\r\n  User ada\r\n");
         assert!(!out.contains("RemoteForward"));
         for line in out.split('\n').filter(|l| !l.is_empty()) {
             assert!(line.ends_with('\r'), "surviving line lost its CR: {line:?}");
         }
 
         // A file without a trailing newline keeps not having one.
-        let no_eol = "Host devhost\n  RemoteForward 7777 localhost:7777\n  User ada";
-        let out = strip_aiui_forward_lines(no_eol, "devhost", 7777).unwrap();
-        assert_eq!(out, "Host devhost\n  User ada");
+        let no_eol = "Host example-host\n  RemoteForward 7777 localhost:7777\n  User ada";
+        let out = strip_aiui_forward_lines(no_eol, "example-host", 7777).unwrap();
+        assert_eq!(out, "Host example-host\n  User ada");
     }
 
     #[test]
     fn strip_forward_only_touches_matching_host_block() {
         let cfg = "Host other\n  RemoteForward 7777 localhost:7777\n  ServerAliveInterval 30\n\
-                   \nHost devhost\n  RemoteForward 7777 localhost:7777\n  ExitOnForwardFailure no\n  User ada\n";
-        let out = strip_aiui_forward_lines(cfg, "devhost", 7777).expect("devhost block changed");
+                   \nHost example-host\n  RemoteForward 7777 localhost:7777\n  ExitOnForwardFailure no\n  User ada\n";
+        let out = strip_aiui_forward_lines(cfg, "example-host", 7777).expect("example-host block changed");
         assert!(
             out.contains("Host other\n  RemoteForward 7777 localhost:7777\n  ServerAliveInterval 30"),
             "another Host block must survive byte-for-byte: {out:?}"
         );
-        assert!(out.contains("Host devhost\n  User ada"), "got: {out:?}");
+        assert!(out.contains("Host example-host\n  User ada"), "got: {out:?}");
         assert!(!out.contains("ExitOnForwardFailure"), "got: {out:?}");
     }
 

@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn sane_target_path_basic() {
         assert!(is_sane_target_path("~/.config/aiui/token"));
-        assert!(is_sane_target_path("/Users/me/.github_tokens/byte5ai"));
+        assert!(is_sane_target_path("/Users/me/.config/demo/token"));
         assert!(!is_sane_target_path(""));
         assert!(!is_sane_target_path("a\nb"));
         assert!(!is_sane_target_path("a\0b"));

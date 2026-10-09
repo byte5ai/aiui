@@ -226,6 +226,13 @@ jobs:
           ./scripts/check-doc-claims.sh --self-test
           ./scripts/check-doc-claims.sh
 
+      # F-16: the repo is public. Concrete internal names come from the
+      # repository variable AIUI_LEAK_PATTERNS, never from the script itself.
+      - name: Guard against private-infrastructure leaks
+        env:
+          AIUI_LEAK_PATTERNS: ${{ vars.AIUI_LEAK_PATTERNS }}
+        run: ./scripts/check-leaks.sh
+
       # #207: the `target` file-write approval line — the only disclosure of
       # an arbitrary file write, and the thing the submit button approves —
       # shipped as hardcoded German, unreadable to anyone outside `de`. This

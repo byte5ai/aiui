@@ -3034,7 +3034,7 @@ mod validate_tests {
         // for first) used to reach the Python bridge's post-submit write and
         // die there on `.get()` — after the user had typed a credential.
         let spec = json!({"kind":"form","fields":[
-            {"kind":"secret","name":"pat","target":"~/.github_tokens/byte5ai"}
+            {"kind":"secret","name":"pat","target":"~/.config/demo/token"}
         ]});
         let (detail, hint) = validate_spec(&spec).unwrap_err();
         assert!(detail.contains("pat"), "names the offending field: {detail}");
@@ -3065,7 +3065,7 @@ mod validate_tests {
         // A well-formed target still validates, in a tab too.
         let good = json!({"kind":"form","fields":[
             {"kind":"secret","name":"pat",
-             "target":{"mode":"create","path":"~/.github_tokens/byte5ai","perm":"0600"}},
+             "target":{"mode":"create","path":"~/.config/demo/token","perm":"0600"}},
             {"kind":"text","name":"note",
              "target":{"mode":"substitute","path":"/etc/app.yml","placeholder":"__X__"}}
         ]});

@@ -2348,7 +2348,7 @@ identified the gaps. Five interlocking fixes:
   `kill_remote_mcp_stdio` sequence that runs in the background at
   every aiui-app startup — but on demand, with the StepResult log
   inline. Lets the user retry a sync that failed silently in the
-  background (e.g. the 2026-05-04 `dev@devhost: sweep failed` case)
+  background (e.g. the 2026-05-04 `dev@<remote>: sweep failed` case)
   without having to close + reopen aiui-app. Sweep failures appear
   in the activity log immediately.
 

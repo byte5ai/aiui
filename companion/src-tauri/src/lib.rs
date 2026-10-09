@@ -3912,7 +3912,7 @@ mod tests {
                 "kind": "secret",
                 "name": "pat",
                 "label": "GitHub PAT",
-                "target": {"mode": "create", "path": "~/.github_tokens/x", "overwrite": true}
+                "target": {"mode": "create", "path": "~/.config/demo/x", "overwrite": true}
             }],
             "actions": [
                 {"label": "Cancel", "value": "cancel", "skip_validation": true},
@@ -4209,7 +4209,7 @@ mod tests {
             "fields": [
                 {"kind": "text", "name": "plain"},
                 {"kind": "secret", "name": "pat",
-                 "target": {"mode": "create", "path": "~/.github_tokens/x"}}
+                 "target": {"mode": "create", "path": "~/.config/demo/x"}}
             ]
         });
         assert_eq!(target_names(&spec), vec!["pat".to_string()]);

@@ -1308,7 +1308,7 @@ mod tests {
         assert!(!victim_identity_matches(VictimKind::McpStdio, CURRENT, &gui));
 
         // Tunnel victims re-assert the port-specific argv shape.
-        let tunnel = ssh_ntr_args("dev@devhost", 7777);
+        let tunnel = ssh_ntr_args("dev@example-host", 7777);
         assert!(victim_identity_matches(
             VictimKind::SshNtr(7777),
             "/usr/bin/ssh",
@@ -1353,13 +1353,13 @@ mod tests {
     /// (#211).
     #[test]
     fn ssh_ntr_signature_matches_real_tunnel_args() {
-        let a = ssh_ntr_args("dev@devhost", 7777);
+        let a = ssh_ntr_args("dev@example-host", 7777);
         assert!(is_aiui_ssh_ntr_for_port(&a, 7777));
     }
 
     #[test]
     fn ssh_ntr_signature_rejects_other_ports() {
-        let a = ssh_ntr_args("dev@devhost", 7777);
+        let a = ssh_ntr_args("dev@example-host", 7777);
         assert!(!is_aiui_ssh_ntr_for_port(&a, 8888));
     }
 
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn find_aiui_ssh_ntr_orphans_only_filters_on_ppid() {
-        let a_orphan = ssh_ntr_args("dev@devhost", 7777);
+        let a_orphan = ssh_ntr_args("dev@example-host", 7777);
         let a_live = ssh_ntr_args("customer@macmini", 7777);
         let s = vec![
             // The live GUI that owns the active tunnel below. #200: it has
@@ -1418,7 +1418,7 @@ mod tests {
             // The surviving aiui that owns pid 40000's tunnel.
             snap_with_ppid(76770, 500, CURRENT, &[CURRENT]),
             // Leaked by a previous instance: ppid 9001 is nowhere any more.
-            snap_with_ppid(30295, 9001, "ssh.exe", &ssh_ntr_args("dev@devhost", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
+            snap_with_ppid(30295, 9001, "ssh.exe", &ssh_ntr_args("dev@example-host", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
             // Live tunnel of the instance above — must be spared.
             snap_with_ppid(40000, 76770, "ssh.exe", &ssh_ntr_args("customer@macmini", 7777).iter().map(String::as_str).collect::<Vec<_>>()),
         ];
