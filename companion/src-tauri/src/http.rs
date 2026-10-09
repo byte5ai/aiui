@@ -365,6 +365,16 @@ pub async fn serve(
         .layer(sandboxed)
     };
 
+    // Review A-04: axum runs every extractor before the handler, so a
+    // handler-level `auth_ok` came AFTER the body was buffered — up to
+    // 64 MiB on /render and 512 MiB on /media for a caller without the
+    // token (any local account, or any user on a shared remote host via the
+    // tunnel). This layer answers 401 after the headers alone.
+    let token_gate = axum::middleware::from_fn_with_state(
+        std::sync::Arc::<str>::from(state.cfg.token.as_str()),
+        require_token,
+    );
+
     let router = Router::new()
         .route("/health", get(health))
         // #178: without this layer axum's 2 MiB default applied, so a routine
@@ -374,14 +384,16 @@ pub async fn serve(
         // guard so the 413 the agent sees is ours, structured and actionable.
         .route(
             "/render",
-            post(render).layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP)),
+            post(render)
+                .layer(DefaultBodyLimit::max(RENDER_BODY_HARD_CAP))
+                .layer(token_gate.clone()),
         )
         // GET polls an async render; DELETE retracts it (#193) — the route a
         // bridge needs to close the dialog when its caller is cancelled.
         .route("/render/:id", get(render_poll).delete(render_cancel))
-        .route("/notify", post(notify))
+        .route("/notify", post(notify).layer(token_gate.clone()))
         .route("/version", get(version))
-        .route("/update", post(update))
+        .route("/update", post(update).layer(token_gate.clone()))
         .route("/ping", get(ping))
         .route("/probe", get(probe))
         // Bridge pushes media bytes here; capped well above the per-file
@@ -390,14 +402,18 @@ pub async fn serve(
         .route(
             "/media",
             post(media_upload)
-                .layer(DefaultBodyLimit::max(crate::media::MEDIA_FILE_CAP as usize)),
+                // Strictly above the handler's own `MEDIA_FILE_CAP` guard, so
+                // an oversize push gets OUR structured 413 (A-04: with equal
+                // limits that branch could never fire).
+                .layer(DefaultBodyLimit::max(MEDIA_BODY_LIMIT))
+                .layer(token_gate.clone()),
         )
         // Inbound file transfer (#146): the bridge asks the Mac to open a
         // native file picker; on selection the picked file's bytes stream
         // back over the same :7777 channel (the reverse direction of
         // `POST /media`). This is the "get a Mac file into the agent
         // session" path.
-        .route("/upload", post(upload_pick))
+        .route("/upload", post(upload_pick).layer(token_gate.clone()))
         // Capability-URL playback: unauthenticated (filename is a UUID),
         // range-capable for video seeking via tower-http's ServeDir.
         //
@@ -512,6 +528,26 @@ fn local_proof_ok(headers: &HeaderMap, cfg: &AppConfig) -> bool {
         .map(|got| constant_time_eq(got.trim().as_bytes(), want.as_bytes()))
         .unwrap_or(false)
 }
+
+/// Route layer for every body-consuming endpoint: 401 before any body byte
+/// is read (review A-04). The handlers keep their own `auth_ok` as well.
+async fn require_token(
+    State(token): State<std::sync::Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !auth_ok(req.headers(), &token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// `/media`'s transport limit: one MiB above `MEDIA_FILE_CAP`.
+const MEDIA_BODY_LIMIT: usize = crate::media::MEDIA_FILE_CAP as usize + 1024 * 1024;
 
 /// Authenticated probe used by the tunnel-manager's shared-forward
 /// detection. Unlike /ping, this requires the bearer token, so it
@@ -878,9 +914,16 @@ async fn upload_pick(
 
     // #194: promote out of Accessory mode (macOS) so the panel is reachable,
     // and serialise — a second concurrent picker is a stack of identical
-    // system panels the user cannot tell apart. Dropping the guard demotes
-    // again on every path below, including the timeout and the 413.
-    let Some(_picker) = crate::surface_for_native_picker(&state.app) else {
+    // system panels the user cannot tell apart.
+    //
+    // Review A-06: the guard lives in the picker's CALLBACK, not on this
+    // handler's stack. The handler returns on timeout (504) or is dropped
+    // when the bridge cancels, while the native panel stays on screen; a
+    // stack-held guard released the slot then, so the agent's retry stacked a
+    // second panel over the first, and the app was demoted behind the
+    // frontmost one. Now the slot is held — and the app kept Regular — until
+    // the panel actually closes.
+    let Some(picker) = crate::surface_for_native_picker(&state.app) else {
         trace("upload_pick: rejected — a picker is already open");
         return (
             StatusCode::CONFLICT,
@@ -908,6 +951,7 @@ async fn upload_pick(
     }
     builder.pick_file(move |picked| {
         let _ = tx.send(picked);
+        drop(picker);
     });
 
     let picked = match tokio::time::timeout(UPLOAD_PICK_TIMEOUT, rx).await {
@@ -1132,12 +1176,16 @@ fn health_hint(reason: &str, pending: usize, attached: usize) -> String {
 /// alternative of grabbing the first entry of `app.webview_windows()` is a
 /// `HashMap` iteration-order pick and would make the probe flap between
 /// windows; `DialogState::newest_id()` is deterministic.
+/// How old a dialog must be before `/health` pings its window: long enough
+/// for the page to load and register its `ui:ping` listener (A-08).
+const UI_PING_MOUNT_GRACE: Duration = Duration::from_secs(3);
+
 async fn probe_webview(state: &AppState) -> WebviewHealth {
     // Probe a dialog window's webview specifically — the setup window is
     // user-driven and irrelevant for render-pipeline health.
     let Some(label) = state
         .dialog
-        .newest_id()
+        .newest_settled_id(UI_PING_MOUNT_GRACE, std::time::Instant::now())
         .filter(|l| crate::is_dialog_window_label(l.as_str()))
     else {
         return WebviewHealth::no_dialog_window();
@@ -1959,9 +2007,44 @@ async fn validate_then_resolve(
     spec: &mut serde_json::Value,
     bridge_served: bool,
 ) -> Result<(), (String, String)> {
-    validate_spec_for(spec, bridge_served)?;
-    crate::imageresolve::resolve_image_srcs(spec).await;
-    Ok(())
+    validate_then_resolve_within(spec, bridge_served, usize::MAX)
+        .await
+        .map_err(|r| match r {
+            RenderReject::Invalid(d, h) | RenderReject::TooLarge(d, h) => (d, h),
+        })
+}
+
+/// Why a spec was refused before any window opened.
+enum RenderReject {
+    /// 422 `invalid_spec`.
+    Invalid(String, String),
+    /// 413 `spec_too_large` — here: the images it inlines (A-07).
+    TooLarge(String, String),
+}
+
+/// [`validate_then_resolve`] with the inline budget the render handler
+/// derives from the body it already has (review A-07).
+async fn validate_then_resolve_within(
+    spec: &mut serde_json::Value,
+    bridge_served: bool,
+    inline_budget: usize,
+) -> Result<(), RenderReject> {
+    validate_spec_for(spec, bridge_served).map_err(|(d, h)| RenderReject::Invalid(d, h))?;
+    crate::imageresolve::resolve_image_srcs_within(spec, inline_budget)
+        .await
+        .map_err(|inlined| {
+            RenderReject::TooLarge(
+                format!(
+                    "the images this spec links would inline to more than {} bytes \
+                     ({inlined} fetched before stopping; max {RENDER_SPEC_SOFT_CAP} per dialog)",
+                    inline_budget
+                ),
+                "Too much image data for one dialog: fewer or smaller images per call, \
+                 or split the review across several dialogs. An http(s) URL is inlined \
+                 too — it counts against the same ceiling."
+                    .into(),
+            )
+        })
 }
 
 /// RAII cleanup for a registered render — closes the cancellation-safety hole
@@ -2366,7 +2449,7 @@ async fn render(
                     body.len(),
                     RENDER_SPEC_SOFT_CAP
                 ),
-                "hint": "Inlined images dominate the spec — shrink the image, send fewer at once, or pass an http(s):// src instead of a local path.",
+                "hint": "Inlined images dominate the spec — shrink the images or send fewer per dialog. An http(s):// src is inlined by aiui too and counts against the same ceiling.",
             })),
         )
             .into_response();
@@ -2396,7 +2479,21 @@ async fn render(
     // showing the "unknown_kind" placeholder — a confusing surface the
     // user had to dismiss. Now the agent gets `invalid_spec` + detail
     // and can correct the call; nothing is shown to the user.
-    if let Err((detail, hint)) = validate_then_resolve(&mut req.spec, bridge_served).await {
+    let inline_budget = RENDER_SPEC_SOFT_CAP.saturating_sub(body.len());
+    let checked = validate_then_resolve_within(&mut req.spec, bridge_served, inline_budget).await;
+    if let Err(RenderReject::TooLarge(detail, hint)) = &checked {
+        trace(&format!("render: rejected — spec_too_large after inlining: {detail}"));
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "spec_too_large",
+                "detail": detail,
+                "hint": hint,
+            })),
+        )
+            .into_response();
+    }
+    if let Err(RenderReject::Invalid(detail, hint)) = checked {
         trace(&format!("render: rejected — invalid_spec: {detail}"));
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3828,6 +3925,42 @@ mod auth_tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer ".parse().unwrap());
         assert!(!auth_ok(&h, ""));
+    }
+
+    #[tokio::test]
+    async fn the_token_gate_answers_before_the_body_is_read() {
+        // A-04: the handler's `body: String` extractor buffered the whole
+        // body before its own auth check. Behind the gate, a tokenless
+        // request never reaches the handler (or its extractor) at all.
+        use tower::ServiceExt;
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = reached.clone();
+        let app = Router::new().route(
+            "/x",
+            post(move |_body: String| {
+                r2.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { "ok" }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::<str>::from("tok"),
+                require_token,
+            )),
+        );
+        let req = |auth: Option<&str>| {
+            let mut b = axum::http::Request::builder().method("POST").uri("/x");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(axum::body::Body::from(vec![0u8; 1024])).unwrap()
+        };
+        let res = app.clone().oneshot(req(None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = app.clone().oneshot(req(Some("Bearer wrong"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst), "handler ran without a token");
+        let res = app.oneshot(req(Some("Bearer tok"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

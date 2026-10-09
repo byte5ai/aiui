@@ -858,7 +858,11 @@ async fn tools_call(
     // Wait for it to become reachable instead of returning a connection-
     // refused error the moment we get one — that masks the auto-resurrect
     // path's startup window cleanly.
-    if !wait_for_aiui(http, cfg).await {
+    //
+    // NOT for `aiui_health` (review A-09, matching the Python bridge, #203):
+    // it is the diagnostic people run BECAUSE things hang, so it must answer
+    // fast — not after a 30 s cold-start wait.
+    if name != "aiui_health" && !wait_for_aiui(http, cfg).await {
         if let Some(h) = &progress_handle {
             h.abort();
         }
@@ -995,9 +999,9 @@ async fn tools_call(
 
         // Health is the one endpoint whose non-2xx body must survive: a 503
         // carries the `reason`/`hint` the agent is supposed to relay (#179).
-        "aiui_health" => get_json_allow_status(http, cfg, "/health")
-            .await
-            .map(value_to_tool_text),
+        "aiui_health" => Ok(value_to_tool_text(
+            health_result(get_json_with_status(http, cfg, "/health").await, &base_url(cfg)),
+        )),
         "version" => get_json(http, cfg, "/version").await.map(value_to_tool_text),
         "update" => post_empty(http, cfg, "/update")
             .await
@@ -1502,9 +1506,11 @@ async fn render_dialog(
     if let Some(proof) = cfg.read_local_proof() {
         post = post.header(crate::http::LOCAL_PROOF_HEADER, proof);
     }
+    // 120 s like the Python bridge (A-09): registration includes fetching
+    // and inlining http(s) images on the companion side (A-07).
     let resp = post
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| RenderError::Transport(format!("POST /render: {e}")))?;
@@ -1546,10 +1552,17 @@ async fn render_dialog(
         return Err(RenderError::Transport(msg));
     }
     if !resp.status().is_success() {
-        return Err(RenderError::Transport(format!(
-            "render http {}",
-            resp.status()
-        )));
+        // A-09: surface the companion's `detail` (e.g. 500 `window_failed`
+        // naming a broken WebView runtime, #193) instead of the bare status
+        // line, as the Python bridge does.
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let detail = error_detail(&raw);
+        return Err(RenderError::Transport(if detail.trim().is_empty() {
+            format!("render http {status}")
+        } else {
+            format!("render http {status}: {}", detail.chars().take(300).collect::<String>())
+        }));
     }
     let accepted = resp.status() == reqwest::StatusCode::ACCEPTED;
     let first = resp
@@ -1714,29 +1727,59 @@ async fn get_json(
 /// bug #179 fixes — `aiui_health` promises to tell a cold companion apart from
 /// a rogue process holding the port. `/render`, `/version` and `/update` keep
 /// the strict [`get_json`], where a non-2xx genuinely is a failed call.
-async fn get_json_allow_status(
+/// GET `path` and return `(status, body)` — the body on ANY status, since a
+/// 503 from `/health` carries the diagnosis (#179).
+async fn get_json_with_status(
     http: &reqwest::Client,
     cfg: &AppConfig,
     path: &str,
-) -> Result<Value, String> {
+) -> Result<(u16, Value), String> {
     let token = load_token(cfg)?;
     let url = format!("{}{}", base_url(cfg), path);
     let resp = http
         .get(&url)
         .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("GET {path}: {e}"))?;
-    let status = resp.status();
-    match resp.json::<Value>().await {
-        Ok(v) => Ok(v),
-        // No JSON to relay — fall back to the status line, which is all we
-        // have and still beats an empty error.
-        Err(e) if !status.is_success() => {
-            Err(format!("{path} http {status} (unparseable body: {e})"))
-        }
-        Err(e) => Err(format!("parse {path}: {e}")),
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| format!("read {path}: {e}"))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Ok((status, v)),
+        Err(_) => Err(format!(
+            "{path} answered HTTP {status} with a non-JSON body: {}",
+            text.chars().take(200).collect::<String>()
+        )),
     }
+}
+
+/// The `aiui_health` tool result, in the Python bridge's shape (review A-09):
+/// `ok` says whether the companion answered 200, the companion's body is
+/// spread in (so a 503's `reason`/`hint` reach the agent), `http_status` is
+/// added when it is not 200 — a 401 body alone is just
+/// `{"error":"unauthorized"}` — and a transport failure is `ok: false` with
+/// the error, never a tool error.
+fn health_result(res: Result<(u16, Value), String>, endpoint: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    match res {
+        Ok((status, body)) => {
+            out.insert("ok".into(), json!(status == 200));
+            if let Value::Object(map) = body {
+                out.extend(map);
+            }
+            if status != 200 {
+                out.insert("http_status".into(), json!(status));
+            }
+        }
+        Err(e) => {
+            out.insert("ok".into(), json!(false));
+            out.insert("error".into(), json!(e));
+        }
+    }
+    out.insert("endpoint".into(), json!(endpoint));
+    out.insert("server".into(), json!(crate::logging::BUILD_INFO));
+    Value::Object(out)
 }
 
 async fn post_empty(
@@ -2538,6 +2581,25 @@ mod tests {
 
     /// #203: the companion answers a bad `/notify` with a structured
     /// `{"error","detail"}`; the agent should get the sentence, not the JSON.
+    #[test]
+    fn health_result_matches_the_python_shape() {
+        // A-09: a 401 came back as a successful bare `{"error":"unauthorized"}`.
+        let out = health_result(Ok((401, json!({"error": "unauthorized"}))), "http://127.0.0.1:7777");
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["http_status"], json!(401));
+        assert_eq!(out["error"], json!("unauthorized"));
+        // A degraded-but-serving companion: ok (200) with its own fields.
+        let out = health_result(Ok((200, json!({"ready": false, "reason": "x"}))), "e");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["ready"], json!(false));
+        assert!(out.get("http_status").is_none());
+        // Unreachable is a result, not a tool error.
+        let out = health_result(Err("GET /health: connection refused".into()), "e");
+        assert_eq!(out["ok"], json!(false));
+        assert!(out["error"].as_str().unwrap().contains("refused"));
+        assert!(out["server"].is_string());
+    }
+
     #[test]
     fn error_detail_prefers_the_structured_message() {
         assert_eq!(

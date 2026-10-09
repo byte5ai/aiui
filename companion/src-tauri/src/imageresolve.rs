@@ -68,9 +68,20 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 /// the Tauri logger). Never panics on malformed specs — a non-image
 /// `src` value is simply ignored.
 pub async fn resolve_image_srcs(spec: &mut Value) {
+    let _ = resolve_image_srcs_within(spec, usize::MAX).await;
+}
+
+/// [`resolve_image_srcs`] with an aggregate byte budget for everything it
+/// inlines (review A-07). The spec-size ceiling is checked on the request
+/// body — before inlining — so 40 small `https://` URLs at ~8 MB each passed
+/// it and then put ~440 MB of base64 into the dialog registry and the
+/// WebView. Once the inlined total would pass `budget`, no further fetch
+/// starts and nothing is rewritten: `Err(inlined_so_far)`, which the caller
+/// turns into `spec_too_large`.
+pub async fn resolve_image_srcs_within(spec: &mut Value, budget: usize) -> Result<(), usize> {
     let urls = collect_external_urls(spec);
     if urls.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Vet every destination *before* a socket is opened, and remember the
@@ -101,26 +112,47 @@ pub async fn resolve_image_srcs(spec: &mut Value) {
         }
     }
     if fetchable.is_empty() {
-        return;
+        return Ok(());
     }
 
     let client = match build_client(&pinned) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("imageresolve: {e}");
-            return;
+            return Ok(());
         }
     };
+    let resolved = fetch_all_within(&client, fetchable, budget).await?;
+    if resolved.is_empty() {
+        return Ok(());
+    }
+    rewrite_urls(spec, &resolved);
+    Ok(())
+}
 
-    // Fetch in parallel — each image is independent and the natural
-    // unit of latency. Sequential would multiply latency by N for a
-    // multi-image grid. Capped, see `MAX_CONCURRENT_FETCHES`.
-    let fetches = fetchable
+/// Fetch `urls` (bounded concurrency) as `data:` URLs, stopping once their
+/// combined size passes `budget` (A-07). Below the destination guard, so the
+/// caller must only hand it vetted URLs.
+async fn fetch_all_within(
+    client: &reqwest::Client,
+    urls: Vec<String>,
+    budget: usize,
+) -> Result<HashMap<String, String>, usize> {
+    let inlined = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fetches = urls
         .into_iter()
         .map(|url| {
             let client = client.clone();
+            let inlined = inlined.clone();
             async move {
+                use std::sync::atomic::Ordering;
+                if inlined.load(Ordering::SeqCst) > budget {
+                    return (url, Err("inline budget spent".to_string()));
+                }
                 let result = fetch_as_data_url(&client, &url).await;
+                if let Ok(d) = &result {
+                    inlined.fetch_add(d.len(), Ordering::SeqCst);
+                }
                 (url, result)
             }
         })
@@ -138,11 +170,11 @@ pub async fn resolve_image_srcs(spec: &mut Value) {
             }
         }
     }
-
-    if resolved.is_empty() {
-        return;
+    let total = inlined.load(std::sync::atomic::Ordering::SeqCst);
+    if total > budget {
+        return Err(total);
     }
-    rewrite_urls(spec, &resolved);
+    Ok(resolved)
 }
 
 /// Run `tasks` with at most [`MAX_CONCURRENT_FETCHES`] of them in flight.
@@ -1154,6 +1186,35 @@ mod tests {
             spec["options"][0]["thumbnail"].as_str(),
             Some("http://192.168.1.1/cgi-bin/reboot")
         );
+    }
+
+    #[tokio::test]
+    async fn inlining_stops_at_the_aggregate_budget() {
+        // A-07: the size ceiling was checked before inlining, so many small
+        // URLs inflated the spec without bound. Two 4 KB images against a
+        // 5 KB budget: the second one tips it over, and nothing is returned.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let body = vec![0u8; 4096];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let client = build_client(&[]).unwrap();
+        let urls = vec![format!("http://{addr}/a.png"), format!("http://{addr}/b.png")];
+        let over = fetch_all_within(&client, urls.clone(), 5 * 1024).await;
+        assert!(over.is_err(), "two ~5.5 KB data URLs exceed a 5 KB budget");
+        server.await.unwrap();
     }
 
     #[tokio::test]

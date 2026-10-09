@@ -500,7 +500,16 @@ impl DialogState {
     /// does, so a deadline derived once at mount drifts in either direction
     /// (#207).
     pub fn remaining_secs(&self, id: &str) -> Option<u64> {
-        self.get_request(id).map(|r| r.remaining_secs)
+        // A-07: computed from the entry directly. Going through `get_request`
+        // deep-cloned the whole spec — inlined images included — under the
+        // registry lock, on the main thread, every 30 s per window, to read
+        // one integer.
+        let map = self.pending.lock().unwrap();
+        let entry = map.get(id)?;
+        Some(remaining_ttl_secs(
+            Duration::from_secs(entry.request.ttl_secs),
+            Instant::now().saturating_duration_since(entry.created_at),
+        ))
     }
 
     /// Registration instant of `id`. Test-only: it is the anchor the
@@ -594,6 +603,20 @@ impl DialogState {
     /// pick, so consecutive probes would flap between windows and an RTT
     /// series would measure nothing in particular. `None` when nothing is
     /// pending. Issue #179.
+    /// The newest dialog registered at least `min_age` before `now` — one
+    /// whose window has had time to load and mount its `ui:ping` listener
+    /// (review A-08: probing a just-built window reported a frozen WebView
+    /// that was merely still loading — a false 503 for every other session).
+    pub fn newest_settled_id(&self, min_age: Duration, now: Instant) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| now.saturating_duration_since(e.created_at) >= min_age)
+            .max_by_key(|(_, e)| e.created_at)
+            .map(|(id, _)| id.clone())
+    }
+
     pub fn newest_id(&self) -> Option<String> {
         self.pending
             .lock()
@@ -625,6 +648,20 @@ impl DialogState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_health_probe_skips_a_dialog_that_is_still_mounting() {
+        let ds = DialogState::new();
+        let (first, _rx1) = ds.register_dialog(serde_json::json!({"kind":"confirm"}), None, None, 60);
+        let t0 = ds.created_at(&first).unwrap();
+        let (second, _rx2) = ds.register_dialog(serde_json::json!({"kind":"confirm"}), None, None, 60);
+        let grace = Duration::from_secs(3);
+        // Right after the second registers, nothing is settled yet…
+        assert_eq!(ds.newest_settled_id(grace, t0), None);
+        // …and once both are old enough, the newest one is probed.
+        let later = ds.created_at(&second).unwrap() + grace;
+        assert_eq!(ds.newest_settled_id(grace, later), Some(second));
+    }
 
     fn reg(s: &DialogState) -> (String, oneshot::Receiver<DialogResult>) {
         s.register_dialog(serde_json::json!({"kind": "confirm", "title": "?"}), None, None, 0)
