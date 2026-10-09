@@ -1368,9 +1368,23 @@ pub fn patch_claude_code_config_remote(
     let pkg_spec = format!("aiui-mcp=={pinned_version}");
     let pkg_spec_lit = serde_json::to_string(&pkg_spec)
         .unwrap_or_else(|_| format!("\"{pkg_spec}\""));
-    let script = format!(r#"{REMOTE_JSON_PREAMBLE}
-servers = data.get("mcpServers") or {{}}
-existing = servers.get("aiui") or {{}}
+    let script = render_remote_patch_script(&uvx_command_lit, command_is_known, &pkg_spec_lit);
+    let mut patch: Option<RemoteConfigPatch> = None;
+    let step = run_remote_python(host_alias, &script, "Patching ~/.claude.json", |stdout| {
+        let (step, outcome) = patch_outcome(host_alias, pinned_version, stdout);
+        patch = outcome;
+        step
+    });
+    (step, patch)
+}
+
+/// The patch script's body, run after [`REMOTE_JSON_PREAMBLE`]. A plain
+/// constant with `__NAME__` placeholders rather than a `format!` template,
+/// so `python/tests/test_remote_config_scripts.py` can execute exactly this
+/// text instead of a hand-copied twin that could drift (review B1-13).
+const REMOTE_PATCH_BODY: &str = r#"
+servers = data.get("mcpServers") or {}
+existing = servers.get("aiui") or {}
 current_cmd = existing.get("command") if isinstance(existing, dict) else None
 
 # #184: decide the command BEFORE comparing, so "we know of no path" never
@@ -1378,64 +1392,82 @@ current_cmd = existing.get("command") if isinstance(existing, dict) else None
 # it wins. Otherwise keep whatever is already there if it looks resolvable
 # (absolute and ending in /uvx) — the version pin in `args` is enforced
 # either way. Only a host with no usable entry gets the bare name.
-want_cmd = {uvx_command_lit}
-if not {command_is_known}:
+want_cmd = __UVX_COMMAND__
+if not __COMMAND_IS_KNOWN__:
     if isinstance(current_cmd, str) and current_cmd.startswith("/") \
             and current_cmd.rstrip("/").endswith("/uvx"):
         want_cmd = current_cmd
 
-if (current_cmd == want_cmd and existing.get("args") == [{pkg_spec_lit}]):
+if (current_cmd == want_cmd and existing.get("args") == [__PKG_SPEC__]):
     print("ok:current")
     raise SystemExit(0)
 backup()
 # Keep any foreign keys on the entry (env, disabled, …) — set only ours.
-entry = dict(existing) if isinstance(existing, dict) else {{}}
+entry = dict(existing) if isinstance(existing, dict) else {}
 entry["command"] = want_cmd
-entry["args"] = [{pkg_spec_lit}]
+entry["args"] = [__PKG_SPEC__]
 servers["aiui"] = entry
 data["mcpServers"] = servers
 save(data)
 print("ok:patched")
-"#);
-    let script = script.as_str();
-    let mut patch: Option<RemoteConfigPatch> = None;
-    let step = run_remote_python(host_alias, script, "Patching ~/.claude.json", |stdout| {
-        let trimmed = stdout.trim();
-        match trimmed {
-            "ok:patched" => {
-                patch = Some(RemoteConfigPatch::Patched);
-                StepResult {
-                    ok: true,
-                    message: format!("aiui pinned to {pinned_version} in ~/.claude.json on {host_alias}"),
-                    details: None,
-                }
-            }
-            "ok:current" => {
-                patch = Some(RemoteConfigPatch::AlreadyCurrent);
-                StepResult {
-                    ok: true,
-                    message: format!("aiui in ~/.claude.json on {host_alias} already pinned to {pinned_version}"),
-                    details: None,
-                }
-            }
-            "err:malformed" => StepResult {
-                ok: false,
+"#;
+
+/// Preamble + patch body with the three values substituted. Each value is
+/// already a Python literal (`serde_json` string or `True`/`False`).
+fn render_remote_patch_script(uvx_command_lit: &str, command_is_known: &str, pkg_spec_lit: &str) -> String {
+    let body = REMOTE_PATCH_BODY
+        .replace("__UVX_COMMAND__", uvx_command_lit)
+        .replace("__COMMAND_IS_KNOWN__", command_is_known)
+        .replace("__PKG_SPEC__", pkg_spec_lit);
+    format!("{REMOTE_JSON_PREAMBLE}{body}")
+}
+
+/// What the patch script's stdout means. Named and pure so the
+/// `err:malformed` arm is tested, not just written (review B1-03).
+fn patch_outcome(
+    host_alias: &str,
+    pinned_version: &str,
+    stdout: &str,
+) -> (StepResult, Option<RemoteConfigPatch>) {
+    match stdout.trim() {
+        "ok:patched" => (
+            StepResult {
+                ok: true,
+                message: format!("aiui pinned to {pinned_version} in ~/.claude.json on {host_alias}"),
+                details: None,
+            },
+            Some(RemoteConfigPatch::Patched),
+        ),
+        "ok:current" => (
+            StepResult {
+                ok: true,
                 message: format!(
-                    "~/.claude.json on {host_alias} is not valid JSON — left untouched"
+                    "aiui in ~/.claude.json on {host_alias} already pinned to {pinned_version}"
                 ),
+                details: None,
+            },
+            Some(RemoteConfigPatch::AlreadyCurrent),
+        ),
+        "err:malformed" => (
+            StepResult {
+                ok: false,
+                message: format!("~/.claude.json on {host_alias} is not valid JSON — left untouched"),
                 details: Some(
                     "Fix the file on that host (or remove it) and register the remote again."
                         .into(),
                 ),
             },
-            other => StepResult {
+            None,
+        ),
+        other => (
+            StepResult {
                 ok: false,
                 message: format!("Patching ~/.claude.json on {host_alias} did not confirm 'ok'"),
                 details: Some(format!("stdout: {other}")),
             },
-        }
-    });
-    (step, patch)
+            None,
+        ),
+    }
 }
 
 // Step 2 removed `kill_remote_mcp_stdio` (an `ssh … pkill -f 'aiui-mcp'`).
@@ -1776,16 +1808,38 @@ fn run_remote_python(
         }
     };
 
-    if !out.status.success() {
-        return StepResult {
-            ok: false,
-            message: format!("{op} on {host_alias} failed"),
-            details: Some(String::from_utf8_lossy(&out.stderr).to_string()),
-        };
-    }
+    remote_python_result(
+        op,
+        host_alias,
+        out.status.success(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+        on_success,
+    )
+}
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    on_success(&stdout)
+/// Route a finished remote script to its interpreter. A known `err:` marker
+/// on stdout is the script's own, deliberate verdict and is interpreted
+/// whatever the exit status — before review B1-03 the malformed-config
+/// marker came with exit 2, the status check short-circuited first, and the
+/// user got a bare "failed" with empty details instead of "not valid JSON —
+/// left untouched" (and a red uninstall instead of a green one).
+fn remote_python_result(
+    op: &str,
+    host_alias: &str,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+    on_success: impl FnOnce(&str) -> StepResult,
+) -> StepResult {
+    if success || stdout.trim_start().starts_with("err:") {
+        return on_success(stdout);
+    }
+    StepResult {
+        ok: false,
+        message: format!("{op} on {host_alias} failed"),
+        details: Some(stderr.to_string()),
+    }
 }
 
 /// Parse-or-bail + timestamped backup + atomic write, shared verbatim by both
@@ -1806,22 +1860,31 @@ p = pathlib.Path.home() / ".claude.json"
 data = {}
 if p.exists():
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         # Never launder an unparsable config into an empty dict: the next
         # write would replace every MCP server, project entry and the OAuth
-        # block with a document containing only aiui.
+        # block with a document containing only aiui. The marker is the
+        # verdict; exit 0 so the caller reads it (B1-03).
         print("err:malformed")
-        raise SystemExit(2)
+        raise SystemExit(0)
     if not isinstance(data, dict):
         print("err:malformed")
-        raise SystemExit(2)
+        raise SystemExit(0)
+
+def _is_our_backup(f):
+    # Only `<name>.bak.<millis>` is ours to prune — never a user's own
+    # `.claude.json.bak.manual` (B1-09).
+    return f.name[len(p.name) + len(".bak."):].isdigit()
 
 def backup():
     if p.exists():
         ts = int(time.time() * 1000)
         shutil.copy(p, p.with_name(p.name + f".bak.{ts}"))
-        baks = sorted(p.parent.glob(p.name + ".bak.*"), key=lambda f: f.stat().st_mtime)
+        baks = sorted(
+            (f for f in p.parent.glob(p.name + ".bak.*") if _is_our_backup(f)),
+            key=lambda f: f.stat().st_mtime,
+        )
         for old in baks[:-5]:
             try:
                 old.unlink()
@@ -1829,55 +1892,87 @@ def backup():
                 pass
 
 def save(data):
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".aiui-tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    os.replace(tmp, p)
+    # B1-02: write THROUGH a symlink (dotfile setups) instead of replacing
+    # it, and keep the file's mode. A fresh tmp + os.replace used to land at
+    # the umask default (0644), so a 0600 config — MCP server env keys,
+    # project history — became world-readable on every release's resync.
+    target = p.resolve() if p.is_symlink() else p
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = os.stat(target).st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o600
+    tmp = target.with_name(target.name + ".aiui-tmp")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.fchmod(fd, mode)  # O_CREAT's mode is filtered by the umask
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            f.write(json.dumps(data, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, target)
 "#;
 
 pub fn remove_claude_code_config_remote(host_alias: &str) -> StepResult {
-    let script = format!(r#"{REMOTE_JSON_PREAMBLE}
+    let script = format!("{REMOTE_JSON_PREAMBLE}{REMOTE_REMOVE_BODY}");
+    run_remote_python(host_alias, &script, "Removing aiui from ~/.claude.json", |stdout| {
+        remove_outcome(host_alias, stdout)
+    })
+}
+
+/// The remove script's body, run after [`REMOTE_JSON_PREAMBLE`]. Executed
+/// verbatim by `python/tests/test_remote_config_scripts.py` (B1-13).
+const REMOTE_REMOVE_BODY: &str = r#"
 if not p.exists():
     print("ok")
 else:
-    servers = data.get("mcpServers") or {{}}
+    servers = data.get("mcpServers") or {}
     if "aiui" in servers:
         backup()
         servers.pop("aiui", None)
         data["mcpServers"] = servers
         save(data)
     print("ok")
-"#);
-    let script = script.as_str();
-    run_remote_python(host_alias, script, "Removing aiui from ~/.claude.json", |stdout| {
-        if stdout.trim() == "err:malformed" {
-            // ok:true on purpose — a full uninstall must not turn red over a
-            // file aiui did not break.
-            return StepResult {
-                ok: true,
-                message: format!(
-                    "~/.claude.json on {host_alias} is not valid JSON — left untouched"
-                ),
-                details: Some(
-                    "Remove the `aiui` entry under `mcpServers` on that host by hand.".into(),
-                ),
-            };
-        }
-        let confirmed = stdout.trim() == "ok";
-        StepResult {
-            ok: confirmed,
-            message: if confirmed {
-                format!("Removed aiui from ~/.claude.json on {host_alias}")
-            } else {
-                format!("Removal on {host_alias} did not confirm 'ok'")
-            },
-            details: if confirmed {
-                None
-            } else {
-                Some(format!("stdout: {}", stdout.trim()))
-            },
-        }
-    })
+"#;
+
+/// What the remove script's stdout means (review B1-03).
+fn remove_outcome(host_alias: &str, stdout: &str) -> StepResult {
+    if stdout.trim() == "err:malformed" {
+        // ok:true on purpose — a full uninstall must not turn red over a
+        // file aiui did not break.
+        return StepResult {
+            ok: true,
+            message: format!("~/.claude.json on {host_alias} is not valid JSON — left untouched"),
+            details: Some("Remove the `aiui` entry under `mcpServers` on that host by hand.".into()),
+        };
+    }
+    let confirmed = stdout.trim() == "ok";
+    StepResult {
+        ok: confirmed,
+        message: if confirmed {
+            format!("Removed aiui from ~/.claude.json on {host_alias}")
+        } else {
+            format!("Removal on {host_alias} did not confirm 'ok'")
+        },
+        details: if confirmed {
+            None
+        } else {
+            Some(format!("stdout: {}", stdout.trim()))
+        },
+    }
 }
 
 /// Cheap liveness probe run before remote cleanup in the removal/uninstall
@@ -2232,6 +2327,55 @@ mod tests {
             ) == false,
             "a helper's own executable path is not the main binary"
         );
+    }
+
+    #[test]
+    fn remote_remove_marker_maps_to_untouched_step() {
+        // B1-03 / #182 AC: the remove script's malformed-config verdict is a
+        // GREEN "left untouched", even if the script exits non-zero.
+        let step = remote_python_result(
+            "Removing aiui from ~/.claude.json",
+            "example-host",
+            false,
+            "err:malformed\n",
+            "",
+            |stdout| remove_outcome("example-host", stdout),
+        );
+        assert!(step.ok, "{}", step.message);
+        assert!(step.message.contains("not valid JSON — left untouched"));
+        assert!(step.details.unwrap().contains("by hand"));
+    }
+
+    #[test]
+    fn remote_patch_marker_names_the_malformed_file() {
+        let step = remote_python_result(
+            "Patching ~/.claude.json",
+            "example-host",
+            false,
+            "err:malformed",
+            "",
+            |stdout| patch_outcome("example-host", "9.9.9", stdout).0,
+        );
+        assert!(!step.ok);
+        assert!(step.message.contains("not valid JSON — left untouched"), "{}", step.message);
+    }
+
+    #[test]
+    fn a_failed_remote_script_without_a_marker_reports_stderr() {
+        let step = remote_python_result("Op", "example-host", false, "", "boom", |_| {
+            panic!("must not interpret a failed run without a marker")
+        });
+        assert!(!step.ok);
+        assert_eq!(step.details.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn the_patch_script_substitutes_every_placeholder() {
+        let script = render_remote_patch_script("\"/opt/bin/uvx\"", "True", "\"aiui-mcp==9.9.9\"");
+        assert!(!script.contains("__"), "unsubstituted placeholder:\n{script}");
+        assert!(script.contains("want_cmd = \"/opt/bin/uvx\""));
+        assert!(script.contains("if not True:"));
+        assert!(script.contains("[\"aiui-mcp==9.9.9\"]"));
     }
 
     #[test]

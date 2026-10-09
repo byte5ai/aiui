@@ -146,6 +146,20 @@ toggle_aiui() {
     CONFIG="$CONFIG" STASH="$STASH" python3 - <<'PYEOF'
 import json, os, sys
 p, stash = os.environ["CONFIG"], os.environ["STASH"]
+def save(p, d):
+    # Keep the config's mode and write through a symlink (review B1-02): a
+    # fresh tmp + os.replace lands at the umask default and replaces a link.
+    target = os.path.realpath(p)
+    try:
+        mode = os.stat(target).st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o600
+    tmp = target + ".aiui-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, target)
 # Re-read the CURRENT config: Claude Code has been writing to it for the whole
 # measurement window. Only the one key we removed goes back in.
 try:
@@ -156,10 +170,7 @@ entry = json.load(open(stash))
 servers = d.get("mcpServers") or {}
 servers["aiui"] = entry
 d["mcpServers"] = servers
-tmp = p + ".aiui-tmp"
-with open(tmp, "w") as f:
-    json.dump(d, f, indent=2)
-os.replace(tmp, p)
+save(p, d)
 os.unlink(stash)
 print("mcpServers now:", list(servers.keys()))
 PYEOF
@@ -169,6 +180,20 @@ PYEOF
   CONFIG="$CONFIG" STASH="$STASH" python3 - <<'PYEOF'
 import json, os, sys
 p, stash = os.environ["CONFIG"], os.environ["STASH"]
+def save(p, d):
+    # Keep the config's mode and write through a symlink (review B1-02): a
+    # fresh tmp + os.replace lands at the umask default and replaces a link.
+    target = os.path.realpath(p)
+    try:
+        mode = os.stat(target).st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o600
+    tmp = target + ".aiui-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, target)
 try:
     d = json.load(open(p))
 except Exception as e:
@@ -177,13 +202,13 @@ servers = d.get("mcpServers") or {}
 entry = servers.pop("aiui", None)
 if entry is None:
     sys.exit("no top-level `aiui` entry in mcpServers — nothing to toggle")
-with open(stash, "w") as f:
+# The stash holds the aiui entry (its env included): owner-only (B1-02).
+fd = os.open(stash, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.fchmod(fd, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(entry, f, indent=2)
 d["mcpServers"] = servers
-tmp = p + ".aiui-tmp"
-with open(tmp, "w") as f:
-    json.dump(d, f, indent=2)
-os.replace(tmp, p)
+save(p, d)
 print("removed: True")
 print("remaining mcpServers:", list(servers.keys()))
 # A per-project entry would keep aiui loaded for the project you are about to
