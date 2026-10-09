@@ -76,9 +76,13 @@ introduced regressions of its own.
 
 ### Security
 
-- **The tunnel probe and the Python bridge no longer send the auth token to
-  an unverified listener.** `/probe?nonce=` answers an HMAC challenge; a
-  co-tenant squatting the remote port collected the token on every probe.
+- **The auth token no longer travels to a remote's port.** `/probe?nonce=`
+  answers an HMAC challenge, so the tunnel probe never sends the token, and
+  the Python bridge challenges the listener before every request and then
+  *signs* the request (`AIUI-HMAC`: method, path, timestamp and nonce bound;
+  each signature accepted once) instead of sending the token. A co-tenant
+  squatting the remote port used to collect the token on every probe and
+  every bridge call. The local bridge keeps the bearer form.
 - **A remote can no longer have a `target` written on your machine** by
   omitting `session_origin`: the local bridge proves locality with a
   secret that never leaves the machine.

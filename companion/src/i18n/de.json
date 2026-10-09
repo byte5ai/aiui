@@ -96,7 +96,8 @@
     "pending_update.install": "Installieren",
     "report.button": "Problem melden",
     "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt.",
-    "updates.downloaded_install_later": "aiui {version} wurde heruntergeladen. Während des Downloads hat sich ein Dialog geöffnet, deshalb hat aiui es noch nicht installiert. Schließ den Dialog ab und klick dann erneut auf Installieren."
+    "updates.downloaded_install_later": "aiui {version} wurde heruntergeladen. Während des Downloads hat sich ein Dialog geöffnet, deshalb hat aiui es noch nicht installiert. Schließ den Dialog ab und klick dann erneut auf Installieren.",
+    "updates.installed_restart_later": "aiui {version} wurde heruntergeladen und installiert. Während der Installation hat sich ein Dialog geöffnet, deshalb hat aiui nicht neu gestartet: Das Update wird beim nächsten Start von aiui aktiv. Schließ den Dialog ab und klick dann erneut auf Installieren, um sofort neu zu starten."
   },
   "dialog": {
     "cancel": "Abbrechen",

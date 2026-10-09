@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from aiui_mcp.server import EXPECTED_WIRE_VERSION
+from companion_auth import auth_ok
 
 TOKEN = "5ca1ab1e" * 8
 RENDER_ID = "host-exit-render"
@@ -65,7 +66,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
-        return self.headers.get("Authorization") == f"Bearer {TOKEN}"
+        return auth_ok(self.headers.get("Authorization"), self.command, self.path, TOKEN)
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
         path, _, query = self.path.partition("?")

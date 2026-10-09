@@ -47,6 +47,7 @@ import pytest
 
 import aiui_mcp.server as server
 from aiui_mcp.server import EXPECTED_WIRE_VERSION, ask, compare, confirm, form, gallery
+from companion_auth import auth_ok
 
 # A real aiui token is 64 hex chars; the bridge rejects any other
 # shape (#185), so the fixture has to look like the real thing.
@@ -121,7 +122,7 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
     def _authed(self) -> bool:
-        return self.headers.get("Authorization") == f"Bearer {TOKEN}"
+        return auth_ok(self.headers.get("Authorization"), self.command, self.path, TOKEN)
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
         self.send_response(code)

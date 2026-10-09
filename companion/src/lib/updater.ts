@@ -185,6 +185,19 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
     }
     await update.install();
 
+    // On macOS/Linux `install()` returns — after extracting the bundle and
+    // possibly waiting for an admin prompt, which is again time an agent can
+    // open a dialog in. Relaunching then would destroy it (Codex review), so
+    // check once more before latching the exit: the new version is already
+    // on disk and takes effect on the next start either way.
+    if (!(await updateIsSafeToInstall())) {
+      await message(tr("settings.updates.installed_restart_later", { version: update.version }), {
+        title: "aiui",
+        kind: "info",
+      });
+      return { ok: true };
+    }
+
     // Everything below runs on macOS/Linux ONLY. On Windows
     // `tauri-plugin-updater` hands the NSIS installer to `ShellExecuteW` and
     // then calls `std::process::exit(0)` *inside* `install()` above, so this
@@ -216,6 +229,11 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
       kind: "error",
     });
     return { ok: false, error };
+  } finally {
+    // The downloaded archive lives in a Rust-side resource until closed
+    // (Codex review): every deferred or failed attempt used to leave one
+    // behind. After a successful relaunch the process is gone anyway.
+    await update.close().catch(() => {});
   }
 }
 

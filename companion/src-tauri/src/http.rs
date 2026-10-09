@@ -427,7 +427,13 @@ pub async fn serve(
         // served out of the media cache can act inside the API's own
         // `127.0.0.1:<port>` origin.
         .nest_service("/media/blob", blob_service)
-        .with_state(state);
+        .with_state(state.clone())
+        // Outermost: turns a valid signed request into the bearer form every
+        // handler checks, before any route layer runs (see `signed_auth`).
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::<str>::from(state.cfg.token.as_str()),
+            signed_auth,
+        ));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = bind_with_reuse(addr)?;
@@ -546,6 +552,132 @@ async fn show_settings(State(state): State<AppState>, headers: HeaderMap) -> imp
     trace("show-settings: requested by a second launch");
     crate::show_settings_from_second_launch(&state.app);
     StatusCode::NO_CONTENT
+}
+
+/// Review B1-01, Codex follow-up: the remote Python bridge never sends the
+/// token itself. Its `/probe?nonce=` challenge proves the listener first, but
+/// cannot pin the TCP connection the next request travels on: if the
+/// listener closes it and a squatter grabs the port in between, a bearer
+/// token went to the squatter. So the bridge SIGNS each request instead:
+///
+///   Authorization: AIUI-HMAC ts=<unix secs>,nonce=<32–128 hex>,mac=<hex>
+///   mac = HMAC-SHA256(token, "aiui-req-v1|<METHOD>|<path?query>|<ts>|<nonce>")
+///
+/// A captured header authorises nothing else (method and path are bound),
+/// expires (±[`SIGNED_REQUEST_WINDOW`]), and is accepted once (nonce cache).
+/// This layer verifies it and rewrites it to the bearer form the handlers
+/// check, so no handler changes. `Bearer` stays accepted — the local Rust
+/// bridge and older bridges use it.
+async fn signed_auth(
+    State(token): State<std::sync::Arc<str>>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let params = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("AIUI-HMAC "))
+        .map(str::to_owned);
+    let Some(params) = params else {
+        return next.run(req).await;
+    };
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "/".into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let verdict = verify_signed_request(
+        &token,
+        req.method().as_str(),
+        &path_query,
+        &params,
+        now,
+        seen_nonces(),
+    );
+    match verdict {
+        Ok(()) => {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
+                req.headers_mut().insert(axum::http::header::AUTHORIZATION, v);
+            }
+            next.run(req).await
+        }
+        Err(why) => {
+            trace(&format!("signed request refused: {why}"));
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// How far a signed request's timestamp may be from this machine's clock.
+/// Generous on purpose: a remote dev host's clock is not ours to fix, and the
+/// nonce cache — not the window — is what stops a replay.
+const SIGNED_REQUEST_WINDOW: u64 = 300;
+
+/// Nonces seen inside the window (nonce → its ts). Pruned on insert.
+/// `OnceLock`, not `LazyLock`: the MSRV is 1.77.
+fn seen_nonces() -> &'static Mutex<std::collections::HashMap<String, u64>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `HMAC-SHA256(token, "aiui-req-v1|METHOD|path?query|ts|nonce")`, hex — the
+/// Python bridge computes the same with `hmac.new`.
+pub(crate) fn signed_request_mac(token: &str, method: &str, path_query: &str, ts: u64, nonce: &str) -> String {
+    let msg = format!("aiui-req-v1|{method}|{path_query}|{ts}|{nonce}");
+    hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
+}
+
+fn verify_signed_request(
+    token: &str,
+    method: &str,
+    path_query: &str,
+    params: &str,
+    now: u64,
+    seen: &Mutex<std::collections::HashMap<String, u64>>,
+) -> Result<(), &'static str> {
+    if token.is_empty() {
+        return Err("no token configured");
+    }
+    let mut ts: Option<u64> = None;
+    let mut nonce: Option<&str> = None;
+    let mut mac: Option<&str> = None;
+    for part in params.split(',') {
+        match part.trim().split_once('=') {
+            Some(("ts", v)) => ts = v.parse().ok(),
+            Some(("nonce", v)) => nonce = Some(v),
+            Some(("mac", v)) => mac = Some(v),
+            _ => return Err("malformed signature header"),
+        }
+    }
+    let (Some(ts), Some(nonce), Some(mac)) = (ts, nonce, mac) else {
+        return Err("incomplete signature header");
+    };
+    if !is_probe_nonce(nonce) {
+        return Err("bad nonce");
+    }
+    if now.abs_diff(ts) > SIGNED_REQUEST_WINDOW {
+        return Err("timestamp outside the window");
+    }
+    let want = signed_request_mac(token, method, path_query, ts, nonce);
+    if !constant_time_eq(mac.as_bytes(), want.as_bytes()) {
+        return Err("bad signature");
+    }
+    let mut seen = seen.lock().unwrap();
+    seen.retain(|_, t| now.abs_diff(*t) <= 2 * SIGNED_REQUEST_WINDOW);
+    if seen.insert(nonce.to_string(), ts).is_some() {
+        return Err("replayed nonce");
+    }
+    Ok(())
 }
 
 /// Route layer for every body-consuming endpoint: 401 before any body byte
@@ -4117,6 +4249,65 @@ mod auth_tests {
         let res = app.oneshot(req(Some("Bearer tok"))).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_signed_request_is_accepted_once_and_only_for_its_own_path() {
+        let seen = Mutex::new(std::collections::HashMap::new());
+        let n = "ab".repeat(16);
+        let mac = signed_request_mac("tok", "GET", "/render/x", 1_000, &n);
+        let hdr = format!("ts=1000,nonce={n},mac={mac}");
+        assert_eq!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_010, &seen), Ok(()));
+        // Replayed: refused.
+        assert!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_011, &seen).is_err());
+        // Captured and pointed elsewhere: refused (method and path are bound).
+        let seen2 = Mutex::new(std::collections::HashMap::new());
+        assert!(verify_signed_request("tok", "POST", "/render/x", &hdr, 1_010, &seen2).is_err());
+        assert!(verify_signed_request("tok", "GET", "/update", &hdr, 1_010, &seen2).is_err());
+        // Wrong token, stale timestamp, malformed header.
+        assert!(verify_signed_request("other", "GET", "/render/x", &hdr, 1_010, &seen2).is_err());
+        assert!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_000 + 301, &seen2).is_err());
+        assert!(verify_signed_request("tok", "GET", "/render/x", "ts=1000", 1_000, &seen2).is_err());
+    }
+
+    #[test]
+    fn the_signed_request_mac_formula_is_pinned() {
+        // The Python bridge pins the same vector (test_listener_verification.py).
+        assert_eq!(
+            signed_request_mac("k".repeat(64).as_str(), "GET", "/health", 1_700_000_000, &"ab".repeat(16)),
+            hmac_sha256_hex(
+                "k".repeat(64).as_bytes(),
+                format!("aiui-req-v1|GET|/health|1700000000|{}", "ab".repeat(16)).as_bytes()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signed_layer_hands_handlers_the_bearer_form() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/x",
+                get(|h: HeaderMap| async move {
+                    if auth_ok(&h, "tok") { StatusCode::OK } else { StatusCode::UNAUTHORIZED }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(std::sync::Arc::<str>::from("tok"), signed_auth));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let n = format!("{:032x}", now as u128 * 7919);
+        let mac = signed_request_mac("tok", "GET", "/x?a=1", now, &n);
+        let req = axum::http::Request::builder()
+            .uri("/x?a=1")
+            .header("authorization", format!("AIUI-HMAC ts={now},nonce={n},mac={mac}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let bad = axum::http::Request::builder()
+            .uri("/x?a=1")
+            .header("authorization", format!("AIUI-HMAC ts={now},nonce={n},mac={}", "0".repeat(64)))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(bad).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

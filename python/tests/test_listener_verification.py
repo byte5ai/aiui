@@ -27,6 +27,7 @@ import pytest
 
 import aiui_mcp.server as server
 from aiui_mcp.server import EXPECTED_WIRE_VERSION, _preflight, aiui_health, confirm
+from companion_auth import auth_ok
 
 TOKEN = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"
 
@@ -83,7 +84,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/probe":
             self._probe(urllib.parse.parse_qs(query).get("nonce", [""])[0], auth)
             return
-        if auth != f"Bearer {TOKEN}":
+        if not auth_ok(auth, self.command, self.path, TOKEN):
             self._json(401, {"error": "unauthorized"})
             return
         if path == "/health":
@@ -162,7 +163,10 @@ def test_a_verified_listener_gets_the_token(bridge: Any) -> None:
     assert all(auth is None for _, _, auth in probes), "the challenge carries no token"
     nonce = urllib.parse.parse_qs(probes[0][1].partition("?")[2])["nonce"][0]
     assert len(nonce) == 64 and all(c in "0123456789abcdef" for c in nonce)
-    assert ("GET", "/health", f"Bearer {TOKEN}") in srv.requests
+    health = [a for m, p, a in srv.requests if p == "/health"]
+    assert health and all(a.startswith("AIUI-HMAC ") for a in health), health
+    # The token itself never reaches the listener, not even the real one.
+    assert all(TOKEN not in a for a in srv.auth_headers), srv.auth_headers
 
     # No cross-request trust: every token-bearing request is directly
     # preceded by its own challenge (Codex review of the 60 s cache).
@@ -211,6 +215,7 @@ def test_an_older_companion_is_refused_unless_opted_in(
 
     monkeypatch.setenv("AIUI_ALLOW_UNVERIFIED_COMPANION", "1")
     asyncio.run(_preflight())
+    # Opted in: an older companion only understands the bearer form.
     assert ("GET", "/health", f"Bearer {TOKEN}") in srv.requests
 
 
@@ -248,6 +253,15 @@ def test_a_port_taken_over_between_two_calls_never_sees_the_token(bridge: Any) -
     with pytest.raises(RuntimeError, match="could not prove it is aiui"):
         asyncio.run(_preflight())
     assert squatter.auth_headers == [], f"token leaked to the squatter: {squatter.requests}"
+
+
+def test_request_mac_matches_the_companion_formula() -> None:
+    """Pinned like `the_signed_request_mac_formula_is_pinned` in http.rs."""
+    nonce = "ab" * 16
+    expected = hmac.new(
+        b"k" * 64, f"aiui-req-v1|GET|/health|1700000000|{nonce}".encode(), hashlib.sha256
+    ).hexdigest()
+    assert server._request_mac("k" * 64, "GET", "/health", 1_700_000_000, nonce) == expected
 
 
 def test_probe_mac_matches_the_companion_formula() -> None:

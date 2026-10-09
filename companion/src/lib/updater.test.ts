@@ -34,8 +34,9 @@ import { checkForUpdates } from "./updater";
 function availableUpdate(
   download: () => Promise<void>,
   install: () => Promise<void> = vi.fn().mockResolvedValue(undefined),
+  close: () => Promise<void> = vi.fn().mockResolvedValue(undefined),
 ) {
-  return { version: "0.10.2", body: "release notes", download, install };
+  return { version: "0.10.2", body: "release notes", download, install, close };
 }
 
 /** Rust commands answer `undefined` unless a test says otherwise; the I5
@@ -145,7 +146,7 @@ describe("checkForUpdates — manual path", () => {
 
     const downloaded = order.indexOf("download");
     const gates = order.flatMap((c, i) => (c === "is_update_safe_to_install" ? [i] : []));
-    expect(gates).toHaveLength(2);
+    expect(gates).toHaveLength(3);
     // Before the download, so a pending dialog costs no download at all…
     expect(gates[0]).toBeLessThan(downloaded);
     // …and after it (D-08): a download can take long enough for an agent
@@ -154,7 +155,10 @@ describe("checkForUpdates — manual path", () => {
     // …and BEFORE the install: on Windows `install()` exits the process, so
     // a check after it would never run.
     expect(gates[1]).toBeLessThan(order.indexOf("install"));
-    expect(order.indexOf("install")).toBeLessThan(order.indexOf("authorize_exit_for_update"));
+    // …and once more after it (macOS/Linux, where install returns): the
+    // install can take long enough for a dialog to open, too.
+    expect(gates[2]).toBeGreaterThan(order.indexOf("install"));
+    expect(gates[2]).toBeLessThan(order.indexOf("authorize_exit_for_update"));
     // And the exit authority is latched only after the install returned —
     // it is irreversible, so arming it earlier would disarm the host's
     // default-deny exit gate for good (Invariant I1).
@@ -191,6 +195,43 @@ describe("checkForUpdates — manual path", () => {
     expect(options).toMatchObject({ kind: "info" });
     expect(text).toContain("0.10.2");
     expect(text).toContain("not installed it yet");
+  });
+
+  it("does not relaunch over a dialog that opened during the install", async () => {
+    const install = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(vi.fn().mockResolvedValue(undefined), install, close));
+    let gateCalls = 0;
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "is_update_safe_to_install") return undefined;
+      gateCalls += 1;
+      return gateCalls < 3; // safe before download and install, not after install
+    });
+
+    const outcome = await checkForUpdates({ silent: false });
+
+    expect(outcome.ok).toBe(true);
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(tauri.relaunch).not.toHaveBeenCalled();
+    expect(invokedCommands()).not.toContain("authorize_exit_for_update");
+    const [text] = tauri.message.mock.calls[0];
+    expect(text).toContain("next time aiui starts");
+    expect(close).toHaveBeenCalled();
+  });
+
+  it("releases the downloaded update when the install is deferred", async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(
+      availableUpdate(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue(undefined), close),
+    );
+    let gateCalls = 0;
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "is_update_safe_to_install") return undefined;
+      gateCalls += 1;
+      return gateCalls === 1;
+    });
+    await checkForUpdates({ silent: false });
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it("does not start a second install while one is in flight", async () => {
