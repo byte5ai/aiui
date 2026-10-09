@@ -121,7 +121,7 @@ describe("checkForUpdates — manual path", () => {
     expect(tauri.message).toHaveBeenCalledTimes(1);
   });
 
-  it("checks the dialog gate before downloading, not after", async () => {
+  it("checks the dialog gate before downloading, and again before relaunching", async () => {
     const order: string[] = [];
     const downloadAndInstall = vi.fn(async () => {
       order.push("downloadAndInstall");
@@ -131,19 +131,55 @@ describe("checkForUpdates — manual path", () => {
       order.push(cmd);
       return cmd === "is_update_safe_to_install" ? true : undefined;
     });
+    tauri.relaunch.mockImplementation(async () => {
+      order.push("relaunch");
+    });
 
     await checkForUpdates({ silent: false });
 
-    expect(order.indexOf("is_update_safe_to_install")).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf("is_update_safe_to_install")).toBeLessThan(
-      order.indexOf("downloadAndInstall"),
-    );
+    const download = order.indexOf("downloadAndInstall");
+    const gates = order.flatMap((c, i) => (c === "is_update_safe_to_install" ? [i] : []));
+    expect(gates).toHaveLength(2);
+    // Before the download, so a pending dialog costs no download at all…
+    expect(gates[0]).toBeLessThan(download);
+    // …and after it (D-08): a download can take long enough for an agent
+    // to open a dialog in the meantime.
+    expect(gates[1]).toBeGreaterThan(download);
+    expect(gates[1]).toBeLessThan(order.indexOf("authorize_exit_for_update"));
     // And the exit authority is latched only after the install returned —
     // it is irreversible, so arming it earlier would disarm the host's
     // default-deny exit gate for good (Invariant I1).
-    expect(order.indexOf("downloadAndInstall")).toBeLessThan(
-      order.indexOf("authorize_exit_for_update"),
-    );
+    expect(download).toBeLessThan(order.indexOf("authorize_exit_for_update"));
+    expect(order.indexOf("authorize_exit_for_update")).toBeLessThan(order.indexOf("relaunch"));
+  });
+
+  // D-08: user clicks Install with no dialog open; while the update
+  // downloads, an agent opens a form and the user starts typing. Relaunching
+  // when the download finishes would destroy the window and the answer.
+  it("does not relaunch over a dialog that opened during the download", async () => {
+    const downloadAndInstall = vi.fn().mockResolvedValue(undefined);
+    tauri.check.mockResolvedValue(availableUpdate(downloadAndInstall));
+    let gateCalls = 0;
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "is_update_safe_to_install") return undefined;
+      gateCalls += 1;
+      return gateCalls === 1; // safe before the download, not after
+    });
+
+    const outcome = await checkForUpdates({ silent: false });
+
+    expect(outcome.ok).toBe(true);
+    expect(downloadAndInstall).toHaveBeenCalledTimes(1);
+    expect(tauri.relaunch).not.toHaveBeenCalled();
+    // The irreversible exit latch stays unarmed, and the banner stays as the
+    // way back to a restart once the dialog is done.
+    expect(invokedCommands()).not.toContain("authorize_exit_for_update");
+    expect(invokedCommands()).not.toContain("clear_pending_update");
+    expect(tauri.message).toHaveBeenCalledTimes(1);
+    const [text, options] = tauri.message.mock.calls[0];
+    expect(options).toMatchObject({ kind: "info" });
+    expect(text).toContain("0.10.2");
+    expect(text).toContain("next time aiui starts");
   });
 
   it("does not start a second install while one is in flight", async () => {

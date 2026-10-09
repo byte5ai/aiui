@@ -39,8 +39,39 @@ export function renderMarkdown(src: string): string {
     // No <script>, no event handlers, no javascript: URLs, no <iframe>.
     // Keep links + basic markup. Defaults are conservative; we explicitly
     // forbid form-related tags to prevent autofill-driven exfiltration.
-    FORBID_TAGS: ["script", "iframe", "form", "input", "button"],
-    FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus"],
+    //
+    // No CSS either (review finding D-01). DOMPurify's default allow-list
+    // keeps both the `<style>` element and the `style` attribute, and
+    // `marked` passes raw HTML blocks through, so an agent could ship
+    // `<style>.write-target{display:none}</style>` and hide the file-write
+    // approval line — the only disclosure that submitting writes a file — or
+    // position a picture of swapped buttons over the real footer. Markdown
+    // in a dialog has no use for author CSS; the app's own stylesheet
+    // already formats everything markdown can express.
+    //
+    // No media and no image maps either (review findings D-03, D-07).
+    // `<audio>`/`<video>`/`<source>` fetch their `src` the moment the
+    // dialog opens, with no click: a markdown body could make the user's
+    // machine request any loopback port or https host — a blind request
+    // against local dev tools, or a tracking ping — and markdown bodies are
+    // not walked by the bridge's image resolver at all. The `audio` field
+    // kind is the supported way to play media. `<map>`/`<area>` are links
+    // that are not `<a>`; nothing in a dialog needs them.
+    FORBID_TAGS: [
+      "script",
+      "iframe",
+      "form",
+      "input",
+      "button",
+      "style",
+      "audio",
+      "video",
+      "source",
+      "track",
+      "map",
+      "area",
+    ],
+    FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus", "style"],
     // The hook above adds these after the allow-list is applied; naming
     // them here keeps a future DOMPurify version from stripping them.
     ADD_ATTR: ["target", "rel"],

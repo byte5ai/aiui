@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { _ } from "svelte-i18n";
   import { renderMarkdown } from "../markdown";
   import { handleContentClick } from "../external-link";
   import { onActivate, reorderTarget } from "../a11y";
+  import { boundedInt, maxHeightStyle } from "../style-values";
   import TreeNode from "./TreeNode.svelte";
   import MermaidView from "./MermaidView.svelte";
   import WireframeView from "./WireframeView.svelte";
@@ -13,6 +14,7 @@
     firstIncompleteTab,
     incompleteFields,
     initialValue,
+    inOrder,
     isFieldComplete,
     listItems,
     serialisableValues,
@@ -67,10 +69,12 @@
 
   /** What the approval line shows as the destination. Local: the absolute
    *  path Rust resolved (`docs/skill.md` promises the user sees it). Remote:
-   *  the raw agent-supplied form, qualified with the origin host in the
-   *  markup — expanding `~` here would name the wrong machine's home. */
+   *  the path the bridge stamped as the one it will actually write
+   *  (`resolved_path`, C-03), qualified with the origin host in the markup —
+   *  expanding `~` here would name the wrong machine's home. An older bridge
+   *  sends no `resolved_path`; then the raw agent-supplied form is shown. */
   function targetPath(name: string, target: WriteTarget): string {
-    if (sessionOrigin) return target.path;
+    if (sessionOrigin) return target.resolved_path ?? target.path;
     return resolvedTargets[name] ?? target.path;
   }
 
@@ -78,6 +82,14 @@
   // If `tabs` is set, fields are the union across tabs; we render only the
   // active tab's fields, but validate over all of them.
   let activeTab = $state(0);
+  /** Tabs the user has had on screen; the first one is shown on open. */
+  let seenTabs = $state<number[]>([0]);
+
+  /** Every tab switch goes through here, so `seenTabs` cannot miss one. */
+  function showTab(i: number) {
+    activeTab = i;
+    if (!seenTabs.includes(i)) seenTabs = [...seenTabs, i];
+  }
   let allFields = $derived<Field[]>(
     spec.tabs && spec.tabs.length > 0
       ? spec.tabs.flatMap((t) => t.fields)
@@ -89,10 +101,16 @@
       : spec.fields ?? []
   );
 
+  // Seeded once, on purpose: re-deriving would reset the user's answers.
+  // This is only correct because DialogShell wraps every widget in
+  // `{#key current.id}`, so a new spec always arrives in a fresh Form
+  // instance; a Form whose `spec` prop changed in place would keep the old
+  // values. `untrack` states that intent (and is what svelte-check's
+  // `state_referenced_locally` asks for).
   let values = $state<Record<string, any>>(
-    Object.fromEntries(
-      valueFields(allFields).map((f) => [(f as any).name, initialValue(f)])
-    )
+    untrack(() =>
+      Object.fromEntries(valueFields(allFields).map((f) => [(f as any).name, initialValue(f)])),
+    ),
   );
 
   // --- list sorting -------------------------------------------------------
@@ -292,6 +310,94 @@
     values[f.name] = { ...v, point: null, region: null };
   }
 
+  // Keyboard annotation (review finding D-11). The stage used to answer the
+  // pointer only, so a `required` annotated_image could not be submitted
+  // without a mouse — Cancel was the only way out, and a reason-less cancel
+  // reads to the agent as "no". Arrow keys now place and move the point or
+  // the region, Shift+arrows resize a region (or take bigger point steps),
+  // Enter/Space drop one in the middle, Delete/Backspace clear.
+  //
+  // The stage is a two-dimensional slider, the pattern colour pickers use
+  // for their saturation area: `role="slider"` with `aria-valuetext` naming
+  // the position, which screen readers speak on every change by themselves.
+  const ANN_STEP = 0.02;
+  const ANN_STEP_COARSE = 0.1;
+  const ANN_ARROWS: Record<string, [number, number]> = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+  };
+
+  const pct = (n: number) => Math.round(n * 100);
+  const within = (n: number, lo: number, hi: number) => round4(Math.min(hi, Math.max(lo, n)));
+
+  /** What the stage reports as its value — the mark the active tool edits. */
+  function annValueText(f: AnnField, v: AnnValue): string {
+    const tool = annActiveTool(f);
+    if (tool === "point" && v.point) {
+      return $_("dialog.annotate.point_at", { values: { x: pct(v.point.x), y: pct(v.point.y) } });
+    }
+    if (tool === "region" && v.region) {
+      return $_("dialog.annotate.region_at", {
+        values: { x: pct(v.region.x), y: pct(v.region.y), w: pct(v.region.w), h: pct(v.region.h) },
+      });
+    }
+    return $_("dialog.annotate.empty");
+  }
+
+  /** `aria-valuenow`: the horizontal position of that mark, in percent. */
+  function annValueNow(f: AnnField, v: AnnValue): number {
+    const mark = annActiveTool(f) === "region" ? v.region : v.point;
+    return mark ? pct(mark.x) : 0;
+  }
+
+  function annKeydown(f: AnnField, e: KeyboardEvent) {
+    const v = values[f.name] as AnnValue;
+    const tool = annActiveTool(f);
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      annClear(f);
+      return;
+    }
+    const arrow = ANN_ARROWS[e.key];
+    const place = e.key === "Enter" || e.key === " ";
+    if (!arrow && !place) return;
+    e.preventDefault();
+    let next: AnnValue;
+    if (tool === "point") {
+      const p = v.point ?? { x: 0.5, y: 0.5 };
+      const step = e.shiftKey ? ANN_STEP_COARSE : ANN_STEP;
+      next = arrow
+        ? { ...v, point: { x: within(p.x + arrow[0] * step, 0, 1), y: within(p.y + arrow[1] * step, 0, 1) } }
+        : { ...v, point: p };
+    } else {
+      const r = v.region ?? { x: 0.25, y: 0.25, w: 0.5, h: 0.5 };
+      if (!arrow) {
+        next = { ...v, region: r };
+      } else if (e.shiftKey) {
+        next = {
+          ...v,
+          region: {
+            ...r,
+            w: within(r.w + arrow[0] * ANN_STEP, ANN_MIN_REGION, 1 - r.x),
+            h: within(r.h + arrow[1] * ANN_STEP, ANN_MIN_REGION, 1 - r.y),
+          },
+        };
+      } else {
+        next = {
+          ...v,
+          region: {
+            ...r,
+            x: within(r.x + arrow[0] * ANN_STEP, 0, 1 - r.w),
+            y: within(r.y + arrow[1] * ANN_STEP, 0, 1 - r.h),
+          },
+        };
+      }
+    }
+    values[f.name] = next;
+  }
+
   function toggleTreeExpand(name: string, value: string) {
     const t = values[name] as { selected: string[]; expanded: Set<string> };
     const expanded = new Set(t.expanded);
@@ -354,14 +460,57 @@
     if (!a.skip_validation && !canSubmit) {
       showErrors = true;
       // Surface the first invalid tab if we have tabs.
-      if (badTab) activeTab = badTab.tabIndex;
+      if (badTab) showTab(badTab.tabIndex);
       void focusFirstInvalid();
+      return;
+    }
+    if (commitsTargets(a) && unseenTargetTab >= 0) {
+      // C-02: show the write before it happens. See `unseenTargetTab`.
+      reviewTab = unseenTargetTab;
+      showTab(unseenTargetTab);
       return;
     }
     onsubmit({
       action: a.value === "__submit__" ? null : a.value,
-      values: serialisableValues(values),
+      values: serialisableValues(values, allFields),
     });
+  }
+
+  // --- writes on tabs the user never opened (review finding C-02) ---------
+  // Only the active tab is rendered, and the `target` approval line — the
+  // only disclosure that submitting writes a file, and where — lives next to
+  // its field. Submitting serialises every tab, though, and the writer walks
+  // every tab of the stored spec. So a `target` field on a tab the user never
+  // clicked, left at an agent-chosen `default`, used to be written without
+  // its approval line ever being on screen.
+  //
+  // We hold the submit and show that tab instead, the way a failed
+  // validation does, rather than leaving the field out of the result. The
+  // writers walk the stored spec, not what was on screen; leaving a value
+  // out would turn the write into an empty file (DialogShell sends `""` for
+  // a missing value on a local session) or into a "no value submitted"
+  // failure the user never saw either. Showing the line keeps the approval
+  // meaningful, and the agent still gets the write it asked for once the
+  // user has seen it.
+
+  /** First tab with a `target` field that has never been on screen, or -1. */
+  let unseenTargetTab = $derived(
+    (spec.tabs ?? []).findIndex(
+      (t, i) =>
+        !seenTabs.includes(i) &&
+        (t.fields ?? []).some((f) => "target" in f && f.target != null),
+    ),
+  );
+  /** The tab C-02 last switched to, for the hint; -1 = none. */
+  let reviewTab = $state(-1);
+
+  /** Whether pressing `a` would write `target` files. Mirrors the
+   *  authoritative Rust `action_commits_targets` (#177): Cancel never does,
+   *  `writes_targets` always does, otherwise `skip_validation` opts out. */
+  function commitsTargets(a: Action): boolean {
+    if (a.value === "__cancel__") return false;
+    if (a.writes_targets) return true;
+    return !a.skip_validation;
   }
 
   // --- markdown rendering -------------------------------------------------
@@ -409,14 +558,16 @@
 
   {#if spec.tabs && spec.tabs.length > 0}
     <div class="tab-bar" role="tablist">
-      {#each spec.tabs as t, i (t.label)}
+      <!-- D-05 / A-02: keyed by position, never by agent-supplied text — a
+           repeated key makes Svelte throw and blank the whole window. -->
+      {#each spec.tabs as t, i (i)}
         <button
           type="button"
           role="tab"
           class="tab"
           class:active={activeTab === i}
           aria-selected={activeTab === i}
-          onclick={() => (activeTab = i)}
+          onclick={() => showTab(i)}
         >
           {t.label}
         </button>
@@ -440,7 +591,8 @@
           {@html renderMarkdown(f.text)}
         </div>
       {:else if f.kind === "image"}
-        <figure class="image-field" style={f.max_height ? `max-height: ${f.max_height}px` : ""}>
+        <!-- D-01: spec values reach `style` only as bounded numbers. -->
+        <figure class="image-field" style={maxHeightStyle(f.max_height)}>
           <img src={f.src} alt={f.alt ?? f.label ?? ""} />
           {#if f.label}<figcaption>{f.label}</figcaption>{/if}
         </figure>
@@ -482,12 +634,21 @@
               disabled={!ann.point && !ann.region}
               onclick={() => annClear(f)}>Clear</button>
           </div>
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <!-- D-11: a two-dimensional slider (see `annKeydown`); the key
+               instructions travel in aria-describedby. -->
           <div
             class="annimg-stage"
             class:region-tool={annActiveTool(f) === "region"}
+            role="slider"
+            aria-label={f.label ?? f.alt ?? $_("dialog.annotate.stage")}
+            aria-describedby={`ann-keys-${f.name}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={annValueNow(f, ann)}
+            aria-valuetext={annValueText(f, ann)}
             aria-invalid={fieldInvalid(f) ? "true" : undefined}
-            tabindex="-1"
+            tabindex="0"
+            onkeydown={(e) => annKeydown(f, e)}
             onpointerdown={(e) => annPointerDown(f, e, e.currentTarget as HTMLElement)}
             onpointermove={(e) => annPointerMove(f, e, e.currentTarget as HTMLElement)}
             onpointerup={(e) => annPointerUp(f, e, e.currentTarget as HTMLElement)}
@@ -497,7 +658,7 @@
               src={f.src}
               alt={f.alt ?? f.label ?? ""}
               draggable="false"
-              style={f.max_height ? `max-height: ${f.max_height}px` : ""}
+              style={maxHeightStyle(f.max_height)}
               onload={(e) => annOnImageLoad(f.name, e.currentTarget as HTMLImageElement)}
             />
             <svg
@@ -522,6 +683,9 @@
               {/if}
             </svg>
           </div>
+          <p class="sr-only" id={`ann-keys-${f.name}`}>
+            {$_(annActiveTool(f) === "region" ? "dialog.annotate.keys_region" : "dialog.annotate.keys_point")}
+          </p>
           <div class="annimg-readout">
             {#if ann.point}
               <code>point {ann.point.x.toFixed(3)}, {ann.point.y.toFixed(3)}</code>
@@ -556,7 +720,7 @@
         <div role="group" aria-labelledby={f.label ? `lbl-${f.name}` : undefined}>
           {#if f.label}<span class="group-label" id={`lbl-${f.name}`}>{f.label}</span>{/if}
           <div class="tree-widget">
-            {#each f.items as root (root.value)}
+            {#each f.items as root, i (i)}
               <TreeNode
                 item={root}
                 depth={0}
@@ -644,10 +808,10 @@
             class:invalid={fieldInvalid(f)}
             aria-invalid={fieldInvalid(f) ? "true" : undefined}
             tabindex="-1"
-            style={`grid-template-columns: repeat(${f.columns ?? 3}, 1fr)`}
+            style={`grid-template-columns: repeat(${boundedInt(f.columns, 1, 12) ?? 3}, 1fr)`}
           >
 
-            {#each f.images as img (img.value)}
+            {#each f.images as img, i (i)}
               <button
                 type="button"
                 class="image-cell"
@@ -708,8 +872,9 @@
                 </tr>
               </thead>
               <tbody>
-                {#each tableValue.order as rowValue (rowValue)}
-                  {@const row = f.rows.find((r) => r.value === rowValue)}
+                <!-- D-05 / A-02: by position, and `inOrder` hands out each row
+                     once even when two share a `value` (or have none). -->
+                {#each inOrder(f.rows, tableValue.order, (r) => r.value) as row, i (i)}
                   {#if row}
                     {#if f.multi_select}
                       <!-- Multi-select rows get a REAL checkbox rather than an
@@ -886,6 +1051,10 @@
             values: { n: invalid.length, tab: badTab.tabLabel },
           })
         : $_("dialog.validation.missing", { values: { n: invalid.length } })}
+    </p>
+  {:else if reviewTab >= 0 && reviewTab === activeTab && spec.tabs?.[reviewTab]}
+    <p class="form-error" role="alert">
+      {$_("dialog.write_target.review_tab", { values: { tab: spec.tabs[reviewTab].label } })}
     </p>
   {/if}
 
@@ -1099,6 +1268,7 @@
     user-select: none;
   }
   .annimg-stage.region-tool { cursor: crosshair; }
+  .annimg-stage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .annimg-stage img {
     display: block;
     max-width: 100%;

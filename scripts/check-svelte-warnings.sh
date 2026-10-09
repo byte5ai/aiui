@@ -21,9 +21,10 @@
 
 set -euo pipefail
 
-# Highest number of svelte-check warnings this repo tolerates. Measured on
-# main: "0 errors and 10 warnings in 2 files".
-BASELINE=10
+# Highest number of svelte-check warnings this repo tolerates. Measured
+# after the 2026-10-09 review fixes: "0 errors and 0 warnings" (F-15; the
+# 0.11.0 baseline of 10 had already fallen to 3 without being lowered).
+BASELINE=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT/companion"

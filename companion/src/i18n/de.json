@@ -95,7 +95,8 @@
     "pending_update.text": "aiui {version} ist verfügbar.",
     "pending_update.install": "Installieren",
     "report.button": "Problem melden",
-    "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt."
+    "report.hint": "Öffnet ein neues Issue auf GitHub mit Version und Build vorausgefüllt.",
+    "updates.installed_restart_later": "aiui {version} wurde heruntergeladen und installiert. Während des Downloads hat sich ein Dialog geöffnet, deshalb hat aiui nicht neu gestartet: Das Update wird beim nächsten Start von aiui aktiv. Schließ den Dialog ab und klick dann erneut auf Installieren, um sofort neu zu starten."
   },
   "dialog": {
     "cancel": "Abbrechen",
@@ -118,12 +119,22 @@
       "secret_only": "Wird nicht an den Agent zurückgegeben und nirgends gespeichert.",
       "on_host": "auf {host}",
       "meta": "Modus: {mode}{perm}{overwrite}",
-      "overwrite_flag": ", überschreiben"
+      "overwrite_flag": ", überschreiben",
+      "review_tab": "Der Tab „{tab}“ schreibt in eine Datei. Prüfe ihn und drücke dann erneut auf den Button."
     },
     "ttl": {
       "yellow": "Noch ca. {countdown} Min zum Abschicken — danach werden die Eingaben automatisch verworfen.",
       "red": "Weniger als {countdown} bis zum automatischen Abbruch. Bitte jetzt abschicken oder abbrechen.",
       "dismiss_aria": "Hinweis ausblenden"
+    },
+    "mermaid.alt": "Diagramm",
+    "annotate": {
+      "stage": "Bild zum Markieren",
+      "keys_point": "Pfeiltasten setzen und verschieben den Punkt (mit Umschalt in größeren Schritten). Eingabe setzt einen in die Mitte, falls noch keiner gesetzt ist, Entf entfernt ihn.",
+      "keys_region": "Pfeiltasten verschieben den Bereich, Umschalt mit Pfeiltasten ändert seine Größe. Eingabe legt einen in der Mitte an, falls noch keiner da ist, Entf entfernt ihn.",
+      "point_at": "Punkt bei {x} % von links, {y} % von oben",
+      "region_at": "Bereich ab {x} % von links, {y} % von oben, {w} % breit, {h} % hoch",
+      "empty": "Noch keine Markierung"
     }
   }
 }

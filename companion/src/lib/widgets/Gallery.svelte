@@ -1,5 +1,6 @@
 <script lang="ts">
   import { _ } from "svelte-i18n";
+  import { boundedInt, maxHeightStyle } from "../style-values";
 
   type Action = {
     label: string;
@@ -68,7 +69,9 @@
     onsubmit({ decisions: out });
   }
 
-  const cols = $derived(spec.columns && spec.columns > 0 ? spec.columns : 0);
+  // D-01: a bounded integer, or 0 for the responsive auto-fill — never the
+  // caller's text inside `style`.
+  const cols = $derived(boundedInt(spec.columns, 0, 12) ?? 0);
 </script>
 
 <main class="window-shell">
@@ -83,10 +86,12 @@
         ? `grid-template-columns: repeat(${cols}, minmax(0, 1fr));`
         : "grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));"}
     >
-      {#each spec.items as item (item.value)}
+      <!-- D-05 / A-02: by position, never by agent-supplied `value` — a
+           repeated or missing one makes Svelte throw and blank the window. -->
+      {#each spec.items as item, i (i)}
         <div class="gallery-item" class:decided={!!decisions[item.value]}>
           {#if item.src}
-            <div class="gallery-thumb" style={item.max_height ? `max-height:${item.max_height}px` : ""}>
+            <div class="gallery-thumb" style={maxHeightStyle(item.max_height)}>
               {#if isVideo(item.src)}
                 <!-- svelte-ignore a11y_media_has_caption -->
                 <video src={item.src} controls preload="metadata"></video>
@@ -99,7 +104,7 @@
           {#if item.detail}<div class="gallery-detail">{item.detail}</div>{/if}
 
           <div class="gallery-actions">
-            {#each actions as a (a.value)}
+            {#each actions as a, j (j)}
               <button
                 type="button"
                 class="ga-btn"

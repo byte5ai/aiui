@@ -3,6 +3,7 @@
   import { renderMarkdown } from "../markdown";
   import { handleContentClick } from "../external-link";
   import { onActivate } from "../a11y";
+  import { boundedInt, boundedNumber, MAX_HEIGHT_PX } from "../style-values";
 
   type Variant = {
     value: string; // stable id returned as `selected`
@@ -54,8 +55,12 @@
     selected = value;
   }
 
+  // D-01: both values below land in a `style` attribute — bounded numbers
+  // only, never the caller's text.
+  // `columns` ≤ 0 or absent means "one per variant", as before; capped at 4.
+  const requestedCols = $derived(boundedInt(spec.columns, 0, 4) ?? 0);
   const cols = $derived(
-    Math.max(1, Math.min(spec.columns && spec.columns > 0 ? spec.columns : spec.variants.length, 4)),
+    requestedCols > 0 ? requestedCols : Math.max(1, Math.min(spec.variants.length, 4)),
   );
 
   // Equal-height panes matter more here than per-variant autonomy — a
@@ -63,7 +68,7 @@
   // up. So a `max_height` set on ANY variant caps ALL panes, rather than
   // each pane sizing independently.
   const paneMaxHeight = $derived(
-    Math.max(360, ...spec.variants.map((v) => v.max_height ?? 0)),
+    Math.max(360, ...spec.variants.map((v) => boundedNumber(v.max_height, 0, MAX_HEIGHT_PX) ?? 0)),
   );
 
   // --- synchronized scroll --------------------------------------------
@@ -104,7 +109,8 @@
     {#if spec.description}<p class="subtitle">{spec.description}</p>{/if}
 
     <div class="compare-grid" style={`grid-template-columns: repeat(${cols}, minmax(0, 1fr));`}>
-      {#each spec.variants as v, i (v.value)}
+      <!-- D-05 / A-02: by position, never by agent-supplied `value`. -->
+      {#each spec.variants as v, i (i)}
         <div
           class="compare-card"
           class:selected={selected === v.value}
@@ -112,7 +118,14 @@
           tabindex="0"
           aria-pressed={selected === v.value}
           onclick={(e) => pick(e, v.value)}
-          onkeydown={(e) => onActivate(e, () => (selected = v.value))}
+          onkeydown={(e) => {
+            // D-12: only a key pressed on the card itself picks it. Enter on
+            // a focused link inside the variant's content, or Space on its
+            // video controls, bubbles up here — `onActivate` would swallow
+            // it with `preventDefault()` and pick the variant instead.
+            if (e.target !== e.currentTarget) return;
+            onActivate(e, () => (selected = v.value));
+          }}
         >
           <div class="compare-head">
             <span class="compare-radio" aria-hidden="true"></span>

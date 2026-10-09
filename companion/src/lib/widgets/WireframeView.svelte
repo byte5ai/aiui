@@ -16,6 +16,8 @@
   // images-inside-panel, interactive bits) is deliberately out of scope —
   // the field stays tiny + agent-friendly.
 
+  import { boundedInt, maxHeightStyle } from "../style-values";
+
   type Tone = "default" | "muted" | "highlight";
 
   type Panel = {
@@ -44,20 +46,24 @@
   // observed shipping 0 or negative numbers when the layout-spec was
   // ambiguous. Falling back to 1 (= vertical stack) is the lossless
   // degradation — every panel still renders, just one per row.
-  const cols = $derived(Math.max(1, Math.floor(columns) || 1));
-  const rowGap = $derived(Math.max(0, Math.floor(gap)));
+  //
+  // D-01: every one of these lands in a `style` attribute, so each is a
+  // bounded number or a fixed fallback — never the caller's text.
+  const cols = $derived(boundedInt(columns, 1, 12) ?? 1);
+  const rowGap = $derived(boundedInt(gap, 0, 64) ?? 8);
+  const span = (v: unknown) => boundedInt(v, 1, 12) ?? 1;
 </script>
 
 <figure
   class="wireframe-block"
-  style="--cols: {cols}; --gap: {rowGap}px; {max_height ? `max-height: ${max_height}px` : ''}"
+  style="--cols: {cols}; --gap: {rowGap}px; {maxHeightStyle(max_height)}"
 >
   <div class="wireframe-grid">
     {#each panels as panel, i (i)}
       <div
         class="wireframe-panel"
         data-tone={panel.tone ?? "default"}
-        style="--col-span: {Math.max(1, Math.floor(panel.col_span ?? 1))}; --row-span: {Math.max(1, Math.floor(panel.row_span ?? 1))}"
+        style="--col-span: {span(panel.col_span)}; --row-span: {span(panel.row_span)}"
       >
         {#if panel.title}
           <div class="wireframe-title">{panel.title}</div>

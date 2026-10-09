@@ -6,44 +6,50 @@
   //
   // Pipeline:
   //   1. mermaid.render() turns the source DSL into an SVG string
-  //   2. sanitizeMermaidSvg() strips script/style/event handlers
-  //   3. {@html} drops it into the DOM
+  //   2. mermaidImageSrc() sanitises it and encodes it as a data: URL
+  //   3. an <img> shows it — the SVG markup never enters this document
   //
   // Issue #189: node labels used to come out empty. Mermaid 11 renders
-  // flowchart labels as HTML inside `<foreignObject>`, and a DOMPurify
-  // *profile* replaces the allow-list rather than adding to it — so with
-  // `USE_PROFILES: { svg, svgFilters }` the element was never allowed,
-  // and `foreignobject` is additionally in `DEFAULT_FORBID_CONTENTS`, so
-  // its children went too. Dropping it from `FORBID_TAGS` in v0.4.38 was
-  // therefore a no-op: nothing it forbade was reachable anyway, and the
-  // "Verfassungsorgane" regression it was meant to fix stayed broken.
+  // flowchart labels as HTML inside `<foreignObject>`, which the svg
+  // sanitiser profile strips. The fix is `htmlLabels: false` at init, so
+  // labels stay in `<text>`/`<tspan>`; see ../mermaid-config.ts.
   //
-  // The real fix is `htmlLabels: false` at init, so Mermaid keeps labels
-  // in `<text>`/`<tspan>` — which the svg profile does allow. The
-  // sanitiser stays strict; see ../mermaid-config.ts for why widening it
-  // would be the wrong trade.
+  // Issue #212: a `classDef` turns agent-supplied text into CSS, and inline
+  // that CSS reached the dialog — an invisible full-window sheet over the
+  // Confirm button. 0.11.0 closed it by stripping every style element and
+  // `style=` from the diagram, which also stripped Mermaid's theme: nodes
+  // rendered as black boxes with black labels (review finding D-04).
   //
-  // Issue #212 asked whether the Mermaid `classDef` CSS-injection
-  // advisories apply to this path. Verdict: **they did**, and not by the
-  // route the advisory text suggests. `securityLevel: "strict"` covers node
-  // labels, not `classDef`, and Mermaid does not put a `classDef`'s
-  // declarations into the theme stylesheet the sanitiser already drops — it
-  // writes them verbatim into an inline `style` attribute on the styled
-  // node. That attribute is allowed by the svg profile, and DOMPurify does
-  // not read the CSS inside it, so an agent-supplied
-  // `position:fixed;width:100vw;…;opacity:.02` arrived in the DOM as an
-  // invisible sheet over the Confirm button. The fix is `style` in
-  // `FORBID_ATTR`, alongside the already-forbidden style element;
-  // `mermaid-config.test.ts` puts both payloads through the real renderer
-  // so a later Mermaid bump cannot reopen this quietly.
+  // Rendering the SVG as an image resolves both. An `<img>` is its own
+  // document: its stylesheet cannot reach the dialog, its links are inert,
+  // its scripts never run and it loads nothing external. So the theme
+  // stays, and a hostile `classDef` can only repaint its own diagram.
+  // `mermaid-config.test.ts` holds the component to that path.
+  //
+  // One window remains where the markup is live in this document: while
+  // `mermaid.render()` lays the diagram out, it mounts the SVG (theme
+  // stylesheet and inline `classDef` styles included) to measure it. Left to
+  // itself it mounts into `document.body`. We hand it `sandbox` instead: off
+  // screen, invisible, inert to the pointer, and with layout + paint
+  // containment, so even a `position: fixed` node is positioned and clipped
+  // inside it rather than over the dialog. Every rule Mermaid emits is
+  // scoped to the diagram's own `#id`; the rule-breakout payloads that would
+  // escape that scope are refused by Mermaid's parser (see the tests).
 
   import mermaid from "mermaid";
-  import { MERMAID_INIT_CONFIG, sanitizeMermaidSvg } from "../mermaid-config";
+  import { _ } from "svelte-i18n";
+  import { MERMAID_INIT_CONFIG, mermaidImageSrc } from "../mermaid-config";
+  import { maxHeightStyle } from "../style-values";
 
   let { source, label, max_height }: { source: string; label?: string; max_height?: number } = $props();
 
-  let svg = $state("");
+  /** `data:image/svg+xml;base64,…` of the sanitised diagram, or "". */
+  let imgSrc = $state("");
   let error = $state<string | null>(null);
+  /** Where Mermaid does its measuring render. See the header comment.
+   *  Deliberately not `$state`: the effect below must re-render when
+   *  `source` changes, not a second time when this binding lands. */
+  let sandbox: HTMLDivElement | undefined;
   let initialised = false;
 
   function ensureInit() {
@@ -55,20 +61,26 @@
   function rerender() {
     ensureInit();
     if (!source) {
-      svg = "";
+      imgSrc = "";
       error = null;
       return;
     }
     const id = `aiui-mermaid-${Math.random().toString(36).slice(2, 10)}`;
     mermaid
-      .render(id, source)
+      .render(id, source, sandbox)
       .then(({ svg: rendered }) => {
-        svg = sanitizeMermaidSvg(rendered);
+        imgSrc = mermaidImageSrc(rendered);
         error = null;
       })
       .catch((e) => {
         error = String(e?.message ?? e);
-        svg = "";
+        imgSrc = "";
+      })
+      .finally(() => {
+        // Mermaid cleans up its scratch element on most paths, but not all:
+        // a `classDef` it refuses while building styles throws past its own
+        // cleanup. Only our own element, by id — never another render's.
+        sandbox?.querySelector(`#d${id}`)?.remove();
       });
   }
 
@@ -82,19 +94,22 @@
   });
 </script>
 
-<figure class="mermaid-block" style={max_height ? `max-height: ${max_height}px` : ""}>
+<!-- D-01: `max_height` reaches `style` only as a bounded number. -->
+<figure class="mermaid-block" style={maxHeightStyle(max_height)}>
+  <div class="mermaid-sandbox" bind:this={sandbox} aria-hidden="true"></div>
   {#if error}
     <pre class="mermaid-error">{error}
 {@html "<!-- source -->"}{source}</pre>
-  {:else if svg}
-    <!-- {@html svg} — sanitised by DOMPurify above before reaching the DOM -->
-    {@html svg}
+  {:else if imgSrc}
+    <!-- Never `{@html}`: see the header comment. -->
+    <img class="mermaid-img" src={imgSrc} alt={$_("dialog.mermaid.alt")} />
   {/if}
   {#if label}<figcaption>{label}</figcaption>{/if}
 </figure>
 
 <style>
   .mermaid-block {
+    position: relative;
     margin: 0;
     padding: 12px;
     border: 1px solid var(--border);
@@ -106,9 +121,28 @@
     gap: 6px;
     overflow: auto;
   }
-  .mermaid-block :global(svg) {
+  /* Mermaid's measuring render (see the script header). `width: 100%` so a
+     diagram that sizes itself to its container (gantt) gets the figure's
+     width; everything else keeps it out of sight and out of the dialog. */
+  .mermaid-sandbox {
+    position: absolute;
+    top: 0;
+    left: -100000px;
+    width: 100%;
+    visibility: hidden;
+    pointer-events: none;
+    overflow: hidden;
+    contain: layout paint;
+  }
+  /* The diagram is drawn in Mermaid's light `default` theme, and an image
+     cannot pick up the app's colour tokens. A light plate keeps the theme's
+     dark edges and labels legible when the dialog itself is dark. */
+  .mermaid-img {
+    display: block;
     max-width: 100%;
     height: auto;
+    background: #fff;
+    border-radius: 4px;
   }
   .mermaid-block figcaption {
     font-size: 11px;

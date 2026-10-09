@@ -51,6 +51,10 @@ export type TableRow = {
 export type WriteTarget = {
   mode: "create" | "substitute";
   path: string;
+  /** C-03: stamped by the bridge with the destination it will actually
+   *  write, on the agent's host. Absent on a local session and from an
+   *  older bridge. */
+  resolved_path?: string;
   perm?: string;
   overwrite?: boolean;
   placeholder?: string;
@@ -63,7 +67,7 @@ export type Field =
   | { kind: "number"; name: string; label: string; default?: number; min?: number; max?: number; step?: number; required?: boolean; target?: WriteTarget }
   | { kind: "select"; name: string; label: string; options: SelectOption[]; default?: string; required?: boolean }
   | { kind: "checkbox"; name: string; label: string; default?: boolean }
-  | { kind: "slider"; name: string; label: string; min: number; max: number; step?: number; default?: number }
+  | { kind: "slider"; name: string; label: string; min?: number; max?: number; step?: number; default?: number }
   | { kind: "date"; name: string; label: string; default?: string; required?: boolean }
   | { kind: "datetime"; name: string; label: string; default?: string; required?: boolean }
   | { kind: "date_range"; name: string; label: string; default?: { from?: string; to?: string }; required?: boolean }
@@ -198,10 +202,64 @@ export function collectTreeValues(items: TreeItem[]): string[] {
 // attempt at a sortable list often produces an empty render — the
 // documented shape isn't easy to discover from the tool's input
 // schema. Normalize once and use everywhere.
+//
+// D-05 / A-02: the list renders as a `{#each}` keyed by value, and Svelte
+// throws `each_key_duplicate` on a repeated key — in production builds too —
+// which tears down the whole mount and leaves an empty, always-on-top window.
+// Two items without a `value` share the key `undefined`. Validation on the
+// Rust side refuses such specs; this is the backstop for one that gets past
+// it: a missing value falls back to the label (as the string shorthand and
+// `ask` already do), and a later duplicate is dropped — it could not be told
+// apart in the result anyway. The key stays the value, because keyboard
+// reordering relies on keyed `{#each}` moving the focused node.
 export function listItems(f: Extract<Field, { kind: "list" }>): ListItem[] {
-  return (f.items as unknown as Array<ListItem | string>).map((it) =>
-    typeof it === "string" ? { label: it, value: it } : it,
-  );
+  const seen = new Set<unknown>();
+  const out: ListItem[] = [];
+  for (const it of (f.items ?? []) as unknown as Array<ListItem | string | null>) {
+    const item = typeof it === "string" ? { label: it, value: it } : it;
+    if (!item || typeof item !== "object") continue;
+    const value = item.value ?? item.label;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value === item.value ? item : { ...item, value });
+  }
+  return out;
+}
+
+/**
+ * `items` in the sequence `order` names, each item at most once, however
+ * the values collide (D-05 / A-02). For widgets keyed by index, so that a
+ * repeated or missing `value` still shows every row exactly once instead of
+ * the first match N times.
+ */
+export function inOrder<T>(items: T[], order: unknown[], valueOf: (t: T) => unknown): T[] {
+  const pool = new Map<unknown, T[]>();
+  for (const it of items) {
+    const k = valueOf(it);
+    const q = pool.get(k);
+    if (q) q.push(it);
+    else pool.set(k, [it]);
+  }
+  const out: T[] = [];
+  for (const v of order) {
+    const it = pool.get(v)?.shift();
+    if (it !== undefined) out.push(it);
+  }
+  return out;
+}
+
+/**
+ * D-09: `default_selected` as the agent sent it, narrowed to what the user
+ * can actually see and change — values the widget offers, no repeats, and
+ * at most one when the widget is single-select. A value the widget does not
+ * render cannot be deselected, so returning it would put words in the
+ * user's mouth.
+ */
+function visibleDefaults(defaults: unknown, offered: unknown[], multi: boolean): string[] {
+  if (!Array.isArray(defaults)) return [];
+  const ok = new Set(offered);
+  const out = [...new Set(defaults)].filter((v) => ok.has(v)) as string[];
+  return multi ? out : out.slice(0, 1);
 }
 
 // --- default normalisation (#206) -----------------------------------------
@@ -237,19 +295,73 @@ export function normaliseDate(v: unknown): string {
   return isRealYmd(Number(y), Number(mo), Number(d)) ? `${y}-${mo}-${d}` : "";
 }
 
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
 /**
- * `YYYY-MM-DDTHH:MM` for `<input type="datetime-local">`, or `""`. Seconds and
- * a trailing `Z` are dropped — the control has no slot for them, and a value
- * it cannot display must not survive into the result.
+ * `YYYY-MM-DDTHH:MM` for `<input type="datetime-local">`, or `""`. Seconds are
+ * dropped — the control has no slot for them, and a value it cannot display
+ * must not survive into the result.
+ *
+ * D-13: a default that names its zone (`Z`, `+02:00`) is an instant, not a
+ * wall-clock reading. Keeping its `HH:MM` digits and dropping the zone showed
+ * a UTC 09:30 as 09:30 local — a plausible, wrong time. It is converted to
+ * the user's local wall-clock time instead, which is what the control shows
+ * and edits; {@link withLocalOffset} puts the zone back on the way out.
  */
 export function normaliseDateTime(v: unknown): string {
   if (typeof v !== "string") return "";
-  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(v.trim());
-  if (!m) return "";
-  const [, y, mo, d, hh, mm] = m;
+  const s = v.trim();
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:(Z)|([+-])(\d{2}):?(\d{2})?)?$/i.exec(
+      s,
+    );
+  if (!m) {
+    // Trailing text we do not understand: keep the old, lenient reading of
+    // the leading wall-clock digits rather than clearing a usable default.
+    const loose = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(s);
+    return loose ? wallClock(loose[1], loose[2], loose[3], loose[4], loose[5]) : "";
+  }
+  const [, y, mo, d, hh, mm, ss, utc, sign, oh, om] = m;
+  const wall = wallClock(y, mo, d, hh, mm);
+  if (!wall || (!utc && !sign)) return wall;
+  // Rebuilt in the one shape `Date` is specified to parse (`±HH:MM`), so
+  // `+02` and `+0200` mean the same thing in every engine.
+  const zone = utc ? "Z" : `${sign}${oh}:${om ?? "00"}`;
+  const at = new Date(`${y}-${mo}-${d}T${hh}:${mm}:${ss ?? "00"}${zone}`);
+  if (Number.isNaN(at.getTime())) return "";
+  return (
+    `${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())}` +
+    `T${pad2(at.getHours())}:${pad2(at.getMinutes())}`
+  );
+}
+
+function wallClock(y: string, mo: string, d: string, hh: string, mm: string): string {
   if (!isRealYmd(Number(y), Number(mo), Number(d))) return "";
   if (Number(hh) > 23 || Number(mm) > 59) return "";
   return `${y}-${mo}-${d}T${hh}:${mm}`;
+}
+
+/** `+02:00` / `-05:30` / `+00:00` for an offset in minutes east of UTC. */
+export function formatUtcOffset(minutesEast: number): string {
+  const sign = minutesEast < 0 ? "-" : "+";
+  const abs = Math.abs(Math.round(minutesEast));
+  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
+/**
+ * D-13: a `datetime` answer as an unambiguous instant. The control yields
+ * the user's wall-clock time with no zone; on its own that reads as 09:30 in
+ * whatever zone the agent's host happens to be in. The user's UTC offset at
+ * that local date and time (DST-aware) is appended: `2026-06-01T09:30+02:00`.
+ * Anything that is not a complete wall-clock value passes through unchanged.
+ */
+export function withLocalOffset(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(v);
+  if (!m) return v;
+  const [, y, mo, d, hh, mm] = m.map(Number);
+  const local = new Date(y, mo - 1, d, hh, mm);
+  return `${v}${formatUtcOffset(-local.getTimezoneOffset())}`;
 }
 
 /** `#rrggbb` for `<input type="color">`; anything else falls back to black. */
@@ -268,6 +380,26 @@ function clamp(n: number, min?: number, max?: number): number {
   return n;
 }
 
+function finiteOr(v: unknown, fallback: number): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : fallback;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  return fallback;
+}
+
+/**
+ * D-09: the interval a slider really has. `<input type="range">` without
+ * `min`/`max` runs 0–100, so a spec that omits them gets exactly that — the
+ * initial value, the validation and the control agree. Comparing against an
+ * `undefined` bound used to fail every value, so such a slider could never be
+ * submitted.
+ */
+export function sliderBounds(f: Extract<Field, { kind: "slider" }>): [number, number] {
+  return [finiteOr(f.min, 0), finiteOr(f.max, 100)];
+}
+
 export function initialValue(f: Field): any {
   switch (f.kind) {
     case "static_text":
@@ -280,14 +412,16 @@ export function initialValue(f: Field): any {
     case "checkbox":
       return f.default ?? false;
     case "slider": {
-      const raw = f.default ?? f.min;
-      const n = Number(raw);
-      return Number.isFinite(n) ? clamp(n, f.min, f.max) : f.min;
+      const [lo, hi] = sliderBounds(f);
+      return clamp(finiteOr(f.default, lo), lo, hi);
     }
     case "number": {
-      if (f.default === undefined || f.default === null) return "";
+      // D-14: "no number" is `null` on every path — untouched, cleared after
+      // typing (Svelte's number binding writes `null` for ""), or a default
+      // that is not a number. It used to be `""` on the first path only.
+      if (f.default === undefined || f.default === null) return null;
       const n = Number(f.default);
-      return Number.isFinite(n) ? clamp(n, f.min, f.max) : "";
+      return Number.isFinite(n) ? clamp(n, f.min, f.max) : null;
     }
     case "color":
       return normaliseColor(f.default);
@@ -297,24 +431,43 @@ export function initialValue(f: Field): any {
       return normaliseDateTime(f.default);
     case "date_range":
       return { from: normaliseDate(f.default?.from), to: normaliseDate(f.default?.to) };
-    case "select":
+    case "select": {
       // Svelte's select binding only adopts the DOM selection when the bound
       // value is `undefined`; `""` matches no <option>, so the dropdown used
       // to render blank and submit `""` — a value the agent never offered.
-      return f.default ?? f.options?.[0]?.value ?? "";
-    case "list":
+      // D-09: the same holds for a `default` that is not among the options:
+      // the control showed blank and the agent got its own default back.
+      const offered = (f.options ?? []).map((o) => o?.value);
+      if (f.default !== undefined && offered.includes(f.default)) return f.default;
+      return offered[0] ?? "";
+    }
+    case "list": {
+      const items = listItems(f);
       return {
-        selected: [...(f.default_selected ?? [])],
-        order: listItems(f).map((it) => it.value),
+        // A non-selectable list has no checkboxes, so nothing in it can be
+        // "selected" by the user (docs: `selected` reflects checkbox state).
+        selected: f.selectable
+          ? visibleDefaults(f.default_selected, items.map((it) => it.value), !!f.multi_select)
+          : [],
+        order: items.map((it) => it.value),
       };
-    case "table":
+    }
+    case "table": {
+      const rows = f.rows ?? [];
       return {
-        selected: [...(f.default_selected ?? [])],
-        order: f.rows.map((r) => r.value),
+        selected: visibleDefaults(f.default_selected, rows.map((r) => r.value), !!f.multi_select),
+        order: rows.map((r) => r.value),
         sort: { column: null as string | null, dir: "asc" as "asc" | "desc" },
       };
+    }
     case "image_grid":
-      return { selected: [...(f.default_selected ?? [])] };
+      return {
+        selected: visibleDefaults(
+          f.default_selected,
+          (f.images ?? []).map((img) => img.value),
+          !!f.multi_select,
+        ),
+      };
     case "annotated_image":
       // Normalized (0..1) coordinates. `natural` is filled in once the
       // image loads so the agent can recover pixel coordinates losslessly.
@@ -325,8 +478,12 @@ export function initialValue(f: Field): any {
       };
     case "tree":
       return {
-        selected: [...(f.default_selected ?? [])],
-        expanded: new Set(f.default_expanded ?? collectTreeValues(f.items)),
+        selected: visibleDefaults(
+          f.default_selected,
+          collectTreeValues(f.items ?? []),
+          !!f.multi_select,
+        ),
+        expanded: new Set(f.default_expanded ?? collectTreeValues(f.items ?? [])),
       };
     default:
       return (f as any).default ?? "";
@@ -384,7 +541,8 @@ export function isFieldComplete(f: Field, values: Values): boolean {
     if (v === undefined || v === null || v === "") return true;
     const n = Number(v);
     if (!Number.isFinite(n)) return false;
-    return n >= f.min && n <= f.max;
+    const [lo, hi] = sliderBounds(f);
+    return n >= lo && n <= hi;
   }
   if (f.kind === "number") {
     // `min`/`max` on `<input type="number">` only constrain the stepper
@@ -442,12 +600,20 @@ export function firstIncompleteTab(
 }
 
 /** JSON-safe copy of the value record — a `tree`'s `expanded` Set is UI state
- *  and would serialise to `{}`, so it is dropped rather than shipped. */
-export function serialisableValues(values: Values): Record<string, any> {
+ *  and would serialise to `{}`, so it is dropped rather than shipped.
+ *
+ *  With `fields`, a `datetime` answer also gets the user's UTC offset
+ *  appended (D-13, {@link withLocalOffset}). */
+export function serialisableValues(values: Values, fields: Field[] = []): Record<string, any> {
+  const datetimes = new Set(
+    fields.filter((f) => f.kind === "datetime").map((f) => (f as { name: string }).name),
+  );
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(values)) {
     if (v && typeof v === "object" && "expanded" in v && v.expanded instanceof Set) {
       out[k] = { selected: v.selected };
+    } else if (datetimes.has(k)) {
+      out[k] = withLocalOffset(v);
     } else {
       out[k] = v;
     }

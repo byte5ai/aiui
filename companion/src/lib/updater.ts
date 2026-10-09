@@ -32,8 +32,9 @@ function tr(key: string, values?: Record<string, string | number>): string {
  * Checks the configured endpoint for a new version.
  *
  * Two modes:
- *  • `silent: true` (auto-triggered on mount and window-focus from
- *    `setup.ts` and `dialog.ts`). No prompts, no surfaced UI, and — since
+ *  • `silent: true` (auto-triggered on mount and window-focus of the
+ *    setup window, via `lifecycle.ts`; dialog windows no longer run update
+ *    checks since #195). No prompts, no surfaced UI, and — since
  *    v0.4.44 — **no install**: it records the available version via
  *    `set_pending_update` and returns. The settings banner and the system
  *    notification from the headless Rust check are what tell the user.
@@ -54,7 +55,7 @@ function tr(key: string, values?: Record<string, string | number>): string {
 export async function checkForUpdates(
   opts: { silent?: boolean } = {},
 ): Promise<UpdateOutcome> {
-  // The dialog windows call this early in mount, so the locale may not be
+  // The setup window calls this early in mount, so the locale may not be
   // resolved yet — and every string below lands in a *native OS modal*,
   // the most prominent text the product shows (#197).
   // Never let a locale hiccup take the update path down with it — a
@@ -166,6 +167,23 @@ async function run(opts: { silent?: boolean }): Promise<UpdateOutcome> {
     }
 
     await update.downloadAndInstall();
+
+    // D-08: the gate above ran before a download that can take tens of
+    // seconds on a slow link, and an agent can open a dialog in that time.
+    // Relaunching now would destroy it with whatever the user has typed, the
+    // exact I5 violation the first check exists to prevent. So ask again,
+    // and if a dialog is pending do not relaunch: the new version is already
+    // on disk and takes effect on the next start. The exit authority is not
+    // latched either, so the host's default-deny exit gate stays armed. The
+    // banner stays too; "Install" again, once the dialog is done, restarts
+    // into the new version.
+    if (!(await updateIsSafeToInstall())) {
+      await message(tr("settings.updates.installed_restart_later", { version: update.version }), {
+        title: "aiui",
+        kind: "info",
+      });
+      return { ok: true };
+    }
 
     // Everything below runs on macOS/Linux ONLY. On Windows
     // `tauri-plugin-updater` hands the NSIS installer to `ShellExecuteW` and
