@@ -62,10 +62,20 @@ const ASYNC_POLL_WINDOW: Duration = Duration::from_secs(25);
 const SLOT_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// How long a slot may go unpolled before its caller counts as gone (#193).
-/// Both bridges re-poll every ≤40 s, so ~3 missed windows is unambiguous. On
-/// expiry the reaper cancels the dialog, which tears the window down — the fix
-/// for "the agent was killed and the dialog sat on the desktop for two hours".
-const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(90);
+/// On expiry the reaper cancels the dialog with `reason: "abandoned"`, which
+/// tears the window down — the fix for "the agent was killed and the dialog
+/// sat on the desktop for two hours".
+///
+/// It must outlast the longest outage a bridge is entitled to ride out
+/// (review A-01/E-01). The 90 s this used to be sat inside the bridges' own
+/// retry budget, so a Wi-Fi or VPN change during a long form destroyed the
+/// window — and the typed input — while the bridge was still waiting for the
+/// tunnel to come back. Both bridges now give up after
+/// `POLL_OUTAGE_BUDGET` (180 s) of wall-clock outage; add one in-flight GET
+/// (40 s) and one backoff (8 s) and the worst case is 228 s. Pinned by
+/// `the_reaper_outlasts_the_bridge_outage_budget` here and by the Python
+/// bridge's contract test, which parses this line.
+pub(crate) const SLOT_ABANDONED_AFTER: Duration = Duration::from_secs(300);
 
 /// Upper bound on buffered async-render slots. Past this the reaper evicts the
 /// oldest by `created_at` (cancelling their dialogs), so a pathological caller
@@ -1965,13 +1975,22 @@ fn slots_over_cap(
     if slots.len() <= cap {
         return Vec::new();
     }
-    let mut by_age: Vec<(&String, Instant)> =
-        slots.iter().map(|(id, s)| (id, s.created_at)).collect();
-    by_age.sort_by_key(|(_, t)| *t);
-    by_age
+    // Review A-05: only FINISHED slots are evictable — delivered ones first,
+    // then finished-but-uncollected, oldest first within each. A live dialog
+    // (`!done`) is never evicted: `DIALOG_HARD_CAP` already bounds those, and
+    // evicting by age alone destroyed a half-filled form while keeping 64
+    // answers nobody needed any more.
+    let mut finished: Vec<(&String, bool, Instant)> = slots
+        .iter()
+        .filter(|(_, s)| s.done.load(std::sync::atomic::Ordering::SeqCst) || s.result.is_some())
+        .map(|(id, s)| (id, s.delivered_at.is_none(), s.created_at))
+        .collect();
+    // `false` (delivered) sorts before `true` (uncollected).
+    finished.sort_by_key(|(_, uncollected, t)| (*uncollected, *t));
+    finished
         .into_iter()
         .take(slots.len() - cap)
-        .map(|(id, _)| id.clone())
+        .map(|(id, _, _)| id.clone())
         .collect()
 }
 
@@ -2011,13 +2030,15 @@ fn sweep_async_slots(state: &AppState) {
         trace(&format!(
             "sweep_async_slots: caller stopped polling id={id} — cancelling the dialog"
         ));
-        state.dialog.cancel(&id);
+        // Not the user's "no": a distinct reason for the trace and for any
+        // caller that comes back after all.
+        state.dialog.cancel_with_reason(&id, Some("abandoned"));
     }
     for id in evicted {
         trace(&format!(
-            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting oldest id={id}"
+            "sweep_async_slots: over ASYNC_SLOT_CAP, evicting finished id={id}"
         ));
-        state.dialog.cancel(&id);
+        state.dialog.cancel_with_reason(&id, Some("evicted"));
     }
 }
 
@@ -3330,13 +3351,34 @@ mod async_render_tests {
     }
 
     #[test]
-    fn slot_cap_evicts_oldest() {
+    fn slot_cap_never_evicts_a_live_dialog() {
+        // A-05: one live form opened first, then a burst of answered
+        // confirms. Eviction by age alone took the live form.
+        let base = Instant::now();
+        let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
+        slots.insert("live".into(), slot(base, false));
+        for i in 0..ASYNC_SLOT_CAP + 1 {
+            let mut s = slot(base + Duration::from_secs(1 + i as u64), true);
+            if i % 2 == 0 {
+                s.delivered_at = Some(base + Duration::from_secs(2 + i as u64));
+            }
+            slots.insert(format!("d{i}"), s);
+        }
+        let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);
+        assert_eq!(evicted.len(), 2);
+        assert!(!evicted.contains(&"live".to_string()), "{evicted:?}");
+        // Delivered slots go before uncollected ones, oldest first.
+        assert_eq!(evicted, vec!["d0".to_string(), "d2".to_string()]);
+    }
+
+    #[test]
+    fn slot_cap_evicts_oldest_finished() {
         let base = Instant::now();
         let mut slots: HashMap<String, AsyncSlot> = HashMap::new();
         for i in 0..ASYNC_SLOT_CAP + 2 {
             slots.insert(
                 format!("d{i}"),
-                slot(base + Duration::from_secs(i as u64), false),
+                slot(base + Duration::from_secs(i as u64), true),
             );
         }
         let evicted = slots_over_cap(&slots, ASYNC_SLOT_CAP);

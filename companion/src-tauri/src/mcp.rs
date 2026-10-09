@@ -903,7 +903,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_ask_result,
         ),
 
         "form" => dispatch_render(
@@ -928,7 +928,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_form_result,
         ),
 
         "gallery" => dispatch_render(
@@ -954,7 +954,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_gallery_result,
         ),
 
         "upload" => Ok(do_upload(&args, cfg, http).await),
@@ -981,7 +981,7 @@ async fn tools_call(
                 render_sink,
             )
             .await,
-            format_dialog_result,
+            format_compare_result,
         ),
 
         "notify" => post_json(
@@ -1316,57 +1316,99 @@ enum RenderError {
     Transport(String),
 }
 
-/// Number of *consecutive* failed polls tolerated before `render_dialog`
-/// gives up on an in-flight dialog (#202). Five, one second apart, covers
-/// roughly three minutes of outage once the 40 s per-GET timeout is counted
-/// in — comfortably more than an SSH reverse-tunnel re-establish or a WebView
-/// restart during an in-app update. The counter resets on every successful
-/// poll, so a flaky link never accumulates its way to a false give-up.
-const POLL_MAX_CONSECUTIVE_FAILURES: u32 = 5;
+/// How long one outage may last before `render_dialog` gives up on an
+/// in-flight dialog — WALL-CLOCK time since the first failure of the current
+/// streak (review A-01/E-01).
+///
+/// #202 counted failures instead: five, a second apart. That only meant
+/// "about three minutes" when every failure was a 40 s timeout. A refused
+/// connection while the tunnel restarts fails in milliseconds, so the bridge
+/// gave up after ~4 s with the dialog still on screen — and a blackholed link
+/// outlived the companion's old 90 s reaper, which destroyed the window
+/// mid-fill. Now: retry for up to this long, whatever the failures look like,
+/// and the companion's `SLOT_ABANDONED_AFTER` (300 s) sits above the worst
+/// case (this + one GET + one backoff = 228 s). The Python bridge uses the
+/// same numbers. A successful poll ends the streak.
+pub(crate) const POLL_OUTAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Backoff between two failed polls of the same render id.
-const POLL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+/// Per-GET timeout of the poll loop: longer than the companion's ~25 s
+/// long-poll window, so a healthy server always answers first.
+pub(crate) const POLL_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// Ceiling of the capped exponential backoff between failed polls (1, 2, 4,
+/// 8, 8, … s).
+pub(crate) const POLL_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Fallback when a 202 body carries no `ttl_secs` — mirrors the companion's
 /// `DIALOG_TTL` (2 h).
 const DEFAULT_POLL_TTL_SECS: u64 = 7200;
 
-/// Retry budget for the async-render poll loop (#202).
+/// Retry budget for the async-render poll loop (#202, A-01/E-01).
 ///
 /// The async-render design exists so that a connection failure cannot cost
 /// the user's think-time: the dialog stays on screen for the whole server-side
 /// TTL, so a transport error on one poll is a blip, not an answer. This bounds
-/// how long the bridge keeps re-polling the same id — by consecutive failures
-/// *and* by the TTL the companion advertised, so we never poll an id that is
-/// certainly gone.
+/// how long the bridge keeps re-polling the same id — by the wall-clock length
+/// of the current outage ([`POLL_OUTAGE_BUDGET`]) *and* by the TTL the
+/// companion advertised, so we never poll an id that is certainly gone.
 struct PollBudget {
-    consecutive: u32,
+    streak_started: Option<std::time::Instant>,
+    failures: u32,
     deadline: std::time::Instant,
 }
 
 impl PollBudget {
     fn new(ttl_secs: u64) -> Self {
+        Self::starting_at(std::time::Instant::now(), ttl_secs)
+    }
+
+    fn starting_at(now: std::time::Instant, ttl_secs: u64) -> Self {
+        // Review A-10: `Instant + Duration` panics on overflow, and
+        // `ttl_secs` comes off the wire. An absurd TTL means "no TTL bound".
+        let deadline = now
+            .checked_add(std::time::Duration::from_secs(ttl_secs))
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         PollBudget {
-            consecutive: 0,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+            streak_started: None,
+            failures: 0,
+            deadline,
         }
     }
 
-    /// A poll came back: the link is healthy again, so forget past failures.
+    /// A poll came back: the link is healthy again, so the outage is over.
     fn on_success(&mut self) {
-        self.consecutive = 0;
+        self.streak_started = None;
+        self.failures = 0;
     }
 
-    /// Count a failed poll. `true` → sleep and re-poll the same id.
-    fn may_retry(&mut self) -> bool {
-        self.consecutive += 1;
-        self.consecutive < POLL_MAX_CONSECUTIVE_FAILURES
-            && std::time::Instant::now() < self.deadline
+    /// Count a failed poll observed at `now`. `Some(backoff)` → sleep that
+    /// long and re-poll the same id; `None` → the outage budget or the TTL is
+    /// spent.
+    fn on_failure(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let started = *self.streak_started.get_or_insert(now);
+        self.failures += 1;
+        if now >= self.deadline || now.duration_since(started) >= POLL_OUTAGE_BUDGET {
+            return None;
+        }
+        Some(poll_backoff(self.failures))
     }
 
-    fn consecutive(&self) -> u32 {
-        self.consecutive
+    fn failures(&self) -> u32 {
+        self.failures
     }
+
+    fn outage(&self, now: std::time::Instant) -> std::time::Duration {
+        self.streak_started
+            .map(|s| now.duration_since(s))
+            .unwrap_or_default()
+    }
+}
+
+/// Capped exponential backoff for the `n`th consecutive failure: 1, 2, 4, 8,
+/// 8, … seconds.
+fn poll_backoff(n: u32) -> std::time::Duration {
+    let secs = 1u64 << n.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(secs).min(POLL_BACKOFF_CAP)
 }
 
 async fn render_dialog(
@@ -1550,33 +1592,38 @@ async fn render_dialog(
         let pr = match http
             .get(&poll_url)
             .bearer_auth(&token)
-            .timeout(std::time::Duration::from_secs(40))
+            .timeout(POLL_GET_TIMEOUT)
             .send()
             .await
         {
             Ok(pr) => pr,
             Err(e) => {
-                if budget.may_retry() {
+                let now = std::time::Instant::now();
+                if let Some(backoff) = budget.on_failure(now) {
                     trace(&format!(
-                        "render_dialog: poll {id} failed ({e}), retry {}/{}",
-                        budget.consecutive(),
-                        POLL_MAX_CONSECUTIVE_FAILURES
+                        "render_dialog: poll {id} failed ({e}), failure {} after {}s of \
+                         outage — retrying in {}s",
+                        budget.failures(),
+                        budget.outage(now).as_secs(),
+                        backoff.as_secs()
                     ));
-                    tokio::time::sleep(POLL_RETRY_BACKOFF).await;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 return Err(RenderError::Transport(format!(
-                    "GET /render/{id}: {e} (gave up after {} consecutive poll \
-                     failures — the dialog may still be open on the user's \
-                     machine)",
-                    budget.consecutive()
+                    "GET /render/{id}: {e} (gave up after {}s without reaching aiui — \
+                     the dialog may still be open on the user's machine; check it \
+                     before re-asking)",
+                    budget.outage(now).as_secs()
                 )));
             }
         };
         budget.on_success();
         if pr.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RenderError::Transport(format!(
-                "aiui lost track of render {id} (expired or never registered)"
+                "aiui lost track of render {id} — it expired, was never registered, \
+                 or the companion closed it after it went unpolled for too long. \
+                 Ask again if the answer is still needed."
             )));
         }
         if !pr.status().is_success() {
@@ -1819,7 +1866,42 @@ fn format_confirm_result(render: Value) -> Value {
     value_to_tool_text(payload)
 }
 
+/// The per-tool keys a cancelled dialog still carries, so an agent can read
+/// `result["values"]` without guarding for it (`docs/skill.md`, "Every dialog
+/// tool returns `cancelled` plus that tool's own keys"). Shared with the
+/// Python bridge's tests through `schemas/dialog-results.json` — review E-02
+/// found the two bridges pinning different shapes.
+const DIALOG_RESULTS_FIXTURE: &str = include_str!("../../../schemas/dialog-results.json");
+
+fn cancel_defaults(kind: &str) -> serde_json::Map<String, Value> {
+    serde_json::from_str::<Value>(DIALOG_RESULTS_FIXTURE)
+        .ok()
+        .and_then(|v| v.get("cancel_defaults")?.get(kind)?.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn format_ask_result(render: Value) -> Value {
+    format_dialog_result_for("ask", render)
+}
+
+fn format_form_result(render: Value) -> Value {
+    format_dialog_result_for("form", render)
+}
+
+fn format_gallery_result(render: Value) -> Value {
+    format_dialog_result_for("gallery", render)
+}
+
+fn format_compare_result(render: Value) -> Value {
+    format_dialog_result_for("compare", render)
+}
+
+#[cfg(test)]
 fn format_dialog_result(render: Value) -> Value {
+    format_dialog_result_for("", render)
+}
+
+fn format_dialog_result_for(kind: &str, render: Value) -> Value {
     // Passthrough: just return what the frontend delivered. The agent gets
     // whatever shape the widget produced (values for form, answers for ask).
     let cancelled = render
@@ -1834,6 +1916,15 @@ fn format_dialog_result(render: Value) -> Value {
         obj.insert("cancelled".into(), json!(cancelled));
     } else {
         payload = json!({ "cancelled": cancelled });
+    }
+    // E-02: a cancel comes back with `result: null`; fill the tool's own
+    // keys with their empty values, exactly like the Python bridge.
+    if cancelled {
+        if let Some(obj) = payload.as_object_mut() {
+            for (k, v) in cancel_defaults(kind) {
+                obj.entry(k).or_insert(v);
+            }
+        }
     }
     // #180: forward WHY a dialog was cancelled. The companion sets
     // `host_exiting`, `ttl_expired`, `evicted` and `channel_dropped`;
@@ -2104,33 +2195,73 @@ mod tests {
     /// yes and return `RenderError::Transport` once it says no.
     #[test]
     fn poll_retries_transient_transport_error() {
-        let mut budget = PollBudget::new(DEFAULT_POLL_TTL_SECS);
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, DEFAULT_POLL_TTL_SECS);
 
         // One failed poll then a success: the dialog survives, and the
-        // success wipes the slate so a flaky link never accumulates its way
+        // success ends the outage so a flaky link never accumulates its way
         // to a false give-up.
-        assert!(budget.may_retry(), "a single blip must be retried");
-        assert_eq!(budget.consecutive(), 1);
+        assert!(budget.on_failure(t0).is_some(), "a single blip must be retried");
+        assert_eq!(budget.failures(), 1);
         budget.on_success();
-        assert_eq!(budget.consecutive(), 0);
+        assert_eq!(budget.failures(), 0);
+    }
 
-        // N *consecutive* failures exhaust it — that is the only give-up.
-        for i in 1..POLL_MAX_CONSECUTIVE_FAILURES {
-            assert!(budget.may_retry(), "failure {i} is still within budget");
+    #[test]
+    fn an_instant_failure_streak_survives_a_tunnel_restart() {
+        // A-01/E-01: refused connections fail in milliseconds. Counting them
+        // gave up after ~4 s; the budget is wall-clock, so a 2-minute tunnel
+        // re-establish of instant failures is ridden out.
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, DEFAULT_POLL_TTL_SECS);
+        let mut t = t0;
+        for _ in 0..30 {
+            let backoff = budget.on_failure(t).expect("still inside the outage budget");
+            t += backoff;
+            if t.duration_since(t0) > std::time::Duration::from_secs(120) {
+                break;
+            }
         }
+        assert!(budget.failures() > 5, "far more than the old five-failure cap");
+        // …and the budget does end.
+        let late = t0 + POLL_OUTAGE_BUDGET;
+        assert!(budget.on_failure(late).is_none(), "the outage budget is spent");
+    }
+
+    #[test]
+    fn poll_backoff_is_capped_exponential() {
+        let secs: Vec<u64> = (1..=7).map(|n| poll_backoff(n).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(poll_backoff(u32::MAX), POLL_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn the_reaper_outlasts_the_bridge_outage_budget() {
+        // A-01: the companion must not destroy a dialog its bridge is still
+        // entitled to come back for. Worst case: the outage budget, plus a
+        // GET that started just before it ran out, plus one backoff.
+        let worst = POLL_OUTAGE_BUDGET + POLL_GET_TIMEOUT + POLL_BACKOFF_CAP;
         assert!(
-            !budget.may_retry(),
-            "the {POLL_MAX_CONSECUTIVE_FAILURES}th consecutive failure gives up"
+            crate::http::SLOT_ABANDONED_AFTER > worst,
+            "SLOT_ABANDONED_AFTER {:?} must exceed the bridge worst case {worst:?}",
+            crate::http::SLOT_ABANDONED_AFTER
         );
-        assert_eq!(budget.consecutive(), POLL_MAX_CONSECUTIVE_FAILURES);
     }
 
     #[test]
     fn poll_stops_once_the_advertised_ttl_has_elapsed() {
         // The id from the 202 is only valid for `ttl_secs`; past that the slot
         // is gone on the companion side and retrying it just burns the budget.
-        let mut budget = PollBudget::new(0);
-        assert!(!budget.may_retry(), "an expired id must not be re-polled");
+        let t0 = std::time::Instant::now();
+        let mut budget = PollBudget::starting_at(t0, 0);
+        assert!(budget.on_failure(t0).is_none(), "an expired id must not be re-polled");
+    }
+
+    #[test]
+    fn an_absurd_advertised_ttl_does_not_panic() {
+        // A-10: `Instant + Duration::from_secs(u64::MAX)` panicked.
+        let mut budget = PollBudget::new(u64::MAX);
+        assert!(budget.on_failure(std::time::Instant::now()).is_some());
     }
 
     /// #202: `/ping` is unauthenticated and returns a static "pong" whatever
@@ -2659,6 +2790,31 @@ mod tests {
         let out = format_dialog_result(json!({"id": "d1", "cancelled": true, "result": null}));
         assert_envelope_is_consistent(&out);
         assert_eq!(out["structuredContent"], json!({"cancelled": true}));
+    }
+
+    #[test]
+    fn a_cancel_carries_each_tools_documented_keys() {
+        // E-02: docs/skill.md promises `cancelled` plus the tool's own keys on
+        // a cancel. The Python bridge did that; this bridge returned a bare
+        // `{cancelled: true}`, so `result["values"]` raised on local sessions.
+        let fixture: Value = serde_json::from_str(DIALOG_RESULTS_FIXTURE).unwrap();
+        let cancel = || json!({"id": "d1", "cancelled": true, "result": null});
+        for (kind, fmt) in [
+            ("ask", format_ask_result as fn(Value) -> Value),
+            ("form", format_form_result),
+            ("gallery", format_gallery_result),
+            ("compare", format_compare_result),
+        ] {
+            let out = tool_payload(fmt(cancel()));
+            let mut want = fixture["cancel_defaults"][kind].as_object().unwrap().clone();
+            want.insert("cancelled".into(), json!(true));
+            assert_eq!(out, Value::Object(want), "{kind}");
+        }
+        // A submit is left exactly as the widget produced it.
+        let out = tool_payload(format_form_result(json!({
+            "id": "d1", "cancelled": false, "result": {"values": {"a": 1}}
+        })));
+        assert_eq!(out, json!({"values": {"a": 1}, "cancelled": false}));
     }
 
     #[test]

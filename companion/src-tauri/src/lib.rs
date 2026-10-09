@@ -143,10 +143,25 @@ fn dialog_cancel(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<dialog::DialogState>>,
     id: String,
+    reason: Option<String>,
 ) -> Result<(), String> {
     require_own_dialog(&window, &id, "dialog_cancel")?;
-    state.cancel(&id);
+    state.cancel_with_reason(&id, frontend_cancel_reason(reason.as_deref()));
     Ok(())
+}
+
+/// The reasons a dialog window may attach to its own cancel (review D-02).
+/// A reason-less cancel means "the user declined" to the agent
+/// (`docs/skill.md`), so the window's TTL countdown firing must say
+/// `ttl_expired` — it used to arrive reason-less, and a timed-out destructive
+/// `confirm` read as an explicit "no, do not re-ask". Anything else a window
+/// sends is dropped rather than forwarded: the window renders agent content,
+/// and must not be able to dress a user's refusal up as something else.
+fn frontend_cancel_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("ttl_expired") => Some("ttl_expired"),
+        _ => None,
+    }
 }
 
 /// Issue #135: write the values of `target`-carrying form fields to **local**
@@ -3152,6 +3167,19 @@ pub fn run() {
                 let _ = app;
             }
         });
+}
+
+#[cfg(test)]
+mod dialog_cancel_reason_tests {
+    use super::frontend_cancel_reason;
+
+    #[test]
+    fn only_the_ttl_reason_passes_from_a_window() {
+        assert_eq!(frontend_cancel_reason(Some("ttl_expired")), Some("ttl_expired"));
+        assert_eq!(frontend_cancel_reason(None), None, "Escape / Cancel stays a user no");
+        assert_eq!(frontend_cancel_reason(Some("host_exiting")), None);
+        assert_eq!(frontend_cancel_reason(Some("anything")), None);
+    }
 }
 
 #[cfg(test)]

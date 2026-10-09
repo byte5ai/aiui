@@ -518,14 +518,23 @@ impl DialogState {
         }
     }
 
+    /// A cancel with no reason — the agent-facing meaning is "the user said
+    /// no" (`docs/skill.md`). Use [`DialogState::cancel_with_reason`] for
+    /// every cancel the user did not make.
     pub fn cancel(&self, id: &str) {
+        self.cancel_with_reason(id, None);
+    }
+
+    /// Cancel with an explicit reason (`ttl_expired`, `abandoned`, …), so the
+    /// agent can tell a dialog that ended without an answer from a refusal.
+    pub fn cancel_with_reason(&self, id: &str, reason: Option<&str>) {
         let entry = self.pending.lock().unwrap().remove(id);
         if let Some(entry) = entry {
             let _ = entry.result_tx.send(DialogResult {
                 id: id.to_string(),
                 cancelled: true,
                 result: serde_json::Value::Null,
-                reason: None,
+                reason: reason.map(str::to_string),
             });
         }
     }
