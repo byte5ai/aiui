@@ -46,6 +46,17 @@ const REASON_TOO_MANY_CHILDREN: &str = "too_many_children";
 /// unchanged, so the wire contract stays v1.
 const ASYNC_RENDER_HEADER: &str = "x-aiui-async";
 
+/// Async mode is chosen by the header's VALUE, not its presence: a signed
+/// request binds the value (absent and empty both sign as ""), so presence
+/// alone would let an empty header flip the mode without breaking the MAC
+/// (Codex review). Both bridges send "1".
+fn wants_async_render(headers: &HeaderMap) -> bool {
+    headers
+        .get(ASYNC_RENDER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 /// How long a single `GET /render/{id}` long-poll parks before returning
 /// `{pending:true}` so the caller can re-poll (and emit a progress
 /// notification). Short enough to stay well under any client read timeout, so
@@ -2959,7 +2970,7 @@ async fn render(
     // caller polls `GET /render/{id}`. This removes the multi-minute open HTTP
     // connection that a tunnel/GUI blip turns into a remote ReadError —
     // resolution now lives in a task, not on the wire.
-    if headers.contains_key(ASYNC_RENDER_HEADER) {
+    if wants_async_render(&headers) {
         // The detached task owns resolution + window teardown from here; the
         // slot below is what keeps the dialog tied to its caller (#193) — the
         // background reaper cancels it if nobody polls any more.
@@ -4318,6 +4329,16 @@ mod auth_tests {
     fn hdr(token: &str, method: &str, pq: &str, ts: u64, n: &str, pid: u32, bd: &str, asy: &str) -> String {
         let mac = signed_request_mac(token, method, pq, ts, n, pid, bd, asy);
         format!("ts={ts},nonce={n},pid={pid},bd={bd},mac={mac}")
+    }
+
+    #[test]
+    fn an_empty_async_header_does_not_select_async_mode() {
+        let mut h = HeaderMap::new();
+        assert!(!wants_async_render(&h));
+        h.insert("x-aiui-async", axum::http::HeaderValue::from_static(""));
+        assert!(!wants_async_render(&h), "same signature as absent, so same mode");
+        h.insert("x-aiui-async", axum::http::HeaderValue::from_static("1"));
+        assert!(wants_async_render(&h));
     }
 
     #[test]
