@@ -24,7 +24,7 @@ aiui/
 ├── scripts/
 │   ├── assert-rust-toolchain.sh        rustc matches rust-toolchain.toml
 │   ├── assert-tauri-cli.sh             the bundler is the one package-lock.json locks
-│   ├── check-doc-claims.sh             no surface promises self-installing updates
+│   ├── check-doc-claims.sh             no surface promises an install without a click
 │   ├── check-i18n-parity.sh            en/de catalogs agree, no hardcoded German
 │   ├── check-leaks.sh                  no private infrastructure in this public repo
 │   ├── check-release-ordering.sh       guards the order of the release steps
