@@ -325,13 +325,16 @@ def _token() -> str:
 #
 # EVERY authenticated request is preceded by its own challenge, and the token
 # itself never goes on the wire: the request carries
-#   Authorization: AIUI-HMAC ts=<unix>,nonce=<hex>,mac=<hex>
-#   mac = HMAC-SHA256(token, "aiui-req-v1|<METHOD>|<path?query>|<ts>|<nonce>")
-# which the companion verifies (method and path bound, ±300 s, nonce used
-# once). The challenge alone could not pin the TCP connection the next
-# request travels on — a listener closing it while a squatter takes the port
-# would have received a bearer token (Codex review). A signed header gives
-# such a squatter nothing reusable.
+#   Authorization: AIUI-HMAC ts=<unix>,nonce=<hex>,pid=<n>,bd=<sha256>,mac=<hex>
+#   mac = HMAC-SHA256(token,
+#         "aiui-req-v2|METHOD|path?query|ts|nonce|pid|bd|<x-aiui-async>")
+# The companion verifies it (see `signed_auth` in http.rs): method, path,
+# body digest and sync/async mode are bound, ±300 s, each nonce accepted
+# once, and `pid` — the companion process the challenge just proved — makes
+# a signature worthless after a restart. The challenge alone could not pin
+# the TCP connection the next request travels on, so a listener closing it
+# while a squatter took the port would have received a bearer token (Codex
+# review); a signed header gives such a squatter nothing reusable.
 # ---------------------------------------------------------------------------
 
 # Opt-in for a companion that predates the challenge (it answers the
@@ -339,7 +342,7 @@ def _token() -> str:
 # an unverified listener may just as well be a squatter.
 ALLOW_UNVERIFIED_ENV = "AIUI_ALLOW_UNVERIFIED_COMPANION"
 _PROBE_MAC_CONTEXT = "aiui-probe-v1"
-_REQUEST_MAC_CONTEXT = "aiui-req-v1"
+_REQUEST_MAC_CONTEXT = "aiui-req-v2"
 
 
 class CompanionUnverifiedError(RuntimeError):
@@ -353,19 +356,33 @@ def _probe_mac(token: str, nonce: str, pid: int, build_sha: str) -> str:
     return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
-def _request_mac(token: str, method: str, path_query: str, ts: int, nonce: str) -> str:
+def _request_mac(
+    token: str,
+    method: str,
+    path_query: str,
+    ts: int,
+    nonce: str,
+    pid: int,
+    body_digest: str,
+    async_hdr: str,
+) -> str:
     """Mirror of the companion's `signed_request_mac` (http.rs)."""
-    msg = f"{_REQUEST_MAC_CONTEXT}|{method}|{path_query}|{ts}|{nonce}"
+    msg = (
+        f"{_REQUEST_MAC_CONTEXT}|{method}|{path_query}|{ts}|{nonce}|{pid}|{body_digest}|{async_hdr}"
+    )
     return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
-def _signed_authorization(token: str, request: httpx.Request) -> str:
+async def _signed_authorization(token: str, request: httpx.Request, pid: int) -> str:
     """The `AIUI-HMAC` header for `request` — never the token itself."""
+    await request.aread()
     ts = int(time.time())
     nonce = secrets.token_hex(16)
     path_query = request.url.raw_path.decode("ascii")
-    mac = _request_mac(token, request.method, path_query, ts, nonce)
-    return f"AIUI-HMAC ts={ts},nonce={nonce},mac={mac}"
+    body_digest = hashlib.sha256(request.content).hexdigest()
+    async_hdr = request.headers.get("x-aiui-async", "")
+    mac = _request_mac(token, request.method, path_query, ts, nonce, pid, body_digest, async_hdr)
+    return f"AIUI-HMAC ts={ts},nonce={nonce},pid={pid},bd={body_digest},mac={mac}"
 
 
 def _probe_failure(status: int, body: bytes, token: str, nonce: str) -> str | None:
@@ -390,12 +407,15 @@ def _probe_failure(status: int, body: bytes, token: str, nonce: str) -> str | No
     return None
 
 
-async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, token: str) -> bool:
+async def _verify_listener(
+    inner: httpx.AsyncBaseTransport, url: httpx.URL, token: str
+) -> int | None:
     """Challenge the listener behind `url` right now: it must prove it holds
     `token`. Raises `CompanionUnverifiedError` instead of letting anything go
     out. Transport errors of the probe itself propagate unchanged, so callers
-    diagnose a dead port exactly as before. Returns True only for the opted-in
-    older companion, which understands nothing but a bearer token."""
+    diagnose a dead port exactly as before. Returns the proven companion's
+    pid — signed requests are bound to it — or None for the opted-in older
+    companion, which understands nothing but a bearer token."""
     nonce = secrets.token_hex(32)
     probe = httpx.Request(
         "GET",
@@ -416,7 +436,7 @@ async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, toke
                 where,
                 ALLOW_UNVERIFIED_ENV,
             )
-            return True
+            return None
         raise CompanionUnverifiedError(
             f"aiui did not send its token to {where}: the listener there answered the "
             f"credential-less challenge probe with 401. An aiui companion older than this "
@@ -436,7 +456,7 @@ async def _verify_listener(inner: httpx.AsyncBaseTransport, url: httpx.URL, toke
             f"(aiui Settings → Connections on the user's machine re-establishes it). If "
             f"the user's aiui holds a different token, re-register this host there."
         )
-    return False
+    return int(json.loads(body)["pid"])
 
 
 class _CompanionTransport(httpx.AsyncBaseTransport):
@@ -455,9 +475,9 @@ class _CompanionTransport(httpx.AsyncBaseTransport):
         auth = request.headers.get("authorization", "")
         if auth.startswith("Bearer "):
             token = auth[len("Bearer ") :]
-            legacy = await _verify_listener(self._inner, request.url, token)
-            if not legacy:
-                request.headers["authorization"] = _signed_authorization(token, request)
+            pid = await _verify_listener(self._inner, request.url, token)
+            if pid is not None:
+                request.headers["authorization"] = await _signed_authorization(token, request, pid)
         return await self._inner.handle_async_request(request)
 
     async def aclose(self) -> None:

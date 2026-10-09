@@ -122,7 +122,13 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
     def _authed(self) -> bool:
-        return auth_ok(self.headers.get("Authorization"), self.command, self.path, TOKEN)
+        return auth_ok(
+            self.headers.get("Authorization"),
+            self.command,
+            self.path,
+            TOKEN,
+            async_hdr=self.headers.get("x-aiui-async", ""),
+        )
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
         self.send_response(code)

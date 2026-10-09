@@ -66,7 +66,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
-        return auth_ok(self.headers.get("Authorization"), self.command, self.path, TOKEN)
+        return auth_ok(
+            self.headers.get("Authorization"),
+            self.command,
+            self.path,
+            TOKEN,
+            async_hdr=self.headers.get("x-aiui-async", ""),
+        )
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
         path, _, query = self.path.partition("?")

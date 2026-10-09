@@ -23,6 +23,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import httpx
 import pytest
 
 import aiui_mcp.server as server
@@ -255,13 +256,31 @@ def test_a_port_taken_over_between_two_calls_never_sees_the_token(bridge: Any) -
     assert squatter.auth_headers == [], f"token leaked to the squatter: {squatter.requests}"
 
 
+def test_a_signature_binds_body_mode_and_companion_process() -> None:
+    """Codex review: a signature over method and path alone let a captured
+    header carry a substituted body, or drop `x-aiui-async` to get the answer
+    back synchronously."""
+    req = httpx.Request(
+        "POST",
+        "http://127.0.0.1:7777/render",
+        content=b'{"a": 1}',
+        headers={"x-aiui-async": "1"},
+    )
+    hdr = asyncio.run(server._signed_authorization(TOKEN, req, 4242))
+    assert TOKEN not in hdr
+    assert "pid=4242" in hdr
+    assert auth_ok(hdr, "POST", "/render", TOKEN, body=b'{"a": 1}', async_hdr="1")
+    assert not auth_ok(hdr, "POST", "/render", TOKEN, body=b'{"a": 2}', async_hdr="1")
+    assert not auth_ok(hdr, "POST", "/render", TOKEN, body=b'{"a": 1}', async_hdr="")
+
+
 def test_request_mac_matches_the_companion_formula() -> None:
-    """Pinned like `the_signed_request_mac_formula_is_pinned` in http.rs."""
-    nonce = "ab" * 16
-    expected = hmac.new(
-        b"k" * 64, f"aiui-req-v1|GET|/health|1700000000|{nonce}".encode(), hashlib.sha256
-    ).hexdigest()
-    assert server._request_mac("k" * 64, "GET", "/health", 1_700_000_000, nonce) == expected
+    """The vector `the_signed_request_mac_formula_is_pinned` pins in http.rs."""
+    empty = hashlib.sha256(b"").hexdigest()
+    got = server._request_mac(
+        "k" * 64, "POST", "/render", 1_700_000_000, "ab" * 16, 4242, empty, "1"
+    )
+    assert got == "69e9c08260c11b26fc5f217fb7bbe0699291522a1c69f53da4095b99b04fea21"
 
 
 def test_probe_mac_matches_the_companion_formula() -> None:

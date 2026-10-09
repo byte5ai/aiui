@@ -8,12 +8,22 @@ accepting the bearer form the local Rust bridge and older bridges use.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 
 from aiui_mcp import server
 
 
-def auth_ok(header: str | None, method: str, path_query: str, token: str) -> bool:
+def auth_ok(
+    header: str | None,
+    method: str,
+    path_query: str,
+    token: str,
+    body: bytes | None = None,
+    async_hdr: str = "",
+) -> bool:
+    """`body`, when given, must match the signed digest (the companion checks
+    it once the body is read)."""
     if header is None:
         return False
     if header == f"Bearer {token}":
@@ -22,8 +32,11 @@ def auth_ok(header: str | None, method: str, path_query: str, token: str) -> boo
         return False
     try:
         params = dict(p.split("=", 1) for p in header[len("AIUI-HMAC ") :].split(","))
-        ts, nonce, mac = int(params["ts"]), params["nonce"], params["mac"]
+        ts, nonce, pid = int(params["ts"]), params["nonce"], int(params["pid"])
+        bd, mac = params["bd"], params["mac"]
     except (KeyError, ValueError):
         return False
-    want = server._request_mac(token, method, path_query, ts, nonce)
-    return hmac.compare_digest(want, mac)
+    want = server._request_mac(token, method, path_query, ts, nonce, pid, bd, async_hdr)
+    if not hmac.compare_digest(want, mac):
+        return False
+    return body is None or hashlib.sha256(body).hexdigest() == bd

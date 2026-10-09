@@ -560,17 +560,27 @@ async fn show_settings(State(state): State<AppState>, headers: HeaderMap) -> imp
 /// listener closes it and a squatter grabs the port in between, a bearer
 /// token went to the squatter. So the bridge SIGNS each request instead:
 ///
-///   Authorization: AIUI-HMAC ts=<unix secs>,nonce=<32–128 hex>,mac=<hex>
-///   mac = HMAC-SHA256(token, "aiui-req-v1|<METHOD>|<path?query>|<ts>|<nonce>")
+///   Authorization: AIUI-HMAC ts=<unix>,nonce=<hex>,pid=<n>,bd=<sha256 hex>,mac=<hex>
+///   mac = HMAC-SHA256(token,
+///         "aiui-req-v2|METHOD|path?query|ts|nonce|pid|bd|<x-aiui-async value>")
 ///
-/// A captured header authorises nothing else (method and path are bound),
-/// expires (±[`SIGNED_REQUEST_WINDOW`]), and is accepted once (nonce cache).
-/// This layer verifies it and rewrites it to the bearer form the handlers
-/// check, so no handler changes. `Bearer` stays accepted — the local Rust
-/// bridge and older bridges use it.
+/// What a captured header can still do, and why that is nothing:
+/// - another method, path or body, or the sync/async mode → the MAC breaks
+///   (`bd` is the body's SHA-256, checked once the body is read);
+/// - a replay → each nonce is accepted once, inside ±[`SIGNED_REQUEST_WINDOW`];
+/// - a replay after a companion restart (the nonce cache is per process) →
+///   `pid` is the companion process the bridge's challenge just proved, and a
+///   restarted companion is a different pid.
+///
+/// The MAC over the CLAIMED digest is checked from the headers alone, so a
+/// caller without the token is refused before any body byte is read (A-04);
+/// only an authenticated request has its body buffered and compared. The
+/// header is then rewritten to the bearer form the handlers check, so no
+/// handler changes. `Bearer` stays accepted — the local Rust bridge and older
+/// bridges use it.
 async fn signed_auth(
     State(token): State<std::sync::Arc<str>>,
-    mut req: axum::extract::Request,
+    req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let params = req
@@ -582,39 +592,67 @@ async fn signed_auth(
     let Some(params) = params else {
         return next.run(req).await;
     };
+    let unauthorized = |why: &str| {
+        trace(&format!("signed request refused: {why}"));
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response()
+    };
     let path_query = req
         .uri()
         .path_and_query()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "/".into());
+    let async_hdr = req
+        .headers()
+        .get("x-aiui-async")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let verdict = verify_signed_request(
+    let claimed = match verify_signed_request(
         &token,
         req.method().as_str(),
         &path_query,
+        &async_hdr,
         &params,
         now,
+        std::process::id(),
         seen_nonces(),
-    );
-    match verdict {
-        Ok(()) => {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
-                req.headers_mut().insert(axum::http::header::AUTHORIZATION, v);
-            }
-            next.run(req).await
-        }
-        Err(why) => {
-            trace(&format!("signed request refused: {why}"));
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "unauthorized"})),
+    ) {
+        Ok(digest) => digest,
+        Err(why) => return unauthorized(why),
+    };
+    // Authenticated: now the body may be read, and must be the one signed.
+    let (mut parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MEDIA_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": "body_too_large"})),
             )
                 .into_response()
         }
+    };
+    if !constant_time_eq(sha256_hex(&bytes).as_bytes(), claimed.as_bytes()) {
+        return unauthorized("body does not match the signed digest");
     }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
+        parts.headers.insert(axum::http::header::AUTHORIZATION, v);
+    }
+    next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
 }
 
 /// How far a signed request's timestamp may be from this machine's clock.
@@ -630,45 +668,68 @@ fn seen_nonces() -> &'static Mutex<std::collections::HashMap<String, u64>> {
     SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// `HMAC-SHA256(token, "aiui-req-v1|METHOD|path?query|ts|nonce")`, hex — the
-/// Python bridge computes the same with `hmac.new`.
-pub(crate) fn signed_request_mac(token: &str, method: &str, path_query: &str, ts: u64, nonce: &str) -> String {
-    let msg = format!("aiui-req-v1|{method}|{path_query}|{ts}|{nonce}");
+/// The signed-request MAC (see [`signed_auth`]), hex. The Python bridge
+/// computes the same with `hmac.new`; both sides pin one test vector.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signed_request_mac(
+    token: &str,
+    method: &str,
+    path_query: &str,
+    ts: u64,
+    nonce: &str,
+    pid: u32,
+    body_digest: &str,
+    async_hdr: &str,
+) -> String {
+    let msg = format!(
+        "aiui-req-v2|{method}|{path_query}|{ts}|{nonce}|{pid}|{body_digest}|{async_hdr}"
+    );
     hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
 }
 
+/// Verify a signed header from the headers alone; on success return the
+/// body digest it claims (the caller compares it with the real body).
+#[allow(clippy::too_many_arguments)]
 fn verify_signed_request(
     token: &str,
     method: &str,
     path_query: &str,
+    async_hdr: &str,
     params: &str,
     now: u64,
+    our_pid: u32,
     seen: &Mutex<std::collections::HashMap<String, u64>>,
-) -> Result<(), &'static str> {
+) -> Result<String, &'static str> {
     if token.is_empty() {
         return Err("no token configured");
     }
-    let mut ts: Option<u64> = None;
-    let mut nonce: Option<&str> = None;
-    let mut mac: Option<&str> = None;
+    let (mut ts, mut nonce, mut pid, mut bd, mut mac) = (None, None, None, None, None);
     for part in params.split(',') {
         match part.trim().split_once('=') {
-            Some(("ts", v)) => ts = v.parse().ok(),
+            Some(("ts", v)) => ts = v.parse::<u64>().ok(),
             Some(("nonce", v)) => nonce = Some(v),
+            Some(("pid", v)) => pid = v.parse::<u32>().ok(),
+            Some(("bd", v)) => bd = Some(v),
             Some(("mac", v)) => mac = Some(v),
             _ => return Err("malformed signature header"),
         }
     }
-    let (Some(ts), Some(nonce), Some(mac)) = (ts, nonce, mac) else {
+    let (Some(ts), Some(nonce), Some(pid), Some(bd), Some(mac)) = (ts, nonce, pid, bd, mac) else {
         return Err("incomplete signature header");
     };
     if !is_probe_nonce(nonce) {
         return Err("bad nonce");
     }
+    if bd.len() != 64 || !bd.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("bad body digest");
+    }
+    if pid != our_pid {
+        return Err("signed for another companion process");
+    }
     if now.abs_diff(ts) > SIGNED_REQUEST_WINDOW {
         return Err("timestamp outside the window");
     }
-    let want = signed_request_mac(token, method, path_query, ts, nonce);
+    let want = signed_request_mac(token, method, path_query, ts, nonce, pid, bd, async_hdr);
     if !constant_time_eq(mac.as_bytes(), want.as_bytes()) {
         return Err("bad signature");
     }
@@ -677,7 +738,7 @@ fn verify_signed_request(
     if seen.insert(nonce.to_string(), ts).is_some() {
         return Err("replayed nonce");
     }
-    Ok(())
+    Ok(bd.to_ascii_lowercase())
 }
 
 /// Route layer for every body-consuming endpoint: 401 before any body byte
@@ -4251,63 +4312,76 @@ mod auth_tests {
         assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[allow(clippy::too_many_arguments)]
+    fn hdr(token: &str, method: &str, pq: &str, ts: u64, n: &str, pid: u32, bd: &str, asy: &str) -> String {
+        let mac = signed_request_mac(token, method, pq, ts, n, pid, bd, asy);
+        format!("ts={ts},nonce={n},pid={pid},bd={bd},mac={mac}")
+    }
+
     #[test]
-    fn a_signed_request_is_accepted_once_and_only_for_its_own_path() {
-        let seen = Mutex::new(std::collections::HashMap::new());
+    fn a_signed_request_is_accepted_once_and_only_as_signed() {
         let n = "ab".repeat(16);
-        let mac = signed_request_mac("tok", "GET", "/render/x", 1_000, &n);
-        let hdr = format!("ts=1000,nonce={n},mac={mac}");
-        assert_eq!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_010, &seen), Ok(()));
-        // Replayed: refused.
-        assert!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_011, &seen).is_err());
-        // Captured and pointed elsewhere: refused (method and path are bound).
-        let seen2 = Mutex::new(std::collections::HashMap::new());
-        assert!(verify_signed_request("tok", "POST", "/render/x", &hdr, 1_010, &seen2).is_err());
-        assert!(verify_signed_request("tok", "GET", "/update", &hdr, 1_010, &seen2).is_err());
-        // Wrong token, stale timestamp, malformed header.
-        assert!(verify_signed_request("other", "GET", "/render/x", &hdr, 1_010, &seen2).is_err());
-        assert!(verify_signed_request("tok", "GET", "/render/x", &hdr, 1_000 + 301, &seen2).is_err());
-        assert!(verify_signed_request("tok", "GET", "/render/x", "ts=1000", 1_000, &seen2).is_err());
+        let h = hdr("tok", "GET", "/render/x", 1_000, &n, 42, EMPTY_SHA, "");
+        let verify = |method: &str, pq: &str, asy: &str, h: &str, now: u64, pid: u32, seen: &Mutex<_>| {
+            verify_signed_request("tok", method, pq, asy, h, now, pid, seen)
+        };
+        let seen = Mutex::new(std::collections::HashMap::new());
+        assert_eq!(verify("GET", "/render/x", "", &h, 1_010, 42, &seen).as_deref(), Ok(EMPTY_SHA));
+        assert!(verify("GET", "/render/x", "", &h, 1_011, 42, &seen).is_err(), "replay");
+        let fresh = || Mutex::new(std::collections::HashMap::new());
+        assert!(verify("POST", "/render/x", "", &h, 1_010, 42, &fresh()).is_err(), "method");
+        assert!(verify("GET", "/update", "", &h, 1_010, 42, &fresh()).is_err(), "path");
+        assert!(verify("GET", "/render/x", "1", &h, 1_010, 42, &fresh()).is_err(), "async mode");
+        assert!(verify("GET", "/render/x", "", &h, 1_010, 43, &fresh()).is_err(), "restarted companion");
+        assert!(verify("GET", "/render/x", "", &h, 1_000 + 301, 42, &fresh()).is_err(), "stale");
+        assert!(verify("GET", "/render/x", "", "ts=1000", 1_000, 42, &fresh()).is_err(), "malformed");
+        assert!(
+            verify_signed_request("other", "GET", "/render/x", "", &h, 1_010, 42, &fresh()).is_err(),
+            "token"
+        );
     }
 
     #[test]
     fn the_signed_request_mac_formula_is_pinned() {
         // The Python bridge pins the same vector (test_listener_verification.py).
         assert_eq!(
-            signed_request_mac("k".repeat(64).as_str(), "GET", "/health", 1_700_000_000, &"ab".repeat(16)),
-            hmac_sha256_hex(
-                "k".repeat(64).as_bytes(),
-                format!("aiui-req-v1|GET|/health|1700000000|{}", "ab".repeat(16)).as_bytes()
-            )
+            signed_request_mac(&"k".repeat(64), "POST", "/render", 1_700_000_000, &"ab".repeat(16), 4242, EMPTY_SHA, "1"),
+            "69e9c08260c11b26fc5f217fb7bbe0699291522a1c69f53da4095b99b04fea21"
         );
     }
 
     #[tokio::test]
-    async fn the_signed_layer_hands_handlers_the_bearer_form() {
+    async fn the_signed_layer_checks_the_body_and_hands_handlers_the_bearer_form() {
         use tower::ServiceExt;
         let app = Router::new()
             .route(
                 "/x",
-                get(|h: HeaderMap| async move {
-                    if auth_ok(&h, "tok") { StatusCode::OK } else { StatusCode::UNAUTHORIZED }
+                post(|h: HeaderMap, body: String| async move {
+                    if auth_ok(&h, "tok") && body == "signed" { StatusCode::OK } else { StatusCode::UNAUTHORIZED }
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(std::sync::Arc::<str>::from("tok"), signed_auth));
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let n = format!("{:032x}", now as u128 * 7919);
-        let mac = signed_request_mac("tok", "GET", "/x?a=1", now, &n);
-        let req = axum::http::Request::builder()
-            .uri("/x?a=1")
-            .header("authorization", format!("AIUI-HMAC ts={now},nonce={n},mac={mac}"))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-        let bad = axum::http::Request::builder()
-            .uri("/x?a=1")
-            .header("authorization", format!("AIUI-HMAC ts={now},nonce={n},mac={}", "0".repeat(64)))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(app.oneshot(bad).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let pid = std::process::id();
+        let req = |n: &str, body: &'static str| {
+            let h = hdr("tok", "POST", "/x?a=1", now, n, pid, &sha256_hex(b"signed"), "");
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/x?a=1")
+                .header("authorization", format!("AIUI-HMAC {h}"))
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let n1 = format!("{:032x}", now as u128 * 7919 + 1);
+        assert_eq!(app.clone().oneshot(req(&n1, "signed")).await.unwrap().status(), StatusCode::OK);
+        // Same signature shape, substituted body: refused.
+        let n2 = format!("{:032x}", now as u128 * 7919 + 2);
+        assert_eq!(
+            app.oneshot(req(&n2, "phishing form")).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
