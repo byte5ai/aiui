@@ -226,6 +226,41 @@ pub fn terminal_exit(
     port: u16,
     scope: crate::housekeeping::SweepScope,
 ) -> ! {
+    drain_and_sweep(app, reason, port, scope);
+    std::process::exit(code)
+}
+
+/// Set by the first [`drain_and_sweep`]; every later call is a no-op. An
+/// honoured update-restart drains in the `ExitRequested` gate and then lets
+/// Tauri run its exit sequence, whose `RunEvent::Exit` arm calls this again.
+static DRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Steps 1–4 of [`terminal_exit`] without the final `process::exit`: drain
+/// the dialog registry, flush, sweep the tunnels (scoped), record `HostExit`
+/// and dump the ring. Idempotent.
+///
+/// Split out for the paths that must NOT end in `std::process::exit`:
+///
+/// - **Update restart (#180 regression, review B2-01).** Tauri restarts in
+///   two steps: `request_restart()` fires `ExitRequested { code:
+///   Some(RESTART_EXIT_CODE) }`, and the relaunch itself happens later, in
+///   the `RunEvent::Exit` arm of Tauri's own loop. Calling `terminal_exit`
+///   from the honoured gate exited before that arm ran, so *Install* quit
+///   aiui and nothing came back. See [`exit_mode_for`].
+/// - **macOS `terminate:`** (⌘Q, app-menu or Dock Quit; review B2-03). AppKit
+///   delivers `RunEvent::Exit` without any `ExitRequested`, so the gate never
+///   sees it. The `Exit` arm cannot veto, but it can still answer every
+///   pending dialog with `host_exiting` (I7) and sweep the tunnels instead of
+///   leaving `ssh -NTR` children holding the remotes' :7777.
+pub fn drain_and_sweep(
+    app: &AppHandle,
+    reason: &'static str,
+    port: u16,
+    scope: crate::housekeeping::SweepScope,
+) {
+    if DRAINED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     crate::lifecycle_log::transition(crate::lifecycle_log::Phase::Exiting);
 
     if let Some(state) = app.try_state::<Arc<crate::dialog::DialogState>>() {
@@ -249,15 +284,37 @@ pub fn terminal_exit(
     for line in crate::lifecycle_log::recent() {
         trace(&format!("lifecycle-dump {line}"));
     }
-    std::process::exit(code)
+}
+
+/// How an honoured `ExitRequested` ends the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitMode {
+    /// Drain, sweep and `std::process::exit` — [`terminal_exit`].
+    Terminate,
+    /// Drain and sweep, then return so Tauri finishes its exit sequence: its
+    /// `RunEvent::Exit` arm performs the relaunch an update asked for.
+    LetTauriRestart,
+}
+
+/// Pure decision for the honoured branch of the `ExitRequested` gate. A
+/// restart (`app.restart()`, `request_restart()`, the process plugin's
+/// `relaunch()`) carries `tauri::RESTART_EXIT_CODE`; `std::process::exit`
+/// there would kill the relaunch Tauri performs afterwards (review B2-01).
+pub fn exit_mode_for(code: Option<i32>) -> ExitMode {
+    if code == Some(tauri::RESTART_EXIT_CODE) {
+        ExitMode::LetTauriRestart
+    } else {
+        ExitMode::Terminate
+    }
 }
 
 /// Explicit exit authority for the two non-Wirt-death cases (uninstall, update
 /// restart). A plain latch: set once by `quit_app` / the updater right before
 /// they ask Tauri to terminate, read by the `ExitRequested` default-deny gate
 /// so those — and only those — Tauri-initiated exits are honoured. Everything
-/// else Tauri tries (last-window-close, ⌘Q, OS quit-all) is vetoed while Claude
-/// Desktop is alive.
+/// else that reaches the gate (last-window-close, a programmatic exit) is
+/// vetoed while Claude Desktop is alive. macOS `terminate:` (⌘Q, Dock Quit)
+/// never reaches it; see `drain_and_sweep`.
 pub struct ExitAuthority {
     authorized: std::sync::atomic::AtomicBool,
 }
@@ -1077,6 +1134,20 @@ mod tests {
         // must read as "not my Wirt", never as "my Wirt died".
         assert!(!wirt_gone(false, false));
         assert!(!wirt_gone(false, true));
+    }
+
+    #[test]
+    fn an_update_restart_lets_tauri_relaunch() {
+        // B2-01: the honoured gate used to `process::exit` on a restart code,
+        // so Tauri's `RunEvent::Exit` arm — where the relaunch happens — never
+        // ran and *Install* quit aiui for good.
+        assert_eq!(
+            exit_mode_for(Some(tauri::RESTART_EXIT_CODE)),
+            ExitMode::LetTauriRestart
+        );
+        assert_eq!(exit_mode_for(Some(0)), ExitMode::Terminate);
+        assert_eq!(exit_mode_for(Some(1)), ExitMode::Terminate);
+        assert_eq!(exit_mode_for(None), ExitMode::Terminate);
     }
 
     #[test]

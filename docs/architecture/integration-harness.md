@@ -107,7 +107,7 @@ Run each against a real build, then read `lifecycle_phase` + the trace dump.
 | Scenario | Action | Expected event-log signature |
 |---|---|---|
 | Window-X is not exit (I2) | Close the setup window | `window close treated as hide`; phase stays `Serving`; process alive |
-| ⌘Q with Claude Desktop up | Quit aiui via menu while CD runs | `ExitRequested default-denied`; phase stays `Serving` |
+| ⌘Q with Claude Desktop up | Quit aiui via menu while CD runs | The process ends (AppKit `terminate:` reaches `RunEvent::Exit` with no `ExitRequested`, so there is no veto); every pending dialog is answered `host_exiting` and the tunnels are swept (`HostExit { reason: "app-terminate" }`) |
 | Last child gone, CD alive | Quit the only Claude Code session | `phase Serving → GracePending`, `grace armed (5s)`, `grace resolved → stay`, `phase GracePending → Serving` |
 | Wirt gone (CD quit) | Quit Claude Desktop | `… → GracePending`, `grace resolved → exit (claude_desktop_running=false)`, `phase → Exiting`, `host exit authorized (claude-desktop-gone)`, `lifecycle-dump …` |
 | Child churn | Restart Claude Desktop quickly | `child detached`/`child attached` around a `grace resolved → stay` (no exit) |

@@ -2998,8 +2998,10 @@ pub fn run() {
         .expect("error building tauri application")
         .run(|app, event| {
             // ExitRequested gate — single exit authority (Invariant I1). Tauri
-            // fires ExitRequested on ⌘Q, on ⌘W / close of the last visible
-            // window, on OS shutdown, and on `.restart()`. The
+            // fires ExitRequested on ⌘W / close of the last visible window,
+            // on `app.exit()` and on `.restart()`. NOT on macOS ⌘Q / Dock
+            // Quit: AppKit `terminate:` goes straight to `RunEvent::Exit`
+            // (handled below — cleanup, no veto). The
             // last-window-close case is the dangerous one: as soon as the
             // agent's dialog window closes after a submit, Tauri wants to
             // terminate the process — but the host is meant to live headless
@@ -3020,8 +3022,8 @@ pub fn run() {
                 // exits are: (b) uninstall / (c) update-restart — both latch
                 // `ExitAuthority` before asking Tauri to terminate — or (a) the
                 // Wirt (Claude Desktop) is already gone. Every other
-                // Tauri-initiated exit (last-window-close, ⌘Q, OS quit-all) is
-                // vetoed. This is what stops the headless host dying ~18 ms
+                // Tauri-initiated exit (last-window-close, programmatic exit)
+                // is vetoed. This is what stops the headless host dying ~18 ms
                 // after a dialog submit (v0.4.42) and on overnight churn
                 // (v0.4.45): the child count and window visibility no longer
                 // enter the decision at all.
@@ -3034,8 +3036,21 @@ pub fn run() {
                 // Codex-only user it is permanently absent, which turned this
                 // default-DENY gate into default-ALLOW — the host quit as soon
                 // as a dialog submit closed its only window.
-                let cd_is_wirt = setup::is_claude_desktop_installed();
-                let cd_running = setup::is_claude_desktop_running();
+                //
+                // The probe spawns `pgrep`/`tasklist` and this runs on the
+                // main thread, so it is taken only when the answer can matter:
+                // an explicit latch is honoured and a `code: None` exit is
+                // vetoed whatever it says (review B2-11 — every last-window
+                // close used to pay for a subprocess it then ignored).
+                let needs_probe = !explicit && code.is_some();
+                let (cd_is_wirt, cd_running) = if needs_probe {
+                    (
+                        setup::is_claude_desktop_installed(),
+                        setup::is_claude_desktop_running(),
+                    )
+                } else {
+                    (false, false)
+                };
                 let gone = lifetime::wirt_gone(cd_is_wirt, cd_running);
                 // `code: None` is Tauri's user-interaction exit — including
                 // the last window being destroyed, which happens after every
@@ -3062,9 +3077,45 @@ pub fn run() {
                     "exit-claude-desktop-gone"
                 };
                 logging::trace(&format!("[aiui] honouring ExitRequested: {reason}"));
-                // Drains pending dialogs, flushes, sweeps, dumps the ring and
-                // exits. Does not return.
-                lifetime::terminal_exit(app, reason, 0, port, housekeeping::SweepScope::All);
+                match lifetime::exit_mode_for(*code) {
+                    // An update restart: drain and sweep, then RETURN so Tauri
+                    // finishes its exit sequence — the relaunch happens in its
+                    // `RunEvent::Exit` handling, which `process::exit` here
+                    // would pre-empt (review B2-01).
+                    lifetime::ExitMode::LetTauriRestart => {
+                        lifetime::drain_and_sweep(
+                            app,
+                            reason,
+                            port,
+                            housekeeping::SweepScope::All,
+                        );
+                        return;
+                    }
+                    // Drains pending dialogs, flushes, sweeps, dumps the ring
+                    // and exits. Does not return.
+                    lifetime::ExitMode::Terminate => lifetime::terminal_exit(
+                        app,
+                        reason,
+                        0,
+                        port,
+                        housekeeping::SweepScope::All,
+                    ),
+                }
+            }
+
+            // macOS ⌘Q / app-menu Quit / Dock Quit send AppKit `terminate:`,
+            // which tao turns into `RunEvent::Exit` WITHOUT an `ExitRequested`
+            // first — the gate above never sees it and cannot veto it (review
+            // B2-03). What can still happen is the cleanup: answer every
+            // pending dialog with `host_exiting` (I7) and sweep the `ssh -NTR`
+            // children, which `kill_on_drop` does not reach on this path.
+            // Idempotent, so the restart path above draining first is fine.
+            if let tauri::RunEvent::Exit = &event {
+                let port = app
+                    .try_state::<Arc<config::AppConfig>>()
+                    .map(|cfg| cfg.http_port)
+                    .unwrap_or(7777);
+                lifetime::drain_and_sweep(app, "app-terminate", port, housekeeping::SweepScope::All);
             }
 
             // macOS: Dock-Klick, "open" bei laufender App, File-Assoc etc.

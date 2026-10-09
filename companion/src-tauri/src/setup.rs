@@ -830,10 +830,28 @@ pub fn remove_codex_config() -> StepResult {
 /// The substring that identifies a running Claude Desktop on macOS: the
 /// bundle's executable path, which is the same wherever the app is
 /// installed (#180). Private so it cannot drift from the matcher below.
-#[cfg(target_os = "macos")]
+/// Not `cfg`-gated, so the matcher and the probe's output parsing are
+/// unit-tested on every platform CI runs, not only on the macOS leg.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const CLAUDE_DESKTOP_PROC_MATCH: &str = "Claude.app/Contents/MacOS/Claude";
 
-/// Is this `pgrep -af` line a running Claude Desktop?
+/// The macOS probe's argv. macOS `pgrep` is BSD `pkill`: there `-a` means
+/// "include process ancestors" and the output is PIDs ONLY — the
+/// `pid + command line` shape is Linux procps `pgrep -a`. With `-af` every
+/// macOS line was a bare number, the matcher never matched, and the probe
+/// said "Claude Desktop is not running" whatever ran (review B2-02). BSD
+/// prints the PID plus the full argument list only for `-l` with `-f`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const CLAUDE_DESKTOP_PGREP_ARGS: [&str; 2] = ["-lf", "Claude.app"];
+
+/// Does BSD `pgrep -lf Claude.app` output contain the Claude Desktop main
+/// binary? Pure, so the exact output shape the probe parses is pinned.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn claude_desktop_in_pgrep_output(stdout: &str) -> bool {
+    stdout.lines().any(is_claude_desktop_proc)
+}
+
+/// Is this `pgrep -lf` line a running Claude Desktop?
 ///
 /// The authority for the liveness probe, not a description of it: the
 /// `pgrep` pattern is a cheap pre-filter and this decides. Pure, so the
@@ -841,7 +859,7 @@ const CLAUDE_DESKTOP_PROC_MATCH: &str = "Claude.app/Contents/MacOS/Claude";
 /// the same treatment `is_aiui_ssh_ntr_for_port` gets in `housekeeping.rs`.
 /// The two properties that matter: it finds the app wherever it is
 /// installed, and it never matches the `claude` CLI.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
     cmdline.contains(CLAUDE_DESKTOP_PROC_MATCH)
 }
@@ -853,7 +871,7 @@ pub fn is_claude_desktop_proc(cmdline: &str) -> bool {
 ///
 /// Pure read-only. Per-OS process probe:
 ///
-/// - macOS: `pgrep -af Claude.app` pre-filters, then
+/// - macOS: `pgrep -lf Claude.app` pre-filters, then
 ///   [`is_claude_desktop_proc`] decides — the bundle executable, at any
 ///   install location, never the `claude` CLI.
 /// - Windows: `tasklist /FI "IMAGENAME eq Claude.exe" /NH` lists running
@@ -870,16 +888,16 @@ pub fn is_claude_desktop_running() -> bool {
         // supports via the config dir), so the app looked permanently dead
         // to its own liveness probe — and the exit gate inverted.
         //
-        // `pgrep -af Claude.app` is only the cheap pre-filter; the decision
+        // `pgrep -lf Claude.app` is only the cheap pre-filter; the decision
         // is `is_claude_desktop_proc`, so the matching rule lives in one
         // unit-tested place rather than inside an argv string.
         let out = std::process::Command::new("pgrep")
-            .args(["-af", "Claude.app"])
+            .args(CLAUDE_DESKTOP_PGREP_ARGS)
             .output();
         match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(is_claude_desktop_proc),
+            Ok(o) if o.status.success() => {
+                claude_desktop_in_pgrep_output(&String::from_utf8_lossy(&o.stdout))
+            }
             _ => false,
         }
     }
@@ -2193,7 +2211,6 @@ mod tests {
         assert!(r.details.is_some());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn claude_desktop_proc_match_is_location_independent() {
         // #180: the old probe hard-coded /Applications, so a ~/Applications
@@ -2204,7 +2221,7 @@ mod tests {
         assert!(is_claude_desktop_proc(
             "/Users/ada/Applications/Claude.app/Contents/MacOS/Claude"
         ));
-        // The real input shape: `pgrep -af` prefixes the pid.
+        // The real input shape: BSD `pgrep -lf` prefixes the pid.
         assert!(is_claude_desktop_proc(
             "4711 /Applications/Claude.app/Contents/MacOS/Claude"
         ));
@@ -2217,7 +2234,31 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_probe_asks_bsd_pgrep_for_the_argument_list() {
+        // B2-02: BSD `pgrep -a` lists ANCESTORS and prints PIDs only, so the
+        // `-af` probe could never see a command line on macOS. `-l` with
+        // `-f` is what makes BSD print `pid argv…`.
+        assert!(CLAUDE_DESKTOP_PGREP_ARGS[0].contains('l'));
+        assert!(CLAUDE_DESKTOP_PGREP_ARGS[0].contains('f'));
+        assert!(!CLAUDE_DESKTOP_PGREP_ARGS[0].contains('a'));
+    }
+
+    #[test]
+    fn the_macos_probe_parses_bsd_pgrep_output() {
+        // What BSD `pgrep -lf Claude.app` prints while Claude Desktop runs:
+        // the main binary plus its helpers, each as `pid argv…`.
+        let running = "4711 /Applications/Claude.app/Contents/MacOS/Claude\n\
+                       4720 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=renderer\n";
+        assert!(claude_desktop_in_pgrep_output(running));
+        // Only helpers left (the app is quitting): not running.
+        let helpers = "4720 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu\n";
+        assert!(!claude_desktop_in_pgrep_output(helpers));
+        // The shape the old `-af` probe produced on macOS: bare PIDs.
+        assert!(!claude_desktop_in_pgrep_output("4711\n4720\n"));
+        assert!(!claude_desktop_in_pgrep_output(""));
+    }
+
     #[test]
     fn claude_desktop_proc_match_never_matches_the_cli() {
         // A Claude Code session must never be mistaken for Claude Desktop —
