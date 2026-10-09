@@ -1,8 +1,8 @@
 # RFC: Self-Healing Companion (event-driven, no idle ticks)
 
 Status: draft
-Origin: post-mortem of a 15h+ stuck-WebView incident on v0.3.0 (see
-`/tmp/aiui-trace.log`, 2026-04-25). HTTP server stayed healthy while the
+Origin: post-mortem of a 15h+ stuck-WebView incident on v0.3.0 (trace
+log of 2026-04-25; the log has since moved to aiui's state directory). HTTP server stayed healthy while the
 WebView event loop was effectively dead, so every `/render` call blocked
 indefinitely with no automatic recovery.
 
@@ -141,6 +141,11 @@ Long-uptime drift gets flushed the moment it would actually matter.
 
 ### 7. Update check on lifecycle events, not on a 6h timer
 
+> **Not adopted.** The 6 h checks were retained: a headless Rust loop
+> (`lib.rs`) that notifies once per new version (#188), and a 6 h cooldown in
+> the Settings frontend (`lifecycle.ts`). The README documents that
+> behaviour; this section is kept as the design discussion it was.
+
 Replace the recurring poll with checks at:
 
 - GUI start (already there).
@@ -185,7 +190,8 @@ HTTP endpoint and the lifetime socket after the window goes away.
 
 ## What this removes
 
-- `setInterval(..., 6 * 60 * 60 * 1000)` for update polling.
+- ~~`setInterval(..., 6 * 60 * 60 * 1000)` for update polling.~~ Not
+  removed — see §7.
 - Any future temptation to add a `setInterval` for liveness, registry GC,
   or child sweeping. The Settings status poll is the single exception and
   is gated as described in §8; anything new needs the same two gates.

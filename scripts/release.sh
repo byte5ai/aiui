@@ -17,7 +17,7 @@
 #
 # This script exists only to stop agents and humans from reinventing a
 # local build path. If GitHub Actions is down, wait for it — do not sign
-# aiui locally. See CONTRIBUTING.md -> Signing / notarising / releasing.
+# aiui locally. See CONTRIBUTING.md -> Releasing.
 set -euo pipefail
 cat >&2 <<'MSG'
 ✋ aiui does not release locally.
@@ -29,6 +29,6 @@ Validate-first (no PyPI publish, marked as GitHub pre-release):
   gh workflow run release-macos.yml -f version=<X.Y.Z> \
     -f prerelease=true -f publish-pypi=false --repo byte5ai/aiui
 
-Details: CONTRIBUTING.md -> Signing / notarising / releasing
+Details: CONTRIBUTING.md -> Releasing
 MSG
 exit 1

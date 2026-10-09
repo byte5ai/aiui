@@ -54,8 +54,17 @@ fail() {
 [ -f "$FEED" ] || fail "$FEED does not exist"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
-FEED="$FEED" TAG="$TAG" VERSION="$VERSION" \
+# Review F-19: the updater's trust anchor. Every platform's signature must
+# have been made by THIS key — a rotated or stale signing secret otherwise
+# publishes fine and fails on every client at install time. Overridable for
+# the self-test.
+CONF="${AIUI_TAURI_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/companion/src-tauri/tauri.conf.json}"
+[ -f "$CONF" ] || fail "$CONF does not exist (needed for the updater public key)"
+
+FEED="$FEED" TAG="$TAG" VERSION="$VERSION" CONF="$CONF" \
 REQUIRED="${REQUIRED_PLATFORMS[*]}" python3 - <<'PY'
+import base64
+import binascii
 import json
 import os
 import sys
@@ -64,6 +73,27 @@ feed_path = os.environ["FEED"]
 tag = os.environ["TAG"]
 version = os.environ["VERSION"]
 required = os.environ["REQUIRED"].split()
+
+
+def minisign_key_id(b64_text):
+    """Key ID (hex) of a base64-wrapped minisign public key or signature
+    file, as Tauri stores both: the second line decodes to 2 algorithm bytes
+    followed by the 8-byte key ID."""
+    text = base64.b64decode(b64_text, validate=True).decode("utf-8")
+    payload = base64.b64decode(text.strip().split("\n")[1].strip(), validate=True)
+    if len(payload) < 10:
+        raise ValueError("payload too short")
+    return payload[2:10].hex()
+
+
+try:
+    expected_key_id = minisign_key_id(
+        json.load(open(os.environ["CONF"]))["plugins"]["updater"]["pubkey"]
+    )
+except (KeyError, ValueError, IndexError, UnicodeDecodeError, binascii.Error) as e:
+    print(f"updater-feed: FAIL — cannot read the updater pubkey: {e}", file=sys.stderr)
+    raise SystemExit(1)
+url_prefix = f"https://github.com/byte5ai/aiui/releases/download/{tag}/"
 
 problems = []
 
@@ -104,6 +134,17 @@ for name in required:
     sig = entry.get("signature")
     if not isinstance(sig, str) or not sig.strip():
         problems.append(f"`{name}` has an empty or missing signature")
+    else:
+        try:
+            got_key_id = minisign_key_id(sig)
+        except (ValueError, IndexError, UnicodeDecodeError, binascii.Error):
+            problems.append(f"`{name}` signature is not a minisign signature")
+        else:
+            if got_key_id != expected_key_id:
+                problems.append(
+                    f"`{name}` is signed by key {got_key_id}, but the app trusts "
+                    f"{expected_key_id} — every client would refuse the install"
+                )
 
     url = entry.get("url")
     if not isinstance(url, str) or not url.strip():
@@ -112,11 +153,12 @@ for name in required:
     # The url must point into THIS release. This is what catches an entry
     # carried forward from a previous release: it would verify and install,
     # silently leaving the client on the old version.
-    expected_prefix = f"/releases/download/{tag}/"
-    if expected_prefix not in url:
+    # F-19: and it must be THIS repository's release, by prefix — a
+    # substring test also accepted https://elsewhere.example/releases/download/<tag>/x.
+    if not url.startswith(url_prefix):
         problems.append(
-            f"`{name}` url does not point at {tag}: {url} — an entry from "
-            f"another release installs the wrong artifact and verifies fine"
+            f"`{name}` url does not point at {url_prefix}: {url} — an entry from "
+            f"another release or host installs the wrong artifact"
         )
 
 # A platform we do not ship for is not fatal, but it is worth naming: it is

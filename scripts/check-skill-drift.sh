@@ -53,7 +53,7 @@
 # or one the two copies disagree on, so each one needs a real reason.
 #
 # Run locally:  scripts/check-skill-drift.sh
-# Self-test:    scripts/test-check-skill-drift.sh
+# Self-test:    python/tests/test_skill_contract.py (CI job `mcp`)
 # CI:           .github/workflows/ci.yml -> job `skill-drift`
 
 set -euo pipefail

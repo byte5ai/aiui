@@ -181,7 +181,8 @@ Actions — never on a maintainer's machine — from third-party actions pinned
 to commit SHAs and a Rust compiler pinned in `rust-toolchain.toml`. The
 macOS build is Apple Developer-ID signed and notarized; the Windows
 installer carries no Authenticode signature yet (see [Install](#install)),
-but its updater artifacts are signature-verified. It never phones home.
+but its updater artifacts are signature-verified. It sends no telemetry;
+the network traffic it does make is listed in [SECURITY.md](SECURITY.md).
 The auth token stays in aiui's config directory on your machine —
 `~/.config/aiui/` on macOS and Linux, `%APPDATA%\aiui\` on Windows — and
 is only copied to hosts you explicitly register in settings.
