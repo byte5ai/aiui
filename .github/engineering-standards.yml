@@ -3,6 +3,7 @@
 # Schema: siehe byte5ai/engineering-standards.
 
 status: applied
+tier: solo               # team | solo — fehlt das Feld, gilt team
 source: byte5ai/engineering-standards
 decided_on: 2026-04-24
 reviewed_on: 2026-04-24
