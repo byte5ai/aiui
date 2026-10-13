@@ -68,7 +68,7 @@ jobs:
       # explicitly from `rust-toolchain.toml`. `@stable` was a *branch* ref —
       # expected to move — so CI and the release built with whatever compiler
       # happened to be stable that morning, recorded nowhere.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-11
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master @ 2026-09-11
         with:
           toolchain: "1.98.1"
           targets: ${{ matrix.target }}
