@@ -172,7 +172,7 @@ jobs:
           workspaces: companion/src-tauri -> target
           key: release-aarch64-apple-darwin
 
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # Exact, not `latest`: this job publishes to PyPI with
           # UV_PUBLISH_TOKEN, so the uv binary is part of the trusted set.
