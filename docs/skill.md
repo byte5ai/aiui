@@ -1,6 +1,6 @@
 ---
 name: aiui
-description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy), `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or image confirmation, `compare` for A/B(/C) side-by-side picks, `gallery` for batch image/video review, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
+description: Render native desktop dialogs on the user's machine via aiui's MCP server — `confirm` before destructive actions (delete, drop, force-push, deploy) and for a yes/no on one image, `ask` for pick-one-of-N where context per option matters, `form` for multi-input requests, secrets, dates, sliders, sortable lists, or picking from many images, `compare` for A/B(/C) side-by-side picks, `gallery` for batch image/video review, `upload` when the user hands you a file from their machine, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents

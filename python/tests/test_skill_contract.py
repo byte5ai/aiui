@@ -161,3 +161,20 @@ def test_tool_name_mismatch_fails_guard(tmp_path: Path) -> None:
     assert "NOT by the Python bridge" in out
     assert "compare2" in out
     assert "NOT by the Rust bridge" in out
+
+
+def test_tool_missing_from_description_fails_guard(tmp_path: Path) -> None:
+    """#274: the Python copy's frontmatter named neither `compare` nor
+    `gallery` while both bodies documented them, so every body check passed.
+    The description is what the host reads to decide whether the skill
+    applies at all."""
+    root = _fixture_repo(tmp_path)
+    _patch(root, COPY, "`compare` for picking one of 2–3 full variants side by side, ", "")
+
+    proc = _run_guard(root)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "missing from a skill.md frontmatter description" in out
+    assert "python/src/aiui_mcp/skill.md: compare" in out
+    # The body still documents `compare`: only the new check can see this.
+    assert "not documented in both skill.md copies" not in out

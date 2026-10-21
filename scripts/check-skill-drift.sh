@@ -40,7 +40,14 @@
 #      decorator's `name=` wins where present), and every dialog tool must
 #      appear backticked in both copies.
 #
-# Checks 2 and 3 parse the Rust/Python sources on purpose. A list
+#   4. check_description_tools — the *frontmatter* must route to every
+#      dialog tool. Each copy's `description:` line is what the host reads
+#      to decide whether to load the skill at all, so a tool missing there
+#      is one the skill never routes to. The Python copy's description named
+#      neither `compare` nor `gallery` while both bodies documented them —
+#      every other check stayed green (#274).
+#
+# Checks 2–4 parse the Rust/Python sources on purpose. A list
 # hardcoded here would drift in exactly the way this guard exists to catch.
 #
 # HOW TO ALLOW A DELIBERATE DIVERGENCE
@@ -298,6 +305,46 @@ check_tool_parity() {
   return "$rc"
 }
 
+# --- 4. frontmatter description names every dialog tool --------------------
+
+# The `description:` line of the file's leading frontmatter block.
+frontmatter_description() {
+  awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } /^description: / { print; exit }' "$1"
+}
+
+check_description_tools() {
+  local rust_tools tool file desc rc=0
+  local -a missing=()
+
+  rust_tools="$(rust_tool_names)"
+  for file in "$CANON" "$COPY"; do
+    desc="$(frontmatter_description "$file")"
+    if [ -z "$desc" ]; then
+      rc=1
+      echo "ERROR: no frontmatter description: line in ${file#"$ROOT"/}."
+      continue
+    fi
+    for tool in $rust_tools; do
+      if printf '%s\n' "${ALLOW_UNDOCUMENTED_TOOLS[@]:-}" | grep -qxF -- "$tool"; then
+        continue
+      fi
+      if ! printf '%s\n' "$desc" | grep -qF -- "\`$tool\`"; then
+        missing+=("${file#"$ROOT"/}: $tool")
+      fi
+    done
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    rc=1
+    echo "ERROR: dialog tools missing from a skill.md frontmatter description:"
+    printf '  - %s\n' "${missing[@]}"
+    echo "  -> name the tool, backticked, in the description: line of that copy;"
+    echo "     the host decides from that line whether the skill applies."
+  fi
+
+  return "$rc"
+}
+
 # --- run -------------------------------------------------------------------
 
 for f in "$CANON" "$COPY" "$HTTP_RS" "$MCP_RS" "$SERVER_PY"; do
@@ -308,11 +355,12 @@ status=0
 check_header_tokens || status=1
 check_field_kinds || status=1
 check_tool_parity || status=1
+check_description_tools || status=1
 
 if [ "$status" -eq 0 ]; then
   echo "skill-drift: OK — both skill.md copies document the same field/tool surface,"
-  echo "             every KNOWN_FIELD_KINDS kind is documented, and the two bridges"
-  echo "             serve the same tools."
+  echo "             every KNOWN_FIELD_KINDS kind is documented, the two bridges"
+  echo "             serve the same tools, and both descriptions name every dialog tool."
 fi
 
 exit "$status"
