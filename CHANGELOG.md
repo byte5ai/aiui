@@ -121,6 +121,14 @@ introduced regressions of its own.
 - Docs: SECURITY.md lists SSH to registered hosts as outbound traffic and
   scopes code signing to macOS; CONTRIBUTING describes the actual release
   and lock behaviour; skill catalogs are platform-neutral again.
+- Agent-facing texts are the same on both bridges (#274): the Rust bridge
+  describes every `ask`, `form`, `gallery` and `compare` parameter, and its
+  `upload` and `update` texts match the Python bridge's. Every dialog tool
+  says on both bridges that it blocks until the user answers. The session
+  instructions and both skill descriptions route to `compare`, `gallery`
+  and `upload`, and send a yes/no on one image to `confirm` with `image`
+  instead of `form`. The skill-drift guard now fails when a skill
+  description leaves out a dialog tool.
 
 ### Corrections to the 0.11.0 notes
 

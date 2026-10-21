@@ -249,10 +249,14 @@ aiui is connected — you can render native dialogs on the user's machine \
 instead of asking via chat. Default behaviour for this session:
 
 - Yes/no question (esp. before delete / drop / force-push / deploy) → \
-  call `confirm` instead of asking in chat.
+  call `confirm` instead of asking in chat; a yes/no on one image \
+  ("is this generated image OK?") → `confirm` with `image`.
 - Pick-one-of-N options where context per option matters → call `ask`.
 - Multiple related inputs, secret, date, slider, sortable order, \
-  table-row triage, image confirm/grid → call `form`.
+  table-row triage, picking from many images → call `form`.
+- Pick one of 2–3 full variants shown side by side (drafts, headlines, \
+  before/after) → call `compare`.
+- A verdict per item on a batch of images or videos → call `gallery`.
 - User wants to hand you a file from their machine (`/aiui:upload`, \
   "take this file", "upload …") → call `upload` with the target \
   directory on your host; don't ask them to `scp` it.
@@ -2155,6 +2159,10 @@ async def ask(
     decision. `media_warnings`, present only when something failed, lists
     local video/audio that could not be shown.
 
+    Blocks until the user answers or closes the dialog, often for minutes: a
+    slow reply means the user is still deciding, not that aiui is broken.
+    Progress notifications arrive while it waits.
+
     Args:
         question: Full question, imperative or interrogative.
         options: List of `{"label": str, "description"?: str, "value"?: str,
@@ -2200,7 +2208,8 @@ async def form(
     Use it when the user needs to provide ≥ 2 related inputs, or any single
     input that doesn't belong in chat (secret, date/datetime/range, bounded
     number, sortable ranking, multi-select, color pick, table-row triage with
-    column context, image confirm/grid), instead of asking one by one in chat.
+    column context, picking from many images), instead of asking one by one in
+    chat. For a yes/no on one image use `confirm` with `image`.
 
     WHEN TO USE: ≥ 2 related inputs, or one input plus context/confirmation.
     For yes/no, use `confirm`. For a single choice, use `ask`.
@@ -2258,6 +2267,10 @@ async def form(
     `host_exiting`, `abandoned`) — only a reason-less cancel is a user
     decision. `media_warnings`, present only when something failed, lists
     local video/audio that could not be shown.
+
+    Blocks until the user answers or closes the dialog, often for minutes: a
+    slow reply means the user is still deciding, not that aiui is broken.
+    Progress notifications arrive while it waits.
 
     Args:
         title: Window title.
@@ -2333,6 +2346,10 @@ async def confirm(
     reason-less cancel is a user decision. `media_warnings`, present only when
     something failed, lists local video/audio that could not be shown.
 
+    Blocks until the user answers or closes the dialog, often for minutes: a
+    slow reply means the user is still deciding, not that aiui is broken.
+    Progress notifications arrive while it waits.
+
     Args:
         title: The decision phrased as a question.
         message: One-sentence explanation of what happens on confirm.
@@ -2405,6 +2422,10 @@ async def gallery(
     cancel is a user decision. `media_warnings`, present only when something
     failed, lists local video/audio that could not be shown.
 
+    Blocks until the user answers or closes the dialog, often for minutes: a
+    slow reply means the user is still deciding, not that aiui is broken.
+    Progress notifications arrive while it waits.
+
     Args:
         items: List of `{value, src?, alt?, label?, detail?, max_height?}`.
             `value` must be non-empty and unique. Order is preserved.
@@ -2460,10 +2481,10 @@ async def upload(
     whenever the user says "take this file", "upload …", "here's the
     file/screenshot/PDF", or triggers `/aiui:upload`.
 
-    WHEN TO USE: the user wants to give you a file from their own machine. Do NOT ask them
-    which file — they pick it in the native dialog. Do NOT ask where to put it;
-    infer `target_dir` from the conversation (usually your cwd or the active
-    project dir) and pass it.
+    WHEN TO USE: the user wants to give you a file from their own machine. Do
+    NOT ask them which file — they pick it in the native dialog. Do NOT ask
+    where to put it; infer `target_dir` from the conversation (usually your cwd
+    or the active project dir) and pass it.
 
     BEHAVIOUR:
     - `target_dir` is optional but you should almost always pass it — an
@@ -2486,8 +2507,7 @@ async def upload(
     Returns `{status: "ok", path, filename, bytes}` on success, or
     `{status: "error", error}` on any failure (user cancelled, file unreadable,
     file too large — 512 MB cap, target directory missing/not writable, another
-    upload in flight, picker never answered). Report briefly; on `ok`, mention
-    the path the file landed at.
+    upload in flight, picker never answered).
 
     Args:
         target_dir: Absolute or `~/`-rooted directory on your host where the
@@ -2630,6 +2650,10 @@ async def compare(
     `abandoned`) — only a reason-less cancel is a user decision.
     `media_warnings`, present only when something failed, lists local
     video/audio that could not be shown.
+
+    Blocks until the user answers or closes the dialog, often for minutes: a
+    slow reply means the user is still deciding, not that aiui is broken.
+    Progress notifications arrive while it waits.
 
     Args:
         variants: List of `{value, label?, content?, src?, alt?, detail?,

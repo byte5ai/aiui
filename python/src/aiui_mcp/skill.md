@@ -1,6 +1,6 @@
 ---
 name: aiui
-description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native desktop dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / image confirm, `compare` for picking one of 2–3 full variants side by side, `gallery` for a per-item verdict on a batch of images/videos, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
+description: Before writing a yes/no question, a numbered option list, or a multi-question request into the chat, open a native desktop dialog instead — `confirm` for yes/no (always for delete/force-push/drop/deploy; with `image` for a yes/no on one image), `ask` for one-of-N with per-option context, `form` for ≥ 2 related inputs / secrets / dates / sliders / sortable lists / table-row triage / picking from many images, `compare` for picking one of 2–3 full variants side by side, `gallery` for a per-item verdict on a batch of images/videos, `upload` when the user hands you a file from their machine, `notify` for a fire-and-forget completion signal that doesn't block on a reply.
 ---
 
 # aiui — Dialog design for Claude agents
