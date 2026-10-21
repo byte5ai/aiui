@@ -28,7 +28,8 @@ jobs:
     # macOS on the own runner (macrunner, #291): a fresh VM per job, Xcode 27.
     # ci-lint: allow-CI006  Fork-PR-Approval: all external contributors; ephemere VM pro Job
     runs-on: ${{ matrix.os }}
-    # Hang protection. Measured on macrunner: see #291; Windows has run 6–13 min.
+    # Hang protection: ~3× the slowest leg (Windows, up to 13 min; the macOS
+    # build and tests took under 2 min on macrunner, #291).
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -312,8 +313,10 @@ jobs:
     # macOS on the own runner (macrunner, #291): a fresh VM per job.
     # ci-lint: allow-CI006  Fork-PR-Approval: all external contributors; ephemere VM pro Job
     runs-on: ${{ matrix.os }}
-    # Hang protection. Measured on macrunner: see #291; the other legs run 2.5–3.6 min.
-    timeout-minutes: 20
+    # Hang protection: ~3× the slowest leg (the macOS tests took 3 min on
+    # macrunner, #291; the other legs 2.5–3.6 min), with room for a slow
+    # Python download into the fresh VM.
+    timeout-minutes: 15
     # Every step below is a bash script (the smoke-check pipes `printf` into
     # `timeout`), so the Windows leg runs Git Bash rather than pwsh — one
     # script, three runners (#210).
