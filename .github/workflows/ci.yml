@@ -28,9 +28,9 @@ jobs:
     # macOS on the own runner (macrunner, #291): a fresh VM per job, Xcode 27.
     # ci-lint: allow-CI006  Fork-PR-Approval: all external contributors; ephemere VM pro Job
     runs-on: ${{ matrix.os }}
-    # Hang protection: ~3× the slowest leg (Windows, up to 13 min; the macOS
-    # build and tests took under 2 min on macrunner, #291).
-    timeout-minutes: 40
+    # Hang protection: ~3× the slowest leg (Windows, 6–18 min). The macOS leg
+    # took 7.8–7.9 min on macrunner, cold, in its first two runs (#291).
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
