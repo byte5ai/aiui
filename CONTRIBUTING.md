@@ -132,8 +132,9 @@ red test never reaches the signing keychain.
 
 ### macOS — `release-macos.yml`
 
-Builds on a `macos-14` runner, refuses a commit whose `ci.yml` run on
-`main` is not green, Developer-ID-signs + notarizes via the App Store
+Builds on the project's own macOS runner (`macrunner`, Xcode 27; the
+binary must stay arm64 with the minimum macOS from `tauri.conf.json`),
+refuses a commit whose `ci.yml` run on `main` is not green, Developer-ID-signs + notarizes via the App Store
 Connect API key, produces the DMG + signed updater bundle + `latest.json`,
 publishes `aiui-mcp` to PyPI, then tags and cuts the GitHub release **as a
 draft**, and dispatches the Windows workflow.

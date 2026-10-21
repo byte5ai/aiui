@@ -116,6 +116,10 @@ introduced regressions of its own.
   no scheduled workflows, new light guards (`check-doc-claims.sh`,
   `check-leaks.sh`), `ubuntu-24.04` pinned. The release's recovery re-run
   works again from the tagged commit.
+- Builds: the macOS CI legs and the release run on the project's own macOS
+  runner with Xcode 27, so the app is built against the macOS 27 SDK
+  (0.11.0: 14.5). It stays arm64-only with macOS 11.0 as its minimum; the
+  release reads both back from the built binary before signing (#291).
 - `aiui-mcp` requires `mcp>=1.27` (the first SDK that cancels handlers when
   the host closes the transport).
 - Docs: SECURITY.md lists SSH to registered hosts as outbound traffic and
