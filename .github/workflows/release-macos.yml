@@ -17,11 +17,11 @@
 # then codesigned explicitly; the minisign key reaches only the
 # `tauri signer sign` step that signs the stapled updater bundle.
 #
-# Manually triggered (workflow_dispatch) — never on push. macOS runners
-# bill at 10× Linux; a release run is a deliberate, single-job spend.
-# The version-sync check runs FIRST so a drifted dispatch dies in
-# seconds, not after a 20-minute build (CI playbook: cheap before
-# expensive).
+# Manually triggered (workflow_dispatch) — never on push: a release run is
+# a deliberate, single-job dispatch. It runs on the own macOS runner
+# (macrunner, #291) — a fresh VM per job, Xcode 27 — whose two slots every
+# repo shares. The version-sync check runs FIRST so a drifted dispatch dies
+# in seconds, not after the build (cheap before expensive).
 #
 # Required secrets (org- or repo-level on byte5ai/aiui):
 #   MACOS_CERTIFICATE_P12_BASE64      Developer ID Application .p12, base64
@@ -66,7 +66,10 @@ concurrency:
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macrunner
+    # Hang protection: ~3× the last release run (11 min on macos-14), plus
+    # room for Apple's notary queue, which the run waits on twice.
+    timeout-minutes: 45
     env:
       VERSION: ${{ inputs.version }}
       TAG: v${{ inputs.version }}
@@ -155,6 +158,17 @@ jobs:
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
+      # #291: the Xcode that links the shipped binary — and so the SDK it
+      # records — is part of the release record, like the compiler below.
+      - name: Assert Xcode
+        run: bash scripts/assert-xcode.sh
+
+      # #291: the macrunner image has no rustup, and the toolchain action
+      # would then pipe an unpinned installer into the shell of the job that
+      # signs the release. Fixed version, SHA-256 checked, before it runs.
+      - name: Install rustup (pinned, checksum-verified)
+        run: bash scripts/install-rustup.sh
+
       # The compiler that builds the signed binary is recorded in
       # `rust-toolchain.toml`, not resolved from the moving `stable` branch.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-11
@@ -170,7 +184,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
-          key: release-aarch64-apple-darwin
+          # The SDK is part of what the cache holds (#291).
+          key: release-aarch64-apple-darwin-xcode27
 
       - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
         with:
@@ -243,6 +258,12 @@ jobs:
           PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
           [ "$PLIST_VERSION" = "$VERSION" ] \
             || { echo "Info.plist is ${PLIST_VERSION}, expected ${VERSION}"; exit 1; }
+
+      # #291: Xcode 27 officially targets macOS 12 and later; aiui declares
+      # 11.0. Read the binary back — arm64 only, and the `minos` it records
+      # equal to tauri.conf.json — before anything is signed.
+      - name: Verify architecture and minimum macOS
+        run: bash scripts/check-macos-binary.sh companion/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/aiui.app
 
       # Ephemeral keychain + Developer ID import — from the macos-sign.yml
       # template. The keychain password is generated per run and never a

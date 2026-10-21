@@ -25,14 +25,21 @@ concurrency:
 jobs:
   companion:
     name: Tauri companion (${{ matrix.label }})
+    # macOS on the own runner (macrunner, #291): a fresh VM per job, Xcode 27.
+    # ci-lint: allow-CI006  Fork-PR-Approval: all external contributors; ephemere VM pro Job
     runs-on: ${{ matrix.os }}
+    # Hang protection. Measured on macrunner: see #291; Windows has run 6–13 min.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macrunner
             target: aarch64-apple-darwin
             label: macOS arm64
+            # The SDK is part of what the cache holds: a cache built by
+            # another Xcode must not be restored into this one.
+            rust_cache_key: aarch64-apple-darwin-xcode27
             build_bundle: false
             # Tested in the profile the shipped bundle is built from. macOS
             # executes the suite — it is where the test *logic* is asserted.
@@ -41,6 +48,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows x86_64
+            rust_cache_key: x86_64-pc-windows-msvc
             build_bundle: true
             # The Windows `aiui_lib` test binary crashes at *load* with
             # STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on this runner (#141) —
@@ -64,6 +72,17 @@ jobs:
           cache: npm
           cache-dependency-path: companion/package-lock.json
 
+      # #291: the Xcode that links the binary is recorded and pinned, and the
+      # macrunner image has no rustup — so the action below would otherwise
+      # pipe an unpinned installer into the shell.
+      - name: Assert Xcode
+        if: runner.os == 'macOS'
+        run: bash scripts/assert-xcode.sh
+
+      - name: Install rustup (pinned, checksum-verified)
+        if: runner.os == 'macOS'
+        run: bash scripts/install-rustup.sh
+
       # #192: pinned to a `master` commit, with the compiler version passed
       # explicitly from `rust-toolchain.toml`. `@stable` was a *branch* ref —
       # expected to move — so CI and the release built with whatever compiler
@@ -84,7 +103,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: companion/src-tauri -> target
-          key: ${{ matrix.target }}
+          key: ${{ matrix.rust_cache_key }}
 
       - name: Install frontend deps
         working-directory: companion
@@ -290,7 +309,11 @@ jobs:
 
   mcp:
     name: aiui-mcp (${{ matrix.label }})
+    # macOS on the own runner (macrunner, #291): a fresh VM per job.
+    # ci-lint: allow-CI006  Fork-PR-Approval: all external contributors; ephemere VM pro Job
     runs-on: ${{ matrix.os }}
+    # Hang protection. Measured on macrunner: see #291; the other legs run 2.5–3.6 min.
+    timeout-minutes: 20
     # Every step below is a bash script (the smoke-check pipes `printf` into
     # `timeout`), so the Windows leg runs Git Bash rather than pwsh — one
     # script, three runners (#210).
@@ -325,7 +348,7 @@ jobs:
           # macOS and Windows run the bridge's own platform branches — above
           # all `_default_token_path`, which decides where the auth token is
           # read from and used to be executed on Linux only.
-          - os: macos-14
+          - os: macrunner
             python: "3.12"
             label: macOS · py3.12
           - os: windows-latest
