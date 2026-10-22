@@ -232,10 +232,9 @@ is a standard MCP server, so technically yes. The companion is Claude
 Desktop-specific in how it auto-installs, but the HTTP protocol on
 `localhost:7777` is client-agnostic.
 
-**What about Codex / ChatGPT?** First-class Codex support — where aiui
-registers itself into Codex's config the same self-contained way it does
-with Claude Desktop and Claude Code, no manual setup — is in progress.
-Follow [#158](https://github.com/byte5ai/aiui/issues/158) for status.
+**What about Codex / ChatGPT?** When Codex is installed, aiui registers
+itself in Codex's config (`~/.codex/config.toml`) the same self-contained
+way it does with Claude Desktop and Claude Code — no manual setup.
 
 ## Known limitations
 
