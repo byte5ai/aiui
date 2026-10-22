@@ -124,7 +124,9 @@ introduced regressions of its own.
   the host closes the transport).
 - Docs: SECURITY.md lists SSH to registered hosts as outbound traffic and
   scopes code signing to macOS; CONTRIBUTING describes the actual release
-  and lock behaviour; skill catalogs are platform-neutral again.
+  and lock behaviour; skill catalogs are platform-neutral again; README and
+  `docs/strategy.md` describe the Codex self-registration that shipped in
+  0.10.0 (#168) instead of calling it "in progress".
 - Agent-facing texts are the same on both bridges (#274): the Rust bridge
   describes every `ask`, `form`, `gallery` and `compare` parameter, and its
   `upload` and `update` texts match the Python bridge's. Every dialog tool
