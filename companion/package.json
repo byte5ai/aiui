@@ -38,7 +38,7 @@
     "@tauri-apps/plugin-dialog": "2.7.0",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
-    "dompurify": "^3.4.15",
+    "dompurify": "^3.4.17",
     "marked": "^18.1.0",
     "mermaid": "^11.17.2",
     "svelte-i18n": "^4.0.1"
